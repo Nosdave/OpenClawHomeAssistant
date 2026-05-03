@@ -2,6 +2,16 @@
 
 All notable changes to the OpenClaw Assistant Home Assistant Add-on will be documented in this file.
 
+## [0.5.72-pin415] - 2026-05-03 (Nosdave fork)
+
+### Changed
+- **Pin OpenClaw to 2026.4.15** (down from 2026.4.29 in upstream).
+- Reverts toward a known-good version on memory-constrained hosts (Home Assistant
+  Green 4 GB) where 4.27/4.29 cold-boot triggers a parallel npm-install storm
+  during plugin-runtime-deps staging that exceeds available RAM and OOMs the
+  host. 4.15 was empirically stable for this user on the same hardware.
+- No other changes — same wrapper code as upstream's 2026.4.29 bump.
+
 ## [0.5.70] - 2026-04-30
 
 - Bump OpenClaw to 2026.4.27.
