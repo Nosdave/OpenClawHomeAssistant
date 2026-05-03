@@ -1,5 +1,5 @@
 name: OpenClaw Assistant
-version: "0.5.71"
+version: "0.5.71-trim1"
 slug: openclaw_assistant
 description: Run OpenClaw Assistant (OpenClaw-compatible) as a Home Assistant add-on.
 url: https://github.com/techartdev/OpenClawHomeAssistant
@@ -138,6 +138,23 @@ options:
   # MCP server in OpenClaw so the AI can control Home Assistant entities/services.
   auto_configure_mcp: false
 
+  # Comma-separated list of bundled extensions to remove from the image at boot,
+  # BEFORE the OpenClaw gateway starts. This prevents their plugin-runtime-deps
+  # staging (npm install storm) which can OOM low-memory hosts (e.g. HA Green 4 GB)
+  # on first boot of a new OpenClaw version.
+  #
+  # Default removes only the heaviest stage-flagged extensions (channels and LLM
+  # providers most users do not use). The deletion is reversible at next add-on
+  # restart by removing the entry from this list and updating the add-on (rebuilds
+  # the image fresh).
+  #
+  # Light-footprint extensions (no stageRuntimeDependencies flag) cost only disk
+  # and boot enumeration time — leave them unless you also need to save image size.
+  #
+  # Set to empty string ("") to keep all bundled extensions.
+  # Example: "slack,discord,whatsapp,signal"
+  extensions_drop: "acpx,slack,discord,whatsapp,feishu,matrix,qqbot,nostr,webhooks,amazon-bedrock,amazon-bedrock-mantle"
+
 
 schema:
   timezone: str
@@ -169,3 +186,4 @@ schema:
       value: str
   nginx_log_level: list(full|minimal)?
   auto_configure_mcp: bool?
+  extensions_drop: str?

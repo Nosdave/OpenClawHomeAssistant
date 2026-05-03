@@ -59,6 +59,7 @@ FORCE_IPV4_DNS=$(jq -r '.force_ipv4_dns // true' "$OPTIONS_FILE")
 ACCESS_MODE=$(jq -r '.access_mode // "custom"' "$OPTIONS_FILE")
 NGINX_LOG_LEVEL=$(jq -r '.nginx_log_level // "minimal"' "$OPTIONS_FILE")
 AUTO_CONFIGURE_MCP=$(jq -r '.auto_configure_mcp // false' "$OPTIONS_FILE")
+EXTENSIONS_DROP=$(jq -r '.extensions_drop // empty' "$OPTIONS_FILE")
 GW_ENV_VARS_TYPE=$(jq -r 'if .gateway_env_vars == null then "null" else (.gateway_env_vars | type) end' "$OPTIONS_FILE")
 GW_ENV_VARS_RAW=$(jq -r '.gateway_env_vars // empty' "$OPTIONS_FILE")
 GW_ENV_VARS_JSON=$(jq -c '.gateway_env_vars // []' "$OPTIONS_FILE")
@@ -177,6 +178,51 @@ elif [ -L "$IMAGE_SKILLS_DIR" ]; then
   echo "INFO: Built-in skills already linked to persistent storage"
 else
   echo "WARN: Built-in skills directory not found at $IMAGE_SKILLS_DIR"
+fi
+
+# ------------------------------------------------------------------------------
+# Trim unused bundled extensions BEFORE the gateway starts.
+#
+# OpenClaw's gateway and its bundled extensions stage their npm runtime deps on
+# first boot of a new OpenClaw version. This is an intense parallel "npm install"
+# storm that can spike RSS by 1+ GB and OOM low-memory hosts (HA Green 4 GB).
+#
+# By removing the unused extension directories BEFORE the gateway's enumeration,
+# their postinstall is silently skipped (verified in OpenClaw's
+# scripts/postinstall-bundled-plugins.mjs which enumerates dynamically and skips
+# missing dirs). Disabled-but-present extensions still trigger their staging.
+#
+# Controlled by addon option `extensions_drop` (CSV of extension folder names).
+# ------------------------------------------------------------------------------
+IMAGE_EXTENSIONS_DIR="$(HOME=/root npm root -g 2>/dev/null)/openclaw/dist/extensions"
+if [ -n "$EXTENSIONS_DROP" ] && [ -d "$IMAGE_EXTENSIONS_DIR" ]; then
+  IFS=',' read -ra DROP_LIST <<< "$EXTENSIONS_DROP"
+  REMOVED=()
+  SKIPPED=()
+  for raw in "${DROP_LIST[@]}"; do
+    # Strip whitespace and validate name (alphanumeric + dash + underscore only,
+    # to prevent path traversal e.g. "../../etc")
+    ext=$(echo "$raw" | tr -d '[:space:]')
+    if ! [[ "$ext" =~ ^[a-zA-Z0-9_-]+$ ]]; then
+      echo "WARN: extensions_drop: skipping invalid name '$raw'"
+      continue
+    fi
+    target="$IMAGE_EXTENSIONS_DIR/$ext"
+    if [ -d "$target" ] && [ ! -L "$target" ]; then
+      rm -rf "$target"
+      REMOVED+=("$ext")
+    else
+      SKIPPED+=("$ext")
+    fi
+  done
+  if [ ${#REMOVED[@]} -gt 0 ]; then
+    echo "INFO: extensions_drop: removed ${#REMOVED[@]} bundled extensions: ${REMOVED[*]}"
+  fi
+  if [ ${#SKIPPED[@]} -gt 0 ]; then
+    echo "INFO: extensions_drop: skipped (not present): ${SKIPPED[*]}"
+  fi
+elif [ -n "$EXTENSIONS_DROP" ]; then
+  echo "WARN: extensions_drop set but $IMAGE_EXTENSIONS_DIR not found; skipping trim"
 fi
 
 # ------------------------------------------------------------------------------
