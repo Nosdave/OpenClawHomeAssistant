@@ -113,8 +113,9 @@ Save this token — you'll need it to access the Gateway Web UI and for API inte
 
 1. In the terminal, confirm the gateway is running:
    ```sh
-   openclaw gateway status
+   oc-gateway status
    ```
+   > In this add-on, the gateway is supervised by `run.sh` (not systemd), so `openclaw gateway status` can show misleading service-manager warnings.
 2. Click the **Open Gateway Web UI** button on the landing page
 3. If prompted for a token, paste the one from Step 2 or go to the Overview tab, paste the token in the 'Gateway Token' field and press Connect.
 
@@ -705,6 +706,7 @@ The add-on image includes these tools, available in the terminal:
 | Chromium | `chromium` | Headless browser for automation |
 | SSH | `ssh` | Remote access |
 | oc-cleanup | `oc-cleanup` | Interactive disk space monitor & cache cleanup helper |
+| oc-gateway | `oc-gateway status` / `oc-gateway restart` | Add-on-native gateway status/restart helper (`run.sh` supervised, no systemd) |
 
 ### oc-cleanup
 
@@ -806,7 +808,7 @@ Go to **Settings → Add-ons → OpenClaw Assistant → Log** tab. Logs show sta
 **Symptom**: Browser shows connection refused when opening the Gateway Web UI.
 
 **Checks**:
-1. Is the gateway running? In the terminal: `openclaw gateway status`
+1. Is the gateway running? In the terminal: `oc-gateway status`
 2. Is the bind mode correct? `openclaw config get gateway.bind` — must be `lan` for direct LAN access, or `loopback` if using `lan_https` mode
 3. Is the port correct? `openclaw config get gateway.port`
 4. Is the firewall blocking the port? Check your HA host firewall rules
@@ -872,7 +874,7 @@ jq 'del(.tools.web.search.provider)' /config/.openclaw/openclaw.json > /tmp/open
      "allowedOrigins": ["https://YOUR_IP:18789"]
    }
    ```
-   Then restart the gateway: `openclaw gateway restart`
+   Then restart only the gateway process: `oc-gateway restart`
 3. Alternatively, approve devices individually without disabling auth:
    ```sh
    openclaw devices list       # show pending pairing requests
