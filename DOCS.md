@@ -43,10 +43,10 @@ When you open the add-on page in Home Assistant, nginx serves a landing page wit
 | `/config/` | Yes | All user data — survives add-on updates and rebuilds |
 | `/config/.openclaw/` | Yes | OpenClaw configuration (`openclaw.json`), skills, agent data |
 | `/config/clawd/` | Yes | Agent workspace (ClawHub-installed skills, files) |
-| `/config/.node_global/` | Yes | User-installed npm packages (skills installed via dashboard) |
+| `/config/.node_global/` | Optional | User-installed npm packages when `persist_node_global=true` |
 | `/config/secrets/` | Yes | Tokens (e.g., `homeassistant.token`) |
 | `/config/keys/` | Yes | SSH keys (e.g., router SSH key) |
-| `/config/.linuxbrew/` | Yes | Homebrew install and brew-installed CLI tools |
+| `/config/.linuxbrew/` | Optional | Homebrew install and brew-installed CLI tools when `persist_brew_tools=true` |
 | `/config/gogcli/` | Yes | gog OAuth credentials for Google APIs |
 | `/usr/lib/node_modules/openclaw/` | No | OpenClaw installation (rebuilt with each image update) |
 
@@ -314,7 +314,10 @@ To provide the SSH key: place the private key file in the add-on config director
 | Option | Type | Default | Description |
 |---|---|---|---|
 | `clean_session_locks_on_start` | bool | `true` | Remove stale session lock files on startup (safe — only removes locks when gateway isn't running) |
-| `clean_session_locks_on_exit` | bool | `true` | Remove session lock files on clean shutdown || `auto_configure_mcp` | bool | `false` | Auto-register Home Assistant as an MCP server on startup (requires `homeassistant_token`) |
+| `clean_session_locks_on_exit` | bool | `true` | Remove session lock files on clean shutdown |
+| `persist_node_global` | bool | `false` | Persist user-installed npm global skills/packages in `/config/.node_global/`. Turn on only if you want those installs to survive add-on rebuilds. |
+| `persist_brew_tools` | bool | `false` | Persist Homebrew and brew-installed CLI tools in `/config/.linuxbrew/`. Turn on only if you want those installs to survive add-on rebuilds. |
+| `auto_configure_mcp` | bool | `false` | Auto-register Home Assistant as an MCP server on startup (requires `homeassistant_token`) |
 ---
 
 ## 6. Use Case Guides
@@ -648,10 +651,10 @@ You should see your account listed with the `sheets` service.
 | Built-in skills | `/config/.openclaw/skills/` | Yes |
 | Agent sessions & data | `/config/.openclaw/agents/` | Yes |
 | ClawHub workspace | `/config/clawd/` | Yes |
-| User-installed npm skills | `/config/.node_global/` | Yes |
+| User-installed npm skills | `/config/.node_global/` | Optional (`persist_node_global=true`) |
 | SSH keys | `/config/keys/` | Yes |
 | Tokens | `/config/secrets/` | Yes |
-| Homebrew & brew-installed tools | `/config/.linuxbrew/` | Yes (synced on startup) |
+| Homebrew & brew-installed tools | `/config/.linuxbrew/` | Optional (`persist_brew_tools=true`) |
 | gog OAuth credentials | `/config/gogcli/` | Yes |
 | TLS certificates (lan_https) | `/config/certs/` | Yes (CA persists; server cert regenerated if IP changes) |
 | OpenClaw binary | `/usr/lib/node_modules/openclaw/` | **No** — reinstalled from image |
@@ -668,19 +671,21 @@ This means built-in skills survive image rebuilds, and any customizations you ma
 
 ### How user-installed skills work
 
-When you install a skill via the OpenClaw dashboard or `npm install -g`, the add-on redirects global npm installs to `/config/.node_global/`. This directory persists across updates.
+By default, user-installed npm skills and global packages are **ephemeral** to keep Home Assistant backups small.
 
-The add-on also configures `pnpm` global directory to persistent storage at `/config/.node_global/pnpm/`.
+If you enable `persist_node_global`, the add-on redirects global npm installs to `/config/.node_global/` so dashboard-installed skills survive add-on rebuilds. The add-on also configures the pnpm global directory at `/config/.node_global/pnpm/` in that mode.
 
 ### Homebrew-installed tools
 
-Homebrew (Linuxbrew) and all brew-installed CLI tools (e.g., `gemini`, `aider`, `gh`, `bw`) are now **persisted** across add-on updates. On each startup, the add-on:
+By default, Homebrew (Linuxbrew) and brew-installed CLI tools are **ephemeral** to keep Home Assistant backups small.
+
+If you enable `persist_brew_tools`, the add-on:
 
 1. Syncs the image's Homebrew install to `/config/.linuxbrew/`
 2. Creates a symlink from `/home/linuxbrew/.linuxbrew/` to the persistent copy
 3. On subsequent boots, only newer files are synced (user-installed packages are preserved)
 
-This means `brew install` packages survive image rebuilds.
+This means `brew install` packages survive image rebuilds only when persistence is enabled.
 
 ---
 
@@ -742,7 +747,7 @@ Home Assistant checks for add-on updates automatically. When an update is availa
 **What happens during an update**:
 - The container is destroyed and recreated from the new image
 - Everything under `/config/` is preserved (config, skills, workspace, keys)
-- Homebrew and brew-installed packages are preserved (synced to `/config/.linuxbrew/`)
+- Homebrew and npm global packages are preserved only if you explicitly enable `persist_brew_tools` / `persist_node_global`
 - The OpenClaw binary is updated to the version in the new image
 
 ### Checking your version
@@ -755,7 +760,20 @@ openclaw --version
 
 ### Backup
 
-Home Assistant's built-in backup system automatically includes add-on configuration data (`/config/`). This covers all persistent data: OpenClaw config, skills, workspace, keys, and tokens.
+Home Assistant's built-in backup system automatically includes add-on configuration data (`/config/`). By default this covers the important user state: OpenClaw config, skills, workspace, keys, and tokens — without large optional toolchains.
+
+### Backup-friendly defaults (v0.5.75+)
+
+Starting with v0.5.75, the add-on keeps large optional toolchains out of backups by default:
+
+- `persist_node_global: false` → `/config/.node_global/` is not used unless you opt in
+- `persist_brew_tools: false` → `/config/.linuxbrew/` is not used unless you opt in
+
+Turn these on only if you specifically want user-installed npm global skills or brew-installed CLI tools to survive add-on rebuilds.
+
+### Migration note for older installs
+
+If you used an older add-on version, you may already have legacy directories such as `/config/.node_global/` or `/config/.linuxbrew/` from previous persistent behavior. Disabling persistence stops future growth, but those directories still count toward backup size until you remove or archive them manually.
 
 **To create a backup**: Go to **Settings → System → Backups → Create Backup**
 
@@ -764,7 +782,8 @@ Home Assistant's built-in backup system automatically includes add-on configurat
 # Key paths to back up:
 # /config/.openclaw/     - OpenClaw config, skills, agent data
 # /config/clawd/         - ClawHub workspace
-# /config/.node_global/  - User-installed npm skills
+# /config/.node_global/  - User-installed npm skills (only if persist_node_global=true)
+# /config/.linuxbrew/    - Homebrew tools (only if persist_brew_tools=true)
 # /config/keys/          - SSH keys
 # /config/secrets/       - Tokens
 ```
@@ -774,12 +793,12 @@ Home Assistant's built-in backup system automatically includes add-on configurat
 To reset the add-on to a clean state, remove the persistent data:
 
 ```sh
-rm -rf /config/.openclaw /config/clawd /config/.node_global
+rm -rf /config/.openclaw /config/clawd /config/.node_global /config/.linuxbrew
 ```
 
 Then restart the add-on. It will re-bootstrap a fresh configuration.
 
-> **Warning**: This deletes all your OpenClaw configuration, skills, and workspace data. Back up first if needed.
+> **Warning**: This deletes all your OpenClaw configuration, skills, workspace data, and any optionally persisted tool installations. Back up first if needed.
 
 ---
 
@@ -948,7 +967,7 @@ Built-in skills are synced to persistent storage on each startup. If skills are 
 
 1. Check logs for `INFO: Synced built-in skills to persistent storage` — this confirms the sync ran
 2. If you see `WARN: Built-in skills directory not found`, the OpenClaw installation may be corrupted. Try reinstalling the add-on.
-3. User-installed skills (via dashboard) are stored in `/config/.node_global/` and should survive updates
+3. User-installed skills (via dashboard) survive updates only when `persist_node_global` is enabled. With the default backup-friendly setting (`false`), they are ephemeral and may need to be reinstalled after an add-on rebuild.
 
 ### Homebrew errors / CPU compatibility
 
