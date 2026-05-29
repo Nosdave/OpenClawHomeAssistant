@@ -1,5 +1,5 @@
 name: OpenClaw Assistant
-version: "0.5.74"
+version: "0.5.75"
 slug: openclaw_assistant
 description: Run OpenClaw Assistant (OpenClaw-compatible) as a Home Assistant add-on.
 url: https://github.com/techartdev/OpenClawHomeAssistant
@@ -55,6 +55,11 @@ options:
   # Cleanup stale session lock files left after crashes/restarts
   clean_session_locks_on_start: true
   clean_session_locks_on_exit: true
+
+  # Persist heavy optional tooling across add-on rebuilds.
+  # Disabled by default to keep Home Assistant backups small.
+  persist_node_global: false
+  persist_brew_tools: false
 
   # Gateway mode:
   # - local: Run gateway locally (recommended for most users)
@@ -153,6 +158,8 @@ schema:
 
   clean_session_locks_on_start: bool?
   clean_session_locks_on_exit: bool?
+  persist_node_global: bool?
+  persist_brew_tools: bool?
   gateway_mode: list(local|remote)?
   gateway_remote_url: str?
   gateway_bind_mode: list(loopback|lan|tailnet)?
