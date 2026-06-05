@@ -1,12 +1,13 @@
 name: OpenClaw Assistant
-version: "0.5.77"
+version: "0.5.77-ghcr1"
 slug: openclaw_assistant
 description: Run OpenClaw Assistant (OpenClaw-compatible) as a Home Assistant add-on.
-url: https://github.com/techartdev/OpenClawHomeAssistant
+url: https://github.com/Nosdave/OpenClawHomeAssistant
+# Pre-built image pulled from a PRIVATE GHCR package — Supervisor does NOT build
+# on the HA Green (avoids build-OOM on the 4 GB box). {arch} → aarch64.
+image: ghcr.io/nosdave/openclaw-assistant-{arch}
 arch:
-  - amd64
   - aarch64
-  - armv7
 startup: services
 boot: auto
 init: false
@@ -57,9 +58,12 @@ options:
   clean_session_locks_on_exit: true
 
   # Persist heavy optional tooling across add-on rebuilds.
-  # Disabled by default to keep Home Assistant backups small.
+  # node_global: FALSE on purpose — image-baked OpenClaw must win, otherwise the
+  #   old persisted npm tree shadows it (the 2026-04 "4.15 twin" version-drift bug).
+  # brew_tools: TRUE on purpose — keeps the user's accumulated /config .linuxbrew
+  #   CLI tools (nano-pdf etc.) across rebuilds; brew holds no OC binary, no drift risk.
   persist_node_global: false
-  persist_brew_tools: false
+  persist_brew_tools: true
 
   # Gateway mode:
   # - local: Run gateway locally (recommended for most users)

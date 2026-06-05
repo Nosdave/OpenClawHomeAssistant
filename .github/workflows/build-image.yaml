@@ -1,0 +1,61 @@
+name: Build & Push OpenClaw image (private GHCR)
+
+# Builds the aarch64 add-on image on GitHub-hosted native ARM runners and pushes
+# it to a PRIVATE GHCR package. The HA Green pulls this image instead of building
+# locally (avoids build-OOM on the 4 GB box). No user secrets are involved:
+# only the ephemeral GITHUB_TOKEN is used to push to this repo's own package.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "openclaw_assistant/**"
+      - ".github/workflows/build-image.yaml"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  IMAGE: ghcr.io/nosdave/openclaw-assistant-aarch64
+  BUILD_FROM: ghcr.io/home-assistant/aarch64-base-debian:bookworm
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04-arm   # native aarch64 runner (GA since 2025) — no QEMU
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Read add-on version
+        id: ver
+        run: |
+          V=$(grep -E '^version:' openclaw_assistant/config.yaml | head -1 | sed -E 's/version:\s*"?([^"]+)"?/\1/')
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+          echo "Add-on version: $V"
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build & push
+        uses: docker/build-push-action@v6
+        with:
+          context: openclaw_assistant
+          file: openclaw_assistant/Dockerfile
+          platforms: linux/arm64
+          push: true
+          provenance: false
+          build-args: |
+            BUILD_FROM=${{ env.BUILD_FROM }}
+            TARGETARCH=arm64
+          tags: |
+            ${{ env.IMAGE }}:${{ steps.ver.outputs.version }}
+            ${{ env.IMAGE }}:latest

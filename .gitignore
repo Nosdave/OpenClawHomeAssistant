@@ -1,0 +1,15 @@
+# Secret-hardening — never commit credentials or live add-on state
+options.json
+*.token
+*.key
+*.pem
+secrets/
+.secrets/
+.env
+.env.*
+homeassistant.token
+
+# Local junk
+*.log
+*.sqlite
+.DS_Store
