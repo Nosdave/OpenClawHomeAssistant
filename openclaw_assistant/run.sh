@@ -462,6 +462,48 @@ cleanup_session_locks() {
   done
 }
 
+# ------------------------------------------------------------------------------
+# Self-heal: reclaim orphaned Telegram ingress-spool claims.
+# OpenClaw's isolated-polling spool leaves an inbound update as
+# <id>.json.processing if the gateway is interrupted mid-claim (e.g. a restart
+# while a message is being handled). Because the container gateway runs as PID 1,
+# OC's own recovery (processExists(1)) false-positives and skips the orphan for
+# ~6h, blocking that Telegram lane -> bot appears unreachable.
+# We run this BEFORE each gateway (re)start (gateway not yet running => race-free),
+# mirroring OC's recoverStaleTelegramSpooledUpdateClaims:
+#   - sibling <id>.json.failed (dead-letter) -> delete .processing (never resurrect)
+#   - sibling <id>.json already exists        -> delete .processing (don't clobber)
+#   - otherwise                               -> rename .processing -> .json (requeue)
+# MUST be fail-safe: never abort run.sh under `set -euo pipefail`.
+# Upstream bug, open as of OC 2026.6.6: openclaw/openclaw#84674 / #85168.
+# ------------------------------------------------------------------------------
+heal_telegram_ingress_spool() {
+  local base="/config/.openclaw/telegram"
+  local healed=0 dropped=0 spool_dir f pending failed
+  shopt -s nullglob
+  for spool_dir in "${base}"/ingress-spool-*/; do
+    [ -d "$spool_dir" ] || continue
+    for f in "${spool_dir}"*.json.processing; do
+      [ -f "$f" ] || continue
+      pending="${f%.processing}"
+      failed="${pending}.failed"
+      if [ -e "$failed" ]; then
+        rm -f -- "$f" && dropped=$((dropped + 1)) || true
+      elif [ -e "$pending" ]; then
+        rm -f -- "$f" && dropped=$((dropped + 1)) || true
+      elif mv -f -- "$f" "$pending" 2>/dev/null; then
+        healed=$((healed + 1))
+      else
+        echo "WARN: could not reclaim orphaned spool file: $f"
+      fi
+    done
+  done
+  shopt -u nullglob
+  if [ "$healed" -gt 0 ] || [ "$dropped" -gt 0 ]; then
+    echo "INFO: Telegram ingress-spool self-heal: requeued $healed, dropped $dropped orphan(s)."
+  fi
+}
+
 if [ "$CLEAN_LOCKS_ON_START" = "true" ]; then
   cleanup_session_locks
 else
@@ -811,6 +853,8 @@ fi
 
 start_openclaw_runtime() {
   echo "Starting OpenClaw Assistant runtime (openclaw)..."
+  # Reclaim orphaned Telegram ingress-spool claims before (re)starting the gateway.
+  heal_telegram_ingress_spool || true
   if [ "$GATEWAY_MODE" = "remote" ]; then
     # Remote mode: do NOT start a local gateway service.
     # Start a node/client host that connects to the configured remote gateway URL.
