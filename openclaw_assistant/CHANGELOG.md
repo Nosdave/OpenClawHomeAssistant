@@ -2,6 +2,25 @@
 
 All notable changes to the OpenClaw Assistant Home Assistant Add-on will be documented in this file.
 
+> **Private fork** (`Nosdave/OpenClawHomeAssistant`): `-ghcrN` suffixes are fork build iterations on top of the upstream `techartdev` base version. The image is pre-built on GitHub Actions and pulled from private GHCR (see `0.5.77-ghcr1`).
+
+## [0.5.78-ghcr2] - 2026-06-17
+
+### Changed
+- **Track upstream**: bump OpenClaw to **2026.6.6** (upstream add-on base `0.5.78`), `npm install -g openclaw@2026.6.6`. The fork's self-heal and the GHCR pre-built-image approach are retained.
+- Note: upstream's PID-1-namespace Telegram-spool recovery bug (openclaw/openclaw#84674, #85168) is **still open in 2026.6.6**, so the self-heal below remains necessary.
+
+## [0.5.78-ghcr1] - 2026-06-15
+
+### Added
+- **Telegram ingress-spool self-heal**: `heal_telegram_ingress_spool()` in `run.sh` runs at the top of `start_openclaw_runtime` — i.e. before every gateway (re)start, while the gateway is down (race-free). It reclaims orphaned `<id>.json.processing` claims (requeue `→ .json`), skips dead-letters (`.failed` sibling), and never clobbers an existing `.json`. Fail-safe under `set -euo pipefail` (`nullglob` + `|| true`). Works around OpenClaw's PID-1-namespace recovery false-positive that otherwise blocks a Telegram lane for ~6h after a restart interrupting an in-flight message — making a plain add-on restart a reliable recovery. (OpenClaw pin unchanged: 2026.5.28.)
+
+## [0.5.77-ghcr1] - 2026-06-05
+
+### Changed
+- **Private GHCR build**: the add-on image is built on GitHub Actions (native `aarch64`) and **pulled from private GHCR** via the `image:` field instead of being built on-device — avoids Supervisor build-OOM on the 4 GB HA Green. `arch` limited to `aarch64`.
+- Stripped Chromium/`chromium-driver` and `node-llama-cpp` from the image (cloud embeddings only) to keep the image lean.
+
 ## [0.5.75] - 2026-05-28
 
 ### Changed

@@ -116,7 +116,7 @@ USER root
 # so the lib would never be loaded at runtime. Re-add `node-llama-cpp@3.18.1`
 # here if memorySearch.provider is ever set to "local".
 RUN npm config set fund false && npm config set audit false \
-    && npm install -g openclaw@2026.5.28
+    && npm install -g openclaw@2026.6.6
 
 # Shell aliases and color options for interactive use
 RUN tee -a /etc/bash.bashrc <<'EOF'
