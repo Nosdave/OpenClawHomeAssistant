@@ -1,10 +1,11 @@
 name: OpenClaw Assistant
-version: "0.5.78-ghcr2"
+version: "0.5.80-full1"
 slug: openclaw_assistant
 description: Run OpenClaw Assistant (OpenClaw-compatible) as a Home Assistant add-on.
 url: https://github.com/Nosdave/OpenClawHomeAssistant
-# Pre-built image pulled from a PRIVATE GHCR package — Supervisor does NOT build
-# on the HA Green (avoids build-OOM on the 4 GB box). {arch} → aarch64.
+# Pre-built image pulled from a GHCR package (built via GitHub Actions, native
+# aarch64) — Supervisor pulls instead of building locally. {arch} → aarch64.
+# "full" build: chromium + node-llama-cpp + acpx/Claude-Code harness included.
 image: ghcr.io/nosdave/openclaw-assistant-{arch}
 arch:
   - aarch64

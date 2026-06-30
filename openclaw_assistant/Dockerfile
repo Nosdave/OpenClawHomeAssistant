@@ -64,10 +64,13 @@ RUN node -v && npm -v
 # Install pnpm globally (required by some OpenClaw skills like clawhub)
 RUN npm install -g pnpm && pnpm -v
 
-# Chromium intentionally NOT installed in this fork.
-# Volt runs tools.profile=coding (no browser tool); stripping chromium +
-# chromium-driver saves ~500-600 MB image size and removes an unused
-# attack surface. Re-add the apt block above if a browser tool is ever enabled.
+# Install Chromium for website automation tasks
+# Includes necessary dependencies for headless browser operation
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    chromium \
+    chromium-driver \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
 
 # Install Homebrew (Linuxbrew) for OpenClaw skill dependencies
 # Homebrew is optional - some skills need CLI tools like gemini, aider, etc.
@@ -110,13 +113,18 @@ RUN if [ -x /home/linuxbrew/.linuxbrew/bin/brew ]; then \
     fi
 USER root
 
-# Install OpenClaw globally.
-# node-llama-cpp intentionally NOT bundled in this fork: it only powers the
-# LOCAL embeddings/memory-search provider (~670 MB). Volt uses cloud embeddings,
-# so the lib would never be loaded at runtime. Re-add `node-llama-cpp@3.18.1`
-# here if memorySearch.provider is ever set to "local".
+# Install OpenClaw globally
+# Bundle node-llama-cpp in the image so the default local memory/embeddings
+# provider works in HAOS without requiring manual npm installs in /usr/lib.
 RUN npm config set fund false && npm config set audit false \
-    && npm install -g openclaw@2026.6.6
+    && npm install -g openclaw@2026.6.10 node-llama-cpp@3.18.1
+
+# ACP / ACPX harness: lets OpenClaw drive external coding agents (Codex, Claude Code)
+# via the Agent Client Protocol. Volt authenticates Anthropic + OpenAI via OAuth
+# (not API keys), so the harness must ship in the image. Codex itself is bundled in
+# OpenClaw; acpx + the Claude Code CLI cover the OAuth/ACP path. acpx auto-downloads
+# the codex-acp / claude-agent-acp adapters via npx on first use.
+RUN npm install -g acpx @anthropic-ai/claude-code
 
 # Shell aliases and color options for interactive use
 RUN tee -a /etc/bash.bashrc <<'EOF'

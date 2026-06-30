@@ -2,7 +2,17 @@
 
 All notable changes to the OpenClaw Assistant Home Assistant Add-on will be documented in this file.
 
-> **Private fork** (`Nosdave/OpenClawHomeAssistant`): `-ghcrN` suffixes are fork build iterations on top of the upstream `techartdev` base version. The image is pre-built on GitHub Actions and pulled from private GHCR (see `0.5.77-ghcr1`).
+> **Private fork** (`Nosdave/OpenClawHomeAssistant`): `-ghcrN` / `-fullN` suffixes are fork build iterations on top of the upstream `techartdev` base version. The image is pre-built on GitHub Actions (native `aarch64`) and pulled from GHCR. `-fullN` marks the un-stripped "full" build line (see `0.5.80-full1`).
+
+## [0.5.80-full1] - 2026-07-01
+
+### Changed
+- **Track upstream**: bump OpenClaw to **2026.6.10** (upstream add-on base `0.5.80`).
+- **Un-stripped "full" image** — the add-on now runs on a roomy DGX Spark HAOS VM (not the 4 GB Green), so the lean-image constraints no longer apply. Re-added **Chromium + chromium-driver** and **`node-llama-cpp@3.18.1`** (the local embeddings/memory-search provider is available again). Reverses the `0.5.77-ghcr1` strip.
+
+### Added
+- **ACP / ACPX harness baked into the image**: `npm install -g acpx @anthropic-ai/claude-code`. Lets OpenClaw drive external coding agents (Codex, Claude Code) over the Agent Client Protocol — required because Anthropic + OpenAI are authenticated via **OAuth** (not API keys). Codex itself is bundled in OpenClaw; `acpx` + the Claude Code CLI cover the OAuth/ACP path (the `codex-acp` / `claude-agent-acp` adapters auto-download via npx on first use).
+- Tag suffix `-ghcrN` → `-fullN` to mark the un-stripped build line.
 
 ## [0.5.78-ghcr2] - 2026-06-17
 
