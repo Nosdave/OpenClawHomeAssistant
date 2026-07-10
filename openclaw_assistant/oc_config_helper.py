@@ -265,14 +265,24 @@ def _brave_plugin_installed(cfg):
     tools.web.search.provider=brave selection; if absent we still strip to avoid
     the gateway boot-loop on an unavailable provider.
     """
+    # Primary signal: `openclaw plugins install` records plugins.entries.brave
+    # in openclaw.json (verified on 2026.6.11: {"entries": {"brave": {...}}}).
     plugins = cfg.get("plugins")
     if isinstance(plugins, dict):
         entries = plugins.get("entries")
         if isinstance(entries, dict) and any("brave" in str(k).lower() for k in entries):
             return True
-    cfg_dir = os.environ.get("OPENCLAW_CONFIG_DIR") or str(CONFIG_PATH.parent)
-    try:
-        for _ in Path(cfg_dir, "extensions").rglob("*rave*"):
+    # Fallback: the installed package dir. Verified location is
+    # ~/.openclaw/npm/projects/openclaw-brave-plugin-<hash>/ (NOT extensions/);
+    # extensions/ kept as a harmless future-proof secondary.
+    cfg_dir = Path(os.environ.get("OPENCLAW_CONFIG_DIR") or str(CONFIG_PATH.parent))
+    try:  # verified real location: npm/projects/openclaw-brave-plugin-<hash>/
+        for _ in (cfg_dir / "npm" / "projects").glob("*rave*"):
+            return True
+    except OSError:
+        pass
+    try:  # speculative future-proof fallback (recursive)
+        for _ in (cfg_dir / "extensions").rglob("*rave*"):
             return True
     except OSError:
         pass
