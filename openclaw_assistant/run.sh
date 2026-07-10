@@ -504,6 +504,42 @@ heal_telegram_ingress_spool() {
   fi
 }
 
+# ------------------------------------------------------------------------------
+# Ensure the Brave web-search provider plugin is installed (idempotent).
+# Brave is an EXTERNAL official plugin (@openclaw/brave-plugin), NOT bundled in
+# core openclaw. It installs into the persistent config dir
+# (/config/.openclaw/extensions), so once present it survives image rebuilds --
+# but a fresh state or a migration has no Brave, and our oc_config_helper would
+# then strip a persisted tools.web.search.provider=brave as "unavailable".
+# We (re)ensure it here, BEFORE the config-helper repair runs, so a user's Brave
+# selection stays intact across rebuilds/fresh states.
+# The plugin version MUST match the baked openclaw (CalVer lockstep; plugin
+# peerDependencies.openclaw>=X). Baked openclaw = 2026.6.11 -> brave 2026.6.11.
+# Best-effort: never blocks startup (guarded, non-fatal). DuckDuckGo needs no
+# install (bundled in core, key-free) -- switch to it via `openclaw configure`.
+# ------------------------------------------------------------------------------
+BRAVE_PLUGIN_VERSION="2026.6.11"
+ensure_brave_plugin() {
+  local marker="/config/.openclaw/.brave_plugin_${BRAVE_PLUGIN_VERSION}"
+  if [ -f "$marker" ]; then
+    return 0
+  fi
+  # Adopt an existing manual install (no marker yet) without reinstalling.
+  if timeout 60 openclaw plugins list 2>/dev/null | grep -qi 'brave'; then
+    touch "$marker" 2>/dev/null || true
+    echo "INFO: Brave web-search plugin already installed; adopted."
+    return 0
+  fi
+  echo "INFO: Installing Brave web-search plugin @openclaw/brave-plugin@${BRAVE_PLUGIN_VERSION}..."
+  if timeout 180 openclaw plugins install "npm:@openclaw/brave-plugin@${BRAVE_PLUGIN_VERSION}" --pin >/dev/null 2>&1; then
+    touch "$marker" 2>/dev/null || true
+    echo "INFO: Brave web-search plugin installed."
+  else
+    echo "WARN: Brave plugin install failed or timed out (non-fatal); web search may use a bundled provider (e.g. duckduckgo)."
+  fi
+  return 0
+}
+
 if [ "$CLEAN_LOCKS_ON_START" = "true" ]; then
   cleanup_session_locks
 else
@@ -632,6 +668,9 @@ if [ ! -f "$HELPER_PATH" ] && [ -f "$(dirname "$0")/oc_config_helper.py" ]; then
 fi
 
 if [ -f "$OPENCLAW_CONFIG_PATH" ]; then
+  # Ensure Brave is present BEFORE repair-known-invalid-settings, so a persisted
+  # tools.web.search.provider=brave is not stripped as "unavailable".
+  ensure_brave_plugin || true
   if [ -f "$HELPER_PATH" ]; then
     if python3 "$HELPER_PATH" repair-known-invalid-settings; then
       :

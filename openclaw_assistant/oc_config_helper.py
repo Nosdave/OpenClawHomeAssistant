@@ -256,6 +256,29 @@ def set_control_ui_origins(origins_csv: str, additional_origins_csv: str = "", d
     return False
 
 
+def _brave_plugin_installed(cfg):
+    """Best-effort check whether the Brave web-search plugin is installed.
+
+    Brave is an external official plugin that installs into the persistent
+    config-dir extensions folder (~/.openclaw/extensions) and/or registers a
+    plugins.entries.brave block. If present we must NOT strip a
+    tools.web.search.provider=brave selection; if absent we still strip to avoid
+    the gateway boot-loop on an unavailable provider.
+    """
+    plugins = cfg.get("plugins")
+    if isinstance(plugins, dict):
+        entries = plugins.get("entries")
+        if isinstance(entries, dict) and any("brave" in str(k).lower() for k in entries):
+            return True
+    cfg_dir = os.environ.get("OPENCLAW_CONFIG_DIR") or str(CONFIG_PATH.parent)
+    try:
+        for _ in Path(cfg_dir, "extensions").rglob("*rave*"):
+            return True
+    except OSError:
+        pass
+    return False
+
+
 def repair_known_invalid_settings():
     """Repair known config values that prevent OpenClaw from starting."""
     cfg = read_config()
@@ -277,9 +300,13 @@ def repair_known_invalid_settings():
     provider = search.get("provider")
     changes = []
 
-    if provider == "brave":
+    # Only strip the Brave provider if the Brave plugin is genuinely absent.
+    # When it IS installed, stripping would silently disable the user's chosen
+    # web search on every restart. When absent, stripping still prevents the
+    # gateway boot-loop on an unavailable provider.
+    if provider == "brave" and not _brave_plugin_installed(cfg):
         del search["provider"]
-        changes.append("removed unavailable tools.web.search.provider=brave")
+        changes.append("removed unavailable tools.web.search.provider=brave (plugin not installed)")
 
     if not changes:
         print("INFO: No known invalid OpenClaw config settings found")

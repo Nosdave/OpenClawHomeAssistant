@@ -4,6 +4,18 @@ All notable changes to the OpenClaw Assistant Home Assistant Add-on will be docu
 
 > **Private fork** (`Nosdave/OpenClawHomeAssistant`): `-ghcrN` / `-fullN` suffixes are fork build iterations on top of the upstream `techartdev` base version. The image is pre-built on GitHub Actions (native `aarch64`) and pulled from GHCR. `-fullN` marks the un-stripped "full" build line (see `0.5.80-full1`).
 
+## [0.5.81-full1] - 2026-07-10
+
+### Changed
+- **Track upstream**: bump OpenClaw to **2026.6.11** (`npm install -g openclaw@2026.6.11`). Upstream `techartdev` add-on base is still `0.5.80`/`2026.6.10`; this fork moves ahead to the newest npm stable for its security fixes (patched DOMPurify in the Control UI, trusted package-source path hardening, no reasoning-leak into Telegram/WhatsApp replies) and continued auth-profiles→SQLite migration work.
+- **Telegram spool self-heal retained**: the upstream PID-1 ingress-orphan fix (openclaw/openclaw#84674 → PR #97118) landed only in the `2026.7.1-beta` line, **not** in stable `2026.6.10`/`2026.6.11`. `heal_telegram_ingress_spool()` therefore stays. Revisit removing it once `2026.7.1` ships stable.
+
+### Added
+- **Brave web-search plugin baked in via idempotent runtime install**: `ensure_brave_plugin()` in `run.sh` installs `@openclaw/brave-plugin@2026.6.11` (`npm:` source, `--pin`) before the config-helper runs, guarded by a version marker (`/config/.openclaw/.brave_plugin_<ver>`) and an "adopt existing install" fast-path. Brave is an **external** official plugin (not bundled in core openclaw) that installs into the persistent config dir, so this ends the recurring need to re-add it manually. Version is CalVer-locked to the baked openclaw (plugin `peerDependencies.openclaw>=2026.6.11`). Best-effort/non-fatal — a failed install never blocks startup. **DuckDuckGo** needs no install (bundled, key-free) and can be selected via `openclaw configure --section web`.
+
+### Fixed
+- **`oc_config_helper.py` no longer strips a valid Brave selection**: `repair-known-invalid-settings` previously deleted `tools.web.search.provider=brave` on *every* start (boot-loop guard from the stripped-image era), silently disabling web search even when the plugin was installed. It now strips only when Brave is genuinely absent (checks `plugins.entries.brave` + the `extensions/` dir), preserving the boot-loop protection for the truly-missing case.
+
 ## [0.5.80-full1] - 2026-07-01
 
 ### Changed
