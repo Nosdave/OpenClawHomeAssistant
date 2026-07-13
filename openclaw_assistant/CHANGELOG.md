@@ -4,6 +4,16 @@ All notable changes to the OpenClaw Assistant Home Assistant Add-on will be docu
 
 > **Private fork** (`Nosdave/OpenClawHomeAssistant`): `-ghcrN` / `-fullN` suffixes are fork build iterations on top of the upstream `techartdev` base version. The image is pre-built on GitHub Actions (native `aarch64`) and pulled from GHCR. `-fullN` marks the un-stripped "full" build line (see `0.5.80-full1`).
 
+## [0.5.82-full1] - 2026-07-13
+
+### Changed
+- **Track upstream**: bump OpenClaw to **2026.7.1** (`npm install -g openclaw@2026.7.1`), the newest npm stable. Upstream `techartdev` add-on base is still `0.5.80`/`2026.6.10`; this fork stays ahead.
+- **Brave plugin pinned to 2026.7.1** (CalVer lockstep with the host; plugin `peerDependencies.openclaw>=2026.7.1`).
+- **Telegram spool self-heal retained (belt-and-suspenders)**: the 2026.7.1 line carries the upstream ingress-orphan fix (openclaw/openclaw#84674 → PR #97118), which first shipped in the `2026.7.1-beta` series and is now stable. `heal_telegram_ingress_spool()` is kept as a safety net pending real-world observation of the upstream fix, then a candidate for removal in a later release.
+
+### Fixed
+- **`ensure_brave_plugin()` now converges Brave to the pinned version on OpenClaw bumps.** The previous adopt-without-version path wrote the new per-version marker for a *stale* Brave install (observed on 0.5.81-full1: host openclaw 2026.6.11 but Brave adopted at 2026.6.6), so a bump would not auto-upgrade the plugin. It now runs `openclaw plugins install …@<ver> --pin --force` when the target-version marker is absent, upgrading any older install to match the host. Still guarded by the marker (runs once per version) and non-fatal.
+
 ## [0.5.81-full1] - 2026-07-10
 
 ### Changed

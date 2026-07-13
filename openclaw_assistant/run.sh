@@ -518,22 +518,22 @@ heal_telegram_ingress_spool() {
 # Best-effort: never blocks startup (guarded, non-fatal). DuckDuckGo needs no
 # install (bundled in core, key-free) -- switch to it via `openclaw configure`.
 # ------------------------------------------------------------------------------
-BRAVE_PLUGIN_VERSION="2026.6.11"
+BRAVE_PLUGIN_VERSION="2026.7.1"
 ensure_brave_plugin() {
   local marker="/config/.openclaw/.brave_plugin_${BRAVE_PLUGIN_VERSION}"
   if [ -f "$marker" ]; then
     return 0
   fi
-  # Adopt an existing manual install (no marker yet) without reinstalling.
-  if timeout 60 openclaw plugins list 2>/dev/null | grep -qi 'brave'; then
+  # Install or CONVERGE to the pinned version. --force upgrades any older Brave
+  # install (e.g. left over from a previous OpenClaw version) to match the host
+  # CalVer, instead of adopting a stale version. Guarded by the per-version
+  # marker so it runs at most once per version. Runs before gateway start
+  # (gateway down => safe). (Replaces the old adopt-without-version path that
+  # wrote a new-version marker for a stale install -> version drift on bumps.)
+  echo "INFO: Ensuring Brave web-search plugin @openclaw/brave-plugin@${BRAVE_PLUGIN_VERSION}..."
+  if timeout 180 openclaw plugins install "npm:@openclaw/brave-plugin@${BRAVE_PLUGIN_VERSION}" --pin --force >/dev/null 2>&1; then
     touch "$marker" 2>/dev/null || true
-    echo "INFO: Brave web-search plugin already installed; adopted."
-    return 0
-  fi
-  echo "INFO: Installing Brave web-search plugin @openclaw/brave-plugin@${BRAVE_PLUGIN_VERSION}..."
-  if timeout 180 openclaw plugins install "npm:@openclaw/brave-plugin@${BRAVE_PLUGIN_VERSION}" --pin >/dev/null 2>&1; then
-    touch "$marker" 2>/dev/null || true
-    echo "INFO: Brave web-search plugin installed."
+    echo "INFO: Brave web-search plugin ensured (@${BRAVE_PLUGIN_VERSION})."
   else
     echo "WARN: Brave plugin install failed or timed out (non-fatal); web search may use a bundled provider (e.g. duckduckgo)."
   fi
