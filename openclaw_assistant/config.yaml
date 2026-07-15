@@ -23,7 +23,7 @@ panel_title: OpenClaw Assistant
 panel_icon: mdi:robot
 
 map:
-  - addon_config:rw
+  - app_config:rw
   - share:rw
   - media:rw
 options:
