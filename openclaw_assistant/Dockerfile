@@ -113,11 +113,13 @@ RUN if [ -x /home/linuxbrew/.linuxbrew/bin/brew ]; then \
     fi
 USER root
 
-# Install OpenClaw globally
-# Bundle node-llama-cpp in the image so the default local memory/embeddings
-# provider works in HAOS without requiring manual npm installs in /usr/lib.
+# Install OpenClaw globally.
+# Bundle node-llama-cpp so the default local memory/embeddings provider works
+# in HAOS without requiring manual npm installs in /usr/lib.
+# Bundle mcporter so Home Assistant MCP auto-configuration works out of the box.
+# mcporter 0.9.0 is the newest release that supports the add-on's Node 22 base.
 RUN npm config set fund false && npm config set audit false \
-    && npm install -g openclaw@2026.7.1 node-llama-cpp@3.18.1
+    && npm install -g openclaw@2026.7.1 node-llama-cpp@3.18.1 mcporter@0.9.0
 
 # Shell aliases and color options for interactive use
 RUN tee -a /etc/bash.bashrc <<'EOF'

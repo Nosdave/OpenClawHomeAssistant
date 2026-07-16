@@ -497,7 +497,7 @@ The **Model Context Protocol (MCP)** lets OpenClaw communicate directly with Hom
 3. Set **Auto-Configure MCP for Home Assistant** (`auto_configure_mcp`) to **ON**
 4. Restart the add-on
 
-The add-on will automatically register Home Assistant as an MCP server named `HA` using `mcporter`. It auto-detects the HA API URL (supervisor proxy when available, otherwise `localhost:8123`). Check the logs for:
+The add-on bundles `mcporter` and automatically registers Home Assistant as an MCP server named `HA`. It auto-detects the HA API URL (supervisor proxy when available, otherwise `localhost:8123`). Check the logs for:
 ```
 INFO: MCP server 'HA' registered — OpenClaw can now control Home Assistant
 ```
@@ -543,7 +543,7 @@ MCP setup requires an AI model that understands tool/skill invocation. Budget mo
 
 | Symptom | Fix |
 |---|---|
-| `mcporter: command not found` | Run `openclaw onboard` first, then restart the add-on |
+| `mcporter: command not found` | Upgrade to add-on `0.5.83` or newer. Older builds did not bundle `mcporter`; as a temporary workaround, install it manually in the add-on terminal and restart. |
 | MCP add fails with auth error | Verify your long-lived token is valid and not expired |
 | OpenClaw doesn’t see HA entities | Run `mcporter call home-assistant.GetLiveContext` to refresh |
 | Model says “what’s MCP?” | Switch to a more capable model for the initial session (see above) |
