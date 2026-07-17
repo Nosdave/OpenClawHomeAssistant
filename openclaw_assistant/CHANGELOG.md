@@ -2,6 +2,11 @@
 
 All notable changes to the OpenClaw Assistant Home Assistant Add-on will be documented in this file.
 
+## [0.5.83] - 2026-07-17
+
+### Changed
+- Bump the add-on runtime from Node 22 to Node 24 LTS so the image stays within OpenClaw's published support matrix and is compatible with current `mcporter` releases that require Node `>=24`.
+
 ## [0.5.82] - 2026-07-15
 
 ### Fixed
