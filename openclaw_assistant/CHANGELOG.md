@@ -4,6 +4,26 @@ All notable changes to the OpenClaw Assistant Home Assistant Add-on will be docu
 
 > **Private fork** (`Nosdave/OpenClawHomeAssistant`): `-ghcrN` / `-fullN` suffixes are fork build iterations on top of the upstream `techartdev` base version. The image is pre-built on GitHub Actions (native `aarch64`) and pulled from GHCR. `-fullN` marks the un-stripped "full" build line (see `0.5.80-full1`).
 
+## [0.5.85-full1] - 2026-07-21
+
+Merge of upstream `techartdev` **0.5.83 → 0.5.85** onto the fork.
+
+### Fixed
+- **`mcporter@0.12.3` is now baked into the image — HA MCP auto-configuration actually runs.** Symptom on this deployment: with `auto_configure_mcp: true` and a valid `homeassistant_token`, startup logged `mcporter MISSING -> auto_configure_mcp silently skipped` / `mcporter not available; skipping MCP auto-configuration`, no `/config/.mcporter` was ever created, and **no Home Assistant MCP server was registered** — i.e. Volt could not drive HA entities/services over MCP at all. Upstream fix for issue #163 (`fix(addon): bundle mcporter for HA MCP auto-config`); the misleading "run `openclaw onboard`" hint was also replaced.
+- **Runtime-downgrade repair on startup**: if the bundled OpenClaw CLI is older than the persisted `/config/.openclaw/openclaw.json` format version, the add-on restores the newer runtime instead of silently coming up broken after a HAOS update or add-on rebuild (upstream 0.5.82).
+- **`lan_https` certificate regeneration** with proper X.509 extensions (`basicConstraints`, `keyUsage`, `extendedKeyUsage`) so strict Python/OpenSSL verification accepts the built-in HTTPS proxy certs (upstream 0.5.82).
+
+### Changed
+- **Track upstream**: bump OpenClaw `2026.7.1` → **`2026.7.1-2`** — a patch on the same 7.1 line we already run, welcome after the 7.1 migration crash-loop experience.
+- Add-on runtime base bumped to **Node 24** (upstream `chore(build): bump add-on runtime to Node 24`); the Dockerfile's `node -v` gate now asserts `v24.*`.
+- Brave plugin pin stays at **`2026.7.1`** — `-2` is a core-only patch and satisfies `peerDependencies.openclaw>=2026.7.1`; no plugin rebuild needed.
+
+### Fork deltas retained over upstream
+- `config.yaml` map `app_config:rw` (upstream still emits the legacy `addon_config`, which trips a Supervisor deprecation warning).
+- GHCR pre-built `image:` (pull, don't build on-device), `aarch64`-only `arch`.
+- ACP/ACPX harness (`acpx`, `@anthropic-ai/claude-code`), full image (Chromium + `node-llama-cpp`).
+- `ensure_brave_plugin()` bake + version convergence, `heal_telegram_ingress_spool()` self-heal.
+
 ## [0.5.82-full1] - 2026-07-13
 
 ### Changed
@@ -52,6 +72,47 @@ All notable changes to the OpenClaw Assistant Home Assistant Add-on will be docu
 ### Changed
 - **Private GHCR build**: the add-on image is built on GitHub Actions (native `aarch64`) and **pulled from private GHCR** via the `image:` field instead of being built on-device — avoids Supervisor build-OOM on the 4 GB HA Green. `arch` limited to `aarch64`.
 - Stripped Chromium/`chromium-driver` and `node-llama-cpp` from the image (cloud embeddings only) to keep the image lean.
+
+---
+
+> Upstream `techartdev` release history below.
+
+## [0.5.85] - 2026-07-21
+
+### Changed
+- Bump OpenClaw to `2026.7.1-2`.
+
+## [0.5.84] - 2026-07-17
+
+### Changed
+- Bundle `mcporter@0.12.3` in the add-on image so `auto_configure_mcp` can register Home Assistant out of the box on fresh installs without a manual global install workaround.
+- Replace the misleading startup hint that told users to run `openclaw onboard` when `mcporter` was missing. The message now correctly points to a broken image state instead.
+
+## [0.5.82] - 2026-07-15
+
+### Fixed
+- Repair add-on startup automatically when the bundled OpenClaw CLI is older than the persisted `/config/.openclaw/openclaw.json` format version. On mismatch, the add-on now restores the newer runtime before launching the gateway instead of silently coming up broken after a Home Assistant OS update or add-on rebuild.
+- Regenerate malformed `lan_https` CA/server certificates with proper X.509 extensions (`basicConstraints`, `keyUsage`, `extendedKeyUsage`) so Python/OpenSSL strict verification accepts the built-in HTTPS proxy certificates.
+
+## [0.5.81] - 2026-07-14
+
+### Changed
+- Bump OpenClaw to `2026.7.1`.
+
+## [0.5.80] - 2026-06-26
+
+### Changed
+- Bump OpenClaw to `2026.6.10`.
+
+## [0.5.78] - 2026-06-16
+
+### Changed
+- Bump OpenClaw through the `2026.5.28` and `2026.6.6` upstream releases.
+
+## [0.5.76] - 2026-05-29
+
+### Changed
+- Bump OpenClaw to `2026.5.27`.
 
 ## [0.5.75] - 2026-05-28
 
