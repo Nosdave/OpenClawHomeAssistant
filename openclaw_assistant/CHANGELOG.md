@@ -4,6 +4,22 @@ All notable changes to the OpenClaw Assistant Home Assistant Add-on will be docu
 
 > **Private fork** (`Nosdave/OpenClawHomeAssistant`): `-ghcrN` / `-fullN` suffixes are fork build iterations on top of the upstream `techartdev` base version. The image is pre-built on GitHub Actions (native `aarch64`) and pulled from GHCR. `-fullN` marks the un-stripped "full" build line (see `0.5.80-full1`).
 
+
+## [0.5.88-full1] - 2026-09-01
+
+Merge of upstream `techartdev` **0.5.86 → 0.5.88** onto the fork. **No OpenClaw bump** — the pin stays `2026.7.1-2`, identical to upstream's.
+
+### Fixed
+- **Explicit `false` add-on options are no longer silently flipped back to their defaults** (upstream #175). `run.sh` read booleans as `jq -r '.opt // true'`, and jq's `//` operator falls back on **`false`** just as it does on `null` — so every option deliberately set to `false` came back as the default on each start. Reads now go through a `read_json_bool()` helper. Affects `enable_terminal`, `controlui_disable_device_auth`, `force_ipv4_dns`, `clean_session_locks_on_start`/`_on_exit`, `enable_openai_api` and the `persist_*` pair. On this deployment the only explicit `false` is `persist_node_global`, whose default is also `false`, so nothing was actually mis-set — this closes a latent trap rather than fixing live damage.
+- Upstream `0.5.87` repaired a broken `0.5.86` image build that requested the nonexistent `openclaw@2026.7.1-2-2`. This fork skipped both releases and was never affected.
+
+### Fork deltas retained over upstream
+- `config.yaml`: `app_config:rw` map, GHCR `image:` pull, `aarch64`-only `arch`, fork `url:`.
+- ACP/ACPX harness (`acpx`, `@anthropic-ai/claude-code`), full image (Chromium + `node-llama-cpp`), `mcporter@0.12.3`.
+- `ensure_brave_plugin()` bake + version convergence, `heal_telegram_ingress_spool()` self-heal.
+
+### Deliberately NOT included: OpenClaw 2026.8.1
+npm `latest` moved to **`2026.8.1`** on 2026-08-31 (the `2026.7.2` line never shipped stable and was superseded). It is not taken here, because it carries two **breaking** migrations that both mandate `openclaw doctor --fix` — a command this deployment bans — namely the OpenProse/`/prose` removal and the `codex/*` + `openai-codex/*` → `openai/*` route migration, which directly touches this install's `openai-codex` provider and OAuth profile. It also replaces `agents.defaults.models` with `modelPolicy.allow` (the structure this fork's wildcards live in) and switches several behaviours on by default: grounded dreaming, automatic self-learning, personal conversation recall, and CPU-scaled 8–16 concurrent runs. That belongs in a planned window with a dry run against a copy of the state.
 ## [0.5.85-full1] - 2026-07-21
 
 Merge of upstream `techartdev` **0.5.83 → 0.5.85** onto the fork.
@@ -76,6 +92,15 @@ Merge of upstream `techartdev` **0.5.83 → 0.5.85** onto the fork.
 ---
 
 > Upstream `techartdev` release history below.
+## [0.5.88] - 2026-08-22
+
+### Fixed
+- Preserve explicit `false` values for boolean add-on options instead of replacing them with `true` defaults during startup. This restores settings such as strict Control UI device authentication, disabled terminal access, and IPv6-capable DNS behavior after an add-on restart or rebuild.
+
+## [0.5.87] - 2026-08-10
+
+### Fixed
+- Correct the bundled OpenClaw npm package version in the Docker image build for add-on `0.5.86`, fixing failed installs that requested the nonexistent `openclaw@2026.7.1-2-2`.
 
 ## [0.5.85] - 2026-07-21
 
