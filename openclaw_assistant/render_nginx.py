@@ -79,9 +79,9 @@ def main():
             proxy_set_header Upgrade $http_upgrade;
             proxy_set_header Connection "upgrade";
             proxy_set_header Host $host;
-            proxy_set_header X-Real-IP $remote_addr;
-            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-            proxy_set_header X-Forwarded-Proto https;
+            proxy_set_header X-Real-IP $gateway_proxy_client_ip;
+            proxy_set_header X-Forwarded-For $gateway_proxy_client_ip;
+            proxy_set_header X-Forwarded-Proto $gateway_proxy_scheme;
             proxy_read_timeout 86400s;
             proxy_send_timeout 86400s;
             proxy_buffering off;
