@@ -55,6 +55,7 @@ When `gateway_bind_mode` is set to `tailnet`, the gateway is exposed only on you
 - Use `gateway_bind_mode: loopback` if you only need local access
 - Prefer `gateway_bind_mode: tailnet` over `lan` when you need remote/private-network access
 - Keep your gateway auth token secret
+- Keep the landing page and web terminal behind Home Assistant Ingress. The add-on restricts port `48099` to loopback and the Supervisor's internal proxy address so direct LAN clients cannot bypass Home Assistant authentication.
 
 ### 3. Plain HTTP Authentication (`allow_insecure_auth`)
 
