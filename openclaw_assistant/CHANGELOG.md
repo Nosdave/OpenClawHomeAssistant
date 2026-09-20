@@ -2,6 +2,18 @@
 
 All notable changes to the OpenClaw Assistant Home Assistant Add-on will be documented in this file.
 
+## [Unreleased]
+
+### Added
+
+- **Safe OpenClaw database upgrades**: before the add-on starts an OpenClaw
+  version for the first time, it archives the migration-sensitive persistent
+  state (configuration, SQLite agent/session databases with WAL files, pairing
+  and delivery state) in `/config/.openclaw/upgrade-backups/`. If that archive
+  cannot be created, startup stops before an irreversible schema migration can
+  occur. The three newest archives are retained; media, skills, npm projects and
+  logs are excluded because they are not required to roll back database state.
+
 ## [0.5.90] - 2026-09-02
 
 ### Added

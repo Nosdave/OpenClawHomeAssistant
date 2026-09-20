@@ -555,6 +555,108 @@ if ! flock -n 9; then
 fi
 
 # ------------------------------------------------------------------------------
+# Upgrade-state backup
+#
+# OpenClaw 2026.9.5 upgrades the persistent agent databases to schema 21. Older
+# OpenClaw builds cannot open that schema, so a config-only snapshot is not
+# enough to make an add-on rollback safe. Before the gateway starts a version we
+# have not started before, archive the migration-sensitive state while the old
+# gateway is down. The archive deliberately excludes regenerable/bulky content
+# (skills, media, npm, logs and previous archives), but retains the config,
+# SQLite databases (including WAL/SHM files), agents, pairing and channel state.
+#
+# The version marker is written only after a complete archive. If this backup
+# fails we refuse to start the new gateway: letting it migrate first would make
+# the promised rollback path dishonest.
+# ------------------------------------------------------------------------------
+OPENCLAW_UPGRADE_BACKUP_DIR="${OPENCLAW_CONFIG_DIR}/upgrade-backups"
+OPENCLAW_UPGRADE_BACKUP_KEEP=3
+
+openclaw_runtime_version() {
+  openclaw --version 2>/dev/null | sed -n 's/^OpenClaw \([0-9][0-9.]*\).*/\1/p' | head -n1
+}
+
+has_upgrade_sensitive_state() {
+  [ -f "${OPENCLAW_CONFIG_DIR}/openclaw.json" ] || \
+    [ -d "${OPENCLAW_CONFIG_DIR}/state" ] || \
+    { [ -d "${OPENCLAW_CONFIG_DIR}/agents" ] && \
+      [ -n "$(find "${OPENCLAW_CONFIG_DIR}/agents" -mindepth 1 -print -quit 2>/dev/null)" ]; }
+}
+
+prune_upgrade_backups() {
+  local stale
+  mapfile -t stale < <(find "$OPENCLAW_UPGRADE_BACKUP_DIR" -maxdepth 1 -type f -name 'openclaw-state-*.tar.gz' -printf '%f\n' 2>/dev/null | sort -r | tail -n +$((OPENCLAW_UPGRADE_BACKUP_KEEP + 1)))
+  for stale in "${stale[@]}"; do
+    rm -f "${OPENCLAW_UPGRADE_BACKUP_DIR}/${stale}" || \
+      echo "WARN: Could not prune old upgrade backup ${stale}."
+  done
+}
+
+backup_state_before_upgrade() {
+  local version marker stamp archive temporary
+  version="$(openclaw_runtime_version)"
+  if [ -z "$version" ]; then
+    echo "ERROR: Could not determine the bundled OpenClaw version; refusing an unprotected startup."
+    return 1
+  fi
+
+  if ! has_upgrade_sensitive_state; then
+    echo "INFO: No existing OpenClaw state; no upgrade-state backup needed."
+    return 0
+  fi
+
+  if ! mkdir -p "$OPENCLAW_UPGRADE_BACKUP_DIR"; then
+    echo "ERROR: Could not create the upgrade-backup directory."
+    return 1
+  fi
+  marker="${OPENCLAW_UPGRADE_BACKUP_DIR}/started-${version}"
+  if [ -f "$marker" ]; then
+    echo "INFO: Upgrade-state backup already recorded for OpenClaw ${version}."
+    return 0
+  fi
+
+  stamp="$(date -u +%Y%m%d-%H%M%S)"
+  archive="${OPENCLAW_UPGRADE_BACKUP_DIR}/openclaw-state-${stamp}-before-${version}.tar.gz"
+  temporary="${archive}.tmp"
+  rm -f "$temporary"
+
+  echo "INFO: Creating pre-upgrade state backup for OpenClaw ${version}..."
+  if ! tar -C "$OPENCLAW_CONFIG_DIR" \
+      --exclude='./upgrade-backups' \
+      --exclude='./media' \
+      --exclude='./npm' \
+      --exclude='./skills' \
+      --exclude='./logs' \
+      --exclude='./.cache' \
+      -czf "$temporary" .; then
+    rm -f "$temporary"
+    echo "ERROR: Could not create pre-upgrade state backup."
+    return 1
+  fi
+
+  if ! mv "$temporary" "$archive"; then
+    rm -f "$temporary"
+    echo "ERROR: Could not finalize the pre-upgrade state backup."
+    return 1
+  fi
+  chmod 600 "$archive" 2>/dev/null || true
+  if ! printf '%s\n' "$archive" > "$marker"; then
+    echo "ERROR: Could not record the completed pre-upgrade state backup."
+    return 1
+  fi
+  chmod 600 "$marker" 2>/dev/null || true
+  prune_upgrade_backups
+  echo "INFO: Saved pre-upgrade state backup: ${archive}."
+  return 0
+}
+
+if ! backup_state_before_upgrade; then
+  echo "ERROR: OpenClaw was not started, so its persistent state remains unchanged."
+  echo "ERROR: Free disk space or repair permissions, then restart the add-on."
+  exit 1
+fi
+
+# ------------------------------------------------------------------------------
 # Session lock cleanup helpers
 # ------------------------------------------------------------------------------
 
