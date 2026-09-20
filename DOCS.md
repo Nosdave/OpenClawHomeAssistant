@@ -1235,6 +1235,24 @@ ls /config/.openclaw/logs/stability/   # per-failure diagnostic bundles
 
 > The add-on backs off between restart attempts (2s doubling to a 60s cap) so a gateway that cannot start does not spin the CPU or fill the disk with stability bundles. The terminal, landing page and Ingress remain usable throughout.
 
+### Safe rollback after an OpenClaw database upgrade
+
+Before the add-on starts a new OpenClaw version, it saves one compressed state
+archive under `/config/.openclaw/upgrade-backups/`. This includes `openclaw.json`,
+agent/session databases (including SQLite WAL files), pairing records and channel
+delivery state. It excludes regenerable or bulky content such as built-in skills,
+media, npm projects and logs. The add-on keeps the three newest upgrade archives.
+
+If the archive cannot be created, the new gateway does **not** start. This avoids
+an irreversible schema migration when disk space or permissions are unhealthy.
+
+OpenClaw database schema upgrades are not downgrade-compatible. To roll back to
+an older add-on release, first stop the add-on and move the current
+`/config/.openclaw` directory aside. Create a new `/config/.openclaw` directory,
+extract the desired archive into it, then start the older release. Do not extract
+over the upgraded directory: its newer database files would remain in place.
+Work created after that archive will not be present after the rollback.
+
 ### `JavaScript heap out of memory` / gateway restart loop on a Raspberry Pi
 
 **Symptom**: The gateway restarts repeatedly; the log shows heap allocation failures, or the whole add-on is killed.
