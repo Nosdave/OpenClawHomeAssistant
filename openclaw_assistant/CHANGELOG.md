@@ -14,6 +14,19 @@ All notable changes to the OpenClaw Assistant Home Assistant Add-on will be docu
   occur. The three newest archives are retained; media, skills, npm projects and
   logs are excluded because they are not required to roll back database state.
 
+### Changed
+
+- Bundle OpenClaw `2026.9.6` (add-on version `0.5.93`) for the next release.
+
+### Fixed
+
+- Restrict the Home Assistant Ingress backend on port `48099` to loopback and
+  the Supervisor proxy, preventing direct LAN access from bypassing Ingress
+  authentication and exposing the terminal.
+- In `lan_https` mode, rebuild forwarded identity at nginx and omit it for
+  same-host loopback clients, avoiding ambiguous proxy attribution while not
+  trusting client-supplied forwarding chains.
+
 ## [0.5.90] - 2026-09-02
 
 ### Added
