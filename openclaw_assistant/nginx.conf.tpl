@@ -21,6 +21,15 @@ http {
   server {
     listen 48099;
 
+    # Port 48099 is the Home Assistant Ingress backend, not a public add-on
+    # endpoint. With host networking, leaving it unrestricted exposes the
+    # landing page and writable ttyd shell directly to the LAN.
+    # 172.30.32.2 is the Supervisor's Ingress proxy address.
+    allow 127.0.0.1;
+    allow ::1;
+    allow 172.30.32.2;
+    deny all;
+
     # Web terminal (ttyd)
     # ttyd base-path is configured as /terminal (no trailing slash).
     # Some clients will hit /terminal first, so redirect to /terminal/.

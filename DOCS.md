@@ -290,6 +290,8 @@ When `gateway_auth_mode: trusted-proxy` is used, the add-on sets `gateway.auth.t
 | `enable_terminal` | bool | `true` | Show the web terminal on the add-on page |
 | `terminal_port` | int | `7681` | Port for the terminal (ttyd). Change if 7681 conflicts. Range: 1024-65535 |
 
+> **Note**: the add-on page and terminal are only reachable through Home Assistant Ingress. The Ingress backend port `48099` accepts connections from loopback and the Supervisor (`172.30.32.2`) only; direct requests from the LAN (e.g. `http://<ha-ip>:48099/`) are answered with `403 Forbidden`.
+
 ### Security & Tokens
 
 | Option | Type | Default | Description |

@@ -7,6 +7,9 @@ All notable changes to the OpenClaw Assistant Home Assistant Add-on will be docu
 
 ## [0.5.88-full2] - 2026-09-26
 
+### Security
+- **The web terminal is no longer reachable from the LAN without Home Assistant login.** Because the add-on runs with `host_network: true`, nginx's Ingress backend on port `48099` listened on every host interface without any access restriction — anyone on the network could open `http://<ha-ip>:48099/terminal/` and get a writable ttyd shell inside the add-on (with access to `/config`, tokens and the OpenClaw state), bypassing Ingress authentication entirely. Port `48099` now only accepts loopback and the Supervisor Ingress proxy (`172.30.32.2`); everything else gets `403`. Opening the add-on through the Home Assistant sidebar/add-on page is unaffected. Same fix as upstream `techartdev` (`security: restrict ingress backend to Supervisor`).
+
 ### Changed
 - **OpenClaw `2026.7.1-2` → `2026.7.35` (npm `extended-stable`).** Extended-stable is the July maintenance line: it sits directly on `2026.7.1-2` and backports the security and reliability fixes from the full `v2026.7.1-2..` audit — no 8.x/9.x migrations. Highlights: hardened command parsing (escaped-newline shell words now need approval), exact-origin browser checks, plugin git-install option injection blocked, backup archives written `0600`, rotated OpenAI OAuth credentials no longer reverted by auth bookkeeping, Telegram/Discord/WhatsApp delivery and transcript-recovery fixes, bounded provider/history/media waits, and new model catalogs (Claude Opus 5, GPT-6 Astra, Gemini 3.6/3.7 Flash, …).
 - `2026.7.34` is deliberately skipped: its Doctor wrote a partial plugin registry (Browser, Canvas, pairing, … missing after restart), which `2026.7.35` repairs.
