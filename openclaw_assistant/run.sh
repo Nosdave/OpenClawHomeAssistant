@@ -522,11 +522,11 @@ heal_telegram_ingress_spool() {
 # We (re)ensure it here, BEFORE the config-helper repair runs, so a user's Brave
 # selection stays intact across rebuilds/fresh states.
 # The plugin version MUST match the baked openclaw (CalVer lockstep; plugin
-# peerDependencies.openclaw>=X). Baked openclaw = 2026.6.11 -> brave 2026.6.11.
+# peerDependencies.openclaw>=X). Baked openclaw = 2026.7.35 -> brave 2026.7.35.
 # Best-effort: never blocks startup (guarded, non-fatal). DuckDuckGo needs no
 # install (bundled in core, key-free) -- switch to it via `openclaw configure`.
 # ------------------------------------------------------------------------------
-BRAVE_PLUGIN_VERSION="2026.7.1"
+BRAVE_PLUGIN_VERSION="2026.7.35"
 ensure_brave_plugin() {
   local marker="/config/.openclaw/.brave_plugin_${BRAVE_PLUGIN_VERSION}"
   if [ -f "$marker" ]; then

@@ -5,6 +5,16 @@ All notable changes to the OpenClaw Assistant Home Assistant Add-on will be docu
 > **Private fork** (`Nosdave/OpenClawHomeAssistant`): `-ghcrN` / `-fullN` suffixes are fork build iterations on top of the upstream `techartdev` base version. The image is pre-built on GitHub Actions (native `aarch64`) and pulled from GHCR. `-fullN` marks the un-stripped "full" build line (see `0.5.80-full1`).
 
 
+## [0.5.88-full2] - 2026-09-26
+
+### Changed
+- **OpenClaw `2026.7.1-2` → `2026.7.35` (npm `extended-stable`).** Extended-stable is the July maintenance line: it sits directly on `2026.7.1-2` and backports the security and reliability fixes from the full `v2026.7.1-2..` audit — no 8.x/9.x migrations. Highlights: hardened command parsing (escaped-newline shell words now need approval), exact-origin browser checks, plugin git-install option injection blocked, backup archives written `0600`, rotated OpenAI OAuth credentials no longer reverted by auth bookkeeping, Telegram/Discord/WhatsApp delivery and transcript-recovery fixes, bounded provider/history/media waits, and new model catalogs (Claude Opus 5, GPT-6 Astra, Gemini 3.6/3.7 Flash, …).
+- `2026.7.34` is deliberately skipped: its Doctor wrote a partial plugin registry (Browser, Canvas, pairing, … missing after restart), which `2026.7.35` repairs.
+- **Brave plugin pin `2026.7.1` → `2026.7.35`** (plugin `peerDependencies.openclaw>=2026.7.35`). The per-version marker makes `ensure_brave_plugin()` converge the persisted install once on the first start.
+
+### Still deliberately NOT included: OpenClaw 2026.8.x / 2026.9.x
+Unchanged reasoning from `0.5.88-full1`: `2026.8.1` requires `openclaw doctor --fix` for the `openai-codex/*` → `openai/*` route migration and the OpenProse removal, and turns on dreaming, self-learning, conversation recall and (from 9.2/9.3) Swarm, recursive delegation and CLI agents by default. `2026.9.3` additionally requires Node ≥ 24.16 and migrates Workshop skills; `2026.9.6` still has open upgrade/performance regression reports. Plan that jump as a separate maintenance window with a state backup.
+
 ## [0.5.88-full1] - 2026-09-01
 
 Merge of upstream `techartdev` **0.5.86 → 0.5.88** onto the fork. **No OpenClaw bump** — the pin stays `2026.7.1-2`, identical to upstream's.
