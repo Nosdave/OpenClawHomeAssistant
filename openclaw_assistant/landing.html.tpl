@@ -66,6 +66,10 @@
         <span class="icon" id="diskIcon">💾</span>
         <span id="diskText">Disk: __DISK_USED__ / __DISK_TOTAL__ (__DISK_PCT__) — __DISK_AVAIL__ free</span>
       </div>
+      <div class="status-item" id="statusResources">
+        <span class="icon">⚙️</span>
+        <span>Resources: <b>__RESOURCE_PROFILE__</b> — heap __NODE_HEAP__</span>
+      </div>
     </div>
 
     <!-- ==================== ACTION BUTTONS ==================== -->

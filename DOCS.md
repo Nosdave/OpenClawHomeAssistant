@@ -29,11 +29,11 @@ The add-on container runs three services:
 | Service | Port | Purpose |
 |---|---|---|
 | **OpenClaw Gateway** | 18789 (configurable) | The AI agent server — handles skills, chat, automations |
-| **nginx** (Ingress proxy) | 48099 (fixed) | Serves the landing page inside Home Assistant |
+| **nginx** (Ingress proxy) | 48099 (fixed, Ingress-only) | Serves the landing page inside Home Assistant; direct LAN access is denied |
 | **ttyd** (Web terminal) | 7681 (configurable) | Provides a browser-based terminal for setup and management |
 
 When you open the add-on page in Home Assistant, nginx serves a landing page with:
-- An **Open Gateway Web UI** button (opens in a new tab to avoid WebSocket issues with Ingress)
+- An **Open Gateway Web UI** button (opens in a new tab — see [why](#4-accessing-the-gateway-web-ui))
 - An embedded **terminal** for running commands
 
 ### Key directories
@@ -123,11 +123,13 @@ Save this token — you'll need it to access the Gateway Web UI and for API inte
 
 ## 4. Accessing the Gateway Web UI
 
-The Gateway Web UI (Control UI) is OpenClaw's main web interface. It opens in a **separate browser tab** because Home Assistant's Ingress proxy has WebSocket limitations.
+The Gateway Web UI (Control UI) is OpenClaw's main web interface. It opens in a **separate browser tab**, not inside the add-on page.
 
-> **Important (v2026.2.21+):** OpenClaw now requires a **secure context** (HTTPS or localhost) for the Control UI. Plain HTTP over LAN is no longer accepted. The add-on's `access_mode` option makes this easy — see below.
+The reason is asset paths, not WebSockets — Ingress proxies WebSockets fine, which is how the embedded terminal works. Home Assistant serves add-on pages under a per-add-on prefix (`/api/hassio_ingress/<token>/`), while the Control UI emits its assets from the origin root unless `gateway.controlUi.basePath` matches that prefix exactly. Serving it under Ingress would therefore require pinning the gateway to that prefix, which would break direct LAN access at the same time.
+
+> **Updated for OpenClaw 2026.8.2:** the Control UI **no longer requires a secure context**. Device identity is generated and signed with pure-JS Ed25519, so pairing works on any origin, including plain HTTP. HTTPS is still strongly recommended — over plaintext, both the page and your gateway token are readable by anyone on the path — but it is no longer a hard requirement.
 >
-> **v2026.2.22 note:** The gateway now emits a startup security warning when `dangerouslyDisableDeviceAuth` is active (used by `lan_https` mode). This warning is **expected and safe to ignore** — token authentication is still enforced.
+> **Every browser must be paired once** before it can use the Control UI. See [Device pairing](#device-pairing-first-connection) below. `gateway.controlUi.dangerouslyDisableDeviceAuth` used to bypass this; upstream has **retired that flag and it is now inert**, so pairing applies to all browsers.
 
 ### Choosing an access mode
 
@@ -196,7 +198,7 @@ Forward the gateway port from your HA host to your local machine:
 ssh -L 18789:127.0.0.1:18789 your-user@your-ha-ip
 ```
 
-Then open `http://localhost:18789` in your browser. `localhost` counts as a secure context.
+Then open `http://localhost:18789` in your browser.
 
 > **Limitation**: SSH forwarding doesn't work on phones/tablets. Use `lan_https` for mobile access.
 
@@ -228,17 +230,41 @@ Set `gateway_public_url` in the add-on configuration to the URL where the gatewa
 
 > **Tip**: In `lan_https` mode, if you leave `gateway_public_url` empty, the add-on auto-constructs it from the detected LAN IP.
 
-### Browser security: "requires HTTPS or localhost"
+### Device pairing (first connection)
 
-If you see:
+The first time a browser opens the Gateway Web UI it shows **Device pairing required** with a request ID. This is normal and happens once per browser.
 
-> control ui requires HTTPS or localhost (secure context)
-> disconnected (1008): control ui requires device identity
+The "Gateway host" the message refers to is **the add-on container itself**, and the add-on's web terminal is a root shell on it — no SSH required.
 
-This means the browser is connecting over plain HTTP. **Solutions**:
-- Set `access_mode` to **lan_https** (easiest — no external setup)
-- Set `access_mode` to **lan_reverse_proxy** and use an HTTPS reverse proxy
-- Use SSH port forwarding to `localhost` (desktop only)
+1. Open the add-on page in Home Assistant and use the embedded terminal (or **Open Terminal (full page)**).
+2. List the pending request:
+   ```sh
+   openclaw devices list
+   ```
+   ```
+   Pending (1)
+   Request                               Device                    Requested            Age
+   5dd686b0-2a01-4f3e-b532-873914bfe829  1a6ad91d... 192.168.1.106 roles: operator; ... 2m ago
+   ```
+3. Approve it, using the ID shown in the browser (or in the table above):
+   ```sh
+   openclaw devices approve 5dd686b0-2a01-4f3e-b532-873914bfe829
+   ```
+4. Click **Connect** again in the browser.
+
+**Useful variations**
+
+```sh
+openclaw devices approve --latest   # preview the newest request (exits 1), then rerun with the exact ID
+openclaw devices list --json        # machine-readable
+openclaw devices rename --device <id> --name "Living room tablet"
+openclaw devices reject <requestId> # deny a request you do not recognise
+openclaw devices remove <deviceId>  # un-pair a device later
+```
+
+> **Ignore the `ssh -N -L ...` hint.** Running `openclaw dashboard` in the add-on prints "No GUI detected" and suggests an SSH tunnel — that guidance is for headless servers. In this add-on you already have a shell on the gateway host, so `openclaw devices list` / `approve` is all you need.
+
+> **Security note:** approve only requests you just triggered yourself. The table shows the requesting IP — check it matches the device you are pairing.
 
 ### Unauthorized error
 
@@ -248,7 +274,7 @@ If the Gateway UI shows **Unauthorized**, re-check your token:
 jq -r '.gateway.auth.token' /config/.openclaw/openclaw.json
 ```
 
-> **Note**: Since OpenClaw v2026.2.22+ `openclaw config get` redacts sensitive values — use `jq` to read directly from the config file.
+> **Note**: `openclaw config get` redacts sensitive values (v2026.2.22+) — read the token from the config file with `jq`.
 
 ---
 
@@ -276,7 +302,7 @@ All options are set via **Settings → Apps/Add-ons → OpenClaw Assistant → C
 | `gateway_auth_mode` | `token` / `trusted-proxy` | `token` | Gateway auth mode. Use `trusted-proxy` when terminating HTTPS in a reverse proxy and forwarding trusted auth headers. |
 | `gateway_trusted_proxies` | string | _(empty)_ | Comma-separated trusted proxy IP/CIDR list used with `gateway_auth_mode: trusted-proxy`. |
 | `gateway_additional_allowed_origins` | string | _(empty)_ | Comma-separated additional origins merged into `gateway.controlUi.allowedOrigins` in `lan_https` mode (example: `https://ha.example.com:8443,capacitor://localhost`). |
-| `controlui_disable_device_auth` | bool | `true` | Controls `gateway.controlUi.dangerouslyDisableDeviceAuth` in `lan_https` mode. **ON (recommended):** skip per-device pairing approval, avoid error 1008 on LAN HTTPS, token auth still required. **OFF:** enforce per-device pairing prompts (stricter, but more friction). |
+| `controlui_disable_device_auth` | bool | `true` | **Deprecated / no effect.** It set `gateway.controlUi.dangerouslyDisableDeviceAuth`, which OpenClaw retired in the `2026.8.x` line — the key is now inert and `openclaw doctor --fix` removes it. Every browser pairs once instead; see [Device pairing](#device-pairing-first-connection). The option is kept so existing configurations keep validating, and the add-on no longer writes the key. |
 | `force_ipv4_dns` | bool | `true` | Force IPv4-first DNS ordering for Node network calls. **Recommended ON** — most HAOS VMs lack IPv6 egress, causing `web_fetch` and Telegram timeouts. Set to `false` only if your network has working IPv6. |
 | `gateway_env_vars` | list of `{name, value}` | `[]` | Environment variables exported to the gateway process at startup. UI format: list entries with `name` and `value` (example: `name=OPENAI_API_KEY`, `value=sk-...`). Limits: max 50 vars, key length 255, value length 10000. Reserved runtime keys are blocked (for example `PATH`, `HOME`, `NODE_OPTIONS`, `NODE_PATH`, `OPENCLAW_*`, proxy vars). Legacy string/object formats are still accepted for backward compatibility. |
 | `nginx_log_level` | `full` / `minimal` | `minimal` | Nginx access log verbosity. `minimal` suppresses repetitive Home Assistant health-check and polling requests (`GET /`, `GET /v1/models`). `full` logs everything. |
@@ -290,7 +316,11 @@ When `gateway_auth_mode: trusted-proxy` is used, the add-on sets `gateway.auth.t
 | `enable_terminal` | bool | `true` | Show the web terminal on the add-on page |
 | `terminal_port` | int | `7681` | Port for the terminal (ttyd). Change if 7681 conflicts. Range: 1024-65535 |
 
-> **Note**: the add-on page and terminal are only reachable through Home Assistant Ingress. The Ingress backend port `48099` accepts connections from loopback and the Supervisor (`172.30.32.2`) only; direct requests from the LAN (e.g. `http://<ha-ip>:48099/`) are answered with `403 Forbidden`.
+The terminal remains available inside the authenticated Home Assistant Ingress
+page. Port `48099` is intentionally not a direct LAN endpoint: opening
+`http://<ha-host>:48099/` outside Home Assistant returns `403`. This prevents
+bypassing Home Assistant authentication for the landing page and writable ttyd
+shell. The internal ttyd listener remains bound to loopback only.
 
 ### Security & Tokens
 
@@ -320,6 +350,22 @@ To provide the SSH key: place the private key file in the add-on config director
 | `persist_node_global` | bool | `false` | Persist user-installed npm global skills/packages in `/config/.node_global/`. Turn on only if you want those installs to survive add-on rebuilds. |
 | `persist_brew_tools` | bool | `false` | Persist Homebrew and brew-installed CLI tools in `/config/.linuxbrew/`. Turn on only if you want those installs to survive add-on rebuilds. |
 | `auto_configure_mcp` | bool | `false` | Auto-register Home Assistant as an MCP server on startup (requires `homeassistant_token`) |
+| `config_backup_keep` | int | `10` | How many `openclaw.json` snapshots to keep in `/config/.openclaw/backups`. See [Config snapshots & rollback](#7a-config-snapshots--rollback). `0` disables snapshots. Range: 0-100 |
+
+### Performance
+
+| Option | Type | Default | Description |
+|---|---|---|---|
+| `resource_profile` | `auto` / `low` / `balanced` / `high` | `auto` | Caps the Node.js heap used by the gateway so it cannot grow until the OOM killer intervenes. See [Resource profiles](#8a-resource-profiles) |
+
+### Home Assistant Integration
+
+| Option | Type | Default | Description |
+|---|---|---|---|
+| `ha_health_sensors` | bool | `false` | Publish `sensor.openclaw_*` health entities to Home Assistant. Requires `homeassistant_token`. See [Health sensors](#6g-home-assistant-health-sensors) |
+| `ha_health_interval` | int | `60` | Seconds between health sensor updates. Range: 15-3600 |
+| `ha_base_url` | string | _(empty)_ | Base URL of Home Assistant for the health sensors. Empty auto-detects (tries `https` and `http` on `127.0.0.1`, `localhost`, `homeassistant`, `homeassistant.local`, port 8123). Set it if Home Assistant uses a non-default port or host, e.g. `https://192.168.1.10:8123` |
+
 ---
 
 ## 6. Use Case Guides
@@ -328,7 +374,7 @@ To provide the SSH key: place the private key file in the add-on config director
 
 This is the most common setup — accessing the Gateway Web UI from a browser on your local network (including phones and tablets).
 
-> **Since OpenClaw v2026.2.21**, the Control UI requires a secure context (HTTPS or localhost). Use the `access_mode` option for easy setup.
+> HTTPS is not strictly required by OpenClaw any more, but it is strongly recommended on a LAN: over plain HTTP your gateway token travels in the clear. The `access_mode` option sets it up for you.
 
 #### Option 1 — Built-in HTTPS proxy (recommended)
 
@@ -641,6 +687,56 @@ You should see your account listed with the `sheets` service.
 
 > **Persistence**: gog stores credentials under `/config/gogcli/` which is persistent storage — your auth survives add-on updates.
 
+### 6g. Home Assistant Health Sensors
+
+The add-on can publish its own health as Home Assistant entities, so you can alert on problems instead of discovering them in the add-on log.
+
+**Setup**
+
+1. Create a long-lived access token: click your user profile in Home Assistant → **Security** tab → **Create Token**
+2. Paste it into the add-on's `homeassistant_token` option
+3. Set `ha_health_sensors`: **true** (optionally adjust `ha_health_interval`, default 60 s)
+4. Restart the add-on
+
+**Entities published**
+
+| Entity | State | Attributes |
+|---|---|---|
+| `sensor.openclaw_gateway` | `running` / `stopped` | pid, bind_mode, access_mode, port, resource_profile |
+| `sensor.openclaw_version` | OpenClaw runtime version | addon_version |
+| `sensor.openclaw_gateway_memory` | Gateway RSS in MB | heap_limit_mb, resource_profile |
+| `sensor.openclaw_disk_used` | `/config` usage in % | total, used, available |
+| `sensor.openclaw_certificate_expiry` | Days until the TLS cert expires | — (only in `lan_https` mode) |
+
+**Example automation**
+
+```yaml
+automation:
+  - alias: OpenClaw gateway down
+    trigger:
+      - platform: state
+        entity_id: sensor.openclaw_gateway
+        to: "stopped"
+        for: "00:05:00"
+    action:
+      - service: notify.persistent_notification
+        data:
+          message: "OpenClaw gateway has been down for 5 minutes."
+```
+
+**Notes**
+
+- These entities are created through the REST API, so they are **not** backed by an integration. After a Home Assistant restart they reappear at the next update interval (up to `ha_health_interval` seconds).
+- Preview the values without publishing anything — no token required:
+  ```sh
+  oc-health show
+  ```
+- Publish a single round manually:
+  ```sh
+  oc-health once
+  ```
+- Cost is one `curl` per interval; there is no resident process.
+
 ---
 
 ## 7. Data Persistence & Skills
@@ -659,7 +755,32 @@ You should see your account listed with the `sheets` service.
 | Homebrew & brew-installed tools | `/config/.linuxbrew/` | Optional (`persist_brew_tools=true`) |
 | gog OAuth credentials | `/config/gogcli/` | Yes |
 | TLS certificates (lan_https) | `/config/certs/` | Yes (CA persists; server cert regenerated if IP changes) |
+| Config snapshots | `/config/.openclaw/backups/` | Yes |
 | OpenClaw binary | `/usr/lib/node_modules/openclaw/` | **No** — reinstalled from image |
+
+### 7a. Config Snapshots & Rollback
+
+The add-on rewrites `openclaw.json` on **every start** — gateway bind/port/auth from your add-on options, `controlUi.allowedOrigins`, and repair rules for settings that would stop the gateway from booting.
+
+To make that safe, a snapshot of `openclaw.json` is taken **before the first write of each start**, so any unwanted change can be undone.
+
+- **Location**: `/config/.openclaw/backups/openclaw.<UTC timestamp>.<label>.json`
+- **Retention**: the newest `config_backup_keep` snapshots (default 10, `0` disables)
+- **Deduplicated**: if the config has not changed since the last snapshot, no new file is written — restarting the add-on repeatedly will not fill the folder
+
+**Commands** (run in the add-on terminal):
+
+```sh
+oc-config list             # show snapshots, newest first
+oc-config diff             # diff the newest snapshot against the current config
+oc-config diff 3           # diff snapshot #3
+oc-config restore 3        # restore snapshot #3, then restart the add-on
+oc-config snapshot before-experiment   # take a labelled snapshot right now
+```
+
+`oc-config restore` always snapshots the config it is about to replace (label `pre-restore`), so a restore is itself reversible.
+
+> **Important**: Settings that the add-on manages from its own options — `gateway.bind`, `gateway.port`, `gateway.auth.mode`, `gateway.trustedProxies`, `gateway.controlUi.allowedOrigins`, `chatCompletions.enabled` — are re-applied on every start and will overwrite the restored values for those specific keys. Change those in the add-on Configuration, not by restoring a snapshot. Everything else (providers, agents, skills, channels, models) restores as-is.
 
 ### How built-in skills work
 
@@ -706,7 +827,7 @@ The add-on image includes these tools, available in the terminal:
 | curl | `curl` | HTTP client |
 | jq | `jq` | JSON processor |
 | Python 3 | `python3` | Scripting |
-| Node.js 22 | `node` | JavaScript runtime |
+| Node.js 24 | `node` | JavaScript runtime |
 | npm | `npm` | Node package manager |
 | pnpm | `pnpm` | Fast Node package manager |
 | Homebrew | `brew` | Package manager (optional — may not be available on all CPUs) |
@@ -714,6 +835,39 @@ The add-on image includes these tools, available in the terminal:
 | SSH | `ssh` | Remote access |
 | oc-cleanup | `oc-cleanup` | Interactive disk space monitor & cache cleanup helper |
 | oc-gateway | `oc-gateway status` / `oc-gateway restart` | Add-on-native gateway status/restart helper (`run.sh` supervised, no systemd) |
+| oc-config | `oc-config list` / `oc-config restore <n>` | Inspect and roll back `openclaw.json` snapshots |
+| oc-health | `oc-health check` / `oc-health show` / `oc-health once` | Diagnose, preview or publish the Home Assistant health sensors |
+
+### 8a. Resource Profiles
+
+Home Assistant runs on everything from a Raspberry Pi 3 to a large NUC, and Node.js sizes its heap against **total host memory**. Left alone, the gateway can grow until the OOM killer takes it — or Home Assistant itself — down.
+
+`resource_profile` gives the gateway an explicit, logged memory budget.
+
+| Profile | Selected when (auto) | Node heap limit |
+|---|---|---|
+| `low` | armv6/armv7, or under 2 GB RAM | 35% of RAM, clamped to 256-768 MB |
+| `balanced` | 2-6 GB RAM | 45% of RAM, clamped to 768-2048 MB |
+| `high` | over 6 GB RAM | none — Node's own default applies |
+
+The resolved profile and heap limit are printed at startup and shown on the add-on landing page:
+
+```
+INFO: Resource profile: low (auto-detected); host: 1024 MB RAM, 4 CPU, armv7l
+INFO: Node heap limit for OpenClaw: 358 MB (--max-old-space-size)
+```
+
+**`auto` never modifies `openclaw.json`.** It only sets add-on process limits, so updating the add-on can never silently change how your agents behave.
+
+Selecting **`low` explicitly** additionally applies conservative OpenClaw defaults — currently `browser.enabled: false`, since Chromium is by far the heaviest optional component. This is only written for keys you have **not** already set yourself, and it is never re-applied: set `browser.enabled: true` in `openclaw.json` and it stays true.
+
+**Other things that matter on small hardware**
+
+- **Chromium** (browser automation) — the largest single consumer. Disable with `openclaw config set browser.enabled false`.
+- **node-llama-cpp** (local memory/embeddings) — CPU- and RAM-heavy on ARM. Consider a remote embeddings provider instead.
+- **`persist_node_global` / `persist_brew_tools`** — leave off unless needed; they add disk and backup weight.
+
+> If the gateway starts hitting the heap ceiling (frequent restarts, `JavaScript heap out of memory` in the log), move up a profile — or reduce the workload. `sensor.openclaw_gateway_memory` (see [Health sensors](#6g-home-assistant-health-sensors)) makes this easy to watch over time.
 
 ### oc-cleanup
 
@@ -764,18 +918,39 @@ openclaw --version
 
 Home Assistant's built-in backup system automatically includes add-on configuration data (`/config/`). By default this covers the important user state: OpenClaw config, skills, workspace, keys, and tokens — without large optional toolchains.
 
-### Backup-friendly defaults (v0.5.75+)
+### What is excluded from backups (v0.5.90+)
 
-Starting with v0.5.75, the add-on keeps large optional toolchains out of backups by default:
+The add-on tells the Supervisor to skip regenerable caches and tooling, so backups stay small no matter how your persistence options are set:
 
-- `persist_node_global: false` → `/config/.node_global/` is not used unless you opt in
-- `persist_brew_tools: false` → `/config/.linuxbrew/` is not used unless you opt in
+| Excluded | Why it is safe |
+|---|---|
+| `.linuxbrew/` | Homebrew install and cellar — reinstallable with `brew install` |
+| `.node_global/` | npm/pnpm global installs — reinstallable |
+| `.npm/` | npm download cache — rebuilt on demand |
+| `.cache/` | tool caches (Chromium, build artifacts) — rebuilt on demand |
+| `__pycache__/` | Python bytecode — regenerated automatically |
+| `*.jsonl.lock` | stale session locks — never useful to restore |
 
-Turn these on only if you specifically want user-installed npm global skills or brew-installed CLI tools to survive add-on rebuilds.
+Everything else is backed up: `openclaw.json`, config snapshots, skills, agent sessions, the `clawd` workspace, keys, secrets and TLS certificates.
+
+> **Important**: restoring a backup replaces `/config` wholesale, so excluded directories are **removed** by a restore rather than left in place. After restoring, reinstall any brew or global npm tools you depend on. Caches rebuild themselves.
+
+### Persistence vs. backups
+
+These are two different things, and since v0.5.90 they no longer trade off against each other:
+
+- **Persistence** (`persist_node_global`, `persist_brew_tools`) controls whether tooling survives an **add-on rebuild**. Both default to `false`.
+- **Backup exclusion** (above) controls whether it lands in a **Home Assistant backup**. Always on.
+
+So you can safely enable persistence to stop losing `brew`/npm tools on every add-on update, without inflating your backups. The cost is that those tools are not restored from a backup — you reinstall them.
 
 ### Migration note for older installs
 
-If you used an older add-on version, you may already have legacy directories such as `/config/.node_global/` or `/config/.linuxbrew/` from previous persistent behavior. Disabling persistence stops future growth, but those directories still count toward backup size until you remove or archive them manually.
+If you used an older add-on version, you may already have legacy directories such as `/config/.node_global/` or `/config/.linuxbrew/` from previous persistent behavior. Since v0.5.90 these no longer count toward backup size, but they still occupy disk. The add-on warns about them at startup; remove them when you no longer need them:
+
+```sh
+rm -rf /config/.node_global /config/.linuxbrew
+```
 
 **To create a backup**: Go to **Settings → System → Backups → Create Backup**
 
@@ -784,8 +959,8 @@ If you used an older add-on version, you may already have legacy directories suc
 # Key paths to back up:
 # /config/.openclaw/     - OpenClaw config, skills, agent data
 # /config/clawd/         - ClawHub workspace
-# /config/.node_global/  - User-installed npm skills (only if persist_node_global=true)
-# /config/.linuxbrew/    - Homebrew tools (only if persist_brew_tools=true)
+# (.node_global / .linuxbrew are intentionally excluded from HA backups —
+#  reinstall those tools instead of restoring them)
 # /config/keys/          - SSH keys
 # /config/secrets/       - Tokens
 ```
@@ -824,6 +999,12 @@ Go to **Settings → Add-ons → OpenClaw Assistant → Log** tab. Logs show sta
 
 **Fix**: Either restart the add-on (stale process cleanup), or change `terminal_port` to a different value (e.g., `7682`).
 
+### Direct access to port 48099 returns `403`
+
+This is expected. Port `48099` is the internal backend for authenticated Home
+Assistant Ingress and rejects direct LAN clients. Open the add-on page from the
+Home Assistant UI instead; the landing page and terminal continue to work there.
+
 ### ERR_CONNECTION_REFUSED
 
 **Symptom**: Browser shows connection refused when opening the Gateway Web UI.
@@ -846,16 +1027,20 @@ Go to **Settings → Add-ons → OpenClaw Assistant → Log** tab. Logs show sta
 jq 'del(.tools.web.search.provider)' /config/.openclaw/openclaw.json > /tmp/openclaw.json && mv /tmp/openclaw.json /config/.openclaw/openclaw.json
 ```
 
-### "disconnected (1008): control ui requires device identity" / "requires HTTPS or localhost"
+### "disconnected (1008): control ui requires device identity"
 
-**Symptom**: Gateway UI shows error 1008 or "requires secure context / device identity".
+**Symptom**: the Control UI connects, then drops with error 1008 mentioning device identity.
 
-**Cause**: OpenClaw v2026.2.21+ requires HTTPS or localhost. Plain HTTP over LAN is blocked. (v2026.2.22 further hardens this by defaulting remote onboarding to `wss://` and rejecting insecure non-loopback targets.)
+**Cause**: the browser has not been paired yet. Since the `2026.8.x` line every Control UI browser pairs once, on any origin — the old `dangerouslyDisableDeviceAuth` bypass is retired and inert.
 
-**Fix** (pick one):
-1. **Easiest**: Set `access_mode` to **lan_https** in add-on Configuration → restart. This adds a built-in HTTPS proxy with zero external setup.
-2. **External proxy**: Set `access_mode` to **lan_reverse_proxy** and configure NPM/Caddy/Traefik with TLS.
-3. **SSH tunnel** (desktop only): `ssh -L 18789:127.0.0.1:18789 user@ha-ip` then open `http://localhost:18789`.
+**Fix**: approve the browser from the add-on terminal — see [Device pairing](#device-pairing-first-connection):
+
+```sh
+openclaw devices list
+openclaw devices approve <requestId>
+```
+
+> Older versions of this documentation said the Control UI "requires HTTPS or localhost". That restriction was removed upstream: device identity is signed with pure-JS Ed25519 and no longer depends on a secure context. HTTPS remains recommended so your token is not sent in clear text.
 
 ### "disconnected (1008): origin not allowed"
 
@@ -873,34 +1058,22 @@ jq 'del(.tools.web.search.provider)' /config/.openclaw/openclaw.json > /tmp/open
    ```
    Then restart the add-on to re-merge defaults + extras.
 
-### "disconnected (1008): pairing required"
+### "Device pairing required" when opening the Gateway Web UI
 
-**Symptom**: Gateway UI loads over HTTPS but shows `pairing required` and the status is Offline.
+**Symptom**: the Gateway Dashboard shows **Device pairing required** with a request ID and will not connect.
 
-**Cause**: OpenClaw v2026.2.21+ requires new devices to complete a pairing handshake before the Control UI WebSocket is accepted. Loopback connections are auto-approved (v2026.2.22 further improves this with loopback scope-upgrade auto-approval), but LAN connections (including those through the HTTPS proxy) require explicit approval.
+**Cause**: expected on a browser's first connection. OpenClaw pairs each Control UI browser once.
 
-**Fix**: In **v0.5.50+** the add-on configures `gateway.controlUi.dangerouslyDisableDeviceAuth` in `lan_https` mode. By default it is enabled (`controlui_disable_device_auth: true`) to bypass per-device pairing while still enforcing token auth. If you prefer stricter behavior, set `controlui_disable_device_auth: false` and approve new devices manually.
+**Fix**: in the add-on terminal (the gateway host *is* this container):
 
-> **v2026.2.22 note:** The gateway now logs a security warning on startup when this flag is active. The warning is expected and harmless — run `openclaw security audit` for details.
+```sh
+openclaw devices list
+openclaw devices approve <requestId>
+```
 
-1. **Restart the add-on** — the startup script writes the config before launching the gateway.
-2. If the error persists, set it manually:
-   ```sh
-   nano /config/.openclaw/openclaw.json
-   ```
-   Ensure `gateway.controlUi` contains:
-   ```json
-   "controlUi": {
-     "dangerouslyDisableDeviceAuth": true,
-     "allowedOrigins": ["https://YOUR_IP:18789"]
-   }
-   ```
-   Then restart only the gateway process: `oc-gateway restart`
-3. Alternatively, approve devices individually without disabling auth:
-   ```sh
-   openclaw devices list       # show pending pairing requests
-   openclaw devices approve <requestId>
-   ```
+Then click **Connect** again. Full walkthrough: [Device pairing](#device-pairing-first-connection).
+
+> **Do not** try to disable pairing with `gateway.controlUi.dangerouslyDisableDeviceAuth`. OpenClaw retired that flag in the `2026.8.x` line; it is inert, `openclaw doctor --fix` removes it, and the add-on no longer writes it. Approving the device is the supported path.
 
 ### Gateway UI shows "Unauthorized"
 
@@ -996,13 +1169,150 @@ The OpenClaw binary should be installed at `/usr/lib/node_modules/openclaw/`. If
 
 **Symptom**: `ERROR: Failed to apply gateway settings` in logs.
 
-**Fix**: The `openclaw.json` config file may be corrupted. To reset it:
+**Fix**: First try rolling back to the last known-good config instead of starting over:
+
+```sh
+oc-config list
+oc-config diff 1        # see what changed
+oc-config restore 1     # then restart the add-on
+```
+
+If the config is genuinely corrupted beyond repair, reset it:
 
 ```sh
 rm /config/.openclaw/openclaw.json
 ```
 
 Restart the add-on — it will generate a fresh config. You'll need to run `openclaw onboard` again.
+
+### A setting I configured keeps getting changed back
+
+**Symptom**: A value in `openclaw.json` reverts every time the add-on restarts.
+
+**Cause**: Settings the add-on manages from its own options are re-applied on every start — `gateway.bind`, `gateway.port`, `gateway.auth.mode`, `gateway.trustedProxies`, `gateway.controlUi.allowedOrigins` and `chatCompletions.enabled`.
+
+**Fix**: Change those in **Settings → Add-ons → OpenClaw Assistant → Configuration**, not in `openclaw.json`. To see exactly what the add-on changed on the last start:
+
+```sh
+oc-config diff 1
+```
+
+### `proxy_attribution_required` / "Proxy client attribution is required"
+
+**Symptom**: the gateway is running, but every request returns:
+
+```json
+{"error":{"message":"Proxy client attribution is required. Configure gateway.trustedProxies narrowly and make the proxy overwrite or safely rebuild forwarded client headers.","type":"proxy_attribution_required"}}
+```
+
+**Cause**: OpenClaw `2026.8.2+` rejects requests that carry forwarded identity headers (`X-Forwarded-For`, `X-Real-IP`, `Forwarded`) from a source that is not listed in `gateway.trustedProxies`. It fails closed rather than trusting a client-supplied IP.
+
+**In `lan_https` mode** the add-on handles this automatically. Its HTTPS proxy
+runs on loopback, so only the actual nginx hop (`127.0.0.1` / `::1`) needs to
+be trusted. For LAN clients nginx overwrites the forwarded identity with the
+address of its direct peer. For same-host clients (for example a Home Assistant
+integration calling the add-on through the host address), it omits forwarded
+identity headers so token authentication is not misclassified as proxy auth.
+
+**In `lan_reverse_proxy` mode** (or `custom` with your own proxy), set `gateway_trusted_proxies` to the address your proxy connects *from* — not the address clients use:
+
+```
+gateway_trusted_proxies: "172.30.0.0/16"
+```
+
+Your proxy must also send a trustworthy `X-Forwarded-For`. In Nginx Proxy
+Manager this is the default. In a hand-written single-hop nginx configuration,
+overwrite any client-supplied chain with the address of nginx's direct peer:
+
+```nginx
+proxy_set_header X-Real-IP $remote_addr;
+proxy_set_header X-Forwarded-For $remote_addr;
+proxy_set_header X-Forwarded-Proto $scheme;
+```
+
+Do not append an untrusted incoming chain with `$proxy_add_x_forwarded_for`
+unless every preceding proxy is known and validates or rebuilds that chain.
+
+### Gateway restart loop after an OpenClaw upgrade (`requires migration`)
+
+**Symptom**: after an add-on update the gateway never comes up, and the log repeats:
+
+```
+Gateway failed to start: Legacy workspace setup state requires migration for
+/config/.openclaw/workspace; run openclaw doctor --fix.
+WARN: OpenClaw runtime exited with code 1. Restarting in 2s...
+```
+
+**Cause**: some OpenClaw releases gate startup behind a one-time data migration and refuse to boot until it has run. This is an upstream requirement, not an add-on misconfiguration.
+
+**Fix**: since v0.5.90 the add-on detects a repeated failed start and runs `openclaw doctor --fix` automatically (once per start, after snapshotting `openclaw.json` first). If it has not recovered on its own, the web terminal stays available during the loop — open it and run:
+
+```sh
+openclaw doctor --fix
+```
+
+Then restart the add-on. If the gateway still refuses to start:
+
+```sh
+openclaw doctor          # full report
+oc-gateway status        # add-on-native status
+ls /config/.openclaw/logs/stability/   # per-failure diagnostic bundles
+```
+
+> The add-on backs off between restart attempts (2s doubling to a 60s cap) so a gateway that cannot start does not spin the CPU or fill the disk with stability bundles. The terminal, landing page and Ingress remain usable throughout.
+
+### Safe rollback after an OpenClaw database upgrade
+
+Before the add-on starts a new OpenClaw version, it saves one compressed state
+archive under `/config/.openclaw/upgrade-backups/`. This includes `openclaw.json`,
+agent/session databases (including SQLite WAL files), pairing records and channel
+delivery state. It excludes regenerable or bulky content such as built-in skills,
+media, npm projects and logs. The add-on keeps the three newest upgrade archives.
+
+If the archive cannot be created, the new gateway does **not** start. This avoids
+an irreversible schema migration when disk space or permissions are unhealthy.
+
+OpenClaw database schema upgrades are not downgrade-compatible. To roll back to
+an older add-on release, first stop the add-on and move the current
+`/config/.openclaw` directory aside. Create a new `/config/.openclaw` directory,
+extract the desired archive into it, then start the older release. Do not extract
+over the upgraded directory: its newer database files would remain in place.
+Work created after that archive will not be present after the rollback.
+
+### `JavaScript heap out of memory` / gateway restart loop on a Raspberry Pi
+
+**Symptom**: The gateway restarts repeatedly; the log shows heap allocation failures, or the whole add-on is killed.
+
+**Cause**: The workload exceeds the Node heap budget for the active [resource profile](#8a-resource-profiles), or the device is genuinely out of RAM.
+
+**Fix**:
+1. Check what profile is active — it is printed at startup and shown on the landing page.
+2. If the device has headroom, move `resource_profile` up one step (`low` → `balanced`).
+3. If it does not, reduce the load: `openclaw config set browser.enabled false`, and switch local embeddings to a remote provider.
+4. Watch `sensor.openclaw_gateway_memory` over time (see [Health sensors](#6g-home-assistant-health-sensors)) to see whether you are near the ceiling.
+
+### Health sensors do not appear in Home Assistant
+
+**Symptom**: `ha_health_sensors` is on, but no `sensor.openclaw_*` entities exist.
+
+**Checks**:
+0. If your Home Assistant serves **HTTPS**, plain-HTTP probes fail with `HTTP 000` (curl reports *Empty reply from server*). Auto-detection tries `https` first from v0.5.90; if Home Assistant is on a non-default port or host, set `ha_base_url` explicitly.
+1. Confirm `homeassistant_token` is set — the log says so at startup if it is missing.
+2. Verify the data collection works at all (this needs no token):
+   ```sh
+   oc-health show
+   ```
+3. Diagnose credentials and connectivity in one step:
+   ```sh
+   oc-health check
+   ```
+   It reports which endpoint was chosen, whether the token is present, and the result of a live probe.
+4. Try one real publish and read the error:
+   ```sh
+   oc-health once
+   ```
+   `HTTP 401` means the token is invalid or expired — create a new long-lived token in your Home Assistant profile → **Security**. `HTTP 000` means Home Assistant could not be reached at all.
+5. Remember these entities are created via the REST API, so they disappear on a Home Assistant restart and come back at the next update interval (up to `ha_health_interval` seconds).
 
 ### Disk space running low / "no space left on device"
 

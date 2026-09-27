@@ -69,11 +69,125 @@ FORCE_IPV4_DNS=$(read_json_bool force_ipv4_dns true)
 ACCESS_MODE=$(jq -r '.access_mode // "custom"' "$OPTIONS_FILE")
 NGINX_LOG_LEVEL=$(jq -r '.nginx_log_level // "minimal"' "$OPTIONS_FILE")
 AUTO_CONFIGURE_MCP=$(read_json_bool auto_configure_mcp false)
+RESOURCE_PROFILE=$(jq -r '.resource_profile // "auto"' "$OPTIONS_FILE")
+HA_HEALTH_SENSORS=$(read_json_bool ha_health_sensors false)
+HA_HEALTH_INTERVAL_RAW=$(jq -r '.ha_health_interval // 60' "$OPTIONS_FILE")
+HA_BASE_URL=$(jq -r '.ha_base_url // empty' "$OPTIONS_FILE")
+CONFIG_BACKUP_KEEP_RAW=$(jq -r '.config_backup_keep // 10' "$OPTIONS_FILE")
 GW_ENV_VARS_TYPE=$(jq -r 'if .gateway_env_vars == null then "null" else (.gateway_env_vars | type) end' "$OPTIONS_FILE")
 GW_ENV_VARS_RAW=$(jq -r '.gateway_env_vars // empty' "$OPTIONS_FILE")
 GW_ENV_VARS_JSON=$(jq -c '.gateway_env_vars // []' "$OPTIONS_FILE")
 
 export TZ="$TZNAME"
+
+# SECURITY/SANITY: validate numeric options before they reach loops or Python.
+if [[ "$HA_HEALTH_INTERVAL_RAW" =~ ^[0-9]+$ ]] && [ "$HA_HEALTH_INTERVAL_RAW" -ge 15 ] && [ "$HA_HEALTH_INTERVAL_RAW" -le 3600 ]; then
+  HA_HEALTH_INTERVAL="$HA_HEALTH_INTERVAL_RAW"
+else
+  echo "WARN: Invalid ha_health_interval '$HA_HEALTH_INTERVAL_RAW'. Must be 15-3600. Using default 60."
+  HA_HEALTH_INTERVAL="60"
+fi
+
+if [[ "$CONFIG_BACKUP_KEEP_RAW" =~ ^[0-9]+$ ]] && [ "$CONFIG_BACKUP_KEEP_RAW" -le 100 ]; then
+  CONFIG_BACKUP_KEEP="$CONFIG_BACKUP_KEEP_RAW"
+else
+  echo "WARN: Invalid config_backup_keep '$CONFIG_BACKUP_KEEP_RAW'. Must be 0-100. Using default 10."
+  CONFIG_BACKUP_KEEP="10"
+fi
+export CONFIG_BACKUP_KEEP
+
+# ------------------------------------------------------------------------------
+# Resource profile — keep the add-on well-behaved on low-power Home Assistant
+# hardware (Raspberry Pi, low-RAM VMs).
+#
+# Node sizes its heap against TOTAL HOST memory, which on HAOS is the whole
+# machine. Without a cap the gateway happily grows until the OOM killer takes
+# it (or Home Assistant itself) down. We give it an explicit, logged budget.
+#
+# `auto` (default) only ever touches add-on process settings — it never writes
+# to openclaw.json, so upgrades cannot silently change agent behavior. An
+# explicitly selected `low` additionally applies conservative OpenClaw defaults
+# for keys the user has not set (see apply-resource-profile in the helper).
+# ------------------------------------------------------------------------------
+MEM_TOTAL_MB=$(awk '/^MemTotal:/{printf "%d", $2/1024}' /proc/meminfo 2>/dev/null || echo 0)
+CPU_COUNT=$(nproc 2>/dev/null || echo 1)
+HOST_ARCH=$(uname -m 2>/dev/null || echo unknown)
+
+case "$RESOURCE_PROFILE" in
+  low|balanced|high) ;;
+  auto|"") RESOURCE_PROFILE="auto" ;;
+  *)
+    echo "WARN: Invalid resource_profile '$RESOURCE_PROFILE'; falling back to auto."
+    RESOURCE_PROFILE="auto"
+    ;;
+esac
+
+RESOURCE_PROFILE_SOURCE="option"
+EFFECTIVE_PROFILE="$RESOURCE_PROFILE"
+
+if [ "$RESOURCE_PROFILE" = "auto" ]; then
+  RESOURCE_PROFILE_SOURCE="auto-detected"
+  case "$HOST_ARCH" in
+    armv6*|armv7*)
+      # 32-bit ARM is Pi 3 / Pi Zero class hardware regardless of reported RAM.
+      EFFECTIVE_PROFILE="low"
+      ;;
+    *)
+      if [ "$MEM_TOTAL_MB" -gt 0 ] && [ "$MEM_TOTAL_MB" -lt 2048 ]; then
+        EFFECTIVE_PROFILE="low"
+      elif [ "$MEM_TOTAL_MB" -gt 0 ] && [ "$MEM_TOTAL_MB" -lt 6144 ]; then
+        EFFECTIVE_PROFILE="balanced"
+      elif [ "$MEM_TOTAL_MB" -eq 0 ]; then
+        # Unreadable /proc/meminfo — assume the conservative middle ground.
+        EFFECTIVE_PROFILE="balanced"
+      else
+        EFFECTIVE_PROFILE="high"
+      fi
+      ;;
+  esac
+fi
+
+# Heap budget as a share of total RAM, clamped to a sane band per profile.
+# `high` intentionally sets no cap so large machines keep Node's own default.
+NODE_HEAP_MB=""
+case "$EFFECTIVE_PROFILE" in
+  low)      HEAP_PCT=35; HEAP_MIN=256; HEAP_MAX=768 ;;
+  balanced) HEAP_PCT=45; HEAP_MIN=768; HEAP_MAX=2048 ;;
+  high)     HEAP_PCT=0;  HEAP_MIN=0;   HEAP_MAX=0 ;;
+esac
+
+if [ "$HEAP_PCT" -gt 0 ]; then
+  NODE_HEAP_MB=$(( MEM_TOTAL_MB * HEAP_PCT / 100 ))
+  if [ "$NODE_HEAP_MB" -lt "$HEAP_MIN" ]; then
+    NODE_HEAP_MB="$HEAP_MIN"
+  fi
+  if [ "$NODE_HEAP_MB" -gt "$HEAP_MAX" ]; then
+    NODE_HEAP_MB="$HEAP_MAX"
+  fi
+  if [ -n "${NODE_OPTIONS:-}" ]; then
+    export NODE_OPTIONS="${NODE_OPTIONS} --max-old-space-size=${NODE_HEAP_MB}"
+  else
+    export NODE_OPTIONS="--max-old-space-size=${NODE_HEAP_MB}"
+  fi
+fi
+
+echo "INFO: Resource profile: ${EFFECTIVE_PROFILE} (${RESOURCE_PROFILE_SOURCE}); host: ${MEM_TOTAL_MB} MB RAM, ${CPU_COUNT} CPU, ${HOST_ARCH}"
+if [ -n "$NODE_HEAP_MB" ]; then
+  echo "INFO: Node heap limit for OpenClaw: ${NODE_HEAP_MB} MB (--max-old-space-size)"
+else
+  echo "INFO: Node heap limit: unset (profile 'high' leaves Node's own default in place)"
+fi
+
+if [ "$EFFECTIVE_PROFILE" = "low" ]; then
+  echo "NOTICE: Low-resource profile active. The heaviest optional components are"
+  echo "NOTICE: Chromium (browser automation) and node-llama-cpp (local embeddings)."
+  if [ "$RESOURCE_PROFILE" != "low" ]; then
+    echo "NOTICE: Set resource_profile=low explicitly to also disable browser automation"
+    echo "NOTICE: in OpenClaw, or disable it yourself with: openclaw config set browser.enabled false"
+  fi
+fi
+
+export RESOURCE_PROFILE EFFECTIVE_PROFILE NODE_HEAP_MB
 
 # ------------------------------------------------------------------------------
 # Access mode presets — override individual gateway settings for common scenarios
@@ -93,7 +207,20 @@ case "$ACCESS_MODE" in
     GATEWAY_AUTH_MODE="token"
     ENABLE_HTTPS_PROXY=true
     GATEWAY_INTERNAL_PORT=$((GATEWAY_PORT + 1))
+    # OpenClaw 2026.8.2+ refuses requests that carry forwarded identity headers
+    # from a source it does not trust ("proxy_attribution_required"). The
+    # built-in HTTPS proxy is our own nginx on loopback and it sets
+    # X-Forwarded-For / X-Real-IP / X-Forwarded-Proto, so loopback must be a
+    # trusted proxy or every gateway request is rejected. Trusting loopback also
+    # lets the gateway attribute the real LAN client IP for rate limiting
+    # instead of seeing every request as 127.0.0.1.
+    if [ -n "$GATEWAY_TRUSTED_PROXIES" ]; then
+      GATEWAY_TRUSTED_PROXIES="127.0.0.1,::1,${GATEWAY_TRUSTED_PROXIES}"
+    else
+      GATEWAY_TRUSTED_PROXIES="127.0.0.1,::1"
+    fi
     echo "INFO: Access mode: lan_https (built-in HTTPS proxy on 0.0.0.0:${GATEWAY_PORT})"
+    echo "INFO: Trusting loopback as a proxy so the gateway can attribute LAN clients."
     ;;
   lan_reverse_proxy)
     GATEWAY_BIND_MODE="lan"
@@ -164,7 +291,8 @@ warn_legacy_persistent_dir() {
   local label="$2"
   if [ -e "$path" ]; then
     echo "WARN: Found legacy persistent ${label} at ${path}, but persistence is disabled."
-    echo "WARN: It will still inflate Home Assistant backups until you remove or archive it manually."
+    echo "WARN: It is excluded from Home Assistant backups, but still uses disk space."
+    echo "WARN: Remove it with: rm -rf ${path}"
   fi
 }
 
@@ -427,6 +555,108 @@ if ! flock -n 9; then
 fi
 
 # ------------------------------------------------------------------------------
+# Upgrade-state backup
+#
+# OpenClaw 2026.9.5 upgrades the persistent agent databases to schema 21. Older
+# OpenClaw builds cannot open that schema, so a config-only snapshot is not
+# enough to make an add-on rollback safe. Before the gateway starts a version we
+# have not started before, archive the migration-sensitive state while the old
+# gateway is down. The archive deliberately excludes regenerable/bulky content
+# (skills, media, npm, logs and previous archives), but retains the config,
+# SQLite databases (including WAL/SHM files), agents, pairing and channel state.
+#
+# The version marker is written only after a complete archive. If this backup
+# fails we refuse to start the new gateway: letting it migrate first would make
+# the promised rollback path dishonest.
+# ------------------------------------------------------------------------------
+OPENCLAW_UPGRADE_BACKUP_DIR="${OPENCLAW_CONFIG_DIR}/upgrade-backups"
+OPENCLAW_UPGRADE_BACKUP_KEEP=3
+
+openclaw_runtime_version() {
+  openclaw --version 2>/dev/null | sed -n 's/^OpenClaw \([0-9][0-9.]*\).*/\1/p' | head -n1
+}
+
+has_upgrade_sensitive_state() {
+  [ -f "${OPENCLAW_CONFIG_DIR}/openclaw.json" ] || \
+    [ -d "${OPENCLAW_CONFIG_DIR}/state" ] || \
+    { [ -d "${OPENCLAW_CONFIG_DIR}/agents" ] && \
+      [ -n "$(find "${OPENCLAW_CONFIG_DIR}/agents" -mindepth 1 -print -quit 2>/dev/null)" ]; }
+}
+
+prune_upgrade_backups() {
+  local stale
+  mapfile -t stale < <(find "$OPENCLAW_UPGRADE_BACKUP_DIR" -maxdepth 1 -type f -name 'openclaw-state-*.tar.gz' -printf '%f\n' 2>/dev/null | sort -r | tail -n +$((OPENCLAW_UPGRADE_BACKUP_KEEP + 1)))
+  for stale in "${stale[@]}"; do
+    rm -f "${OPENCLAW_UPGRADE_BACKUP_DIR}/${stale}" || \
+      echo "WARN: Could not prune old upgrade backup ${stale}."
+  done
+}
+
+backup_state_before_upgrade() {
+  local version marker stamp archive temporary
+  version="$(openclaw_runtime_version)"
+  if [ -z "$version" ]; then
+    echo "ERROR: Could not determine the bundled OpenClaw version; refusing an unprotected startup."
+    return 1
+  fi
+
+  if ! has_upgrade_sensitive_state; then
+    echo "INFO: No existing OpenClaw state; no upgrade-state backup needed."
+    return 0
+  fi
+
+  if ! mkdir -p "$OPENCLAW_UPGRADE_BACKUP_DIR"; then
+    echo "ERROR: Could not create the upgrade-backup directory."
+    return 1
+  fi
+  marker="${OPENCLAW_UPGRADE_BACKUP_DIR}/started-${version}"
+  if [ -f "$marker" ]; then
+    echo "INFO: Upgrade-state backup already recorded for OpenClaw ${version}."
+    return 0
+  fi
+
+  stamp="$(date -u +%Y%m%d-%H%M%S)"
+  archive="${OPENCLAW_UPGRADE_BACKUP_DIR}/openclaw-state-${stamp}-before-${version}.tar.gz"
+  temporary="${archive}.tmp"
+  rm -f "$temporary"
+
+  echo "INFO: Creating pre-upgrade state backup for OpenClaw ${version}..."
+  if ! tar -C "$OPENCLAW_CONFIG_DIR" \
+      --exclude='./upgrade-backups' \
+      --exclude='./media' \
+      --exclude='./npm' \
+      --exclude='./skills' \
+      --exclude='./logs' \
+      --exclude='./.cache' \
+      -czf "$temporary" .; then
+    rm -f "$temporary"
+    echo "ERROR: Could not create pre-upgrade state backup."
+    return 1
+  fi
+
+  if ! mv "$temporary" "$archive"; then
+    rm -f "$temporary"
+    echo "ERROR: Could not finalize the pre-upgrade state backup."
+    return 1
+  fi
+  chmod 600 "$archive" 2>/dev/null || true
+  if ! printf '%s\n' "$archive" > "$marker"; then
+    echo "ERROR: Could not record the completed pre-upgrade state backup."
+    return 1
+  fi
+  chmod 600 "$marker" 2>/dev/null || true
+  prune_upgrade_backups
+  echo "INFO: Saved pre-upgrade state backup: ${archive}."
+  return 0
+}
+
+if ! backup_state_before_upgrade; then
+  echo "ERROR: OpenClaw was not started, so its persistent state remains unchanged."
+  echo "ERROR: Free disk space or repair permissions, then restart the add-on."
+  exit 1
+fi
+
+# ------------------------------------------------------------------------------
 # Session lock cleanup helpers
 # ------------------------------------------------------------------------------
 
@@ -586,11 +816,17 @@ GW_PID=""
 GW_RELAY_PID=""
 NGINX_PID=""
 TTYD_PID=""
+HEALTH_PID=""
 SHUTTING_DOWN="false"
 
 shutdown() {
   SHUTTING_DOWN="true"
   echo "Shutdown requested; stopping services..."
+
+  if [ -n "${HEALTH_PID}" ] && kill -0 "${HEALTH_PID}" >/dev/null 2>&1; then
+    kill -TERM "${HEALTH_PID}" >/dev/null 2>&1 || true
+    wait "${HEALTH_PID}" 2>/dev/null || true
+  fi
 
   if [ -n "${NGINX_PID}" ] && kill -0 "${NGINX_PID}" >/dev/null 2>&1; then
     kill -TERM "${NGINX_PID}" >/dev/null 2>&1 || true
@@ -743,6 +979,12 @@ if [ -f "$OPENCLAW_CONFIG_PATH" ]; then
   # tools.web.search.provider=brave is not stripped as "unavailable".
   ensure_brave_plugin || true
   if [ -f "$HELPER_PATH" ]; then
+    # Snapshot BEFORE the first mutation of this boot so `oc-config restore`
+    # can always undo whatever the repair/apply steps below decide to change.
+    # A failed backup must never block startup — the helper reports and returns 0.
+    python3 "$HELPER_PATH" snapshot "$CONFIG_BACKUP_KEEP" startup || \
+      echo "WARN: Could not snapshot openclaw.json; continuing startup."
+
     if python3 "$HELPER_PATH" repair-known-invalid-settings; then
       :
     else
@@ -761,6 +1003,13 @@ if [ -f "$OPENCLAW_CONFIG_PATH" ]; then
       echo "ERROR: Failed to apply gateway settings via oc_config_helper.py (exit code ${rc})."
       echo "ERROR: Gateway configuration may be incorrect; aborting startup."
       exit "${rc}"
+    fi
+
+    # Conservative OpenClaw defaults for explicitly selected low-resource setups.
+    # Only writes keys the user has not set, and never runs for auto-detection.
+    if [ "$RESOURCE_PROFILE" = "low" ]; then
+      python3 "$HELPER_PATH" apply-resource-profile low || \
+        echo "WARN: Could not apply low-profile OpenClaw defaults; continuing."
     fi
   else
     echo "WARN: oc_config_helper.py not found, cannot apply gateway settings"
@@ -981,9 +1230,14 @@ fi
 # ------------------------------------------------------------------------------
 if [ "$AUTO_CONFIGURE_MCP" = "true" ] && [ -n "$HA_TOKEN" ]; then
   if command -v mcporter >/dev/null 2>&1; then
-    # Detect HA API URL: prefer supervisor proxy (works in all add-on network modes),
-    # fall back to localhost:8123 (works with host_network: true).
-    if [ -n "${SUPERVISOR_TOKEN:-}" ]; then
+    # Detect HA API URL. This add-on runs with host_network: true, so the
+    # container is not on the Supervisor bridge network and the `supervisor`
+    # hostname normally does not resolve — registering that URL would silently
+    # produce a dead MCP server. Prefer the host's Home Assistant on localhost
+    # and only use the Supervisor proxy when it actually resolves.
+    if [ -n "$HA_BASE_URL" ]; then
+      MCP_HA_URL="${HA_BASE_URL%/}/api/mcp"
+    elif [ -n "${SUPERVISOR_TOKEN:-}" ] && getent hosts supervisor >/dev/null 2>&1; then
       MCP_HA_URL="http://supervisor/core/api/mcp"
     else
       MCP_HA_URL="http://localhost:8123/api/mcp"
@@ -1268,6 +1522,7 @@ print(json.load(open(p)).get('gateway',{}).get('auth',{}).get('token',''), end='
     GATEWAY_INTERNAL_PORT="$GATEWAY_INTERNAL_PORT" ACCESS_MODE="$ACCESS_MODE" \
     DISK_TOTAL="$disk_total" DISK_USED="$disk_used" DISK_AVAIL="$disk_avail" DISK_PCT="$disk_pct" \
     NGINX_LOG_LEVEL="$NGINX_LOG_LEVEL" \
+    RESOURCE_PROFILE="$EFFECTIVE_PROFILE" NODE_HEAP_MB="$NODE_HEAP_MB" \
     python3 /render_nginx.py
 
   if [ "$label" != "startup" ]; then
@@ -1317,6 +1572,38 @@ except Exception:
   done
 ) &
 
+# ------------------------------------------------------------------------------
+# Home Assistant health sensors (optional)
+# Publishes gateway status / version / memory / disk / cert expiry as HA states
+# so users can alert on them. One curl per interval; no resident daemon.
+# ------------------------------------------------------------------------------
+if [ "$HA_HEALTH_SENSORS" = "true" ] || [ "$HA_HEALTH_SENSORS" = "1" ]; then
+  # Gate on the current option value, not the token file: clearing
+  # homeassistant_token leaves the previously written file behind.
+  if [ -z "${SUPERVISOR_TOKEN:-}" ] && [ -z "$HA_TOKEN" ]; then
+    echo "WARN: ha_health_sensors=true but no Home Assistant token is available."
+    echo "WARN: Set 'homeassistant_token' in the add-on Configuration and restart."
+    echo "WARN: Preview the sensors without publishing by running 'oc-health show'."
+  elif command -v oc-health >/dev/null 2>&1; then
+    HA_HEALTH_INTERVAL="$HA_HEALTH_INTERVAL" \
+    HA_BASE_URL="$HA_BASE_URL" \
+    ADDON_VERSION="${ADDON_VERSION:-unknown}" \
+    ACCESS_MODE="$ACCESS_MODE" \
+    GATEWAY_BIND_MODE="$GATEWAY_BIND_MODE" \
+    GATEWAY_INTERNAL_PORT="$GATEWAY_INTERNAL_PORT" \
+    RESOURCE_PROFILE="$EFFECTIVE_PROFILE" \
+    NODE_HEAP_MB="$NODE_HEAP_MB" \
+    ENABLE_HTTPS_PROXY="$ENABLE_HTTPS_PROXY" \
+      oc-health loop &
+    HEALTH_PID=$!
+    echo "INFO: Home Assistant health sensors enabled (PID ${HEALTH_PID}, every ${HA_HEALTH_INTERVAL}s)"
+  else
+    echo "WARN: oc-health is missing from the add-on image; skipping health sensors."
+  fi
+else
+  echo "INFO: ha_health_sensors=false; not publishing Home Assistant sensor entities."
+fi
+
 # Keep add-on alive even if gateway/node runtime restarts itself (e.g. during onboarding).
 # If runtime exits unexpectedly, restart it while nginx/ttyd stay up.
 #
@@ -1340,7 +1627,46 @@ except Exception:
 #        guard to prevent launching a duplicate.
 GW_IS_CHILD=true   # true only when GW_PID was started by us (can use `wait`)
 
+# Consecutive failed starts, used for restart backoff (reset once a boot sticks).
+GW_FAIL_STREAK=0
+# `openclaw doctor --fix` is attempted at most once per add-on start.
+GW_DOCTOR_FIX_DONE=false
+
+# Some OpenClaw upgrades gate startup behind a data migration and refuse to boot
+# until `openclaw doctor --fix` has run (e.g. the legacy workspace state check
+# introduced in 2026.8.2). Without this the supervisor restarts forever, writing
+# a stability bundle on every attempt. Try the documented repair exactly once,
+# snapshotting openclaw.json first so the change is reversible.
+attempt_doctor_fix() {
+  if [ "$GW_DOCTOR_FIX_DONE" = "true" ]; then
+    return 1
+  fi
+  GW_DOCTOR_FIX_DONE=true
+
+  echo "NOTICE: Gateway failed to start repeatedly; running 'openclaw doctor --fix' once."
+  echo "NOTICE: This is the repair OpenClaw itself recommends for upgrade migrations."
+
+  if [ -f "$HELPER_PATH" ] && [ -f "$OPENCLAW_CONFIG_PATH" ]; then
+    python3 "$HELPER_PATH" snapshot "$CONFIG_BACKUP_KEEP" pre-doctor-fix --force ||       echo "WARN: Could not snapshot openclaw.json before doctor --fix; continuing."
+  fi
+
+  # --non-interactive is required: there is no TTY here, and without it doctor
+  # only prints advisory notices and skips the repairs that need confirmation.
+  # --yes accepts repair defaults so migrations are not deferred.
+  if openclaw doctor --fix --non-interactive --yes; then
+    echo "INFO: 'openclaw doctor --fix' completed; retrying gateway startup."
+  else
+    echo "WARN: 'openclaw doctor --fix' exited non-zero — the repair did not fully complete."
+    echo "WARN: Doctor exits non-zero while a legacy source or an interrupted"
+    echo "WARN: '.doctor-importing' claim remains. Open the add-on terminal and run:"
+    echo "WARN:   openclaw doctor --fix"
+    echo "WARN: Do not delete the reported files to silence it; they hold unmigrated state."
+  fi
+  return 0
+}
+
 while true; do
+  GW_START_SECONDS=$SECONDS
   if [ "$GW_IS_CHILD" = "true" ]; then
     # Efficient blocking wait on our child process.
     GW_EXIT_CODE=0
@@ -1354,6 +1680,10 @@ while true; do
     done
     GW_EXIT_CODE=0
   fi
+
+  # Capture how long the runtime actually lived BEFORE the daemon-detection
+  # retries below, otherwise their sleeps count as gateway uptime.
+  GW_UPTIME=$((SECONDS - GW_START_SECONDS))
 
   if [ "$SHUTTING_DOWN" = "true" ]; then
     break
@@ -1378,6 +1708,7 @@ while true; do
 
   if [ -n "$RESTARTED_PID" ]; then
     echo "INFO: OpenClaw runtime active (PID $RESTARTED_PID); monitoring."
+    GW_FAIL_STREAK=0
     GW_PID="$RESTARTED_PID"
     GW_IS_CHILD=false
     continue
@@ -1394,13 +1725,41 @@ while true; do
       | sed -n 's/.*pid=\([0-9]*\).*/\1/p' \
       | head -1 || true)
     echo "INFO: Gateway port ${GATEWAY_INTERNAL_PORT} occupied by PID ${PORT_PID:-unknown}; monitoring."
+    GW_FAIL_STREAK=0
     GW_PID="${PORT_PID:-$GW_PID}"
     GW_IS_CHILD=false
     continue
   fi
 
-  echo "WARN: OpenClaw runtime exited with code ${GW_EXIT_CODE}. Restarting in 2s..."
-  sleep 2
+  # Exponential backoff so a persistently broken gateway cannot hammer the CPU
+  # or fill the disk with stability bundles. Reset whenever a start sticks.
+  # A runtime that stayed up for a while is not part of a crash loop.
+  # The threshold is well above a normal cold start (~45s on this image) so a
+  # gateway that only ever survives its own startup still counts as looping.
+  if [ "$GW_UPTIME" -ge 120 ]; then
+    GW_FAIL_STREAK=0
+  fi
+  GW_FAIL_STREAK=$((GW_FAIL_STREAK + 1))
+  GW_BACKOFF=$((2 ** (GW_FAIL_STREAK < 6 ? GW_FAIL_STREAK : 6)))
+  if [ "$GW_BACKOFF" -gt 60 ]; then
+    GW_BACKOFF=60
+  fi
+
+  # After a few quick failures, try the one-shot upgrade repair before backing off.
+  if [ "$GW_FAIL_STREAK" -ge 2 ] && attempt_doctor_fix; then
+    GW_BACKOFF=2
+  fi
+
+  if [ "$GW_FAIL_STREAK" -ge 5 ]; then
+    echo "ERROR: OpenClaw runtime has failed ${GW_FAIL_STREAK} times in a row."
+    echo "ERROR: The terminal and add-on page stay available — open the terminal and run:"
+    echo "ERROR:   openclaw doctor"
+    echo "ERROR:   oc-gateway status"
+    echo "ERROR: Recent failures are detailed in /config/.openclaw/logs/stability/."
+  fi
+
+  echo "WARN: OpenClaw runtime exited with code ${GW_EXIT_CODE}. Restarting in ${GW_BACKOFF}s..."
+  sleep "$GW_BACKOFF"
 
   # Stop the loopback relay BEFORE restarting the gateway (tailnet mode only).
   # The relay holds 127.0.0.1:GATEWAY_PORT — leaving it up causes the new gateway

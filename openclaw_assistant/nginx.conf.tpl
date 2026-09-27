@@ -16,6 +16,21 @@ http {
   sendfile        on;
   keepalive_timeout  65;
 
+  # The built-in HTTPS proxy must distinguish actual LAN clients from
+  # same-host integrations that connect over loopback. OpenClaw treats any
+  # forwarded identity header as proxy attribution, so omit those headers for
+  # loopback clients and overwrite them with the nginx peer address otherwise.
+  map $remote_addr $gateway_proxy_client_ip {
+    default $remote_addr;
+    127.0.0.1 "";
+    ::1 "";
+  }
+
+  map $gateway_proxy_client_ip $gateway_proxy_scheme {
+    default https;
+    "" "";
+  }
+
   # Ingress note: keep redirects relative so we stay under HA Ingress.
 
   server {

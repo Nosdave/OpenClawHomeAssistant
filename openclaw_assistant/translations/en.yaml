@@ -67,8 +67,8 @@ configuration:
     description: Comma-separated extra Control UI origins to merge into gateway.controlUi.allowedOrigins in lan_https mode (example - https://ha.example.com:8443,capacitor://localhost)
 
   controlui_disable_device_auth:
-    name: Disable Control UI Device Pairing (lan_https)
-    description: "When ON (recommended), sets gateway.controlUi.dangerouslyDisableDeviceAuth=true to skip per-device approval and avoid error 1008 in LAN HTTPS mode. Keep ON for home/trusted LAN. Turn OFF only when you want strict per-device pairing prompts on every new browser/device."
+    name: Disable Control UI Device Pairing (deprecated)
+    description: "No longer has any effect. OpenClaw retired gateway.controlUi.dangerouslyDisableDeviceAuth in the 2026.8.x line, so every browser now pairs once. Approve a browser from the add-on terminal with: openclaw devices list, then openclaw devices approve <requestId>."
 
   gateway_bind_mode:
     name: Gateway Bind Mode
@@ -121,3 +121,28 @@ configuration:
   auto_configure_mcp:
     name: Auto-Configure MCP for Home Assistant
     description: "When ON and Home Assistant Token is set, automatically registers Home Assistant as an MCP server on each startup. This lets OpenClaw control HA entities, services, and automations via the Model Context Protocol. Disable only if you manage mcporter configuration manually."
+
+  resource_profile:
+    name: Resource Profile
+    description: "Keeps the add-on well behaved on low-power hardware by capping the Node.js heap used by the gateway. 'auto' (recommended) picks a profile from CPU architecture and total RAM and never changes your OpenClaw configuration. 'low' additionally disables OpenClaw browser automation, but only for settings you have not already chosen yourself."
+    options:
+      auto: "Auto (detect from hardware)"
+      low: "Low (Raspberry Pi / under 2 GB RAM)"
+      balanced: "Balanced (2-6 GB RAM)"
+      high: "High (no heap limit)"
+
+  ha_health_sensors:
+    name: Publish Health Sensors
+    description: Publish gateway status, OpenClaw version, gateway memory, disk usage and TLS certificate expiry as Home Assistant sensor entities (sensor.openclaw_*) so you can build automations and alerts on them. Requires Home Assistant Token to be set.
+
+  ha_health_interval:
+    name: Health Sensor Interval
+    description: How often (in seconds) the health sensors are refreshed. Range 15-3600, default 60.
+
+  ha_base_url:
+    name: Home Assistant Base URL
+    description: Base URL of your Home Assistant instance for the health sensors. Leave empty to auto-detect (tries https and http on 127.0.0.1, localhost, homeassistant and homeassistant.local, port 8123). Set it if Home Assistant uses a non-default port or another host, e.g. https://192.168.1.10:8123
+
+  config_backup_keep:
+    name: Config Snapshots to Keep
+    description: How many openclaw.json snapshots to keep in /config/.openclaw/backups. A snapshot is taken before the add-on's first configuration write on each start, so unwanted changes can be rolled back with 'oc-config restore'. Set to 0 to disable snapshots.
