@@ -67,8 +67,8 @@ configuration:
     description: Origens extras da Control UI separadas por vírgula, mescladas em gateway.controlUi.allowedOrigins no modo lan_https (exemplo - https://ha.example.com:8443,capacitor://localhost)
 
   controlui_disable_device_auth:
-    name: Desativar pareamento de dispositivos no Control UI (obsoleto)
-    description: "Não tem mais efeito. O OpenClaw aposentou gateway.controlUi.dangerouslyDisableDeviceAuth na linha 2026.8.x, portanto cada navegador é pareado uma vez. Aprove um navegador pelo terminal do complemento com: openclaw devices list e depois openclaw devices approve <requestId>."
+    name: Desativar pareamento de dispositivos no Control UI (somente OpenClaw ≤ 2026.7)
+    description: "Ignora o pareamento único do navegador no Control UI (a autenticação por token continua ativa). Só tem efeito enquanto o OpenClaw incluído for 2026.7.x; o OpenClaw aposentou gateway.controlUi.dangerouslyDisableDeviceAuth na linha 2026.8.x e, a partir daí, o complemento remove a chave e cada navegador é pareado uma vez. Aprove um navegador pelo terminal do complemento com: openclaw devices list e depois openclaw devices approve <requestId>."
 
   gateway_bind_mode:
     name: Modo de Vinculação do Gateway

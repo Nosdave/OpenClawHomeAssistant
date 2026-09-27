@@ -67,8 +67,8 @@ configuration:
     description: Kommagetrennte zusätzliche Control-UI-Origins, die bei lan_https in gateway.controlUi.allowedOrigins zusammengeführt werden (Beispiel - https://ha.example.com:8443,capacitor://localhost)
 
   controlui_disable_device_auth:
-    name: Control-UI-Geräte-Pairing deaktivieren (veraltet)
-    description: "Hat keine Wirkung mehr. OpenClaw hat gateway.controlUi.dangerouslyDisableDeviceAuth in der 2026.8.x-Reihe zurückgezogen, daher koppelt sich jeder Browser einmal. Genehmigen Sie einen Browser im Add-on-Terminal mit: openclaw devices list, dann openclaw devices approve <requestId>."
+    name: Control-UI-Geräte-Pairing deaktivieren (nur OpenClaw ≤ 2026.7)
+    description: "Überspringt das einmalige Browser-Pairing der Control UI (Token-Authentifizierung bleibt aktiv). Wirkt nur, solange das gebündelte OpenClaw 2026.7.x ist; OpenClaw hat gateway.controlUi.dangerouslyDisableDeviceAuth in der 2026.8.x-Reihe zurückgezogen, danach entfernt das Add-on den Schlüssel und jeder Browser koppelt sich einmal. Genehmigen Sie einen Browser im Add-on-Terminal mit: openclaw devices list, dann openclaw devices approve <requestId>."
 
   gateway_bind_mode:
     name: Gateway-Bindungsmodus

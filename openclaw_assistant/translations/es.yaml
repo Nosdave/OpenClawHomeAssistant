@@ -67,8 +67,8 @@ configuration:
     description: Orígenes extra de Control UI separados por comas que se combinan en gateway.controlUi.allowedOrigins en modo lan_https (ejemplo - https://ha.example.com:8443,capacitor://localhost)
 
   controlui_disable_device_auth:
-    name: Desactivar emparejamiento de dispositivos en Control UI (obsoleto)
-    description: "Ya no tiene ningún efecto. OpenClaw retiró gateway.controlUi.dangerouslyDisableDeviceAuth en la serie 2026.8.x, por lo que cada navegador se empareja una vez. Apruebe un navegador desde el terminal del complemento con: openclaw devices list y luego openclaw devices approve <requestId>."
+    name: Desactivar emparejamiento de dispositivos en Control UI (solo OpenClaw ≤ 2026.7)
+    description: "Omite el emparejamiento único del navegador para Control UI (la autenticación por token sigue activa). Solo tiene efecto mientras el OpenClaw incluido sea 2026.7.x; OpenClaw retiró gateway.controlUi.dangerouslyDisableDeviceAuth en la serie 2026.8.x y desde entonces el complemento elimina la clave y cada navegador se empareja una vez. Apruebe un navegador desde el terminal del complemento con: openclaw devices list y luego openclaw devices approve <requestId>."
 
   gateway_bind_mode:
     name: Modo de enlace del Gateway

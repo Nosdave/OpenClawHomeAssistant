@@ -9,6 +9,7 @@ import json
 import os
 import re
 import sys
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -19,26 +20,85 @@ BACKUP_SUFFIX = ".json"
 
 
 
+# First OpenClaw release line in which gateway.controlUi.dangerouslyDisableDeviceAuth is inert.
+DEVICE_AUTH_RETIRED_IN = (2026, 8, 0)
+
+
+def _runtime_version():
+    """Bundled OpenClaw version as a tuple, from OPENCLAW_RUNTIME_VERSION (set by run.sh).
+
+    Returns None when unknown.
+    """
+    raw = os.environ.get("OPENCLAW_RUNTIME_VERSION", "")
+    m = re.match(r"^\s*(\d{4})\.(\d+)\.(\d+)", raw)
+    if not m:
+        return None
+    return tuple(int(x) for x in m.groups())
+
+
+def _runtime_at_least(version):
+    """True when the bundled runtime is known and >= version.
+
+    An unknown runtime is treated as current (retired-key handling applies),
+    matching the upstream add-on's behaviour.
+    """
+    current = _runtime_version()
+    return current is None or current >= version
+
+
+class ConfigReadError(Exception):
+    """openclaw.json exists but cannot be read or parsed."""
+
+
 def read_config():
-    """Read and parse openclaw.json."""
+    """Read and parse openclaw.json.
+
+    Returns None only when the file does not exist. An existing file that
+    cannot be read or parsed raises ConfigReadError: callers treat None as
+    "start from an empty config", and doing that for a damaged file would
+    overwrite every agent, channel and credential in it with a near-empty
+    config.
+    """
     if not CONFIG_PATH.exists():
         return None
     try:
         return json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, IOError) as e:
-        print(f"ERROR: Failed to read config: {e}", file=sys.stderr)
-        return None
+    except (json.JSONDecodeError, OSError, UnicodeDecodeError) as e:
+        raise ConfigReadError(f"{CONFIG_PATH}: {e}") from e
 
 
 def write_config(cfg):
-    """Write config back to file with nice formatting."""
+    """Write config back to file with nice formatting.
+
+    Atomic: the new content goes to a temp file in the same directory, is
+    fsynced, then renamed over openclaw.json, so an interrupted write (power
+    loss, SIGKILL on add-on stop) never leaves a truncated config behind.
+    """
+    tmp_path = None
     try:
         CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
-        CONFIG_PATH.write_text(json.dumps(cfg, indent=2) + "\n", encoding="utf-8")
+        try:
+            mode = CONFIG_PATH.stat().st_mode & 0o777
+        except FileNotFoundError:
+            mode = 0o600
+        fd, tmp_path = tempfile.mkstemp(prefix=".openclaw.json.", suffix=".tmp", dir=str(CONFIG_PATH.parent))
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(json.dumps(cfg, indent=2) + "\n")
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(tmp_path, mode)
+        os.replace(tmp_path, CONFIG_PATH)
+        tmp_path = None
         return True
-    except IOError as e:
+    except OSError as e:
         print(f"ERROR: Failed to write config: {e}", file=sys.stderr)
         return False
+    finally:
+        if tmp_path is not None:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -479,8 +539,8 @@ def set_control_ui_origins(origins_csv: str, additional_origins_csv: str = "", d
     Args:
         origins_csv: Comma-separated list of default origins provided by the add-on.
         additional_origins_csv: Comma-separated list of user-provided extra origins.
-        disable_device_auth: Accepted for backward compatibility and ignored —
-            gateway.controlUi.dangerouslyDisableDeviceAuth is retired upstream.
+        disable_device_auth: Desired gateway.controlUi.dangerouslyDisableDeviceAuth
+            value on runtimes before 2026.8; ignored (key stripped) from 2026.8 on.
     """
     cfg = read_config()
     if cfg is None:
@@ -512,14 +572,23 @@ def set_control_ui_origins(origins_csv: str, additional_origins_csv: str = "", d
         control_ui["allowedOrigins"] = merged_origins
         changes.append(f"allowedOrigins: {current_origins} -> {merged_origins}")
 
-    # --- dangerouslyDisableDeviceAuth (retired upstream) ---
-    # OpenClaw retired this flag in the 2026.8.x line: it is inert, the security
-    # audit lists it as a dangerous key, and `openclaw doctor --fix` removes it.
-    # Writing it back every boot would fight Doctor, so the add-on now strips it.
-    # Browsers pair once instead (`openclaw devices approve <requestId>`).
-    if "dangerouslyDisableDeviceAuth" in control_ui:
-        del control_ui["dangerouslyDisableDeviceAuth"]
-        changes.append("removed retired key: dangerouslyDisableDeviceAuth (now inert upstream)")
+    # --- dangerouslyDisableDeviceAuth ---
+    # Up to the 2026.7.x line this flag still works: it skips the per-browser
+    # pairing ceremony (token auth is still enforced), driven by the
+    # controlui_disable_device_auth option. OpenClaw retired it in the 2026.8.x
+    # line: it is inert there, the security audit lists it as a dangerous key and
+    # `openclaw doctor --fix` removes it, so on those runtimes the add-on strips
+    # it and browsers pair once (`openclaw devices approve <requestId>`).
+    if _runtime_at_least(DEVICE_AUTH_RETIRED_IN):
+        if "dangerouslyDisableDeviceAuth" in control_ui:
+            del control_ui["dangerouslyDisableDeviceAuth"]
+            changes.append("removed retired key: dangerouslyDisableDeviceAuth (inert since OpenClaw 2026.8)")
+    else:
+        desired_device_auth_flag = bool(disable_device_auth)
+        if control_ui.get("dangerouslyDisableDeviceAuth") is not desired_device_auth_flag:
+            prev = control_ui.get("dangerouslyDisableDeviceAuth")
+            control_ui["dangerouslyDisableDeviceAuth"] = desired_device_auth_flag
+            changes.append(f"dangerouslyDisableDeviceAuth: {prev} -> {desired_device_auth_flag}")
 
     # --- Remove invalid keys from earlier add-on versions ---
     for stale_key in ("pairingMode",):
@@ -725,4 +794,9 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except ConfigReadError as e:
+        print(f"ERROR: openclaw.json is unreadable; not modifying it: {e}", file=sys.stderr)
+        print("ERROR: Restore a snapshot with 'oc-config list' / 'oc-config restore <n>', or fix the file by hand.", file=sys.stderr)
+        sys.exit(2)

@@ -22,19 +22,25 @@ ingress_port: 48099
 panel_title: OpenClaw Assistant
 panel_icon: mdi:robot
 
-# Liveness probe for the Supervisor: the ingress proxy (nginx) is the add-on's
-# front door, so a dead listener means the add-on page is broken.
-# Users can turn this off with the Watchdog toggle on the add-on page.
-watchdog: tcp://[HOST]:48099
+# No Supervisor `watchdog:` in this fork (upstream probes tcp://[HOST]:48099).
+# nginx comes up late in run.sh, after the config repair steps, and a restart
+# triggered mid-startup could interrupt a future pre-upgrade backup or state
+# migration. Crash handling stays in run.sh's own supervisor loop.
+
+# Give run.sh time to stop the gateway cleanly (it drains in-flight work and
+# flushes SQLite) before the Supervisor sends SIGKILL. Default is 10 s; 300 s
+# is the Supervisor maximum.
+timeout: 300
 
 # Keep Home Assistant backups small by excluding regenerable caches and
 # tooling from the add-on backup. Patterns are matched against the full path
 # of each item; a matching directory is skipped without descending into it.
 # NOTE: restoring a backup replaces /config wholesale, so anything listed here
-# is NOT restored and must be reinstalled (brew/npm tools) or is rebuilt on
-# demand (caches). User data, skills, agents and secrets are never excluded.
+# is NOT restored and must be reinstalled (npm tools) or is rebuilt on demand
+# (caches). User data, skills, agents and secrets are never excluded.
+# Fork: `.linuxbrew` is NOT excluded — this fork defaults persist_brew_tools to
+# true, so brew-installed tools are part of the add-on and must survive a restore.
 backup_exclude:
-  - ".linuxbrew"      # Homebrew install + cellar (persist_brew_tools)
   - ".node_global"    # npm/pnpm global installs (persist_node_global)
   - ".npm"            # npm download cache
   - ".cache"          # generic tool caches (Chromium, build artifacts)

@@ -5,6 +5,36 @@ All notable changes to the OpenClaw Assistant Home Assistant Add-on will be docu
 > **Private fork** (`Nosdave/OpenClawHomeAssistant`): `-ghcrN` / `-fullN` suffixes are fork build iterations on top of the upstream `techartdev` base version. The image is pre-built on GitHub Actions (native `aarch64`) and pulled from GHCR. `-fullN` marks the un-stripped "full" build line (see `0.5.80-full1`).
 
 
+## [0.5.93-full1] - 2026-09-27
+
+Merge of upstream `techartdev` **0.5.88 → 0.5.93** onto the fork. **No OpenClaw bump** — the pin stays **`2026.7.35`** (extended-stable); upstream's `2026.9.6` is not taken (see "Not included" below).
+
+### Added (from upstream)
+- **Config snapshots and rollback** (`config_backup_keep`, `oc-config list|diff|restore|snapshot`): `openclaw.json` is snapshotted before the add-on's first write of each start.
+- **Pre-upgrade state archive**: before an OpenClaw version starts for the first time, the migration-sensitive state is archived to `/config/.openclaw/upgrade-backups/` (newest 3 kept). **The first start of this release writes one archive for `2026.7.35`**, which becomes the rollback baseline for the later 9.x upgrade. Fork changes: `tmp/` is excluded from the archive, and on 2026.7.x runtimes a failed archive (e.g. full disk) only warns instead of refusing to start — 7.x performs no state migration, so there is nothing to protect yet. From 2026.8 on the upstream behaviour applies: no archive, no start.
+- **Resource profiles** (`resource_profile`, default `auto`). On this 10 GB VM `auto` resolves to `high`, which sets no Node heap cap — no change in behaviour.
+- **Home Assistant health sensors** (`ha_health_sensors`, `ha_health_interval`, `ha_base_url`, `oc-health`) — off by default.
+- `backup_exclude` for regenerable caches (`.node_global`, `.npm`, `.cache`, `__pycache__`, stale `*.jsonl.lock`).
+- `lan_https`: nginx rebuilds forwarded-identity headers instead of appending client-supplied ones, and loopback is trusted as the local proxy hop.
+- Crash-loop restart backoff (2 s doubling to 60 s) with a correct uptime measurement.
+
+### Fixed (fork)
+- **A damaged `openclaw.json` could be silently wiped on startup.** If the file existed but was not valid JSON, `oc_config_helper.py` treated it as missing and wrote back a config containing only the gateway block — agents, channels (incl. the Telegram bot token) and model settings were gone, and the helper still exited successfully. The helper now refuses to write (exit 2), startup continues with the add-on page and terminal available, and the log points at `oc-config restore`. Config writes are now atomic (temp file + fsync + rename, file mode preserved), so an interrupted write can no longer truncate the file.
+- **Clean shutdown**: stopping the add-on now waits up to 270 s for the gateway to drain (previously 5 s), also signals the gateway daemon when the tracked PID is a finished wrapper after an in-process restart, and `config.yaml` sets `timeout: 300` so the Supervisor no longer SIGKILLs the gateway after 10 s mid-write.
+- `repair_runtime_version_mismatch` only installs a plain stable release number read from `openclaw.json` (`YYYY.M.P` or `YYYY.M.P-N`); tags, prereleases, URLs and git/file specs are refused instead of being passed to a root `npm install -g`.
+- `oc-gateway restart` picks the restart signal from the installed OpenClaw: `SIGUSR1` up to 2026.9.5, `SIGUSR2` from 2026.9.6 (where `SIGUSR1` would open a Node debugger on port 9229 instead of restarting). No change on the current 7.35.
+
+### Changed vs. upstream (fork decisions)
+- **No automatic `openclaw doctor --fix`.** Upstream runs it unattended after repeated failed starts; here that would run the `openai-codex/*` → `openai/*` route migration without a backup. The crash loop only backs off and reports. A controlled, backup-guarded migration step comes with the OpenClaw 2026.9 upgrade.
+- **`controlui_disable_device_auth` keeps working on 7.x.** Upstream strips `gateway.controlUi.dangerouslyDisableDeviceAuth` unconditionally (it is inert from OpenClaw 2026.8). The fork only strips it once the bundled runtime is ≥ 2026.8.0; on 7.35 the option still skips browser pairing as before. Option texts updated in all six locales.
+- **No Supervisor `watchdog`** (upstream probes `tcp://[HOST]:48099`): a Supervisor restart during startup could later interrupt the pre-upgrade archive or a state migration.
+- **`.linuxbrew` is kept in HA backups** — the fork defaults `persist_brew_tools` to `true`, so brew tools are part of the add-on and must survive a restore.
+- `OPENCLAW_NO_AUTO_UPDATE=1` is exported so the gateway never applies an OpenClaw update on its own, bypassing the image pin.
+- `acpx@0.19.3` and `@anthropic-ai/claude-code@2.1.283` are pinned instead of floating.
+
+### Not included: OpenClaw 2026.9.6
+Upstream 0.5.93 bundles OpenClaw `2026.9.6`. Not taken: 9.6 leaks ~77 MB per agent turn in the catalog worker (openclaw/openclaw#157842, fixed in the upcoming 2026.9.7), and the 7.x → 9.x jump runs one-way state migrations plus the `openai-codex` route migration. Target is `2026.9.7` with a backup-guarded migration step in a later release.
+
 ## [0.5.88-full2] - 2026-09-26
 
 ### Security

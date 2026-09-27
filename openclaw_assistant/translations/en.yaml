@@ -67,8 +67,8 @@ configuration:
     description: Comma-separated extra Control UI origins to merge into gateway.controlUi.allowedOrigins in lan_https mode (example - https://ha.example.com:8443,capacitor://localhost)
 
   controlui_disable_device_auth:
-    name: Disable Control UI Device Pairing (deprecated)
-    description: "No longer has any effect. OpenClaw retired gateway.controlUi.dangerouslyDisableDeviceAuth in the 2026.8.x line, so every browser now pairs once. Approve a browser from the add-on terminal with: openclaw devices list, then openclaw devices approve <requestId>."
+    name: Disable Control UI Device Pairing (OpenClaw ≤ 2026.7 only)
+    description: "Skips the one-time browser pairing for the Control UI (token auth is still enforced). Only effective while the bundled OpenClaw is 2026.7.x; OpenClaw retired gateway.controlUi.dangerouslyDisableDeviceAuth in the 2026.8.x line, and from then on the add-on removes the key and every browser pairs once. Approve a browser from the add-on terminal with: openclaw devices list, then openclaw devices approve <requestId>."
 
   gateway_bind_mode:
     name: Gateway Bind Mode

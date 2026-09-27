@@ -91,8 +91,18 @@ restart_cmd() {
     exit 1
   fi
 
-  echo "Requesting gateway self-restart via SIGUSR1 (PID ${pid})..."
-  kill -USR1 "$pid"
+  # OpenClaw 2026.9.6 moved the in-process restart to SIGUSR2. There, SIGUSR1
+  # no longer restarts anything — Node treats it as "open the inspector" and
+  # starts a debugger on 127.0.0.1:9229 (the HA host's loopback, with
+  # host_network). Pick the signal from the installed version.
+  local sig="USR1" ver
+  ver="$(openclaw --version 2>/dev/null | grep -oE '[0-9]{4}\.[0-9]+\.[0-9]+' | head -n 1 || true)"
+  if [ -n "$ver" ] && [ "$(printf '%s\n%s\n' "2026.9.6" "$ver" | sort -V | head -n 1)" = "2026.9.6" ]; then
+    sig="USR2"
+  fi
+
+  echo "Requesting gateway self-restart via SIG${sig} (PID ${pid}, OpenClaw ${ver:-unknown})..."
+  kill "-${sig}" "$pid"
 
   for _ in $(seq 1 20); do
     sleep 1
@@ -121,7 +131,7 @@ case "$cmd" in
 Usage: oc-gateway <status|restart|reload>
 
 status   Show add-on-native gateway status (run.sh-supervised)
-restart  Request gateway self-restart via SIGUSR1
+restart  Request gateway self-restart (SIGUSR1; SIGUSR2 on OpenClaw >= 2026.9.6)
 reload   Alias of restart
 EOF
     ;;

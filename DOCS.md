@@ -302,7 +302,7 @@ All options are set via **Settings → Apps/Add-ons → OpenClaw Assistant → C
 | `gateway_auth_mode` | `token` / `trusted-proxy` | `token` | Gateway auth mode. Use `trusted-proxy` when terminating HTTPS in a reverse proxy and forwarding trusted auth headers. |
 | `gateway_trusted_proxies` | string | _(empty)_ | Comma-separated trusted proxy IP/CIDR list used with `gateway_auth_mode: trusted-proxy`. |
 | `gateway_additional_allowed_origins` | string | _(empty)_ | Comma-separated additional origins merged into `gateway.controlUi.allowedOrigins` in `lan_https` mode (example: `https://ha.example.com:8443,capacitor://localhost`). |
-| `controlui_disable_device_auth` | bool | `true` | **Deprecated / no effect.** It set `gateway.controlUi.dangerouslyDisableDeviceAuth`, which OpenClaw retired in the `2026.8.x` line — the key is now inert and `openclaw doctor --fix` removes it. Every browser pairs once instead; see [Device pairing](#device-pairing-first-connection). The option is kept so existing configurations keep validating, and the add-on no longer writes the key. |
+| `controlui_disable_device_auth` | bool | `true` | Skips the one-time Control UI browser pairing by setting `gateway.controlUi.dangerouslyDisableDeviceAuth` (token auth is still enforced). **Only effective while the bundled OpenClaw is `2026.7.x`** (this fork currently ships `2026.7.35`). OpenClaw retired the key in the `2026.8.x` line — it is inert there and `openclaw doctor --fix` removes it — so on those runtimes the add-on strips it and every browser pairs once; see [Device pairing](#device-pairing-first-connection). |
 | `force_ipv4_dns` | bool | `true` | Force IPv4-first DNS ordering for Node network calls. **Recommended ON** — most HAOS VMs lack IPv6 egress, causing `web_fetch` and Telegram timeouts. Set to `false` only if your network has working IPv6. |
 | `gateway_env_vars` | list of `{name, value}` | `[]` | Environment variables exported to the gateway process at startup. UI format: list entries with `name` and `value` (example: `name=OPENAI_API_KEY`, `value=sk-...`). Limits: max 50 vars, key length 255, value length 10000. Reserved runtime keys are blocked (for example `PATH`, `HOME`, `NODE_OPTIONS`, `NODE_PATH`, `OPENCLAW_*`, proxy vars). Legacy string/object formats are still accepted for backward compatibility. |
 | `nginx_log_level` | `full` / `minimal` | `minimal` | Nginx access log verbosity. `minimal` suppresses repetitive Home Assistant health-check and polling requests (`GET /`, `GET /v1/models`). `full` logs everything. |
@@ -924,7 +924,6 @@ The add-on tells the Supervisor to skip regenerable caches and tooling, so backu
 
 | Excluded | Why it is safe |
 |---|---|
-| `.linuxbrew/` | Homebrew install and cellar — reinstallable with `brew install` |
 | `.node_global/` | npm/pnpm global installs — reinstallable |
 | `.npm/` | npm download cache — rebuilt on demand |
 | `.cache/` | tool caches (Chromium, build artifacts) — rebuilt on demand |
@@ -944,6 +943,8 @@ These are two different things, and since v0.5.90 they no longer trade off again
 
 So you can safely enable persistence to stop losing `brew`/npm tools on every add-on update, without inflating your backups. The cost is that those tools are not restored from a backup — you reinstall them.
 
+> **Fork note:** this fork does **not** exclude `.linuxbrew/`. `persist_brew_tools` defaults to `true` here, so brew-installed tools are part of the add-on's working state and are restored with a backup (at the cost of a larger backup).
+
 ### Migration note for older installs
 
 If you used an older add-on version, you may already have legacy directories such as `/config/.node_global/` or `/config/.linuxbrew/` from previous persistent behavior. Since v0.5.90 these no longer count toward backup size, but they still occupy disk. The add-on warns about them at startup; remove them when you no longer need them:
@@ -959,8 +960,8 @@ rm -rf /config/.node_global /config/.linuxbrew
 # Key paths to back up:
 # /config/.openclaw/     - OpenClaw config, skills, agent data
 # /config/clawd/         - ClawHub workspace
-# (.node_global / .linuxbrew are intentionally excluded from HA backups —
-#  reinstall those tools instead of restoring them)
+# (.node_global is intentionally excluded from HA backups — reinstall those
+#  tools instead of restoring them; this fork keeps .linuxbrew in backups)
 # /config/keys/          - SSH keys
 # /config/secrets/       - Tokens
 ```
@@ -1073,7 +1074,7 @@ openclaw devices approve <requestId>
 
 Then click **Connect** again. Full walkthrough: [Device pairing](#device-pairing-first-connection).
 
-> **Do not** try to disable pairing with `gateway.controlUi.dangerouslyDisableDeviceAuth`. OpenClaw retired that flag in the `2026.8.x` line; it is inert, `openclaw doctor --fix` removes it, and the add-on no longer writes it. Approving the device is the supported path.
+> **Fork note:** on the bundled OpenClaw `2026.7.x` the `controlui_disable_device_auth` option (default `true`) still skips pairing. From OpenClaw `2026.8.x` on, `gateway.controlUi.dangerouslyDisableDeviceAuth` is retired — it is inert, `openclaw doctor --fix` removes it, and the add-on strips it — so approving the device is then the only path.
 
 ### Gateway UI shows "Unauthorized"
 
@@ -1245,10 +1246,13 @@ WARN: OpenClaw runtime exited with code 1. Restarting in 2s...
 
 **Cause**: some OpenClaw releases gate startup behind a one-time data migration and refuse to boot until it has run. This is an upstream requirement, not an add-on misconfiguration.
 
-**Fix**: since v0.5.90 the add-on detects a repeated failed start and runs `openclaw doctor --fix` automatically (once per start, after snapshotting `openclaw.json` first). If it has not recovered on its own, the web terminal stays available during the loop — open it and run:
+**Fix**: upstream v0.5.90+ runs `openclaw doctor --fix` automatically after repeated failed starts. **This fork does not** — Doctor migrates configuration and state (including the `openai-codex/*` → `openai/*` model route) and that must not happen unattended without a backup. The fork currently ships OpenClaw `2026.7.35`, which has no such startup gate. If you hit it anyway (e.g. after a manual `openclaw update`), the web terminal stays available during the loop:
+
+1. Stop the add-on and create a Home Assistant backup of it (**Settings → System → Backups**), then download it.
+2. Start the add-on again, open the terminal and run:
 
 ```sh
-openclaw doctor --fix
+openclaw doctor --fix --non-interactive --yes
 ```
 
 Then restart the add-on. If the gateway still refuses to start:
