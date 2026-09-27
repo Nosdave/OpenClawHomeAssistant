@@ -121,14 +121,15 @@ USER root
 # Bundle mcporter so Home Assistant MCP auto-configuration works out of the box.
 # The image now ships Node 24, so use the current mcporter line.
 RUN npm config set fund false && npm config set audit false \
-    && npm install -g openclaw@2026.7.1-2 node-llama-cpp@3.18.1 mcporter@0.12.3
+    && npm install -g openclaw@2026.7.35 node-llama-cpp@3.18.1 mcporter@0.12.3
 
 # ACP / ACPX harness: lets OpenClaw drive external coding agents (Codex, Claude Code)
 # via the Agent Client Protocol. Volt authenticates Anthropic + OpenAI via OAuth
 # (not API keys), so the harness must ship in the image. Codex itself is bundled in
 # OpenClaw; acpx + the Claude Code CLI cover the OAuth/ACP path. acpx auto-downloads
 # the codex-acp / claude-agent-acp adapters via npx on first use.
-RUN npm install -g acpx @anthropic-ai/claude-code
+# Pinned (not floating) so an image rebuild cannot silently change the harness.
+RUN npm install -g acpx@0.19.3 @anthropic-ai/claude-code@2.1.283
 
 # Shell aliases and color options for interactive use
 RUN tee -a /etc/bash.bashrc <<'EOF'
@@ -148,15 +149,23 @@ if [ -z "${LS_COLORS+x}" ]; then
   export LS_COLORS="di=1;34:ln=1;36:so=1;pi=33:ex=1;32:bd=1;33:cd=1;33:su=1;31:sg=1;31:tw=1;34:ow=1;34"
 fi
 EOF
+# Expose the add-on version to the runtime (Home Assistant's builder passes
+# BUILD_VERSION); used by the optional Home Assistant health sensors.
+ARG BUILD_VERSION
+ENV ADDON_VERSION=${BUILD_VERSION}
+
 COPY run.sh /run.sh
 COPY oc_config_helper.py /oc_config_helper.py
 COPY render_nginx.py /render_nginx.py
 COPY oc-cleanup.sh /usr/local/bin/oc-cleanup
 COPY oc-gateway /usr/local/bin/oc-gateway
+COPY oc-health.sh /usr/local/bin/oc-health
+COPY oc-config.sh /usr/local/bin/oc-config
 COPY openclaw-proxy-shim.cjs /usr/local/lib/openclaw-proxy-shim.cjs
 COPY nginx.conf.tpl /etc/nginx/nginx.conf.tpl
 COPY landing.html.tpl /etc/nginx/landing.html.tpl
 RUN chmod +x /run.sh /oc_config_helper.py /render_nginx.py /usr/local/bin/oc-cleanup /usr/local/bin/oc-gateway \
+    /usr/local/bin/oc-health /usr/local/bin/oc-config \
     && mkdir -p /run/nginx
 
 CMD [ "/run.sh" ]

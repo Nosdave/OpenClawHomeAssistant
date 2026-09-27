@@ -1,8 +1,9 @@
 name: Build & Push OpenClaw image (private GHCR)
 
 # Builds the aarch64 add-on image on GitHub-hosted native ARM runners and pushes
-# it to a PRIVATE GHCR package. The HA Green pulls this image instead of building
-# locally (avoids build-OOM on the 4 GB box). No user secrets are involved:
+# it to a PRIVATE GHCR package. Home Assistant (a HAOS VM on a DGX Spark, 10 GB
+# RAM / 8 vCPU; formerly a 4 GB HA Green) pulls this image instead of building
+# locally. No user secrets are involved:
 # only the ephemeral GITHUB_TOKEN is used to push to this repo's own package.
 
 on:
@@ -56,6 +57,7 @@ jobs:
           build-args: |
             BUILD_FROM=${{ env.BUILD_FROM }}
             TARGETARCH=arm64
+            BUILD_VERSION=${{ steps.ver.outputs.version }}
           tags: |
             ${{ env.IMAGE }}:${{ steps.ver.outputs.version }}
             ${{ env.IMAGE }}:latest

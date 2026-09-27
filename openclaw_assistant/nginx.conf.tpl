@@ -16,10 +16,34 @@ http {
   sendfile        on;
   keepalive_timeout  65;
 
+  # The built-in HTTPS proxy must distinguish actual LAN clients from
+  # same-host integrations that connect over loopback. OpenClaw treats any
+  # forwarded identity header as proxy attribution, so omit those headers for
+  # loopback clients and overwrite them with the nginx peer address otherwise.
+  map $remote_addr $gateway_proxy_client_ip {
+    default $remote_addr;
+    127.0.0.1 "";
+    ::1 "";
+  }
+
+  map $gateway_proxy_client_ip $gateway_proxy_scheme {
+    default https;
+    "" "";
+  }
+
   # Ingress note: keep redirects relative so we stay under HA Ingress.
 
   server {
     listen 48099;
+
+    # Port 48099 is the Home Assistant Ingress backend, not a public add-on
+    # endpoint. With host networking, leaving it unrestricted exposes the
+    # landing page and writable ttyd shell directly to the LAN.
+    # 172.30.32.2 is the Supervisor's Ingress proxy address.
+    allow 127.0.0.1;
+    allow ::1;
+    allow 172.30.32.2;
+    deny all;
 
     # Web terminal (ttyd)
     # ttyd base-path is configured as /terminal (no trailing slash).
