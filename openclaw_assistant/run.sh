@@ -291,7 +291,15 @@ warn_legacy_persistent_dir() {
   local label="$2"
   if [ -e "$path" ]; then
     echo "WARN: Found legacy persistent ${label} at ${path}, but persistence is disabled."
-    echo "WARN: It is excluded from Home Assistant backups, but still uses disk space."
+    case "$path" in
+      */.linuxbrew)
+        # Fork: .linuxbrew is not in backup_exclude (persist_brew_tools defaults to true).
+        echo "WARN: It is still included in Home Assistant backups and uses disk space."
+        ;;
+      *)
+        echo "WARN: It is excluded from Home Assistant backups, but still uses disk space."
+        ;;
+    esac
     echo "WARN: Remove it with: rm -rf ${path}"
   fi
 }
@@ -611,8 +619,17 @@ backup_state_before_upgrade() {
   fi
   marker="${OPENCLAW_UPGRADE_BACKUP_DIR}/started-${version}"
   if [ -f "$marker" ]; then
-    echo "INFO: Upgrade-state backup already recorded for OpenClaw ${version}."
-    return 0
+    # The marker holds the archive path. Pruning keeps only the newest archives,
+    # so after a rollback to an older version its archive may be gone: take a
+    # fresh one instead of trusting a marker that points at nothing.
+    local recorded
+    recorded="$(head -n 1 "$marker" 2>/dev/null || true)"
+    if [ -n "$recorded" ] && [ -f "$recorded" ]; then
+      echo "INFO: Upgrade-state backup already recorded for OpenClaw ${version}."
+      return 0
+    fi
+    echo "INFO: Upgrade-state backup for OpenClaw ${version} was pruned; taking a new one."
+    rm -f "$marker"
   fi
 
   stamp="$(date -u +%Y%m%d-%H%M%S)"
@@ -651,22 +668,30 @@ backup_state_before_upgrade() {
   return 0
 }
 
-if ! backup_state_before_upgrade; then
-  # Fork: only refuse to start when the bundled runtime can actually migrate
-  # state (the 2026.8+ lines). The 2026.7.x runtime performs no schema
-  # migration, so a failed archive there must not take the add-on page and
-  # terminal down with it.
-  _bundled_version="$(openclaw_runtime_version)"
-  if [ -n "$_bundled_version" ] && \
-     [ "$(printf '%s\n%s\n' "2026.8.0" "$_bundled_version" | sort -V | head -n 1)" != "2026.8.0" ]; then
-    echo "WARN: Pre-upgrade state backup failed; continuing because OpenClaw ${_bundled_version} performs no state migration."
-    echo "WARN: Free disk space before the next OpenClaw upgrade — that upgrade will refuse to start without this backup."
-  else
-    echo "ERROR: OpenClaw was not started, so its persistent state remains unchanged."
-    echo "ERROR: Free disk space or repair permissions, then restart the add-on."
-    exit 1
+# Fork: only refuse to start when the runtime that is about to run can actually
+# migrate state (the 2026.8+ lines). The 2026.7.x runtime performs no schema
+# migration, so a failed archive there must not take the add-on page and
+# terminal down with it. Called again after repair_runtime_version_mismatch
+# swaps in a newer runtime, so the decision always matches the runtime that
+# will really start.
+require_upgrade_backup() {
+  local bundled_version
+  if backup_state_before_upgrade; then
+    return 0
   fi
-fi
+  bundled_version="$(openclaw_runtime_version)"
+  if [ -n "$bundled_version" ] && \
+     [ "$(printf '%s\n%s\n' "2026.8.0" "$bundled_version" | sort -V | head -n 1)" != "2026.8.0" ]; then
+    echo "WARN: Pre-upgrade state backup failed; continuing because OpenClaw ${bundled_version} performs no state migration."
+    echo "WARN: Free disk space before the next OpenClaw upgrade — that upgrade will refuse to start without this backup."
+    return 0
+  fi
+  echo "ERROR: OpenClaw was not started, so its persistent state remains unchanged."
+  echo "ERROR: Free disk space or repair permissions, then restart the add-on."
+  exit 1
+}
+
+require_upgrade_backup
 
 # ------------------------------------------------------------------------------
 # Session lock cleanup helpers
@@ -959,6 +984,9 @@ PY
   if npm install -g "openclaw@${persisted_version}" >/tmp/openclaw-runtime-repair.log 2>&1; then
     refreshed_version="$(get_openclaw_version)"
     echo "INFO: OpenClaw runtime repair succeeded (${runtime_version} -> ${refreshed_version:-$persisted_version})."
+    # A different runtime will start now: archive state for it first (and
+    # refuse to start it without that archive if it can migrate state).
+    require_upgrade_backup
     return 0
   fi
 
@@ -1288,7 +1316,7 @@ fi
 # Auto-configure MCP (Model Context Protocol) for Home Assistant
 # Registers HA as an MCP server so OpenClaw can control HA entities/services.
 # Requires: homeassistant_token set in add-on options + mcporter CLI available.
-# Runs once; re-runs when the token changes.
+# Runs once; re-runs when the token or the Home Assistant URL changes.
 # Auto-detects HA API URL: supervisor proxy if available, else localhost:8123.
 # ------------------------------------------------------------------------------
 if [ "$AUTO_CONFIGURE_MCP" = "true" ] && [ -n "$HA_TOKEN" ]; then
@@ -1306,10 +1334,14 @@ if [ "$AUTO_CONFIGURE_MCP" = "true" ] && [ -n "$HA_TOKEN" ]; then
       MCP_HA_URL="http://localhost:8123/api/mcp"
     fi
     MCP_FLAG="/config/.openclaw/.mcp_ha_configured"
-    MCP_TOKEN_HASH=$(printf '%s' "$HA_TOKEN" | sha256sum | cut -d' ' -f1)
+    # Fingerprint covers token AND URL, so changing ha_base_url (or the URL
+    # detection above) re-registers the server. Older markers held a token-only
+    # hash and trigger one re-registration; add-on versions before 0.5.90
+    # registered the unreachable http://supervisor/... URL.
+    MCP_TOKEN_HASH=$(printf '%s\n%s' "$HA_TOKEN" "$MCP_HA_URL" | sha256sum | cut -d' ' -f1)
 
     if [ -f "$MCP_FLAG" ] && [ "$(cat "$MCP_FLAG" 2>/dev/null)" = "$MCP_TOKEN_HASH" ]; then
-      echo "INFO: MCP Home Assistant server already configured (token unchanged)"
+      echo "INFO: MCP Home Assistant server already configured (token and URL unchanged)"
     else
       echo "INFO: Configuring MCP for Home Assistant at $MCP_HA_URL ..."
       # Remove stale entry if present (token may have changed)

@@ -127,9 +127,10 @@ The Gateway Web UI (Control UI) is OpenClaw's main web interface. It opens in a 
 
 The reason is asset paths, not WebSockets — Ingress proxies WebSockets fine, which is how the embedded terminal works. Home Assistant serves add-on pages under a per-add-on prefix (`/api/hassio_ingress/<token>/`), while the Control UI emits its assets from the origin root unless `gateway.controlUi.basePath` matches that prefix exactly. Serving it under Ingress would therefore require pinning the gateway to that prefix, which would break direct LAN access at the same time.
 
-> **Updated for OpenClaw 2026.8.2:** the Control UI **no longer requires a secure context**. Device identity is generated and signed with pure-JS Ed25519, so pairing works on any origin, including plain HTTP. HTTPS is still strongly recommended — over plaintext, both the page and your gateway token are readable by anyone on the path — but it is no longer a hard requirement.
+> **Depends on the bundled OpenClaw version.** This fork currently ships **OpenClaw `2026.7.35`**:
 >
-> **Every browser must be paired once** before it can use the Control UI. See [Device pairing](#device-pairing-first-connection) below. `gateway.controlUi.dangerouslyDisableDeviceAuth` used to bypass this; upstream has **retired that flag and it is now inert**, so pairing applies to all browsers.
+> - **On `2026.7.x` (current):** plain HTTP from the LAN is a non-secure browser context, WebCrypto is blocked, and OpenClaw rejects Control UI connections without device identity. **Use HTTPS** (`lan_https`, a reverse proxy or Tailscale Serve) or `http://127.0.0.1` on the host. The only built-in exception is `controlui_disable_device_auth: true` (default), which sets the break-glass `gateway.controlUi.dangerouslyDisableDeviceAuth` — token auth is still enforced, but over plain HTTP the token travels in clear text.
+> - **From OpenClaw `2026.8.2` on:** the Control UI no longer requires a secure context — device identity is signed with pure-JS Ed25519 on any origin. `dangerouslyDisableDeviceAuth` is retired (inert), so **every browser must be paired once**; see [Device pairing](#device-pairing-first-connection) below. HTTPS remains strongly recommended because a plaintext page exposes the gateway token.
 
 ### Choosing an access mode
 

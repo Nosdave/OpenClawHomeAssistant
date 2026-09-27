@@ -57,6 +57,7 @@ jobs:
           build-args: |
             BUILD_FROM=${{ env.BUILD_FROM }}
             TARGETARCH=arm64
+            BUILD_VERSION=${{ steps.ver.outputs.version }}
           tags: |
             ${{ env.IMAGE }}:${{ steps.ver.outputs.version }}
             ${{ env.IMAGE }}:latest

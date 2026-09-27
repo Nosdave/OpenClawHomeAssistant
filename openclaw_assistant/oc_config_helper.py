@@ -67,32 +67,30 @@ def read_config():
         raise ConfigReadError(f"{CONFIG_PATH}: {e}") from e
 
 
-def write_config(cfg):
-    """Write config back to file with nice formatting.
+def _atomic_write_text(path, content, default_mode=0o600):
+    """Atomically replace `path` with `content`.
 
-    Atomic: the new content goes to a temp file in the same directory, is
-    fsynced, then renamed over openclaw.json, so an interrupted write (power
-    loss, SIGKILL on add-on stop) never leaves a truncated config behind.
+    The content goes to a temp file in the same directory, is fsynced, then
+    renamed over the target, so an interrupted write (disk full, power loss,
+    SIGKILL on add-on stop) never leaves a truncated file behind. The existing
+    file mode is preserved; new files get `default_mode`.
     """
+    path = Path(path)
     tmp_path = None
     try:
-        CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        path.parent.mkdir(parents=True, exist_ok=True)
         try:
-            mode = CONFIG_PATH.stat().st_mode & 0o777
+            mode = path.stat().st_mode & 0o777
         except FileNotFoundError:
-            mode = 0o600
-        fd, tmp_path = tempfile.mkstemp(prefix=".openclaw.json.", suffix=".tmp", dir=str(CONFIG_PATH.parent))
+            mode = default_mode
+        fd, tmp_path = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent))
         with os.fdopen(fd, "w", encoding="utf-8") as f:
-            f.write(json.dumps(cfg, indent=2) + "\n")
+            f.write(content)
             f.flush()
             os.fsync(f.fileno())
         os.chmod(tmp_path, mode)
-        os.replace(tmp_path, CONFIG_PATH)
+        os.replace(tmp_path, path)
         tmp_path = None
-        return True
-    except OSError as e:
-        print(f"ERROR: Failed to write config: {e}", file=sys.stderr)
-        return False
     finally:
         if tmp_path is not None:
             try:
@@ -101,13 +99,15 @@ def write_config(cfg):
                 pass
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Config snapshots
-#
-# The add-on rewrites openclaw.json on every start (gateway settings, controlUi,
-# repair rules). A snapshot is taken before the first write of each boot so a bad
-# merge or an unwanted repair can always be rolled back with `oc-config restore`.
-# ──────────────────────────────────────────────────────────────────────────────
+def write_config(cfg):
+    """Write config back to file with nice formatting (atomically)."""
+    try:
+        _atomic_write_text(CONFIG_PATH, json.dumps(cfg, indent=2) + "\n")
+        return True
+    except OSError as e:
+        print(f"ERROR: Failed to write config: {e}", file=sys.stderr)
+        return False
+
 
 def _sanitize_label(label):
     """Reduce a free-form label to a filename-safe token."""
@@ -183,9 +183,10 @@ def create_snapshot(keep, label="manual", force=False):
 
     try:
         current = CONFIG_PATH.read_text(encoding="utf-8")
-    except IOError as e:
+    except (OSError, UnicodeDecodeError) as e:
+        # Report failure; the startup caller already treats it as non-fatal.
         print(f"WARN: Could not read config for snapshot: {e}", file=sys.stderr)
-        return True
+        return False
 
     existing = list_snapshots()
     if not force and existing:
@@ -205,15 +206,13 @@ def create_snapshot(keep, label="manual", force=False):
     target = BACKUP_DIR / f"{BACKUP_PREFIX}{stamp}.{_sanitize_label(label)}{BACKUP_SUFFIX}"
 
     try:
-        BACKUP_DIR.mkdir(parents=True, exist_ok=True)
-        target.write_text(current, encoding="utf-8")
-        try:
-            target.chmod(0o600)
-        except OSError:
-            pass
-    except IOError as e:
+        _atomic_write_text(target, current)
+    except OSError as e:
+        # Report failure (exit 1): `oc-config snapshot` must not claim success and
+        # `restore` must not proceed without its safety copy. The startup caller
+        # in run.sh already treats a failed snapshot as non-fatal.
         print(f"WARN: Could not write snapshot {target.name}: {e}", file=sys.stderr)
-        return True  # never block startup on a failed backup
+        return False
 
     removed = prune_snapshots(keep)
     suffix = f" (pruned {removed} old)" if removed else ""
@@ -320,12 +319,15 @@ def restore_snapshot(target, keep=10):
         return False
 
     # Safety net: the config being replaced becomes a snapshot of its own.
-    create_snapshot(keep, label="pre-restore", force=True)
+    # Refuse to restore without it (keep=0 disables snapshots entirely, and a
+    # missing live config has nothing to protect).
+    if keep > 0 and CONFIG_PATH.exists() and not create_snapshot(keep, label="pre-restore", force=True):
+        print("ERROR: Could not back up the current config first; refusing to restore")
+        return False
 
     try:
-        CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
-        CONFIG_PATH.write_text(content, encoding="utf-8")
-    except IOError as e:
+        _atomic_write_text(CONFIG_PATH, content)
+    except OSError as e:
         print(f"ERROR: Could not write config: {e}")
         return False
 

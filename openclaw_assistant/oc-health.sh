@@ -41,7 +41,19 @@ LAST_FAIL_CODE=""
 cleanup() {
   [ -n "$CURL_RC" ] && rm -f "$CURL_RC"
 }
-trap cleanup EXIT INT TERM
+trap cleanup EXIT
+# INT/TERM must terminate the process: a handler that only cleans up would let
+# `oc-health loop` resume, and run.sh waits on it during add-on shutdown before
+# stopping the gateway. `exit` still runs the EXIT trap (token file cleanup).
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+# Interruptible sleep: bash defers traps until a foreground command returns, so
+# a plain `sleep "$INTERVAL"` would delay shutdown by up to one interval.
+pause() {
+  sleep "$1" &
+  wait "$!" || true
+}
 
 # ── Credentials ──────────────────────────────────────────────
 # The add-on runs with host_network: true, so the host's Home Assistant is
@@ -56,9 +68,11 @@ supervisor_api_reachable() {
 }
 
 # Write the bearer token to a 0600 curl config so it never appears in `ps`/argv.
-# `insecure` is added for local Home Assistant endpoints: HA commonly serves
-# HTTPS with a certificate issued for its external hostname, which never matches
-# 127.0.0.1 or homeassistant.local. The connection stays on the local host/LAN.
+# `insecure` is added only for loopback endpoints (127.0.0.1 / localhost): HA
+# commonly serves HTTPS with a certificate issued for its external hostname, which
+# never matches a loopback address, and loopback traffic cannot be intercepted.
+# LAN names (homeassistant, homeassistant.local) and a user-supplied ha_base_url
+# are resolved over DNS/mDNS and must verify TLS before the bearer token is sent.
 write_curl_rc() {
   local token="$1" insecure="${2:-false}" previous_umask
   case "$token" in
@@ -98,10 +112,14 @@ resolve_api() {
 
   if [ -n "$user_token" ]; then
     if [ -n "${HA_BASE_URL:-}" ]; then
-      candidates+=("${HA_BASE_URL%/}/api|$user_token|true")
+      candidates+=("${HA_BASE_URL%/}/api|$user_token|false")
     fi
     for host in 127.0.0.1 localhost homeassistant homeassistant.local; do
-      candidates+=("https://${host}:8123/api|$user_token|true")
+      case "$host" in
+        127.0.0.1|localhost) insecure="true" ;;
+        *) insecure="false" ;;
+      esac
+      candidates+=("https://${host}:8123/api|$user_token|${insecure}")
       candidates+=("http://${host}:8123/api|$user_token|false")
     done
   fi
@@ -391,7 +409,7 @@ while true; do
         echo "WARN: Retrying every ${INTERVAL}s; logged once per status change." >&2
         LAST_ROUND_OK="no"
       fi
-      sleep "$INTERVAL"
+      pause "$INTERVAL"
       continue
     fi
   fi
@@ -410,5 +428,5 @@ while true; do
       HA_API=""
     fi
   fi
-  sleep "$INTERVAL"
+  pause "$INTERVAL"
 done
