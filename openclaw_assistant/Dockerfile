@@ -161,11 +161,36 @@ COPY oc-cleanup.sh /usr/local/bin/oc-cleanup
 COPY oc-gateway /usr/local/bin/oc-gateway
 COPY oc-health.sh /usr/local/bin/oc-health
 COPY oc-config.sh /usr/local/bin/oc-config
+COPY oc_upgrade.py /usr/local/bin/oc-upgrade
+COPY openclaw-wrapper.sh /usr/local/libexec/oc-addon/openclaw
 COPY openclaw-proxy-shim.cjs /usr/local/lib/openclaw-proxy-shim.cjs
 COPY nginx.conf.tpl /etc/nginx/nginx.conf.tpl
 COPY landing.html.tpl /etc/nginx/landing.html.tpl
 RUN chmod +x /run.sh /oc_config_helper.py /render_nginx.py /usr/local/bin/oc-cleanup /usr/local/bin/oc-gateway \
-    /usr/local/bin/oc-health /usr/local/bin/oc-config \
+    /usr/local/bin/oc-health /usr/local/bin/oc-config /usr/local/bin/oc-upgrade \
+    /usr/local/libexec/oc-addon/openclaw \
     && mkdir -p /run/nginx
+
+# Route every `openclaw` executable through the add-on wrapper (refuses
+# `openclaw update`, independent of the caller's PATH order) and record the
+# pinned package entry and version it runs. The wrapper is also placed in every
+# standard bin directory, so a later `npm install -g openclaw@...` (runtime npm
+# prefix /usr/local) collides with it (EEXIST) instead of silently shadowing it.
+RUN set -eu; \
+    W=/usr/local/libexec/oc-addon/openclaw; \
+    pkg="$(npm root -g)/openclaw"; \
+    test -f "$pkg/openclaw.mjs"; \
+    printf '%s\n' "$pkg/openclaw.mjs" > /usr/local/libexec/oc-addon/openclaw-entry; \
+    jq -r .version "$pkg/package.json" > /usr/local/libexec/oc-addon/openclaw-pinned-version; \
+    for bin in $(IFS=:; for d in $PATH; do [ -e "$d/openclaw" ] && echo "$d/openclaw"; done | sort -u); do \
+      if [ "$(readlink -f "$bin")" != "$(readlink -f "$W")" ]; then ln -sf "$W" "$bin"; fi; \
+    done; \
+    for d in /usr/local/sbin /usr/local/bin /usr/sbin /usr/bin; do \
+      mkdir -p "$d"; \
+      if [ "$(readlink -f "$d/openclaw" 2>/dev/null || true)" != "$(readlink -f "$W")" ]; then ln -sf "$W" "$d/openclaw"; fi; \
+    done; \
+    test "$(readlink -f "$(command -v openclaw)")" = "$(readlink -f "$W")"; \
+    openclaw --version; \
+    if openclaw update --help >/dev/null 2>&1; then echo "wrapper does not block update" >&2; exit 1; fi
 
 CMD [ "/run.sh" ]

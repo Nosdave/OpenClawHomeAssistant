@@ -915,6 +915,52 @@ The add-on version is shown on the add-on page in Home Assistant. To check the O
 openclaw --version
 ```
 
+### `openclaw update` is disabled
+
+The add-on image pins the OpenClaw version. Moving to a newer OpenClaw release
+line runs one-way database migrations, which the add-on performs itself after a
+verified backup. Running `openclaw update` inside the add-on would bypass that
+(and the next image update would replace it again), so every `openclaw` command
+in the image goes through a small add-on wrapper that refuses `openclaw update`
+(and `openclaw --update ...`). Update the **add-on** in Home Assistant instead.
+OpenClaw's own automatic updates are disabled as well (`OPENCLAW_NO_AUTO_UPDATE=1`).
+
+The wrapper sits in every standard bin directory, so a plain
+`npm install -g openclaw@...` inside the container fails (`EEXIST`) instead of
+installing a second OpenClaw next to it. If one is forced in anyway (`--force`,
+another prefix, an in-place replacement of the pinned package), the add-on
+notices at start and before every gateway restart — another `openclaw` in a bin
+directory, a second OpenClaw package, or a package version that differs from the
+image pin — and holds instead of (re)starting OpenClaw. A CLI forced in that way
+can still be run by hand or by an agent until then. Reinstall or rebuild the
+add-on to recover.
+
+### Upgrade checks and rehearsal export (`oc-upgrade`)
+
+```sh
+oc-upgrade check     # read-only inventory before an OpenClaw upgrade
+oc-upgrade status    # hold reason, upgrade archives, pending export
+oc-upgrade export    # request a cold copy of the state for an upgrade rehearsal
+```
+
+`oc-upgrade check` only reads. It prints versions, database schema versions,
+leftovers from OpenClaw versions before June 2026, model wildcards and free
+space — file names, sizes and versions only, never tokens. Exit codes: `0`
+nothing to note, `4` notes (items the next OpenClaw upgrade handles), `2`
+possible bridge case (an old database with data that was never imported — do not
+upgrade, ask first), `3` the state was written by a newer OpenClaw than this image
+ships.
+
+`oc-upgrade export` writes a cold copy on the **next** add-on start, before the
+gateway starts (Telegram is offline for a few minutes), to
+`/share/openclaw-rehearsal/<timestamp>/`. It contains `/config/.openclaw`
+(including installed plugins) and the `/config/clawd` workspace; logs, media,
+caches, earlier archives and `node_modules` folders inside the workspace are left
+out. An interrupted export is removed on the next start. **The copy contains
+secrets** (tokens, OAuth logins):
+move it only to a machine you trust and delete it after the rehearsal.
+`oc-upgrade export --cancel` withdraws the request.
+
 ### Backup
 
 Home Assistant's built-in backup system automatically includes add-on configuration data (`/config/`). By default this covers the important user state: OpenClaw config, skills, workspace, keys, and tokens — without large optional toolchains.
@@ -1283,6 +1329,26 @@ an older add-on release, first stop the add-on and move the current
 extract the desired archive into it, then start the older release. Do not extract
 over the upgraded directory: its newer database files would remain in place.
 Work created after that archive will not be present after the rollback.
+
+### HOLD: "Persistent OpenClaw state is newer than the bundled runtime"
+
+**Symptom**: the add-on starts, the add-on page and terminal work, but OpenClaw
+does not, and the log shows `HOLD — OpenClaw will NOT be started`.
+
+**Cause**: the data under `/config/.openclaw` was written by a newer OpenClaw than
+the one in this add-on image — typically after a Home Assistant restore brought
+back an older add-on version without its matching data (or the reverse). An
+older OpenClaw cannot open databases a newer one has migrated, and starting it
+anyway can damage them. Earlier add-on versions silently `npm install`ed the
+newer OpenClaw in this case. The add-on now holds instead: OpenClaw is not
+started, and its config, databases, sessions and plugins are not modified (only
+the built-in skill files are refreshed from the image, as on every start). The
+same hold applies when the OpenClaw inside the container no longer matches the
+version pinned in the image.
+
+**Fix**: run `oc-upgrade status` to see what was detected, then restore the Home
+Assistant backup that matches this add-on version (or update the add-on to the
+version that wrote the data). Do not start OpenClaw by hand on that state.
 
 ### `JavaScript heap out of memory` / gateway restart loop on a Raspberry Pi
 
