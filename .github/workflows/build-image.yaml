@@ -46,7 +46,29 @@ jobs:
       - name: Set up Buildx
         uses: docker/setup-buildx-action@v3
 
+      # Published version tags are immutable: Home Assistant's rollback ("restore
+      # backup") re-pulls the image by its version tag, so rebuilding an existing
+      # tag would silently change what a rollback restores. A push that does not
+      # bump config.yaml's version therefore builds nothing.
+      - name: Refuse to overwrite an existing version tag
+        id: tagcheck
+        env:
+          REF: ${{ env.IMAGE }}:${{ steps.ver.outputs.version }}
+        run: |
+          if out="$(docker buildx imagetools inspect "$REF" 2>&1)"; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "::warning::$REF is already published; not rebuilding it. Bump 'version' in openclaw_assistant/config.yaml to publish a new image."
+          elif grep -qiE 'not found|manifest unknown|name unknown' <<< "$out"; then
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "$REF is new; building."
+          else
+            echo "::error::Could not determine whether $REF exists:"
+            printf '%s\n' "$out"
+            exit 1
+          fi
+
       - name: Build & push
+        if: steps.tagcheck.outputs.exists != 'true'
         uses: docker/build-push-action@v6
         with:
           context: openclaw_assistant

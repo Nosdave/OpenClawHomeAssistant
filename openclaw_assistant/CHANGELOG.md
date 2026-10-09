@@ -5,6 +5,22 @@ All notable changes to the OpenClaw Assistant Home Assistant Add-on will be docu
 > **Private fork** (`Nosdave/OpenClawHomeAssistant`): `-ghcrN` / `-fullN` suffixes are fork build iterations on top of the upstream `techartdev` base version. The image is pre-built on GitHub Actions (native `aarch64`) and pulled from GHCR. `-fullN` marks the un-stripped "full" build line (see `0.5.80-full1`).
 
 
+## [0.5.93-full2] - 2026-10-09
+
+Preparation release ("stage A") for the later jump to OpenClaw 2026.9.x. **No OpenClaw change** — still `2026.7.35`. Contains everything from `0.5.93-full1` (which was never installed on this deployment): the LAN lockdown of port 48099, the upstream 0.5.93 merge, atomic config writes and the pre-upgrade state archive.
+
+### Added
+- **`oc-upgrade`** helper:
+  - `oc-upgrade check` — read-only inventory before an OpenClaw upgrade: versions, database schema versions, pre-June-2026 leftovers (old task/flow/plugin databases and whether they were imported, legacy Telegram/Active Memory files, `credentials/oauth.json`), memory sidecar databases, model wildcards, free space. Prints names, sizes and versions only, never secret values. Exit code 0 / 4 notes / 2 possible bridge case / 3 state newer than this image.
+  - `oc-upgrade export` — on the next start, before the gateway starts, writes a cold copy of state and workspace (without logs, media, caches, earlier archives) to `/share/openclaw-rehearsal/<timestamp>/` for an offline upgrade rehearsal. The copy contains secrets; it is `0600` and comes with a manifest (sha256, versions).
+  - `oc-upgrade status` — hold reason, upgrade archives, pending export.
+
+### Changed
+- **State newer than the image → HOLD instead of a silent runtime install.** If `/config/.openclaw` was written by a newer OpenClaw than the bundled one (newer `meta.lastTouchedVersion`, or — on a 2026.7.x runtime — a state/agent database with a schema version above 1), the add-on no longer `npm install -g`s that newer OpenClaw at boot (`repair_runtime_version_mismatch` is removed). It leaves the state untouched (no archive, no plugin install, no config repair, no lock cleanup), does not start OpenClaw, keeps the add-on page and terminal running and logs/records the reason (`oc-upgrade status`). This makes a Home Assistant restore after the 9.x upgrade safe: a mismatched image/data pair can no longer corrupt the data.
+- **`openclaw update` is refused** by a thin wrapper that is first on `PATH` for the add-on and its terminal (everything else is passed through via `exec`). The image pins the OpenClaw version; line upgrades need the add-on's backup and migration steps.
+- **GHCR version tags are immutable.** The build workflow no longer rebuilds an image tag that is already published (a push without a version bump builds nothing and leaves a warning). Home Assistant's backup restore re-pulls the add-on image by its version tag, so a rebuilt tag would silently change what a rollback restores.
+
+
 ## [0.5.93-full1] - 2026-09-27
 
 Merge of upstream `techartdev` **0.5.88 → 0.5.93** onto the fork. **No OpenClaw bump** — the pin stays **`2026.7.35`** (extended-stable); upstream's `2026.9.6` is not taken (see "Not included" below).

@@ -161,11 +161,14 @@ COPY oc-cleanup.sh /usr/local/bin/oc-cleanup
 COPY oc-gateway /usr/local/bin/oc-gateway
 COPY oc-health.sh /usr/local/bin/oc-health
 COPY oc-config.sh /usr/local/bin/oc-config
+COPY oc_upgrade.py /usr/local/bin/oc-upgrade
+COPY openclaw-wrapper.sh /usr/local/libexec/oc-addon/openclaw
 COPY openclaw-proxy-shim.cjs /usr/local/lib/openclaw-proxy-shim.cjs
 COPY nginx.conf.tpl /etc/nginx/nginx.conf.tpl
 COPY landing.html.tpl /etc/nginx/landing.html.tpl
 RUN chmod +x /run.sh /oc_config_helper.py /render_nginx.py /usr/local/bin/oc-cleanup /usr/local/bin/oc-gateway \
-    /usr/local/bin/oc-health /usr/local/bin/oc-config \
+    /usr/local/bin/oc-health /usr/local/bin/oc-config /usr/local/bin/oc-upgrade \
+    /usr/local/libexec/oc-addon/openclaw \
     && mkdir -p /run/nginx
 
 CMD [ "/run.sh" ]

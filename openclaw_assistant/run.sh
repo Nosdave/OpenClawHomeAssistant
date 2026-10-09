@@ -363,6 +363,15 @@ else
   echo "INFO: persist_node_global=false; npm/pnpm global installs are ephemeral and excluded from HA backups."
 fi
 
+# The add-on's `openclaw` wrapper goes first on PATH (for run.sh and the web
+# terminal it spawns): it refuses `openclaw update` — the image pins the
+# OpenClaw version and line upgrades need the add-on's backup/migration steps —
+# and execs the real CLI for everything else.
+OC_ADDON_BIN="/usr/local/libexec/oc-addon"
+if [ -x "${OC_ADDON_BIN}/openclaw" ]; then
+  export PATH="${OC_ADDON_BIN}:${PATH}"
+fi
+
 # Protect critical runtime variables from accidental override via gateway_env_vars.
 is_reserved_gateway_env_var() {
   case "$1" in
@@ -671,9 +680,7 @@ backup_state_before_upgrade() {
 # Fork: only refuse to start when the runtime that is about to run can actually
 # migrate state (the 2026.8+ lines). The 2026.7.x runtime performs no schema
 # migration, so a failed archive there must not take the add-on page and
-# terminal down with it. Called again after repair_runtime_version_mismatch
-# swaps in a newer runtime, so the decision always matches the runtime that
-# will really start.
+# terminal down with it.
 require_upgrade_backup() {
   local bundled_version
   if backup_state_before_upgrade; then
@@ -691,7 +698,109 @@ require_upgrade_backup() {
   exit 1
 }
 
-require_upgrade_backup
+# ------------------------------------------------------------------------------
+# State guard (HOLD)
+#
+# If the persistent state was written by a newer OpenClaw than this image ships
+# (e.g. a Home Assistant restore brought back the old image but not the old
+# data, or the reverse), starting the bundled runtime on it can corrupt it: a
+# 2026.7.x runtime cannot open databases migrated by 2026.8+. Earlier add-on
+# versions "repaired" this by silently npm-installing the newer runtime. Now the
+# add-on holds instead: nothing touches the state, OpenClaw is not started, and
+# the add-on page and terminal stay up so a backup can be restored.
+# ------------------------------------------------------------------------------
+UPG_DIR="/config/.openclaw-upgrade"
+mkdir -p "$UPG_DIR"
+chmod 700 "$UPG_DIR" 2>/dev/null || true
+STATE_HOLD=false
+STATE_HOLD_REASON=""
+if command -v oc-upgrade >/dev/null 2>&1; then
+  if guard_out="$(oc-upgrade state-guard 2>&1)"; then
+    [ -n "$guard_out" ] && echo "$guard_out"
+  else
+    guard_rc=$?
+    if [ "$guard_rc" -eq 3 ]; then
+      STATE_HOLD=true
+      STATE_HOLD_REASON="$guard_out"
+    else
+      echo "WARN: oc-upgrade state-guard failed (exit ${guard_rc}); continuing without the state guard."
+      [ -n "$guard_out" ] && echo "$guard_out"
+    fi
+  fi
+else
+  echo "WARN: oc-upgrade is missing from the add-on image; state guard skipped."
+fi
+
+if [ "$STATE_HOLD" = "true" ]; then
+  {
+    echo "Persistent OpenClaw state is newer than the bundled runtime ($(openclaw_runtime_version || true)):"
+    printf '%s\n' "$STATE_HOLD_REASON"
+    echo "Restore the Home Assistant backup that matches this add-on version (or update to the add-on"
+    echo "version that wrote the state). OpenClaw is not started and nothing in /config/.openclaw is changed."
+  } > "${UPG_DIR}/hold.txt"
+  echo "ERROR: ================================================================"
+  echo "ERROR: HOLD — OpenClaw will NOT be started."
+  sed 's/^/ERROR: /' "${UPG_DIR}/hold.txt"
+  echo "ERROR: The add-on page and terminal stay available. Details: oc-upgrade status"
+  echo "ERROR: ================================================================"
+else
+  rm -f "${UPG_DIR}/hold.txt"
+  require_upgrade_backup
+fi
+
+# ------------------------------------------------------------------------------
+# Cold export for an offline upgrade rehearsal (requested via `oc-upgrade export`)
+# Runs before anything starts or writes, so the copy is consistent.
+# ------------------------------------------------------------------------------
+process_export_request() {
+  local request="${UPG_DIR}/export-request" ts dest need_kb avail_kb archive
+  [ -f "$request" ] || return 0
+  # One-shot: never retry on every boot, even after a failure.
+  rm -f "$request"
+  ts="$(date -u +%Y%m%d-%H%M%S)"
+  dest="/share/openclaw-rehearsal/${ts}"
+  need_kb="$(du -skc "$OPENCLAW_CONFIG_DIR" /config/clawd 2>/dev/null | tail -n 1 | cut -f1)"
+  avail_kb="$(df -Pk /share 2>/dev/null | awk 'NR==2 {print $4}')"
+  if [ -z "$need_kb" ] || [ -z "$avail_kb" ] || [ "$avail_kb" -lt "$need_kb" ]; then
+    echo "WARN: Rehearsal export skipped: not enough free space in /share (need ~${need_kb:-?} KiB, have ${avail_kb:-?} KiB)."
+    return 0
+  fi
+  echo "INFO: Creating cold rehearsal export in ${dest} (gateway not started yet)..."
+  if ! (umask 077 && mkdir -p "$dest"); then
+    echo "WARN: Rehearsal export skipped: cannot create ${dest}."
+    return 0
+  fi
+  archive="${dest}/openclaw-rehearsal.tar.gz"
+  local members=(.openclaw)
+  [ -d /config/clawd ] && members+=(clawd)
+  if tar -C /config \
+      --exclude='.openclaw/upgrade-backups' \
+      --exclude='.openclaw/media' \
+      --exclude='.openclaw/logs' \
+      --exclude='.openclaw/.cache' \
+      --exclude='.openclaw/tmp' \
+      --exclude='node_modules' \
+      --exclude='.git' \
+      -czf "${archive}.tmp" "${members[@]}" \
+     && mv "${archive}.tmp" "$archive"; then
+    chmod 600 "$archive" 2>/dev/null || true
+    {
+      echo "created_utc=${ts}"
+      echo "addon_version=${ADDON_VERSION:-unknown}"
+      echo "openclaw_runtime=$(openclaw_runtime_version || true)"
+      echo "sha256=$(sha256sum "$archive" | cut -d' ' -f1)"
+      echo "size_bytes=$(stat -c %s "$archive")"
+      echo "contains_secrets=yes"
+    } > "${dest}/manifest.txt"
+    chmod 600 "${dest}/manifest.txt" 2>/dev/null || true
+    echo "INFO: Rehearsal export ready: ${archive} ($(du -h "$archive" | cut -f1)). It contains secrets — delete it after the rehearsal."
+  else
+    rm -f "${archive}.tmp"
+    echo "WARN: Rehearsal export failed; nothing was changed. Startup continues."
+  fi
+  return 0
+}
+process_export_request
 
 # ------------------------------------------------------------------------------
 # Session lock cleanup helpers
@@ -815,7 +924,9 @@ ensure_brave_plugin() {
   return 0
 }
 
-if [ "$CLEAN_LOCKS_ON_START" = "true" ]; then
+if [ "$STATE_HOLD" = "true" ]; then
+  echo "INFO: HOLD: skipping session lock cleanup."
+elif [ "$CLEAN_LOCKS_ON_START" = "true" ]; then
   cleanup_session_locks
 else
   echo "INFO: clean_session_locks_on_start=false; skipping session lock cleanup."
@@ -927,76 +1038,6 @@ get_openclaw_version() {
   printf '%s\n' "$raw" | grep -oE '[0-9]{4}\.[0-9]+\.[0-9]+' | head -n 1 || true
 }
 
-version_is_less_than() {
-  local left="$1"
-  local right="$2"
-  [ -n "$left" ] && [ -n "$right" ] && [ "$left" != "$right" ] && \
-    [ "$(printf '%s\n%s\n' "$left" "$right" | sort -V | head -n 1)" = "$left" ]
-}
-
-repair_runtime_version_mismatch() {
-  local config_path="/config/.openclaw/openclaw.json"
-  local runtime_version persisted_version refreshed_version
-
-  if [ ! -f "$config_path" ]; then
-    return 0
-  fi
-
-  runtime_version="$(get_openclaw_version)"
-  persisted_version="$(python3 - "$config_path" <<'PY'
-import json
-import sys
-from pathlib import Path
-
-path = Path(sys.argv[1])
-try:
-    data = json.loads(path.read_text(encoding="utf-8"))
-except Exception:
-    print("", end="")
-    raise SystemExit(0)
-
-value = data.get("meta", {}).get("lastTouchedVersion", "")
-print(value if isinstance(value, str) else "", end="")
-PY
-)"
-
-  if [ -z "$runtime_version" ] || [ -z "$persisted_version" ]; then
-    return 0
-  fi
-
-  if ! version_is_less_than "$runtime_version" "$persisted_version"; then
-    return 0
-  fi
-
-  # The version string comes from a user-writable file and is handed to a root
-  # `npm install -g`. Accept only a plain stable CalVer release (optionally with
-  # a -N patch suffix, e.g. 2026.7.1-2); anything else (tags, URLs, git/file
-  # specs, prereleases) is refused.
-  if ! printf '%s' "$persisted_version" | grep -Eq '^[0-9]{4}\.[0-9]{1,2}\.[0-9]{1,3}(-[0-9]{1,3})?$'; then
-    echo "WARN: Persisted OpenClaw config reports version '$persisted_version', which is not a stable release number."
-    echo "WARN: Skipping automatic runtime repair; startup continues with bundled OpenClaw $runtime_version."
-    return 0
-  fi
-
-  echo "WARN: Persisted OpenClaw config was last written by newer version $persisted_version, but bundled runtime is $runtime_version."
-  echo "WARN: Attempting one-time runtime repair so the gateway can start after add-on rebuilds or Home Assistant OS updates."
-
-  if npm install -g "openclaw@${persisted_version}" >/tmp/openclaw-runtime-repair.log 2>&1; then
-    refreshed_version="$(get_openclaw_version)"
-    echo "INFO: OpenClaw runtime repair succeeded (${runtime_version} -> ${refreshed_version:-$persisted_version})."
-    # A different runtime will start now: archive state for it first (and
-    # refuse to start it without that archive if it can migrate state).
-    require_upgrade_backup
-    return 0
-  fi
-
-  echo "ERROR: Automatic runtime repair failed; startup will continue with bundled OpenClaw $runtime_version."
-  echo "ERROR: Review /tmp/openclaw-runtime-repair.log and rerun 'openclaw update' or 'npm install -g openclaw@${persisted_version}' once connectivity is available."
-  return 0
-}
-
-repair_runtime_version_mismatch
-
 # Bundled OpenClaw version, for version-dependent config handling in the helper.
 OPENCLAW_RUNTIME_VERSION="$(get_openclaw_version)"
 export OPENCLAW_RUNTIME_VERSION
@@ -1008,7 +1049,7 @@ echo "INFO: OpenClaw runtime version: ${OPENCLAW_RUNTIME_VERSION:-unknown}"
 # Bootstrap minimal OpenClaw config ONLY if missing.
 # We do not overwrite or patch existing configs; onboarding owns everything else.
 OPENCLAW_CONFIG_PATH="/config/.openclaw/openclaw.json"
-if [ ! -f "$OPENCLAW_CONFIG_PATH" ]; then
+if [ ! -f "$OPENCLAW_CONFIG_PATH" ] && [ "$STATE_HOLD" != "true" ]; then
   echo "INFO: OpenClaw config missing; bootstrapping minimal config at $OPENCLAW_CONFIG_PATH"
   python3 - <<'PY'
 import json
@@ -1053,7 +1094,11 @@ if [ ! -f "$HELPER_PATH" ] && [ -f "$(dirname "$0")/oc_config_helper.py" ]; then
 fi
 
 CONFIG_UNREADABLE=false
-if [ -f "$OPENCLAW_CONFIG_PATH" ]; then
+if [ "$STATE_HOLD" = "true" ]; then
+  # Nothing may write to state that is newer than this runtime.
+  CONFIG_UNREADABLE=true
+  echo "INFO: HOLD: skipping plugin and config repair steps."
+elif [ -f "$OPENCLAW_CONFIG_PATH" ]; then
   # Ensure Brave is present BEFORE repair-known-invalid-settings, so a persisted
   # tools.web.search.provider=brave is not stripped as "unavailable".
   ensure_brave_plugin || true
@@ -1505,11 +1550,14 @@ find_gateway_daemon_pid() {
   return 1
 }
 
-if ! start_openclaw_runtime; then
-  exit 1
+if [ "$STATE_HOLD" = "true" ]; then
+  echo "ERROR: HOLD: OpenClaw runtime not started (see above / oc-upgrade status)."
+else
+  if ! start_openclaw_runtime; then
+    exit 1
+  fi
+  start_gw_relay
 fi
-
-start_gw_relay
 
 # Start web terminal (optional)
 TTYD_PID_FILE="/var/run/openclaw-ttyd.pid"
@@ -1731,6 +1779,16 @@ GW_FAIL_STREAK=0
 # migration) unattended and without a pre-migration backup. A controlled,
 # backup-guarded migration step is planned for the OpenClaw 2026.9 upgrade; until
 # then a crash loop only backs off and reports.
+
+if [ "$STATE_HOLD" = "true" ]; then
+  # Keep nginx/ttyd (and the health sensors) running so the user can inspect
+  # and restore; wait until the Supervisor stops the add-on.
+  while [ "$SHUTTING_DOWN" != "true" ]; do
+    sleep 30 &
+    wait "$!" || true
+  done
+  exit 0
+fi
 
 while true; do
   GW_START_SECONDS=$SECONDS
