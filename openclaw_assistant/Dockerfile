@@ -171,4 +171,20 @@ RUN chmod +x /run.sh /oc_config_helper.py /render_nginx.py /usr/local/bin/oc-cle
     /usr/local/libexec/oc-addon/openclaw \
     && mkdir -p /run/nginx
 
+# Route every `openclaw` executable through the add-on wrapper (refuses
+# `openclaw update`, independent of the caller's PATH order) and record the
+# pinned package entry and version it runs.
+RUN set -eu; \
+    W=/usr/local/libexec/oc-addon/openclaw; \
+    pkg="$(npm root -g)/openclaw"; \
+    test -f "$pkg/openclaw.mjs"; \
+    printf '%s\n' "$pkg/openclaw.mjs" > /usr/local/libexec/oc-addon/openclaw-entry; \
+    jq -r .version "$pkg/package.json" > /usr/local/libexec/oc-addon/openclaw-pinned-version; \
+    for bin in $(IFS=:; for d in $PATH; do [ -e "$d/openclaw" ] && echo "$d/openclaw"; done | sort -u); do \
+      if [ "$(readlink -f "$bin")" != "$(readlink -f "$W")" ]; then ln -sf "$W" "$bin"; fi; \
+    done; \
+    test "$(readlink -f "$(command -v openclaw)")" = "$(readlink -f "$W")"; \
+    openclaw --version; \
+    if openclaw update --help >/dev/null 2>&1; then echo "wrapper does not block update" >&2; exit 1; fi
+
 CMD [ "/run.sh" ]

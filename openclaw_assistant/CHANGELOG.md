@@ -7,19 +7,43 @@ All notable changes to the OpenClaw Assistant Home Assistant Add-on will be docu
 
 ## [0.5.93-full2] - 2026-10-09
 
-Preparation release ("stage A") for the later jump to OpenClaw 2026.9.x. **No OpenClaw change** — still `2026.7.35`. Contains everything from `0.5.93-full1` (which was never installed on this deployment): the LAN lockdown of port 48099, the upstream 0.5.93 merge, atomic config writes and the pre-upgrade state archive.
+Preparation release ("stage A") for the later jump to OpenClaw 2026.9.x. No OpenClaw change compared with `0.5.93-full1` (still `2026.7.35`).
+
+**Coming from `0.5.88-full1` (this deployment), this update also brings everything from `0.5.88-full2` and `0.5.93-full1`, neither of which was installed here:**
+- OpenClaw `2026.7.1-2` → `2026.7.35`. Same database schema; reversible by restoring the Home Assistant backup.
+- One-time Brave plugin reinstall `2026.7.1` → `2026.7.35` on the first start. Needs network; non-fatal.
+- The LAN lockdown of port 48099, the upstream 0.5.93 merge, atomic config writes and the pre-upgrade state archive.
+
+On the first start the archive captures the 7.1-2 state (`…-before-2026.7.35.tar.gz`). The rollback baseline for the 9.x upgrade is the separate `…-before-2026.9.x` archive that the 9.x release takes before its first start. Stop the add-on and create a Home Assistant backup before updating.
 
 ### Added
 - **`oc-upgrade`** helper:
-  - `oc-upgrade check` — read-only inventory before an OpenClaw upgrade: versions, database schema versions, pre-June-2026 leftovers (old task/flow/plugin databases and whether they were imported, legacy Telegram/Active Memory files, `credentials/oauth.json`), memory sidecar databases, model wildcards, free space. Prints names, sizes and versions only, never secret values. Exit code 0 / 4 notes / 2 possible bridge case / 3 state newer than this image.
-  - `oc-upgrade export` — on the next start, before the gateway starts, writes a cold copy of state and workspace (without logs, media, caches, earlier archives) to `/share/openclaw-rehearsal/<timestamp>/` for an offline upgrade rehearsal. The copy contains secrets; it is `0600` and comes with a manifest (sha256, versions).
+  - `oc-upgrade check` — read-only inventory before an OpenClaw upgrade. Prints names, sizes and versions only, never secret values. Exit code 0 / 4 notes / 2 possible bridge case / 3 state newer than this image. SQLite files are opened so that no `-wal`/`-shm` files are created. It covers:
+    - versions and database schema versions;
+    - pre-June-2026 leftovers: old task/flow/plugin databases and whether they were imported, legacy Telegram/Active Memory files, `credentials/oauth.json`;
+    - memory sidecar databases;
+    - model wildcards;
+    - free space.
+  - `oc-upgrade export` — on the next start, before the gateway starts, writes a cold copy to `/share/openclaw-rehearsal/<timestamp>/` for an offline upgrade rehearsal.
+    - Contents: `/config/.openclaw` including installed plugins, plus the workspace.
+    - Left out: logs, media, caches, earlier archives and workspace `node_modules`.
+    - The copy contains secrets. It is `0600`, comes with a manifest (sha256, versions), and an interrupted export is removed on the next start.
   - `oc-upgrade status` — hold reason, upgrade archives, pending export.
 
 ### Changed
-- **State newer than the image → HOLD instead of a silent runtime install.** If `/config/.openclaw` was written by a newer OpenClaw than the bundled one (newer `meta.lastTouchedVersion`, or — on a 2026.7.x runtime — a state/agent database with a schema version above 1), the add-on no longer `npm install -g`s that newer OpenClaw at boot (`repair_runtime_version_mismatch` is removed). It leaves the state untouched (no archive, no plugin install, no config repair, no lock cleanup), does not start OpenClaw, keeps the add-on page and terminal running and logs/records the reason (`oc-upgrade status`). This makes a Home Assistant restore after the 9.x upgrade safe: a mismatched image/data pair can no longer corrupt the data.
-- **`openclaw update` is refused** by a thin wrapper that is first on `PATH` for the add-on and its terminal (everything else is passed through via `exec`). The image pins the OpenClaw version; line upgrades need the add-on's backup and migration steps.
-- **GHCR version tags are immutable.** The build workflow no longer rebuilds an image tag that is already published (a push without a version bump builds nothing and leaves a warning). Home Assistant's backup restore re-pulls the add-on image by its version tag, so a rebuilt tag would silently change what a rollback restores.
-
+- **State newer than the image → HOLD instead of a silent runtime install.**
+  - **Trigger:** `/config/.openclaw` was written by a newer OpenClaw than the bundled one — a newer `meta.lastTouchedVersion`, or, on a 2026.7.x runtime, a state/agent database with a schema version above 1.
+  - **Before:** the add-on `npm install -g`ed that newer OpenClaw at boot. `repair_runtime_version_mismatch` is removed.
+  - **Now:** OpenClaw is not started and its config, databases, sessions and plugins are not modified: no archive, plugin install, config repair, MCP re-registration or session-lock cleanup, at start or at stop. The add-on page and terminal stay up, and the reason is logged and shown by `oc-upgrade status`.
+  - **Fail-safe:** the guard holds if it cannot complete.
+  - **Why:** a Home Assistant restore after the 9.x upgrade becomes safe, because a mismatched image/data pair can no longer corrupt the data.
+- **`openclaw update` is refused.**
+  - At image build time every `openclaw` executable is replaced by a wrapper that refuses `openclaw update` and `openclaw --update …`. Everything else is exec'd unchanged, regardless of the caller's PATH, including tools the agent runs.
+  - If the OpenClaw package inside the container is swapped anyway (e.g. `npm install -g openclaw@…`), the add-on detects that it no longer matches the image pin and does not (re)start OpenClaw.
+- **GHCR version tags are not rebuilt.**
+  - The build workflow skips a version tag that is already published: a push without a version bump builds nothing and leaves a warning.
+  - Runs are serialized, and only `main` publishes.
+  - Why: Home Assistant's backup restore re-pulls the add-on image by its version tag, so a rebuilt tag would silently change what a rollback restores.
 
 ## [0.5.93-full1] - 2026-09-27
 

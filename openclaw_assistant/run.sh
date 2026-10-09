@@ -698,6 +698,43 @@ require_upgrade_backup() {
   exit 1
 }
 
+# Bundled OpenClaw version (keeps a -N patch suffix such as 2026.7.1-2), for
+# the state guard and version-dependent config handling in the helpers.
+get_openclaw_version() {
+  local raw
+  raw="$(openclaw --version 2>/dev/null | head -n 1 || true)"
+  printf '%s\n' "$raw" | grep -oE '[0-9]{4}\.[0-9]+\.[0-9]+(-[0-9]+)?' | head -n 1 || true
+}
+OPENCLAW_RUNTIME_VERSION="$(get_openclaw_version)"
+export OPENCLAW_RUNTIME_VERSION
+# The image pins the OpenClaw version; never let the gateway apply an update on
+# its own (would bypass the image pin and any pre-upgrade backup).
+export OPENCLAW_NO_AUTO_UPDATE=1
+echo "INFO: OpenClaw runtime version: ${OPENCLAW_RUNTIME_VERSION:-unknown}"
+
+# The image routes every `openclaw` executable through the add-on wrapper and
+# records the pinned package version. If something inside the container swapped
+# the runtime (e.g. an `npm install -g openclaw@...` run by an agent), the
+# swapped runtime could migrate the state without the add-on's backup steps.
+runtime_integrity_problem() {
+  local wrapper="/usr/local/libexec/oc-addon/openclaw" pinned entry actual resolved
+  [ -f /usr/local/libexec/oc-addon/openclaw-pinned-version ] || return 0
+  pinned="$(head -n 1 /usr/local/libexec/oc-addon/openclaw-pinned-version 2>/dev/null || true)"
+  entry="$(head -n 1 /usr/local/libexec/oc-addon/openclaw-entry 2>/dev/null || true)"
+  if [ -z "$entry" ]; then
+    echo "the add-on's record of the pinned OpenClaw package is missing (broken image?)"
+    return 0
+  fi
+  actual="$(jq -r '.version // empty' "$(dirname "$entry")/package.json" 2>/dev/null || true)"
+  resolved="$(readlink -f "$(command -v openclaw 2>/dev/null || true)" 2>/dev/null || true)"
+  if [ -n "$pinned" ] && [ "$actual" != "$pinned" ]; then
+    echo "the OpenClaw package in the container is ${actual:-missing}, but this image pins ${pinned} (changed by npm inside the container?)"
+  elif [ "$resolved" != "$(readlink -f "$wrapper")" ]; then
+    echo "'openclaw' resolves to ${resolved:-nothing} instead of the add-on wrapper (another OpenClaw installed inside the container?)"
+  fi
+  return 0
+}
+
 # ------------------------------------------------------------------------------
 # State guard (HOLD)
 #
@@ -730,13 +767,20 @@ if command -v oc-upgrade >/dev/null 2>&1; then
 else
   echo "WARN: oc-upgrade is missing from the add-on image; state guard skipped."
 fi
+RUNTIME_PROBLEM="$(runtime_integrity_problem)"
+if [ -n "$RUNTIME_PROBLEM" ]; then
+  STATE_HOLD=true
+  STATE_HOLD_REASON="${STATE_HOLD_REASON:+${STATE_HOLD_REASON}
+}${RUNTIME_PROBLEM}. Reinstall or rebuild the add-on in Home Assistant to restore the pinned OpenClaw."
+fi
 
 if [ "$STATE_HOLD" = "true" ]; then
   {
-    echo "Persistent OpenClaw state is newer than the bundled runtime ($(openclaw_runtime_version || true)):"
+    echo "OpenClaw is held (bundled runtime ${OPENCLAW_RUNTIME_VERSION:-unknown}):"
     printf '%s\n' "$STATE_HOLD_REASON"
     echo "Restore the Home Assistant backup that matches this add-on version (or update to the add-on"
-    echo "version that wrote the state). OpenClaw is not started and nothing in /config/.openclaw is changed."
+    echo "version that wrote the state). OpenClaw is not started, and its config, databases, sessions and"
+    echo "plugins are not modified (built-in skill files are still refreshed from the image)."
   } > "${UPG_DIR}/hold.txt"
   echo "ERROR: ================================================================"
   echo "ERROR: HOLD — OpenClaw will NOT be started."
@@ -753,14 +797,26 @@ fi
 # Runs before anything starts or writes, so the copy is consistent.
 # ------------------------------------------------------------------------------
 process_export_request() {
-  local request="${UPG_DIR}/export-request" ts dest need_kb avail_kb archive
+  local request="${UPG_DIR}/export-request" ts dest need_kb avail_kb archive stale
+  # An interrupted export (power loss, SIGKILL) leaves a secret-bearing .tmp
+  # behind; remove those on every start, whether or not a new export is due.
+  for stale in /share/openclaw-rehearsal/*/openclaw-rehearsal.tar.gz.tmp; do
+    [ -e "$stale" ] || continue
+    echo "WARN: Removing incomplete rehearsal export ${stale}."
+    rm -f "$stale"
+    rmdir "$(dirname "$stale")" 2>/dev/null || true
+  done
   [ -f "$request" ] || return 0
   # One-shot: never retry on every boot, even after a failure.
   rm -f "$request"
+  if [ ! -d /share ]; then
+    echo "WARN: Rehearsal export skipped: /share is not available."
+    return 0
+  fi
   ts="$(date -u +%Y%m%d-%H%M%S)"
   dest="/share/openclaw-rehearsal/${ts}"
-  need_kb="$(du -skc "$OPENCLAW_CONFIG_DIR" /config/clawd 2>/dev/null | tail -n 1 | cut -f1)"
-  avail_kb="$(df -Pk /share 2>/dev/null | awk 'NR==2 {print $4}')"
+  need_kb="$(du -skc "$OPENCLAW_CONFIG_DIR" /config/clawd 2>/dev/null | tail -n 1 | cut -f1)" || need_kb=""
+  avail_kb="$(df -Pk /share 2>/dev/null | awk 'NR==2 {print $4}')" || avail_kb=""
   if [ -z "$need_kb" ] || [ -z "$avail_kb" ] || [ "$avail_kb" -lt "$need_kb" ]; then
     echo "WARN: Rehearsal export skipped: not enough free space in /share (need ~${need_kb:-?} KiB, have ${avail_kb:-?} KiB)."
     return 0
@@ -773,15 +829,17 @@ process_export_request() {
   archive="${dest}/openclaw-rehearsal.tar.gz"
   local members=(.openclaw)
   [ -d /config/clawd ] && members+=(clawd)
-  if tar -C /config \
+  # Plugin packages under .openclaw (npm/, extensions/) stay in the copy; only
+  # dependency trees inside the workspace are left out.
+  if (umask 077 && tar -C /config \
       --exclude='.openclaw/upgrade-backups' \
       --exclude='.openclaw/media' \
       --exclude='.openclaw/logs' \
       --exclude='.openclaw/.cache' \
       --exclude='.openclaw/tmp' \
-      --exclude='node_modules' \
-      --exclude='.git' \
-      -czf "${archive}.tmp" "${members[@]}" \
+      --exclude='clawd/node_modules' \
+      --exclude='clawd/*/node_modules' \
+      -czf "${archive}.tmp" "${members[@]}") \
      && mv "${archive}.tmp" "$archive"; then
     chmod 600 "$archive" 2>/dev/null || true
     {
@@ -1020,7 +1078,7 @@ shutdown() {
 
   stop_gw_relay
 
-  if [ "$CLEAN_LOCKS_ON_EXIT" = "true" ]; then
+  if [ "$CLEAN_LOCKS_ON_EXIT" = "true" ] && [ "${STATE_HOLD:-false}" != "true" ]; then
     cleanup_session_locks || true
   fi
 }
@@ -1031,20 +1089,6 @@ if ! command -v openclaw >/dev/null 2>&1; then
   echo "ERROR: openclaw is not installed."
   exit 1
 fi
-
-get_openclaw_version() {
-  local raw
-  raw="$(openclaw --version 2>/dev/null | head -n 1 || true)"
-  printf '%s\n' "$raw" | grep -oE '[0-9]{4}\.[0-9]+\.[0-9]+' | head -n 1 || true
-}
-
-# Bundled OpenClaw version, for version-dependent config handling in the helper.
-OPENCLAW_RUNTIME_VERSION="$(get_openclaw_version)"
-export OPENCLAW_RUNTIME_VERSION
-# The image pins the OpenClaw version; never let the gateway apply an update on
-# its own (would bypass the image pin and any pre-upgrade backup).
-export OPENCLAW_NO_AUTO_UPDATE=1
-echo "INFO: OpenClaw runtime version: ${OPENCLAW_RUNTIME_VERSION:-unknown}"
 
 # Bootstrap minimal OpenClaw config ONLY if missing.
 # We do not overwrite or patch existing configs; onboarding owns everything else.
@@ -1364,7 +1408,9 @@ fi
 # Runs once; re-runs when the token or the Home Assistant URL changes.
 # Auto-detects HA API URL: supervisor proxy if available, else localhost:8123.
 # ------------------------------------------------------------------------------
-if [ "$AUTO_CONFIGURE_MCP" = "true" ] && [ -n "$HA_TOKEN" ]; then
+if [ "$STATE_HOLD" = "true" ]; then
+  echo "INFO: HOLD: skipping MCP auto-configuration."
+elif [ "$AUTO_CONFIGURE_MCP" = "true" ] && [ -n "$HA_TOKEN" ]; then
   if command -v mcporter >/dev/null 2>&1; then
     # Detect HA API URL. This add-on runs with host_network: true, so the
     # container is not on the Supervisor bridge network and the `supervisor`
@@ -1887,6 +1933,14 @@ while true; do
   # The relay holds 127.0.0.1:GATEWAY_PORT — leaving it up causes the new gateway
   # to detect the port as occupied and exit with code 1, re-entering the loop.
   stop_gw_relay
+
+  RUNTIME_PROBLEM="$(runtime_integrity_problem)"
+  if [ -n "$RUNTIME_PROBLEM" ]; then
+    echo "ERROR: Not restarting OpenClaw: ${RUNTIME_PROBLEM}."
+    echo "ERROR: Reinstall or rebuild the add-on in Home Assistant to restore the pinned OpenClaw."
+    sleep 60
+    continue
+  fi
 
   if ! start_openclaw_runtime; then
     echo "ERROR: Failed to restart OpenClaw runtime; retrying in 5s..."

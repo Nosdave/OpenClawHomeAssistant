@@ -14,6 +14,12 @@ on:
       - ".github/workflows/build-image.yaml"
   workflow_dispatch: {}
 
+# One publish at a time: the "existing tag" check below is check-then-push, so
+# two concurrent runs could otherwise both see a version tag as new.
+concurrency:
+  group: build-image
+  cancel-in-progress: false
+
 permissions:
   contents: read
   packages: write
@@ -24,6 +30,8 @@ env:
 
 jobs:
   build:
+    # Only main publishes version tags and :latest (also for manual dispatches).
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04-arm   # native aarch64 runner (GA since 2025) — no QEMU
     steps:
       - name: Checkout

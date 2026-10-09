@@ -103,8 +103,43 @@ def header_user_version(path):
     return int.from_bytes(head[60:64], "big")
 
 
+def _is_wal_mode(path):
+    """Header bytes 18/19 == 2 mark a WAL-mode database."""
+    try:
+        with open(path, "rb") as f:
+            head = f.read(20)
+    except OSError:
+        return False
+    return len(head) >= 20 and head[18] == 2 and head[19] == 2
+
+
 def _query_ro(path, sql):
-    con = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=2)
+    """Run a read-only query without creating or modifying any file.
+
+    - WAL database without -wal/-shm (closed and fully checkpointed): open with
+      immutable=1 — there is nothing to replay, and SQLite then creates no
+      -shm/-wal companions.
+    - Companions present, or not a WAL database: plain mode=ro uses what exists
+      and creates nothing new.
+    - Non-empty -wal but no -shm: query a private copy of database + WAL.
+    """
+    wal, shm = Path(f"{path}-wal"), Path(f"{path}-shm")
+    wal_has_data = wal.exists() and wal.stat().st_size > 0
+    if wal_has_data and not shm.exists():
+        with tempfile.TemporaryDirectory(prefix="oc-upgrade-") as tmp:
+            copy = Path(tmp) / "db.sqlite"
+            shutil.copyfile(path, copy)
+            shutil.copyfile(wal, Path(f"{copy}-wal"))
+            con = sqlite3.connect(str(copy), timeout=2)
+            try:
+                return con.execute(sql).fetchall()
+            finally:
+                con.close()
+    if _is_wal_mode(path) and not wal.exists() and not shm.exists():
+        uri = f"file:{path}?mode=ro&immutable=1"
+    else:
+        uri = f"file:{path}?mode=ro"
+    con = sqlite3.connect(uri, uri=True, timeout=2)
     try:
         return con.execute(sql).fetchall()
     finally:
@@ -115,8 +150,7 @@ def user_version(path):
     """Schema version of a SQLite file without writing to it.
 
     The header is authoritative unless a non-empty WAL may carry a newer page 1;
-    then ask SQLite read-only, and if that is not possible (no -shm), read a
-    private copy of the database + WAL.
+    then ask SQLite read-only (see _query_ro; never creates or changes files).
     """
     header = header_user_version(path)
     wal = Path(f"{path}-wal")
@@ -124,18 +158,6 @@ def user_version(path):
         return header
     try:
         return int(_query_ro(path, "PRAGMA user_version")[0][0])
-    except sqlite3.Error:
-        pass
-    try:
-        with tempfile.TemporaryDirectory(prefix="oc-upgrade-") as tmp:
-            copy = Path(tmp) / "db.sqlite"
-            shutil.copyfile(path, copy)
-            shutil.copyfile(wal, Path(f"{copy}-wal"))
-            con = sqlite3.connect(str(copy), timeout=2)
-            try:
-                return int(con.execute("PRAGMA user_version").fetchone()[0])
-            finally:
-                con.close()
     except (OSError, sqlite3.Error):
         return header
 
@@ -178,8 +200,9 @@ def newer_state_reasons(runtime):
     """Reasons why the persistent state is newer than `runtime` (empty = fine)."""
     reasons = []
     cfg = read_config()
-    if isinstance(cfg, dict):
-        touched = version_tuple((cfg.get("meta") or {}).get("lastTouchedVersion"))
+    meta = cfg.get("meta") if isinstance(cfg, dict) else None
+    if isinstance(meta, dict):
+        touched = version_tuple(meta.get("lastTouchedVersion"))
         if runtime and touched and touched > runtime:
             reasons.append(
                 f"openclaw.json was last written by OpenClaw {fmt_version(touched)}, "
@@ -200,7 +223,11 @@ def cmd_state_guard(_args):
     if runtime is None:
         print("WARN: could not determine the bundled OpenClaw version; state guard skipped")
         return RC_OK
-    reasons = newer_state_reasons(runtime)
+    try:
+        reasons = newer_state_reasons(runtime)
+    except Exception as exc:  # fail closed: a guard that crashes must not let OpenClaw start
+        print(f"state guard could not complete ({type(exc).__name__}: {exc}); holding to be safe — run 'oc-upgrade check'")
+        return RC_NEWER
     for r in reasons:
         print(r)
     return RC_NEWER if reasons else RC_OK
@@ -216,7 +243,7 @@ def legacy_db_rows(path):
         for t in tables:
             total += int(_query_ro(path, f'SELECT COUNT(*) FROM "{t}"')[0][0])
         return total
-    except sqlite3.Error:
+    except (OSError, sqlite3.Error):
         return None
 
 
@@ -239,7 +266,8 @@ def cmd_check(_args):
     cfg = read_config()
     print("\n== A Versions")
     print(f"  bundled OpenClaw:      {fmt_version(runtime)}")
-    touched = (cfg or {}).get("meta", {}).get("lastTouchedVersion") if isinstance(cfg, dict) else None
+    meta = cfg.get("meta") if isinstance(cfg, dict) else None
+    touched = meta.get("lastTouchedVersion") if isinstance(meta, dict) else None
     print(f"  openclaw.json written by: {touched or 'unknown'}")
     if cfg is None and CONFIG_PATH.exists():
         print("  NOTE: openclaw.json is not valid JSON")
@@ -252,7 +280,7 @@ def cmd_check(_args):
         try:
             row = _query_ro(state_db, "SELECT app_version FROM schema_meta WHERE meta_key='startup-migrations'")
             print(f"  startup-migrations checkpoint: {row[0][0] if row else 'none'}")
-        except sqlite3.Error:
+        except (OSError, sqlite3.Error):
             print("  startup-migrations checkpoint: n/a")
     reasons = newer_state_reasons(runtime)
     for r in reasons:
@@ -406,8 +434,8 @@ def cmd_export(args):
     state_size = du_bytes(STATE_DIR)
     print("Export requested. Restart the add-on to create it:")
     print("  - it runs on the next start, BEFORE the gateway starts (Telegram is offline for a few minutes);")
-    print("  - the copy goes to /share/openclaw-rehearsal/<timestamp>/ (state + workspace, without logs, media,")
-    print("    caches and earlier archives);")
+    print("  - the copy goes to /share/openclaw-rehearsal/<timestamp>/ (state incl. installed plugins + workspace,")
+    print("    without logs, media, caches, earlier archives and workspace node_modules);")
     if state_size is not None:
         print(f"  - current state size: {human(state_size)} before compression;")
     print("  - THE COPY CONTAINS SECRETS (tokens, OAuth logins). Move it only to a machine you trust and")
