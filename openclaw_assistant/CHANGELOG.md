@@ -35,11 +35,11 @@ On the first start the archive captures the 7.1-2 state (`…-before-2026.7.35.t
   - **Trigger:** `/config/.openclaw` was written by a newer OpenClaw than the bundled one — a newer `meta.lastTouchedVersion`, or, on a 2026.7.x runtime, a state/agent database with a schema version above 1.
   - **Before:** the add-on `npm install -g`ed that newer OpenClaw at boot. `repair_runtime_version_mismatch` is removed.
   - **Now:** OpenClaw is not started and its config, databases, sessions and plugins are not modified: no archive, plugin install, config repair, MCP re-registration or session-lock cleanup, at start or at stop. The add-on page and terminal stay up, and the reason is logged and shown by `oc-upgrade status`.
-  - **Fail-safe:** the guard holds if it cannot complete.
+  - **Fail-safe:** the guard holds if it cannot complete, including when a database's WAL cannot be read; it never falls back to a possibly stale header.
   - **Why:** a Home Assistant restore after the 9.x upgrade becomes safe, because a mismatched image/data pair can no longer corrupt the data.
 - **`openclaw update` is refused.**
   - At image build time every `openclaw` executable is replaced by a wrapper that refuses `openclaw update` and `openclaw --update …`. Everything else is exec'd unchanged. The wrapper is also placed in every standard bin directory, so it applies whatever the caller's PATH, including tools the agent runs, and a plain `npm install -g openclaw@…` fails with `EEXIST` instead of shadowing it.
-  - If another OpenClaw is forced into the container anyway, the add-on holds instead of (re)starting OpenClaw. It checks at start and before every gateway restart for an extra `openclaw` in a bin directory, a second package, or a pinned package whose version changed. Until the next check, such a CLI can still be run by hand or by an agent.
+  - If another OpenClaw is forced into the container anyway, the add-on holds instead of (re)starting OpenClaw. It checks at start and whenever the gateway process exits or self-restarts, before adopting a new daemon, for an extra `openclaw` in a bin directory, a second package, or a pinned package whose version changed. A gateway that may already run the swapped code is stopped. Until the next check, such a CLI can still be run by hand or by an agent.
 - **GHCR version tags are not rebuilt.**
   - The build workflow skips a version tag that is already published: a push without a version bump builds nothing and leaves a warning.
   - Publishing runs are serialized (job-level concurrency), and only `main` publishes.

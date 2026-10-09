@@ -810,10 +810,12 @@ if [ "$STATE_HOLD" = "true" ]; then
     fi
     echo "OpenClaw is not started, and its config, databases, sessions and plugins are not modified"
     echo "(built-in skill files are still refreshed from the image)."
-  } > "${UPG_DIR}/hold.txt"
+  } > "${UPG_DIR}/hold.txt" 2>/dev/null || true
   echo "ERROR: ================================================================"
   echo "ERROR: HOLD — OpenClaw will NOT be started."
-  sed 's/^/ERROR: /' "${UPG_DIR}/hold.txt"
+  printf '%s\n' "$STATE_HOLD_REASON" | sed 's/^/ERROR: /'
+  [ -n "$RUNTIME_PROBLEM" ] && echo "ERROR: Reinstall or rebuild the add-on in Home Assistant to restore the pinned OpenClaw runtime."
+  [ "$STATE_NEWER" = "true" ] && echo "ERROR: Restore the Home Assistant backup that matches this add-on version."
   echo "ERROR: The add-on page and terminal stay available. Details: oc-upgrade status"
   echo "ERROR: ================================================================"
 else
@@ -844,7 +846,13 @@ process_export_request() {
   fi
   ts="$(date -u +%Y%m%d-%H%M%S)"
   dest="/share/openclaw-rehearsal/${ts}"
-  need_kb="$(du -skc "$OPENCLAW_CONFIG_DIR" /config/clawd 2>/dev/null | tail -n 1 | cut -f1)" || need_kb=""
+  # Estimate with the same exclusions as the archive below (uncompressed size,
+  # so a safe upper bound for the compressed export).
+  need_kb="$(du -skc \
+      --exclude='.openclaw/upgrade-backups' --exclude='.openclaw/media' \
+      --exclude='.openclaw/logs' --exclude='.openclaw/.cache' --exclude='.openclaw/tmp' \
+      --exclude='clawd/node_modules' --exclude='clawd/*/node_modules' \
+      "$OPENCLAW_CONFIG_DIR" /config/clawd 2>/dev/null | tail -n 1 | cut -f1)" || need_kb=""
   avail_kb="$(df -Pk /share 2>/dev/null | awk 'NR==2 {print $4}')" || avail_kb=""
   if [ -z "$need_kb" ] || [ -z "$avail_kb" ] || [ "$avail_kb" -lt "$need_kb" ]; then
     echo "WARN: Rehearsal export skipped: not enough free space in /share (need ~${need_kb:-?} KiB, have ${avail_kb:-?} KiB)."
@@ -871,16 +879,19 @@ process_export_request() {
       -czf "${archive}.tmp" "${members[@]}") \
      && mv "${archive}.tmp" "$archive"; then
     chmod 600 "$archive" 2>/dev/null || true
-    {
-      echo "created_utc=${ts}"
-      echo "addon_version=${ADDON_VERSION:-unknown}"
-      echo "openclaw_runtime=$(openclaw_runtime_version || true)"
-      echo "sha256=$(sha256sum "$archive" | cut -d' ' -f1)"
-      echo "size_bytes=$(stat -c %s "$archive")"
-      echo "contains_secrets=yes"
-    } > "${dest}/manifest.txt"
-    chmod 600 "${dest}/manifest.txt" 2>/dev/null || true
-    echo "INFO: Rehearsal export ready: ${archive} ($(du -h "$archive" | cut -f1)). It contains secrets — delete it after the rehearsal."
+    if (umask 077 && {
+          echo "created_utc=${ts}"
+          echo "addon_version=${ADDON_VERSION:-unknown}"
+          echo "openclaw_runtime=$(openclaw_runtime_version || true)"
+          echo "sha256=$(sha256sum "$archive" | cut -d' ' -f1)"
+          echo "size_bytes=$(stat -c %s "$archive")"
+          echo "contains_secrets=yes"
+        } > "${dest}/manifest.txt") 2>/dev/null; then
+      echo "INFO: Rehearsal export ready: ${archive} ($(du -h "$archive" 2>/dev/null | cut -f1)). It contains secrets — delete it after the rehearsal."
+    else
+      rm -f "${dest}/manifest.txt" 2>/dev/null || true
+      echo "WARN: Rehearsal export written to ${archive}, but its manifest could not be written (disk full?). Startup continues."
+    fi
   else
     rm -f "${archive}.tmp"
     echo "WARN: Rehearsal export failed; nothing was changed. Startup continues."
@@ -1889,6 +1900,41 @@ while true; do
     break
   fi
 
+  # A runtime swapped inside the container (e.g. `npm install -g openclaw@...`)
+  # must not be (re)started or adopted after a self-restart: check before the
+  # daemon detection below, stop a daemon that may already run the swapped
+  # code, and hold here without counting it as a crash.
+  RUNTIME_PROBLEM="$(runtime_integrity_problem)"
+  if [ -n "$RUNTIME_PROBLEM" ]; then
+    if [ "$RUNTIME_PROBLEM" != "${LAST_RUNTIME_PROBLEM:-}" ]; then
+      {
+        echo "OpenClaw is held (bundled runtime ${OPENCLAW_RUNTIME_VERSION:-unknown}):"
+        echo "${RUNTIME_PROBLEM}."
+        echo "Reinstall or rebuild the add-on in Home Assistant to restore the pinned OpenClaw runtime."
+      } > "${UPG_DIR}/hold.txt" 2>/dev/null || true
+      echo "ERROR: HOLD — not restarting OpenClaw: ${RUNTIME_PROBLEM}."
+      echo "ERROR: Reinstall or rebuild the add-on in Home Assistant. Details: oc-upgrade status"
+      LAST_RUNTIME_PROBLEM="$RUNTIME_PROBLEM"
+    fi
+    _swapped_pid="$(ss -tlnp 2>/dev/null | grep ":${GATEWAY_INTERNAL_PORT} " \
+      | sed -n 's/.*pid=\([0-9]*\).*/\1/p' | head -1 || true)"
+    [ -n "$_swapped_pid" ] || _swapped_pid="$(pgrep -f "openclaw-gateway" 2>/dev/null | head -1 || true)"
+    if [ -n "$_swapped_pid" ] && kill -0 "$_swapped_pid" 2>/dev/null; then
+      echo "ERROR: Stopping gateway PID ${_swapped_pid} (it may run the swapped OpenClaw)."
+      kill -TERM "$_swapped_pid" 2>/dev/null || true
+    fi
+    stop_gw_relay
+    sleep 60 &
+    wait "$!" || true
+    if [ "$SHUTTING_DOWN" = "true" ]; then
+      break
+    fi
+    GW_IS_CHILD=true
+    GW_PID=""
+    continue
+  fi
+  LAST_RUNTIME_PROBLEM=""
+
   # --- Detect self-restart ---------------------------------------------------
   # Try up to 10 times (≈ 20 s) using all 3 tiers of find_gateway_daemon_pid.
   # Tier 3 (/proc scan) usually finds the daemon on the very first attempt
@@ -1939,31 +1985,6 @@ while true; do
   if [ "$GW_UPTIME" -ge 120 ]; then
     GW_FAIL_STREAK=0
   fi
-  # A runtime swapped inside the container (e.g. `npm install -g openclaw@...`)
-  # must not be (re)started: hold here, without counting it as a crash.
-  RUNTIME_PROBLEM="$(runtime_integrity_problem)"
-  if [ -n "$RUNTIME_PROBLEM" ]; then
-    if [ "$RUNTIME_PROBLEM" != "${LAST_RUNTIME_PROBLEM:-}" ]; then
-      {
-        echo "OpenClaw is held (bundled runtime ${OPENCLAW_RUNTIME_VERSION:-unknown}):"
-        echo "${RUNTIME_PROBLEM}."
-        echo "Reinstall or rebuild the add-on in Home Assistant to restore the pinned OpenClaw runtime."
-      } > "${UPG_DIR}/hold.txt"
-      echo "ERROR: HOLD — not restarting OpenClaw: ${RUNTIME_PROBLEM}."
-      echo "ERROR: Reinstall or rebuild the add-on in Home Assistant. Details: oc-upgrade status"
-      LAST_RUNTIME_PROBLEM="$RUNTIME_PROBLEM"
-    fi
-    stop_gw_relay
-    sleep 60 &
-    wait "$!" || true
-    if [ "$SHUTTING_DOWN" = "true" ]; then
-      break
-    fi
-    GW_IS_CHILD=true
-    GW_PID=""
-    continue
-  fi
-  LAST_RUNTIME_PROBLEM=""
 
   GW_FAIL_STREAK=$((GW_FAIL_STREAK + 1))
   GW_BACKOFF=$((2 ** (GW_FAIL_STREAK < 6 ? GW_FAIL_STREAK : 6)))

@@ -147,11 +147,16 @@ def _query_ro(path, sql):
             raise
         return _query_private_copy(path, sql)
 
+class SchemaUnknown(Exception):
+    """The schema version of a database could not be determined safely."""
+
+
 def user_version(path):
     """Schema version of a SQLite file without writing to it.
 
     The header is authoritative unless a non-empty WAL may carry a newer page 1;
     then ask SQLite read-only (see _query_ro; never creates or changes files).
+    Raises SchemaUnknown if that WAL cannot be read.
     """
     header = header_user_version(path)
     wal = Path(f"{path}-wal")
@@ -159,8 +164,10 @@ def user_version(path):
         return header
     try:
         return int(_query_ro(path, "PRAGMA user_version")[0][0])
-    except (OSError, sqlite3.Error):
-        return header
+    except (OSError, sqlite3.Error) as exc:
+        # The newer schema may live only in the WAL: never fall back to the
+        # (possibly stale) header here.
+        raise SchemaUnknown(f"{rel(path)}: WAL present but unreadable ({type(exc).__name__}: {exc})") from exc
 
 
 def core_databases():
@@ -211,7 +218,11 @@ def newer_state_reasons(runtime):
             )
     if runtime and runtime < FIRST_MIGRATING_LINE:
         for db in core_databases():
-            uv = user_version(db)
+            try:
+                uv = user_version(db)
+            except SchemaUnknown as exc:
+                reasons.append(f"could not determine the schema version safely: {exc}")
+                continue
             if uv is not None and uv > JULY_LINE_SCHEMA:
                 reasons.append(
                     f"{rel(db)} has schema version {uv}; OpenClaw {fmt_version(runtime)} only understands {JULY_LINE_SCHEMA}"
@@ -275,7 +286,10 @@ def cmd_check(_args):
         notes.append("openclaw.json unreadable")
         bump(RC_NOTES)
     for db in core_databases():
-        print(f"  schema {rel(db)}: {user_version(db)}")
+        try:
+            print(f"  schema {rel(db)}: {user_version(db)}")
+        except SchemaUnknown as exc:
+            print(f"  schema {rel(db)}: UNKNOWN ({exc})")
     state_db = STATE_DIR / "state" / "openclaw.sqlite"
     if state_db.exists():
         try:
@@ -352,14 +366,23 @@ def cmd_check(_args):
 
     print("\n== F Model wildcards")
     wildcards = []
-    if isinstance(cfg, dict):
-        agents = cfg.get("agents") or {}
-        for key in ((agents.get("defaults") or {}).get("models") or {}):
+    agents = cfg.get("agents") if isinstance(cfg, dict) else None
+    if agents is not None and not isinstance(agents, dict):
+        print("  NOTE: 'agents' is not an object in openclaw.json")
+        notes.append("openclaw.json has an unexpected 'agents' section")
+        bump(RC_NOTES)
+        agents = None
+    if isinstance(agents, dict):
+        defaults = agents.get("defaults")
+        models = defaults.get("models") if isinstance(defaults, dict) else None
+        for key in (models if isinstance(models, dict) else {}):
             if str(key).endswith("*"):
                 wildcards.append(str(key))
-        for entry in agents.get("list") or []:
+        entries = agents.get("list")
+        for entry in (entries if isinstance(entries, list) else []):
             if isinstance(entry, dict):
-                for key in (entry.get("models") or {}):
+                entry_models = entry.get("models")
+                for key in (entry_models if isinstance(entry_models, dict) else {}):
                     if str(key).endswith("*"):
                         wildcards.append(f"{entry.get('id', '?')}: {key}")
     print(f"  {wildcards if wildcards else 'none'}")
