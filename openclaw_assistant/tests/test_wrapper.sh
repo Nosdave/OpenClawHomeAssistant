@@ -37,7 +37,7 @@ check() {
 # ------------------------------------------------------------------------------
 # 1. Wrapper
 # ------------------------------------------------------------------------------
-mkdir -p "$T/oc-addon" "$T/pkg" "$T/bin" "$T/fakebin" "$T/upg"
+mkdir -p "$T/oc-addon" "$T/pkg" "$T/bin" "$T/fakebin" "$T/brewbin" "$T/upg"
 cp "$WRAPPER_SRC" "$T/oc-addon/openclaw"
 chmod +x "$T/oc-addon/openclaw"
 ENTRY="$T/pkg/openclaw.mjs"
@@ -55,17 +55,26 @@ printf '\n'
 exit 0
 EOF
 chmod +x "$T/fakebin/node"
+# The image's Node, recorded at build time (Dockerfile: openclaw-node).
+printf '%s\n' "$T/fakebin/node" > "$T/oc-addon/openclaw-node"
+# A Homebrew node that comes first on PATH (run.sh puts linuxbrew/bin early).
+printf '#!/bin/sh\necho BREW-NODE "$@"\n' > "$T/brewbin/node"
+chmod +x "$T/brewbin/node"
 
 OC="$T/bin/openclaw"
 HOLD_FILE="$T/upg/hold.txt"
 EXTRA_ENV=()
 
-# Run the wrapper with a controlled environment; sets OUT, ERR, RC.
+# Run the wrapper with a controlled environment; sets OUT, ERR, RC and
+# DIR_WARNED (the OC_UPGRADE_DIR override warning, which is not part of ERR:
+# every test points OC_UPGRADE_DIR at its own HOLD directory).
+DIR_WARNING="— add-on safety checks bypassed (HOLD marker not read from /config/.openclaw-upgrade)"
 invoke() {
-  OUT="$(env -u OC_ADDON_UNSAFE PATH="$T/fakebin:/usr/bin:/bin" OC_UPGRADE_DIR="$T/upg" \
+  OUT="$(env -u OC_ADDON_UNSAFE PATH="$T/brewbin:/usr/bin:/bin" OC_UPGRADE_DIR="$T/upg" \
            ${EXTRA_ENV[@]+"${EXTRA_ENV[@]}"} "$OC" "$@" 2>"$T/stderr")"
   RC=$?
-  ERR="$(cat "$T/stderr")"
+  ERR="$(grep -vF -- "$DIR_WARNING" "$T/stderr" || true)"
+  if grep -qF -- "$DIR_WARNING" "$T/stderr"; then DIR_WARNED=true; else DIR_WARNED=false; fi
 }
 
 expected_exec() {
@@ -243,6 +252,41 @@ deny "$DOCTOR_MSG" doctor --fix
 printf 'garbage\n' > "$T/oc-addon/openclaw-pinned-version"
 deny "$DOCTOR_MSG" doctor --fix
 printf '2026.9.9\n' > "$T/oc-addon/openclaw-pinned-version"
+
+# --- the image's Node, never a Homebrew node first on PATH (F8) ---------------
+# invoke puts $T/brewbin first on PATH: every allow() above already proved that
+# the recorded node ran. Without a usable record, PATH is the fallback.
+invoke status
+check "node: recorded image node not used (out='$OUT')" [ "$OUT" = "$(expected_exec status)" ]
+printf '%s\n' "$T/missing/node" > "$T/oc-addon/openclaw-node"
+invoke status
+check "node: stale record did not fall back to PATH (out='$OUT')" [ "$OUT" = "BREW-NODE $ENTRY status" ]
+rm -f "$T/oc-addon/openclaw-node"
+EXTRA_ENV=(PATH="$T/fakebin:/usr/bin:/bin")
+allow status
+EXTRA_ENV=()
+printf '%s\n' "$T/fakebin/node" > "$T/oc-addon/openclaw-node"
+
+# --- OC_UPGRADE_DIR override: warned like OC_ADDON_UNSAFE (F14) ---------------
+invoke status
+check "upgrade dir: override not warned (err='$(cat "$T/stderr")')" [ "$DIR_WARNED" = "true" ]
+check "upgrade dir: warning lacks the directory" grep -qF "openclaw: OC_UPGRADE_DIR=$T/upg $DIR_WARNING" "$T/stderr"
+for d in /config/.openclaw-upgrade /config/.openclaw-upgrade/; do
+  EXTRA_ENV=(OC_UPGRADE_DIR="$d")
+  allow status
+  check "upgrade dir: default $d warned" [ "$DIR_WARNED" = "false" ]
+done
+EXTRA_ENV=(OC_UPGRADE_DIR=)
+allow status
+check "upgrade dir: empty value warned" [ "$DIR_WARNED" = "false" ]
+EXTRA_ENV=(OC_ADDON_UNSAFE=1)
+allow_unsafe status
+check "upgrade dir: warned twice with OC_ADDON_UNSAFE=1" [ "$DIR_WARNED" = "false" ]
+EXTRA_ENV=()
+printf 'held\n' > "$HOLD_FILE"
+deny "$HOLD_MSG" status
+check "upgrade dir: no warning in HOLD" [ "$DIR_WARNED" = "true" ]
+rm -f "$HOLD_FILE"
 
 # --- broken install: entry missing -> 127 -------------------------------------
 mv "$ENTRY" "$ENTRY.away"
@@ -496,6 +540,102 @@ check "shutdown: stubborn run did not finish" grep -q "RESULT stopped" "$T/stop/
 env STUBBORN=0 bash "$T/stop/runner.sh" > "$T/stop/quick.log" 2>&1 || true
 check "shutdown: quick stop warned" bash -c "! grep -q 'still stopping' '$T/stop/quick.log'"
 check "shutdown: quick stop did not finish" grep -q "RESULT stopped" "$T/stop/quick.log"
+
+# ------------------------------------------------------------------------------
+# 5. run.sh main loop: a stop request during the crash-restart window (daemon
+#    detection, backoff) never starts another gateway, and the loop leaves at
+#    once (sleeps are `sleep & wait`). Sleeps are scaled down 10x.
+# ------------------------------------------------------------------------------
+main_loop="$(awk '/^while true; do$/ { on = 1 } on { print } on && /^done$/ { exit }' "$RUN_SH")"
+if [ -z "$main_loop" ]; then
+  fail "run.sh has no top-level 'while true; do ... done' main loop"
+fi
+mkdir -p "$T/loop"
+{
+  cat <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+sleep() { command sleep "$(awk -v s="$1" 'BEGIN { printf "%.3f", s / 10 }')"; }
+ss() { return 1; }
+STATE_HOLD=false SHUTTING_DOWN=false GW_IS_CHILD=true GW_FAIL_STREAK="${START_STREAK:-0}"
+GW_CRASH_LOOP_HOLD_AFTER=10 GATEWAY_MODE=local GATEWAY_INTERNAL_PORT=59999 OPENCLAW_RUNTIME_VERSION=2026.9.9
+HEALTH_PID="" NGINX_PID="" TTYD_PID="" GW_RELAY_PID="" CLEAN_LOCKS_ON_EXIT=false UPG_DIR="$1"
+runtime_at_least() { return 0; }
+runtime_integrity_problem() { :; }
+find_gateway_daemon_pid() { return 1; }
+stop_gw_relay() { :; }
+start_gw_relay() { :; }
+cleanup_session_locks() { :; }
+STARTS=0
+start_openclaw_runtime() {
+  STARTS=$((STARTS + 1))
+  echo "START #${STARTS} SHUTTING_DOWN=${SHUTTING_DOWN}"
+  ( command sleep 0.3; exit 1 ) &
+  GW_PID=$!
+}
+EOF
+  extract_function shutdown
+  echo 'trap shutdown INT TERM'
+  echo 'start_openclaw_runtime'
+  printf '%s\n' "$main_loop"
+  echo 'echo "RESULT starts=${STARTS}"'
+} > "$T/loop/runner.sh"
+
+# loop_case NAME TERM_AFTER_SECONDS START_STREAK: TERM at the given time; checks
+# that no gateway starts after the stop and that the loop leaves within 2 s.
+loop_case() {
+  local name="$1" after="$2" streak="$3" pid t0 t1 ms
+  local d="$T/loop/$name"
+  mkdir -p "$d"
+  START_STREAK="$streak" bash "$T/loop/runner.sh" "$d" > "$d/log" 2>&1 &
+  pid=$!
+  sleep "$after"
+  t0="$(date +%s%N)"
+  kill -TERM "$pid" 2>/dev/null || true
+  wait "$pid" || true
+  t1="$(date +%s%N)"
+  ms=$(( (t1 - t0) / 1000000 ))
+  if grep -q "START #[0-9]* SHUTTING_DOWN=true" "$d/log" || ! grep -q "^RESULT starts=1$" "$d/log"; then
+    fail "loop[$name]: a gateway was started after the stop request:"
+    sed 's/^/    | /' "$d/log" >&2
+  else
+    pass
+  fi
+  if [ "$ms" -lt 2000 ]; then pass; else fail "loop[$name]: the loop took ${ms} ms to leave after TERM"; fi
+}
+# gateway exits at 0.3 s; detection 0.3-2.3 s; TERM during the detection retries
+loop_case detection 1 0
+# streak 5 -> backoff 60 s (6 s scaled) from about 2.3 s; TERM during the backoff
+loop_case backoff 4 5
+# control: without a stop request the loop does restart the gateway
+d="$T/loop/control"
+mkdir -p "$d"
+START_STREAK=0 bash "$T/loop/runner.sh" "$d" > "$d/log" 2>&1 &
+pid=$!
+sleep 4
+kill -TERM "$pid" 2>/dev/null || true
+wait "$pid" || true
+check "loop[control]: the gateway was not restarted" grep -q "^START #2 SHUTTING_DOWN=false$" "$d/log"
+
+# ------------------------------------------------------------------------------
+# 6. run.sh: a stop request during startup skips the cold export and the 7.x
+#    pre-upgrade backup (the Supervisor would kill them mid-way).
+# ------------------------------------------------------------------------------
+backup_line="$(grep -m1 'then require_upgrade_backup; fi$' "$RUN_SH" || true)"
+export_block="$(grep -B1 -A1 '^  process_export_request$' "$RUN_SH" || true)"
+if [ -z "$backup_line" ] || [ "$(printf '%s\n' "$export_block" | wc -l)" -ne 3 ]; then
+  fail "run.sh: require_upgrade_backup / process_export_request call sites not found"
+fi
+{
+  echo 'runtime_at_least() { return 1; }'
+  echo 'require_upgrade_backup() { echo BACKUP; }'
+  echo 'process_export_request() { echo EXPORT; }'
+  printf '%s\n' "$backup_line" "$export_block"
+} > "$T/startup-guards.sh"
+check "startup: export/backup ran after a stop request" \
+  [ -z "$(bash -c "set -eu; SHUTTING_DOWN=true; . '$T/startup-guards.sh'")" ]
+check "startup: export/backup skipped without a stop request" \
+  [ "$(bash -c "set -eu; SHUTTING_DOWN=false; . '$T/startup-guards.sh'" | tr '\n' ' ')" = "BACKUP EXPORT " ]
 
 echo "wrapper: $WRAPPER_PASS passed, $WRAPPER_FAIL failed; total: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]

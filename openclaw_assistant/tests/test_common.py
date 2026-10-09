@@ -120,9 +120,41 @@ class SqliteTests(TmpCase):
         self.assertEqual(rows, [{"a": 1}])
 
     def test_node_query_missing_node(self):
-        with mock.patch.object(C.shutil, "which", return_value=None):
+        with mock.patch.object(C, "image_node", return_value=None):
             with self.assertRaises(C.NodeQueryError):
                 C.node_query(self.tmp / "x.sqlite", "SELECT 1")
+
+    @unittest.skipUnless(shutil.which("node"), "node not available")
+    def test_node_query_creates_no_companion_files(self):
+        """F11: like query_ro, a DB without WAL content is opened immutable (node used to create -wal/-shm)."""
+        d = self.tmp / "dir with space?#%"
+        d.mkdir()
+        db = d / "nq.sqlite"
+        make_db(db, wal=True).close()
+        self.assertEqual(sorted(os.listdir(d)), ["nq.sqlite"])
+        with mock.patch.object(C, "image_node", return_value=shutil.which("node")):
+            try:
+                rows = C.node_query(db, "SELECT a FROM t WHERE a=?", params=(1,))
+            except C.NodeQueryError as exc:  # node without node:sqlite
+                self.skipTest(str(exc))
+        self.assertEqual(rows, [{"a": 1}])
+        self.assertEqual(sorted(os.listdir(d)), ["nq.sqlite"])
+
+    def test_node_query_honours_the_stop_event(self):
+        slow = self.tmp / "slow-node"
+        slow.write_text("#!/bin/sh\nsleep 30\n")
+        slow.chmod(0o755)
+        ev = threading.Event()
+        threading.Timer(0.3, ev.set).start()
+        t0 = time.monotonic()
+        with mock.patch.object(C, "image_node", return_value=str(slow)):
+            with self.assertRaises(C.Stopped):
+                C.node_query(self.tmp / "x.sqlite", "SELECT 1", stop_event=ev)
+        self.assertLess(time.monotonic() - t0, 15)
+        with mock.patch.object(C, "image_node", return_value=str(slow)):
+            with self.assertRaises(C.NodeQueryError) as cm:
+                C.node_query(self.tmp / "x.sqlite", "SELECT 1", timeout=1)
+        self.assertIn("timed out", str(cm.exception))
 
 
 class FileTests(TmpCase):
@@ -138,6 +170,16 @@ class FileTests(TmpCase):
         self.assertEqual(g.read_text(), "new")
         self.assertEqual(stat.S_IMODE(os.stat(g).st_mode), 0o644)
         self.assertEqual([x for x in os.listdir(self.tmp) if x.endswith(".tmp")], [])
+
+    def test_json_dumps_lone_surrogates(self):
+        """F5: a lone UTF-16 surrogate (truncated emoji) must not make a config/session rewrite crash."""
+        self.assertEqual(C.json_dumps({"a": "Grüße"}), '{\n  "a": "Grüße"\n}\n')
+        text = C.json_dumps({"a": "Hallo \ud83d", "b": "Grüße"})
+        text.encode("utf-8")
+        self.assertEqual(json.loads(text), {"a": "Hallo \ud83d", "b": "Grüße"})
+        f = self.tmp / "s.json"
+        C.atomic_write_json(f, {"label": "x \udc00"})
+        self.assertEqual(json.loads(f.read_bytes().decode("utf-8")), {"label": "x \udc00"})
 
     def test_read_json_strict(self):
         f = self.tmp / "c.json"
@@ -193,6 +235,25 @@ class RuntimePackageTests(TmpCase):
         self.assertEqual((p["version"], p["schema_state"], p["schema_agent"]), ("2026.9.9", 19, 24))
         self.assertTrue(p["entry"].endswith("openclaw.mjs"))
 
+    def test_runtime_package_uses_the_recorded_image_node(self):
+        """F8: a Homebrew node earlier on PATH must not run OpenClaw."""
+        entry = self._pkg({"version": "2026.9.9", "openclaw": {"schemaVersions": {"state": 19, "agent": 24}}})
+        image, brew = self.tmp / "usr-bin" / "node", self.tmp / "linuxbrew" / "node"
+        for n in (image, brew):
+            n.parent.mkdir(parents=True)
+            n.write_text("#!/bin/sh\n")
+            n.chmod(0o755)
+        record = entry.parent / "openclaw-node"
+        record.write_text(f"{image}\n")
+        with mock.patch.dict(os.environ, {"OC_ADDON_ENTRY_FILE": str(entry),
+                                          "PATH": f"{brew.parent}:{os.environ.get('PATH', '')}"}):
+            self.assertEqual(C.runtime_package()["node"], str(image))
+            self.assertEqual(C.image_node(), str(image))
+            record.write_text(f"{self.tmp / 'gone'}\n")  # stale record: PATH fallback
+            self.assertEqual(C.image_node(), str(brew))
+            record.unlink()
+            self.assertEqual(C.runtime_package()["node"], str(brew))
+
     def test_runtime_package_without_schema_targets(self):
         entry = self._pkg({"version": "2026.9.9"})
         with mock.patch.dict(os.environ, {"OC_ADDON_ENTRY_FILE": str(entry)}):
@@ -230,6 +291,40 @@ class EnvTests(TmpCase):
 
 
 class RedactTests(unittest.TestCase):
+    def test_review_patterns(self):
+        """F12: secrets in key: value, CLI flag, URL userinfo and Telegram Bot API forms."""
+        tok = "98CQRdpOS9aIqH9zUd6Q0jBQEYcz5bTw"
+        for raw, want in (
+                ("{ mode: 'token', token: '%s' }" % tok, "{ mode: 'token', token: '***' }"),
+                ("token: %s" % tok, "token: ***"),
+                ("gateway.auth.token = %s" % tok, "gateway.auth.token = ***"),
+                ("openclaw gateway call health --token %s" % tok, "openclaw gateway call health --token ***"),
+                ("--password hunter2 --json", "--password *** --json"),
+                ("--api-key abc123", "--api-key ***"),
+                ("baseUrl http://admin:S3cretPass@192.168.1.5:8000/v1 down", "baseUrl http://***@192.168.1.5:8000/v1 down"),
+                ("apiKey: 'FAKE-TU-VLLM-KEY-91d0e2'", "apiKey: '***'"),
+                ("x-api-key: abcdef0123456789abcdef", "x-api-key: ***"),
+                ("GET /bot123456789:AAHdqTcvCH1vGWJxfSeofSAs0K5PALDsaw/getMe failed", "GET /bot***/getMe failed"),
+                ("access eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.c2lnbmF0dXJlLXZhbHVl", "access ***"),
+                ("gateway token " + "9f86d081" * 8 + ".", "gateway token ***."),
+                ("http://127.0.0.1:18789/?token=%s&lang=de" % tok, "http://127.0.0.1:18789/?token=***&lang=de")):
+            with self.subTest(raw=raw):
+                self.assertEqual(C.redact_text(raw), want)
+
+    def test_paths_and_file_names_are_not_tokens(self):
+        """F12: the 40+ character rule leaves path segments and file names alone."""
+        for line in (
+                "Saved pre-migration SQLite backup: /config/.openclaw/state/openclaw.sqlite.pre-startup-migration-"
+                "2026-10-09T12-00-00-000Z-3f2b8c1e-9a4d-4e6f-8b7a-1c2d3e4f5a6b.bak",
+                "npm/projects/openclaw-codex-" + "0123456789abcdef" * 3 + "/node_modules/@openclaw/codex",
+                "/share/openclaw-upgrade/r-full/openclaw-state-20261009-120000-before-2026.9.9.tar.gz.tmp: Wrote only 4096",
+                "https://github.com/openclaw/openclaw/commit/" + "0123456789abcdef" * 2 + "01234567",
+                "Paths: gateway.auth.token, channels.telegram.botToken",
+                '"maxTokens": 8, maxTokens: 8, sessionKey: agent:main:main',
+                "Replaced retired openai/gpt-5.4-mini with openai/gpt-5.6-luna."):
+            with self.subTest(line=line[:40]):
+                self.assertEqual(C.redact_text(line), line)
+
     def test_redact_text(self):
         s = ('key sk-abcdefghijklmnop "apiKey": "abc123" token=deadbeef '
              '123456789:AAHbcdefghijklmnopqrstuvwxyz0123456 ' + "A" * 45 + ' Bearer abcdefghijkl')

@@ -279,18 +279,49 @@ class TestScanAndPreflight(unittest.TestCase):
         cfg["models"] = {"providers": {"Codex": {"models": []}}}
         self.assertIn("models-codex-provider", self.codes(cfg))
 
-    def test_preflight_codex_runtime_any_depth(self):
-        for where in (["agents", "defaults", "models", "anthropic/claude-sonnet-4-6"], ["agents", "defaults"],
-                      ["agents", "list", 0], ["models", "providers", "openai"]):
-            for rid in ("codex", " Codex-App-Server ", "codex-cli"):
-                cfg = spec_example()
-                cfg.setdefault("models", {}).setdefault("providers", {}).setdefault("openai", {})
-                node = cfg
-                for p in where:
-                    node = node[p]
-                node["agentRuntime"] = {"id": rid}
+    def test_preflight_codex_runtime_legacy_entries_only(self):
+        """F3: a Codex pin on a legacy openai-codex/codex entry is hard; on a canonical openai/ entry,
+        models.providers.openai or any other holder it is the documented 7.35 choice: kept (info)."""
+        def pinned(where, rid):
+            cfg = spec_example()
+            cfg["agents"]["defaults"]["models"]["openai/o3"] = {}
+            cfg["agents"]["list"][0]["models"] = {"openai-codex/gpt-5.4": {}}
+            cfg["models"] = {"providers": {"openai": {"models": [{"id": "o3"}]},
+                                           "openai-codex": {"models": [{"id": "gpt-5.5"}]}}}
+            node = cfg
+            for p in where:
+                node = node[p]
+            node["agentRuntime"] = {"id": rid}
+            return self.codes(cfg)
+        for rid in ("codex", " Codex-App-Server ", "codex-cli"):
+            for where in (["agents", "defaults", "models", "openai-codex/gpt-5.5"],
+                          ["agents", "defaults", "models", "openai-codex/*"],
+                          ["agents", "list", 0, "models", "openai-codex/gpt-5.4"],
+                          ["models", "providers", "openai-codex"], ["models", "providers", "openai-codex", "models", 0]):
                 with self.subTest(where=where, rid=rid):
-                    self.assertEqual(self.codes(cfg).get("models-codex-runtime"), "hard")
+                    self.assertEqual(pinned(where, rid).get("models-codex-runtime"), "hard")
+            for where in (["agents", "defaults", "models", "openai/o3"],
+                          ["agents", "defaults", "models", "anthropic/claude-sonnet-4-6"], ["agents", "defaults"],
+                          ["agents", "list", 0], ["models", "providers", "openai"],
+                          ["models", "providers", "openai", "models", 0]):
+                with self.subTest(where=where, rid=rid):
+                    codes = pinned(where, rid)
+                    self.assertNotIn("models-codex-runtime", codes)
+                    self.assertEqual(codes.get("codex-runtime-kept"), "info")
+        cfg = spec_example()
+        cfg["agents"]["defaults"]["models"]["Codex/gpt-5"] = {"agentRuntime": {"id": "codex"}}
+        self.assertEqual(self.codes(cfg).get("models-codex-runtime"), "hard")
+
+    def test_preflight_documented_735_codex_pins_are_kept(self):
+        """Reviewer repro userpin.py: v735 docs/providers/openai.md forces the Codex app-server this way."""
+        for cfg in ({"agents": {"defaults": {"model": {"primary": "vllm/q", "fallbacks": ["openai/gpt-5.5"]},
+                                             "models": {"openai/gpt-5.5": {"agentRuntime": {"id": "codex"}}}}}},
+                    {"models": {"providers": {"openai": {"agentRuntime": {"id": "codex"}, "models": []}}},
+                     "agents": {"defaults": {"model": {"primary": "openai/gpt-5.6-sol"}}}}):
+            codes = self.codes(cfg)
+            self.assertEqual(codes, {"codex-runtime-kept": "info", "canonical-openai-refs": "info"})
+            msg = [f["message"] for f in m.models_preflight(cfg) if f["code"] == "codex-runtime-kept"][0]
+            self.assertIn("agentRuntime.id=codex", msg)
 
     def test_preflight_provider_merge(self):
         cfg = spec_example()
@@ -323,8 +354,14 @@ class TestScanAndPreflight(unittest.TestCase):
         self.assertTrue(msg.startswith("1 canonical openai/* refs keep their runtime (Codex app-server by default, "
                                        "as on 7.35)"), msg)
         cfg = spec_example()
-        cfg["agents"]["defaults"]["models"]["OpenAI/gpt-5.5"] = {}
+        cfg["agents"]["defaults"]["models"]["OpenAI/o3"] = {}
         self.assertIn("canonical-openai-refs", self.codes(cfg))
+        # F2: an id that is also a legacy ref is a route collision, not "keeps its runtime"
+        cfg["agents"]["defaults"]["models"]["OpenAI/gpt-5.5"] = {}
+        self.assertEqual(self.codes(cfg).get("models-route-collision"), "acceptable")
+        msg = [f["message"] for f in m.models_preflight(cfg) if f["code"] == "canonical-openai-refs"][0]
+        self.assertIn("OpenAI/o3", msg)
+        self.assertNotIn("gpt-5.5", msg)
         cfg = spec_example()
         cfg["models"] = {"providers": {"openai": {"models": [{"id": "openai/gpt-5.5"}]}}}
         self.assertNotIn("canonical-openai-refs", self.codes(cfg), "provider model ids are not scanned")
@@ -746,10 +783,38 @@ class TestFixups(unittest.TestCase):
         self.assertEqual(new["plugins"]["entries"]["codex"], {"enabled": True})
         self.assertEqual((s["codex_plugin_restored"], s["codex_needed"]), (False, True))
         self.assertFalse(any(e["step"] == "F1b" for e in ledger))
-        self.pre_gate["agents"]["defaults"]["imageModel"] = "openai/gpt-image-1"
-        new, _l, s = self.run_fixups()
-        self.assertEqual(new["plugins"]["entries"]["codex"], {"enabled": True})
-        self.assertTrue(s["codex_needed"])
+        # F15: only text-model uses count; image/TTS/PDF/media/memory-search models never ran on Codex
+        not_text = ({"agents": {"defaults": {"imageModel": "openai/gpt-image-1"}}},
+                    {"agents": {"defaults": {"imageGenerationModel": {"primary": "openai/gpt-image-1"}}}},
+                    {"agents": {"defaults": {"pdfModel": "openai/gpt-5.5"}}},
+                    {"agents": {"defaults": {"memorySearch": {"model": "openai/text-embedding-3-small"}}}},
+                    {"messages": {"tts": {"openai": {"model": "openai/gpt-4o-mini-tts"}}}},
+                    {"tools": {"media": {"audio": {"models": [{"model": "openai/whisper-1"}]}}}})
+        text = ({"agents": {"defaults": {"model": {"primary": "vllm/q", "fallbacks": ["openai/gpt-5.5"]}}}},
+                {"agents": {"defaults": {"heartbeat": {"model": "openai/o3"}}}},
+                {"agents": {"defaults": {"subagents": {"model": {"primary": "openai/o3"}}}}},
+                {"agents": {"defaults": {"compaction": {"model": "openai/o3"}}}},
+                {"agents": {"defaults": {"utilityModel": "openai/o3"}}},
+                {"agents": {"list": [{"id": "a", "model": "openai/o3"}]}},
+                {"agents": {"entries": {"a": {"heartbeat": {"model": "openai/o3"}}}}},
+                {"agents": {"defaults": {"models": {"openai/o3": {}}}}},
+                {"hooks": {"mappings": [{"model": "openai/o3"}]}})
+        for extra, needed in [(x, False) for x in not_text] + [(x, True) for x in text]:
+            with self.subTest(extra=extra):
+                self.assertEqual(bool(m.canonical_text_model_refs(extra)), needed)
+                pre = copy.deepcopy(self.pre_gate)
+                for k, v in copy.deepcopy(extra).items():
+                    if k != "agents":
+                        pre[k] = v
+                        continue
+                    for ak, av in v.items():
+                        if ak == "defaults":
+                            pre["agents"]["defaults"].update(av)
+                        else:
+                            pre["agents"][ak] = av
+                new, _l, s = m.fixups(self.now, pre, self.pre_pass1)
+                self.assertEqual(s["codex_needed"], needed)
+                self.assertEqual("codex" in new["plugins"]["entries"], needed)
         # the same rule after pass 2/3 and in bump/maintenance mode
         now = {"plugins": {"entries": {"codex": {"enabled": True}}}}
         self.assertEqual(m.post_doctor_fixups(now, {})[2]["codex_plugin_restored"], True)
@@ -1120,6 +1185,78 @@ class TestCanonicalRefs(unittest.TestCase):
         self.assertEqual(m.canonical_openai_refs(cfg), ['agents.defaults.model.fallbacks[0]=OpenAI/gpt-5.5',
                                                         'agents.defaults.models["openai/*"]=openai/*'])
         self.assertEqual(m.canonical_openai_refs(live_like()), [])
+
+
+class TestRouteCollision(unittest.TestCase):
+    """F2: a model used both as openai-codex/<id> and as openai/<id> ends up on one openai/<id> route."""
+
+    def codes(self, cfg):
+        return {f["code"]: f["cls"] for f in m.models_preflight(cfg)}
+
+    @staticmethod
+    def mixed():
+        """Reviewer repro collision.py: E3-shaped wildcard plus a live-user-style canonical fallback."""
+        return {"agents": {"defaults": {
+            "model": {"primary": "vllm/qwen3.5-122b", "fallbacks": ["openai/gpt-5.5", "openai-codex/gpt-5.4-mini"]},
+            "models": {"openai-codex/*": {}, "vllm/qwen3.5-122b": {}, "openai/gpt-5.5": {"alias": "gpt"}}}}}
+
+    def test_r1_skips_expansions_with_an_existing_canonical_key(self):
+        cfg = self.mixed()
+        self.assertEqual(m.route_collisions(cfg), {})
+        self.assertNotIn("models-route-collision", self.codes(cfg))
+        new, ledger, summary = m.premigrate_config(cfg)
+        dm = new["agents"]["defaults"]["models"]
+        self.assertNotIn("openai-codex/gpt-5.5", dm)
+        self.assertEqual(dm["openai/gpt-5.5"], {"alias": "gpt"}, "the canonical entry keeps its runtime")
+        self.assertEqual(dm["openai-codex/gpt-5.4-mini"], {"agentRuntime": {"id": "openclaw"}})
+        for x in set(m.EXPLICIT_DEFAULT_IDS) - {"gpt-5.5"}:
+            self.assertIn("openai-codex/" + x, dm)
+        self.assertFalse(any(e["path"].endswith('"openai-codex/gpt-5.5"]') for e in ledger))
+        # the info line still claims "keep their runtime" for the canonical refs, and it is true now
+        msg = [f["message"] for f in m.models_preflight(cfg) if f["code"] == "canonical-openai-refs"][0]
+        self.assertIn("openai/gpt-5.5", msg)
+        # F1/PC2 never treat the skipped id as a migrated slot (defaults or any agent)
+        ctx = m.legacy_key_context(cfg)
+        self.assertFalse(m.is_migrated_legacy_key(ctx, None, "gpt-5.5"))
+        self.assertFalse(m.is_migrated_legacy_key(ctx, "main", "gpt-5.5"))
+        self.assertTrue(m.is_migrated_legacy_key(ctx, None, "gpt-5.4"))
+        # doctor merges nothing into openai/gpt-5.5, so the canonical fallback keeps the implicit choice
+        post = copy.deepcopy(new)
+        post["agents"]["defaults"]["models"] = {
+            ("openai/" + m.remap_model_id(k.split("/", 1)[1]) if k.startswith("openai-codex/") else k): v
+            for k, v in dm.items()}
+        self.assertEqual(m._resolve_openai_runtime(post, "gpt-5.5", None), (None, "none"))
+
+    def test_real_legacy_ref_plus_canonical_use_is_acceptable_hold(self):
+        cfg = self.mixed()
+        cfg["agents"]["defaults"]["model"]["primary"] = "openai-codex/gpt-5.5"
+        col = m.route_collisions(cfg)
+        self.assertEqual(sorted(col), ["gpt-5.5"])
+        self.assertEqual(col["gpt-5.5"], ["agents.defaults.model.fallbacks[0]", 'agents.defaults.models["openai/gpt-5.5"]'])
+        codes = self.codes(cfg)
+        self.assertEqual(codes["models-route-collision"], "acceptable")
+        self.assertNotIn("canonical-openai-refs", codes, "no 'keep their runtime' claim for a collided id")
+        msg = [f["message"] for f in m.models_preflight(cfg) if f["code"] == "models-route-collision"][0]
+        self.assertIn("gpt-5.5 (agents.defaults.model.fallbacks[0]", msg)
+        # a real legacy ref is still expanded and pinned (it is reported, not silently dropped)
+        self.assertIn("openai-codex/gpt-5.5", m.premigrate_config(cfg)[0]["agents"]["defaults"]["models"])
+
+    def test_remapped_legacy_id_and_agent_scopes(self):
+        # openai-codex/gpt-5.2 becomes openai/gpt-5.5; R2 pins it in agents.defaults.models (every scope)
+        cfg = {"agents": {"list": [{"id": "work", "model": "openai-codex/gpt-5.2"},
+                                   {"id": "home", "model": {"fallbacks": ["openai/gpt-5.5"]}}]}}
+        self.assertEqual(m.route_collisions(cfg), {"gpt-5.5": ["agents.list[1].model.fallbacks[0]"]})
+        # an agent-scope wildcard expands only into that agent's map
+        cfg = {"agents": {"defaults": {"model": "openai/gpt-5.4"},
+                          "list": [{"id": "work", "models": {"openai-codex/*": {}}},
+                                   {"id": "home", "model": "openai/gpt-5.4-mini"}]}}
+        self.assertEqual(sorted(m.route_collisions(cfg)), ["gpt-5.4"], "defaults overlaps every agent")
+        cfg["agents"]["defaults"]["model"] = "vllm/q"
+        self.assertEqual(m.route_collisions(cfg), {}, "another agent's scope does not overlap")
+        cfg["agents"]["list"][0]["model"] = "openai/gpt-5.4-mini"
+        self.assertEqual(m.route_collisions(cfg), {"gpt-5.4-mini": ["agents.list[0].model"]})
+        self.assertEqual(m.route_collisions(live_like()), {})
+        self.assertEqual(m.route_collisions(spec_example()), {})
 
 
 # --- pins --------------------------------------------------------------------------------------------

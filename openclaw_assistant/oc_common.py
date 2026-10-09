@@ -13,6 +13,7 @@ whole module at a temporary tree:
   OC_UPGRADE_SHARE_DIR   default /share
   OC_CONFIG_ROOT         default /config   (HOME of every OpenClaw subprocess)
   OC_ADDON_ENTRY_FILE    default /usr/local/libexec/oc-addon/openclaw-entry
+                         (the image's Node binary is recorded next to it in openclaw-node)
 """
 
 import hashlib
@@ -29,6 +30,7 @@ import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import quote as _urlquote
 
 DEFAULT_ENTRY_FILE = "/usr/local/libexec/oc-addon/openclaw-entry"
 GIB = 1 << 30
@@ -227,29 +229,38 @@ NODE_QUERY_JS = (
 )
 
 
-def node_query(path, sql, timeout=120, params=()):
+def node_query(path, sql, timeout=120, params=(), stop_event=None):
     """Read-only query through node:sqlite (fallback when Python's SQLite cannot read a DB).
 
+    Like query_ro, a database without WAL content is opened as an immutable URI, so SQLite creates
+    no -wal/-shm file next to it. A set stop_event stops the query (raises Stopped).
     Returns a list of dicts (column -> value). Raises NodeQueryError.
     """
-    node = shutil.which("node")
+    node = image_node()
     if not node:
         raise NodeQueryError("node not found")
+    location = str(path)
+    try:
+        wal_has_data = os.path.exists(f"{path}-wal") and os.stat(f"{path}-wal").st_size > 0
+    except OSError:
+        wal_has_data = True
+    if not wal_has_data:
+        location = f"file:{_urlquote(os.path.abspath(path))}?mode=ro&immutable=1"
     env = dict(os.environ)
-    env.update(OCQ_PATH=str(path), OCQ_SQL=sql, OCQ_PARAMS=json.dumps(list(params)))
+    env.update(OCQ_PATH=location, OCQ_SQL=sql, OCQ_PARAMS=json.dumps(list(params)))
     with tempfile.TemporaryDirectory(prefix="oc-nodeq-") as tmp:
         out_p, err_p = Path(tmp) / "out.json", Path(tmp) / "err.txt"
-        with open(out_p, "wb") as out, open(err_p, "wb") as err:
-            try:
-                proc = subprocess.run([node, "--input-type=module", "-e", NODE_QUERY_JS], stdin=subprocess.DEVNULL,
-                                      stdout=out, stderr=err, env=env, timeout=timeout)
-            except subprocess.TimeoutExpired as exc:
-                raise NodeQueryError(f"node:sqlite query timed out after {timeout}s") from exc
-            except OSError as exc:
-                raise NodeQueryError(f"node:sqlite query failed to start: {exc}") from exc
-        if proc.returncode != 0:
+        res = run_process([node, "--input-type=module", "-e", NODE_QUERY_JS], timeout=timeout, log_path=err_p,
+                          stdout_path=out_p, stop_event=stop_event, kill_grace=5, env=env)
+        if res.stopped:
+            raise Stopped("stop requested")
+        if res.timed_out:
+            raise NodeQueryError(f"node:sqlite query timed out after {timeout}s")
+        if res.error is not None:
+            raise NodeQueryError(f"node:sqlite query failed to start: {res.error}")
+        if res.rc != 0:
             tail = err_p.read_text(encoding="utf-8", errors="replace").strip().splitlines()[-3:]
-            raise NodeQueryError(f"node:sqlite query failed (rc {proc.returncode}): {' | '.join(tail)}")
+            raise NodeQueryError(f"node:sqlite query failed (rc {res.rc}): {' | '.join(tail)}")
         try:
             data = json.loads(out_p.read_text(encoding="utf-8"))
         except ValueError as exc:
@@ -310,8 +321,23 @@ def atomic_write_text(path, text, default_mode=0o600):
     atomic_write_bytes(path, text.encode("utf-8"), default_mode)
 
 
+def json_dumps(obj, indent=2):
+    """JSON text plus a newline that always encodes to UTF-8.
+
+    Non-ASCII characters are kept as they are, unless the data holds a lone UTF-16 surrogate
+    (Node's JSON.stringify writes "\\ud83d" for a label truncated mid-emoji, which json.loads
+    accepts but UTF-8 cannot encode): then everything non-ASCII is written as \\u escapes.
+    """
+    text = json.dumps(obj, indent=indent, ensure_ascii=False) + "\n"
+    try:
+        text.encode("utf-8")
+    except UnicodeEncodeError:
+        text = json.dumps(obj, indent=indent, ensure_ascii=True) + "\n"
+    return text
+
+
 def atomic_write_json(path, obj, mode=0o600):
-    atomic_write_text(path, json.dumps(obj, indent=2, ensure_ascii=False) + "\n", mode)
+    atomic_write_text(path, json_dumps(obj), mode)
 
 
 def _reject_constant(name):
@@ -394,6 +420,23 @@ def walk_lstat(root, skip_dir=None, stop_event=None):
 
 # --- runtime package / environment ---------------------------------------------------
 
+def image_node():
+    """The image's Node binary, recorded at build time in openclaw-node next to the entry file.
+
+    A Homebrew `node` may come first on PATH; OpenClaw must still run on the Node the image
+    checked. Falls back to PATH when the record is missing or not executable.
+    """
+    entry_file = os.environ.get("OC_ADDON_ENTRY_FILE") or DEFAULT_ENTRY_FILE
+    try:
+        with open(os.path.join(os.path.dirname(entry_file), "openclaw-node"), encoding="utf-8") as f:
+            node = f.readline().strip()
+    except OSError:
+        node = ""
+    if node and os.path.isfile(node) and os.access(node, os.X_OK):
+        return node
+    return shutil.which("node")
+
+
 def runtime_package():
     """{"version","entry","pkg_dir","node","schema_state","schema_agent"} of the bundled OpenClaw.
 
@@ -421,7 +464,7 @@ def runtime_package():
     s, a = sv.get("state"), sv.get("agent")
     if not (isinstance(s, int) and not isinstance(s, bool) and isinstance(a, int) and not isinstance(a, bool)):
         raise RuntimePackageError(f"{pkg_dir}/package.json lacks openclaw.schemaVersions.state/agent")
-    return {"version": version, "entry": entry, "pkg_dir": pkg_dir, "node": shutil.which("node"),
+    return {"version": version, "entry": entry, "pkg_dir": pkg_dir, "node": image_node(),
             "schema_state": s, "schema_agent": a}
 
 
@@ -464,13 +507,25 @@ def openclaw_env():
 # --- redaction --------------------------------------------------------------------------
 
 _SECRET_KEY = r"[A-Za-z0-9_.-]*(?:token|secret|password|apikey|api_key|bottoken)[A-Za-z0-9_.-]*|[A-Za-z0-9_.-]*key"
+# a key that names a secret (token, botToken, apiKey, x-api-key, password ...), for "key: value" forms
+_SECRET_WORD = r"[A-Za-z0-9_.-]*?(?:token|secret|password|passwd|api[_-]?key)"
 _REDACT_RES = [
     (re.compile(r'("(?:' + _SECRET_KEY + r')"\s*:\s*)"(?:[^"\\]|\\.)*"', re.I), r'\1"***"'),
     (re.compile(r"\b((?:" + _SECRET_KEY + r")=)[^\s&\"']+", re.I), r"\1***"),
+    # token: value / apiKey: 'value' / x-api-key: value (YAML, JS object inspection, HTTP headers)
+    (re.compile(r"\b(" + _SECRET_WORD + r")([\"']?\s*[:=]\s*[\"']?)[^\s'\",;&}]+", re.I), r"\1\2***"),
+    # --token <value>, --password <value>, --api-key <value>
+    (re.compile(r"(?i)(--(?:token|password|secret|api[-_]?key)\s+)(?!-)\S+"), r"\1***"),
+    # URL userinfo: scheme://user:password@host
+    (re.compile(r"://[^/\s:@]+:[^@\s/]+@"), "://***@"),
     (re.compile(r"(?i)\b(Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{8,}"), r"\1 ***"),
     (re.compile(r"sk-[A-Za-z0-9_-]{10,}"), "***"),
+    (re.compile(r"(?i)\bbot\d{6,12}:[A-Za-z0-9_-]{30,}"), "bot***"),  # Telegram Bot API URL form
     (re.compile(r"\b\d{6,12}:[A-Za-z0-9_-]{30,}\b"), "***"),
-    (re.compile(r"\b[A-Za-z0-9_-]{40,}\b"), "***"),
+    (re.compile(r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}"), "***"),  # JWT
+    # Long standalone tokens. A run next to "/" or "." (path segment, file name such as
+    # openclaw.sqlite.<uuid>.bak or npm/projects/<hash>/) is not a token; a sentence-final "." is.
+    (re.compile(r"(?<![A-Za-z0-9_/.-])[A-Za-z0-9_-]{40,}(?![A-Za-z0-9_/-])(?!\.[A-Za-z0-9_-])"), "***"),
 ]
 
 

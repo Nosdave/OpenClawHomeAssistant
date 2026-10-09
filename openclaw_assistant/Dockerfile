@@ -223,11 +223,17 @@ RUN chmod +x /run.sh /oc_config_helper.py /render_nginx.py /usr/local/bin/oc-cle
 # later `npm install -g openclaw@...` (runtime npm prefix /usr/local) collides
 # with it (EEXIST) instead of silently shadowing it. Then check the launcher's
 # version, the doctor flags the migration gate relies on (in a throwaway HOME),
-# and the wrapper's doctor rule.
+# and the wrapper's doctor rule. The image's Node (the one checked above) is
+# recorded too: the wrapper and the migration gate run OpenClaw with it even when
+# a Homebrew `node` comes first on PATH at runtime.
 RUN set -eu; \
     W=/usr/local/libexec/oc-addon/openclaw; \
     pkg="$(npm root -g)/openclaw"; \
     test -f "$pkg/openclaw.mjs"; \
+    node_bin="$(command -v node)"; \
+    case "$node_bin" in *linuxbrew*|"") echo "unexpected node for OpenClaw: '$node_bin'" >&2; exit 1 ;; esac; \
+    test -x "$node_bin"; \
+    printf '%s\n' "$node_bin" > /usr/local/libexec/oc-addon/openclaw-node; \
     printf '%s\n' "$pkg/openclaw.mjs" > /usr/local/libexec/oc-addon/openclaw-entry; \
     jq -r .version "$pkg/package.json" > /usr/local/libexec/oc-addon/openclaw-pinned-version; \
     printf '%s\n' "${BRAVE_PLUGIN_VERSION}" > /usr/local/libexec/oc-addon/brave-plugin-version; \

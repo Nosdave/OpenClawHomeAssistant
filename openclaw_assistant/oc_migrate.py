@@ -34,7 +34,8 @@ __all__ = [
     "EXPLICIT_DEFAULT_IDS", "PINS", "TRANSIENT_SQLITE_RE", "TELEGRAM_CACHE_RE", "EMPTY_BINDINGS_RES",
     "LEGACY_REF_RE", "redact_value", "fmt_path", "parse_path", "remap_model_id", "scan_legacy_refs",
     "models_preflight", "explicit_ids", "premigrate_config", "premigrate_sessions", "fixups",
-    "post_doctor_fixups", "canonical_openai_refs", "ref_base", "retired_chain", "apply_retired",
+    "post_doctor_fixups", "canonical_openai_refs", "canonical_text_model_refs", "route_collisions", "ref_base",
+    "retired_chain", "apply_retired",
     "legacy_key_context", "is_migrated_legacy_key",
     "check_legacy_refs", "check_codex_runtime", "check_runtime_pins", "apply_pins", "auth_order_adjust",
     "classify_state_files", "scan_sessions_files", "config_precheck", "flatten_paths",
@@ -462,15 +463,31 @@ def _provider_model_ids(block):
     return ids
 
 
+_LEGACY_PROVIDER_IDS = ("openai-codex", "codex", "codex-cli")
+
+
+def _is_legacy_runtime_holder(parts):
+    """True for an agentRuntime holder the migration rewrites: a models-map entry keyed
+    openai-codex/... or codex/... (wildcards included), or a legacy provider block / its models."""
+    if parts and isinstance(parts[-1], str) and _is_models_map_path(parts[:-1]):
+        return _split_ref(parts[-1])[0] in _LEGACY_PROVIDER_IDS
+    if len(parts) >= 3 and parts[0] == "models" and parts[1] == "providers" and isinstance(parts[2], str):
+        return parts[2].strip().lower() in _LEGACY_PROVIDER_IDS
+    return False
+
+
 def models_preflight(cfg):
     """§7.4.1 codes for the pre-migration config (run only in from-7x precheck)."""
     phase = "precheck"
     findings = []
     if not isinstance(cfg, dict):
         return findings
-    codex_refs, platform = [], []
-    canonical = canonical_openai_refs(cfg)
+    codex_refs, platform, canonical = [], [], []
     for parts, s, _where in _iter_scanned(cfg):
+        if _CANONICAL_OPENAI_PREFIX_RE.match(s):
+            cm = _CANONICAL_OPENAI_REF_RE.match(s)
+            canonical.append(("%s=%s" % (fmt_path(parts), redact_value(parts, s.strip())),
+                              cm.group(1).lower() if cm else None))
         if _CODEX_PROVIDER_REF_RE.match(s):
             codex_refs.append(fmt_path(parts))
         m = LEGACY_REF_RE.match(s)
@@ -483,19 +500,25 @@ def models_preflight(cfg):
             "config uses the retired 'codex'/'codex-cli' provider (%s); 9.9 cannot migrate it automatically. "
             "Switch these to openai-codex/<model> (or remove them) on 0.5.93 first."
             % _brief(codex_refs + codex_prov), phase))
-    runtime_hits = []
+    runtime_hits, runtime_kept = [], []
     for parts, holder in _iter_runtime_holders(cfg):
         if parts and parts[0] == "auth":
             continue
         rid = _runtime_id_raw(holder.get("agentRuntime"))
         if isinstance(rid, str) and rid.strip().lower() in CODEX_RUNTIME_IDS:
-            runtime_hits.append("%s=%s" % (fmt_path(parts + ["agentRuntime", "id"]), rid.strip()))
+            hit = "%s=%s" % (fmt_path(parts + ["agentRuntime", "id"]), rid.strip())
+            (runtime_hits if _is_legacy_runtime_holder(parts) else runtime_kept).append(hit)
     if runtime_hits:
         findings.append(_finding(
             "models-codex-runtime", "hard",
-            "config already pins the Codex runtime (%s); the gate keeps models on the OpenClaw runtime and "
-            "cannot tell these apart from pins doctor writes. Remove these agentRuntime pins on 0.5.93 first."
-            % _brief(runtime_hits), phase))
+            "config pins the Codex runtime on legacy openai-codex/codex entries (%s); the migration turns them into "
+            "openai/ entries that the gate keeps on the OpenClaw runtime, so these pins cannot be kept. Remove them "
+            "(or use openai/<model> entries for Codex) on 0.5.93 first." % _brief(runtime_hits), phase))
+    if runtime_kept:
+        # the documented 7.35 way to force the Codex app-server; the gate and doctor leave these alone
+        findings.append(_finding(
+            "codex-runtime-kept", "info",
+            "Codex runtime pins kept as configured: %s" % _brief(runtime_kept), phase))
     legacy_blocks = _provider_blocks(cfg, "openai-codex")
     canonical_blocks = _provider_blocks(cfg, "openai")
     if legacy_blocks and canonical_blocks:
@@ -530,6 +553,15 @@ def models_preflight(cfg):
             "models-platform-only", "acceptable",
             "legacy refs name models that 9.9 serves only with an OpenAI API key (metered), not with the "
             "ChatGPT subscription: %s" % _brief(platform), phase))
+    collisions = route_collisions(cfg)
+    if collisions:
+        findings.append(_finding(
+            "models-route-collision", "acceptable",
+            "openai-codex model(s) also used as canonical openai/ refs: %s. 9.9 has one openai/<model> route per "
+            "model, so after the migration these openai/ refs run on the OpenClaw runtime like the migrated "
+            "openai-codex refs (on 7.35 they used the Codex app-server)"
+            % _brief("%s (%s)" % (mid, _brief(paths, 3)) for mid, paths in sorted(collisions.items())), phase))
+    canonical = [c for c, mid in canonical if mid not in collisions]
     if canonical:
         # Contract addendum 2 (replaces addendum 1 items 1-4): not a HOLD and never re-pinned. 7.35 ran
         # unpinned openai/* turns on the bundled Codex app-server, and 9.9 does the same.
@@ -552,6 +584,69 @@ def explicit_ids(cfg):
                 if not re.search(r"[\s@*]", mid):
                     ids.add(mid)
     return sorted(ids)
+
+
+def _r1_expansion(mmap, explicit, ref_ids):
+    """Ids R1 adds as openai-codex/<x> keys for a map's openai-codex/* wildcard: the EXPLICIT ids the
+    map lacks, except expansions whose canonical openai/<remap x> key the map already has (F2: that
+    key keeps its runtime; a real legacy ref id is still expanded and reported as a collision)."""
+    existing = {_split_ref(k) for k in mmap if isinstance(k, str)}
+    canonical = {m.lower() for p, m in existing if p == "openai" and m and m != "*"}
+    real = {i.lower() for i in ref_ids}
+    out = []
+    for x in explicit:
+        if ("openai-codex", x) in existing:
+            continue
+        if x.lower() not in real and remap_model_id(x).lower() in canonical:
+            continue
+        out.append(x)
+        existing.add(("openai-codex", x))
+    return out
+
+
+def _ref_scope(cfg, parts):
+    """None for a defaults/global ref, else its agent (lower-cased id, or the agents.list[i] label)."""
+    if len(parts) >= 3 and parts[0] == "agents" and parts[1] in ("list", "entries"):
+        aid = _agent_id_for_parts(cfg, parts)
+        return aid.strip().lower() if isinstance(aid, str) else fmt_path(parts[:3])
+    return None
+
+
+def route_collisions(cfg):
+    """F2: {openai model id: [paths]} of canonical openai/<id> refs and keys whose id an openai-codex
+    ref (after the retired-id remap) or an R1 wildcard expansion also uses in an overlapping scope.
+
+    9.9 keeps one openai/<id> route per scope: the migrated openai-codex slot and the canonical use end
+    up on the same entry, pinned to the OpenClaw runtime (R2), while 7.35 ran the canonical use on the
+    Codex app-server. R2 pins every legacy ref id in agents.defaults.models, so a real legacy ref
+    overlaps every scope; an R1 expansion only its own map's scope (defaults = every scope).
+    """
+    if not isinstance(cfg, dict):
+        return {}
+    refs = scan_legacy_refs(cfg)
+    legacy = {}
+    for r in refs:
+        if r["id"] != "*":
+            legacy.setdefault(remap_model_id(r["id"]).lower(), set()).add(None)
+    if refs:
+        explicit = explicit_ids(cfg)
+        ref_ids = {r["id"] for r in refs if r["id"] != "*"}
+        for label, parts, aid, mmap in _models_map_scopes(cfg):
+            if any(isinstance(k, str) and _LEGACY_WILDCARD_KEY_RE.match(k) for k in mmap):
+                for x in _r1_expansion(mmap, explicit, ref_ids):
+                    legacy.setdefault(remap_model_id(x).lower(), set()).add(_scope_id(parts, aid, label))
+    out = {}
+    for parts, s, _where in _iter_scanned(cfg):
+        m = _CANONICAL_OPENAI_REF_RE.match(s)
+        mid = m.group(1).lower() if m else None
+        if mid is None or mid not in legacy:
+            continue
+        scope = _ref_scope(cfg, parts)
+        if None in legacy[mid] or scope is None or scope in legacy[mid]:
+            path = fmt_path(parts)
+            if path not in out.setdefault(mid, []):
+                out[mid].append(path)
+    return out
 
 
 # --- R1-R3: pre-migrate config ---------------------------------------------------------
@@ -624,13 +719,9 @@ def premigrate_config(cfg):
             ledger.append({"step": "R1", "file": CONFIG_FILE, "path": fmt_path(parts + [k]),
                            "before": copy.deepcopy(mmap[k]), "after": None})
             del mmap[k]
-        existing = {_split_ref(k) for k in mmap if isinstance(k, str)}
-        for x in explicit:
-            if ("openai-codex", x) in existing:
-                continue
+        for x in _r1_expansion(mmap, explicit, ref_ids):
             key = "openai-codex/" + x
             mmap[key] = copy.deepcopy(template)
-            existing.add(("openai-codex", x))
             ledger.append({"step": "R1", "file": CONFIG_FILE, "path": fmt_path(parts + [key]),
                            "before": None, "after": copy.deepcopy(template)})
         scopes.append(label)
@@ -839,11 +930,9 @@ def legacy_key_context(pre_gate, retired_map=None, extra_ids=()):
     if not isinstance(pre_gate, dict):
         return ctx
     refs = scan_legacy_refs(pre_gate)
-    explicit = set()
-    if refs:
-        for x in explicit_ids(pre_gate):
-            explicit |= _derived_ids(x, retired_map)
-    wild = set()
+    explicit = explicit_ids(pre_gate) if refs else []
+    ref_ids = {r["id"] for r in refs if r["id"] != "*"}
+    wild = {}  # scope -> derived ids of the keys R1 adds there (F2: not the skipped canonical ones)
     for label, parts, aid, mmap in _models_map_scopes(pre_gate):
         scope = _scope_id(parts, aid, label)
         keys = ctx["pre_keys"].setdefault(scope, set())
@@ -851,7 +940,9 @@ def legacy_key_context(pre_gate, retired_map=None, extra_ids=()):
             if not isinstance(k, str):
                 continue
             if _LEGACY_WILDCARD_KEY_RE.match(k):
-                wild.add(scope)
+                ids = wild.setdefault(scope, set())
+                for x in _r1_expansion(mmap, explicit, ref_ids):
+                    ids |= _derived_ids(x, retired_map)
             prov, mid = _split_ref(k)
             if prov == "openai" and mid and mid != "*":
                 keys.add(mid.lower())
@@ -871,11 +962,11 @@ def legacy_key_context(pre_gate, retired_map=None, extra_ids=()):
             ctx["defaults"] |= ids
             ctx["global"] |= ids
     if None in wild:
-        ctx["defaults"] |= explicit
-        ctx["global"] |= explicit
-    for scope in wild:
+        ctx["defaults"] |= wild[None]
+        ctx["global"] |= wild[None]
+    for scope, ids in wild.items():
         if scope is not None:
-            ctx["agents"].setdefault(scope, set()).update(explicit)
+            ctx["agents"].setdefault(scope, set()).update(ids)
     for parts, s, where in _iter_scanned(pre_gate):
         if where != "value" or len(parts) < 3 or parts[0] != "agents" or parts[1] not in ("list", "entries"):
             continue
@@ -905,9 +996,48 @@ def is_migrated_legacy_key(ctx, scope, model_id):
     return mid in ctx["global"] or mid in ctx["agents"].get(scope, ())
 
 
+_TEXT_MODEL_HOLDERS = ("heartbeat", "subagents", "compaction")
+
+
+def _is_text_model_slot(parts):
+    """A config path that selects a text (chat) model: agents.defaults / agents.list[i] /
+    agents.entries.<id> .model (primary/fallbacks), .utilityModel and .heartbeat/.subagents/.compaction
+    .model, and any *.model / *.utilityModel under hooks (mappings) or cron. Image, media, TTS, PDF and
+    memory-search models never run on an agent runtime and do not count."""
+    p = [x for x in parts if not _is_index(x)]
+    if len(p) >= 2 and p[-2] in ("model", "utilityModel") and p[-1] in ("primary", "fallbacks"):
+        p = p[:-1]
+    if not p or p[-1] not in ("model", "utilityModel"):
+        return False
+    if p[0] in ("hooks", "cron"):
+        return True
+    if len(p) < 3 or p[0] != "agents":
+        return False
+    if p[1] in ("defaults", "list"):
+        rest = p[2:]
+    elif p[1] == "entries" and len(p) >= 4:
+        rest = p[3:]
+    else:
+        return False
+    return len(rest) == 1 or (len(rest) == 2 and rest[0] in _TEXT_MODEL_HOLDERS)
+
+
+def canonical_text_model_refs(cfg):
+    """["path=value"] of canonical openai/ refs that select a text model: models-map keys of the defaults
+    and agents, and the slots of _is_text_model_slot (F15: what "Codex was in use" means)."""
+    out = []
+    if not isinstance(cfg, dict):
+        return out
+    for parts, s, where in _iter_scanned(cfg):
+        if _CANONICAL_OPENAI_PREFIX_RE.match(s) and (where == "key" or _is_text_model_slot(parts)):
+            out.append("%s=%s" % (fmt_path(parts), redact_value(parts, s.strip())))
+    return out
+
+
 def _codex_needed(rule_cfg, codex_pkg_before):
-    """F1b rule 4: Codex was in use before the gate (canonical openai/ refs or an installed codex plugin)."""
-    return bool(codex_pkg_before) or bool(canonical_openai_refs(rule_cfg))
+    """F1b rule 4: Codex was in use before the gate (canonical openai/ text-model refs, or other evidence
+    the gate passes as codex_pkg_before: an installed codex plugin, cron jobs on openai/ models)."""
+    return bool(codex_pkg_before) or bool(canonical_text_model_refs(rule_cfg))
 
 
 def _f1b(new, pre_value_cfg, rule_cfg, codex_pkg_before, ledger, policy_failures, phase="fixups"):
@@ -969,9 +1099,9 @@ def fixups(cfg_now, cfg_pre_gate, cfg_pre_pass1, *, retired_map=None, codex_pkg_
 
     cfg_pre_gate: config.pre-gate.json (7.35 original); cfg_pre_pass1: config.pre-pass1.json.
     retired_map: doctor's retired-model replacements so far (journal doctor_retired_map); F2/F3 map
-    their values through it so pass 2 does not undo them. codex_pkg_before: a codex plugin package
-    (npm/projects/openclaw-codex-*) existed before pass 1. extra_legacy_ids: openai-codex ids used by
-    cron jobs only.
+    their values through it so pass 2 does not undo them. codex_pkg_before: Codex was in use outside
+    openclaw.json (a codex plugin package npm/projects/openclaw-codex-* existed before pass 1, or cron jobs
+    used openai/ models). extra_legacy_ids: openai-codex ids used by cron jobs only.
     Returns (new_cfg, ledger, summary{codex_pins, refs_rewritten, compaction_restored,
     codex_plugin_restored, codex_needed, policy_failures}). F4 (config validate) is run by the caller.
     """

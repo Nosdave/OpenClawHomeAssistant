@@ -442,6 +442,31 @@ class DecideTests(unittest.TestCase):
         self.assertEqual(G.infer_mode(c, {}), "from-7x")
         c = cls_of("gate", state_uv=None, agents={})
         self.assertEqual(G.infer_mode(c, {"meta": {"lastTouchedVersion": "2026.7.35"}}), "from-7x")
+        # F6: a v1 agent DB or a 7.x config means from-7x whatever the state DB says
+        for uv in (0, 19):
+            self.assertEqual(G.infer_mode(cls_of("gate", state_uv=uv, agents={"main": 24, "work": 1}), {}), "from-7x")
+            self.assertEqual(G.infer_mode(cls_of("gate", state_uv=uv),
+                                          {"meta": {"lastTouchedVersion": "2026.7.35"}}), "from-7x")
+        self.assertEqual(G.infer_mode(cls_of("gate", state_uv=19), {"meta": {"lastTouchedVersion": "2026.9.5"}}), "bump")
+
+    def test_F6_from7x_wins_for_post_run_retries_and_bumps(self):
+        """Reviewer repro decide_test.py: a rolled-back 2026.7.x state never gets a maintenance or bump run."""
+        cls735 = cls_of("gate", state_uv=1)
+        cfg7 = {"meta": {"lastTouchedVersion": "2026.7.35"}}
+        marker = {"runtime": RUNTIME, "mode": "from-7x", "run_id": "old", "binding": {}}
+        for code in ("exit78", "crash-loop"):
+            j = {"status": "hold", "run_id": "old", "mode": "from-7x", "first_write_at": None,
+                 "hold": {"code": code, "phase": "gateway"}}
+            for retry in ({"doctor": False, "accept": []}, {"doctor": True}):
+                d = G.decide(ctx(cls=cls735, journal=j, marker=marker, retry=retry, cfg=cfg7, binding={}))
+                self.assertEqual((d["rc"], d["action"], d["mode"], d["new_run"]), (10, "run", "from-7x", True))
+        # version bumps (marker for another runtime / config written by another version)
+        d = G.decide(ctx(marker=dict(marker, runtime="2026.9.5"), cfg=cfg7))
+        self.assertEqual((d["rc"], d["mode"]), (10, "from-7x"))
+        d = G.decide(ctx(cfg=cfg7))
+        self.assertEqual((d["rc"], d["mode"]), (10, "from-7x"))
+        d = G.decide(ctx(cls=cls_of("gate", state_uv=19, agents={"main": 1}), marker=dict(marker, runtime="2026.9.5")))
+        self.assertEqual((d["rc"], d["mode"]), (10, "from-7x"))
 
 
 # --- classification ---------------------------------------------------------------------------
@@ -603,6 +628,33 @@ class PlanTests(GateEnv):
         os.remove(self.upg / "gate" / "migrated.json")
         with mock.patch.object(G, "classify", side_effect=RuntimeError("boom")):
             self.assertEqual(self.plan()["rc"], 1)
+
+    def test_B11_shortcut_only_without_an_open_gate_run(self):
+        """Reviewer repro b11.py: a planning error must not bypass a held maintenance run."""
+        make_99_state(self.state)
+        self.write_cfg({})
+        (self.upg / "gate").mkdir(parents=True)
+        (self.upg / "gate" / "migrated.json").write_text(json.dumps({"runtime": RUNTIME, "mode": "from-7x"}))
+        jpath = self.upg / "gate" / "journal.json"
+        for status, rc in (("hold", 1), ("running", 1), ("interrupted", 1), ("done", 0), ("abandoned", 0)):
+            jpath.write_text(json.dumps({"status": status, "run_id": "m1", "mode": "maintenance",
+                                         "first_write_at": "t", "hold": {"code": "doctor-failed", "phase": "doctor2"}}))
+            with self.subTest(status=status), mock.patch.object(G, "classify", side_effect=ValueError("boom")):
+                d = self.plan()
+                self.assertEqual(d["rc"], rc, self.out)
+                self.assertEqual("planning error ignored" in self.out, rc == 0)
+        jpath.write_text("{not json")
+        with mock.patch.object(G, "classify", side_effect=ValueError("boom")):
+            self.assertEqual(self.plan()["rc"], 1)
+
+    def test_plan_reraises_a_stop(self):
+        make_99_state(self.state)
+        self.write_cfg({})
+        (self.upg / "gate").mkdir(parents=True)
+        (self.upg / "gate" / "migrated.json").write_text(json.dumps({"runtime": RUNTIME, "mode": "from-7x"}))
+        with mock.patch.object(G, "classify", side_effect=C.Stopped("stop requested")):
+            with self.assertRaises(C.Stopped):
+                self.plan()
 
     def test_sticky_hold_writes_hold_txt(self):
         make_735_state(self.state)
@@ -1151,9 +1203,17 @@ class HoldRetryTests(GateEnv):
         add(12, ["/bin/bash", "/run.sh"])
         add(13, ["python3", "/usr/local/bin/oc-upgrade", "gate"])
         add(14, ["node", "/usr/local/lib/node_modules/openclaw/openclaw.mjs", "doctor"], ppid=13)
+        add(15, ["node", "/usr/local/lib/node_modules/openclaw/openclaw.mjs", "gateway", "call", "health",
+                 "--token", "SECRET-TOKEN-VALUE"])
+        add(16, ["openclaw", "--token=SECRET-TOKEN-VALUE", "status"])
         found = G.find_openclaw_processes("/usr/local/lib/node_modules/openclaw/openclaw.mjs", proc_dir=str(proc),
                                           self_pid=13)
-        self.assertEqual([f["pid"] for f in found], [10, 11])
+        self.assertEqual([f["pid"] for f in found], [10, 11, 15, 16])
+        # F13: argv[0..2] only, redacted
+        cmds = {f["pid"]: f["cmd"] for f in found}
+        self.assertEqual(cmds[15], "node /usr/local/lib/node_modules/openclaw/openclaw.mjs gateway")
+        self.assertEqual(cmds[16], "openclaw --token=*** status")
+        self.assertNotIn("SECRET", json.dumps(found))
 
 
 # --- full gate runs (fake node + fake doctor + real oc_migrate) -------------------------------------
@@ -1553,6 +1613,192 @@ print("Doctor complete.")
         finally:
             os.environ.pop("OC_GATE_PLAN_SHOWN", None)
         self.assertEqual(sum(1 for x in self.out.splitlines() if x.startswith("[gate] plan:")), 1, self.out)
+
+
+class ReviewFixTests(GateEnv):
+    """Stage B review fixes: F1 symlinked archive roots, F4 pins retry, F5 lone surrogates, F15 cron."""
+
+    @staticmethod
+    def move_aside(path, dest):
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        os.rename(path, dest)
+        os.symlink(dest, path)
+
+    def test_F1_state_symlinks_at_every_level(self):
+        make_735_state(self.state)
+        cls = G.classify(self.state, {}, 19, 24, RUNTIME)
+        self.assertEqual(G.state_symlinks(self.state, cls), [])
+        for rel in ("state", "state/openclaw.sqlite", "agents", "agents/main", "agents/main/agent",
+                    "agents/main/agent/openclaw-agent.sqlite"):
+            src, dst = self.state / rel, self.tmp / "moved" / rel.replace("/", "_")
+            self.move_aside(src, dst)
+            try:
+                with self.subTest(rel=rel):
+                    self.assertEqual(G.state_symlinks(self.state, cls), [str(src)])
+            finally:
+                os.unlink(src)
+                os.rename(dst, src)
+        self.move_aside(self.state, self.tmp / "big-disk" / ".openclaw")
+        self.assertEqual(G.state_symlinks(self.state, cls), [str(self.state)])
+
+    def test_F1_symlinked_agent_dir_holds_before_anything_is_written(self):
+        """Reviewer repro symstate.py: a symlinked directory gave a 'verified' archive without the DBs."""
+        self.build_735()
+        self.hooks()
+        adir = self.state / "agents" / "main" / "agent"
+        self.move_aside(adir, self.tmp / "media" / "agent")
+        self.assertEqual(self.run_gate(), 20, self.out)
+        j = self.journal()
+        self.assertEqual((j["hold"]["code"], j["hold"]["acceptable"], j["first_write_at"]),
+                         ("state-symlink", False, None))
+        self.assertIn(str(adir), j["hold"]["message"])
+        self.assertIn("replace the symlink by the real directory", (self.upg / "hold.txt").read_text())
+        self.assertFalse((self.share / "openclaw-upgrade").exists())
+        self.assertEqual(G.retry_cmd(["--accept", "state-symlink"], emit=lambda s: None), 1)
+
+    def test_F1_symlinked_workspace_holds(self):
+        """Reviewer repro archive_test.py: only the link of a symlinked workspace was archived."""
+        self.build_735()
+        self.hooks()
+        ext = self.tmp / "elsewhere" / "ws2"
+        (ext / "memory").mkdir(parents=True)
+        (ext / "memory" / "notes.md").write_text("important")
+        os.symlink(ext, self.root / "clawd-helper")
+        cfg = json.loads(json.dumps(CFG_735))
+        cfg["agents"]["list"].append({"id": "helper", "workspace": str(self.root / "clawd-helper")})
+        self.write_cfg(cfg)
+        self.assertEqual(self.run_gate(), 20, self.out)
+        h = self.journal()["hold"]
+        self.assertEqual(h["code"], "state-symlink")
+        self.assertIn("clawd-helper", h["message"])
+        # a link whose target is archived anyway (another workspace root, the state dir) is fine
+        os.unlink(self.root / "clawd-helper")
+        os.symlink(self.ws, self.root / "clawd-helper")
+        (self.state / "workspace-ops").mkdir()
+        os.symlink(self.state / "workspace-ops", self.root / "ws-ops")
+        cfg["agents"]["list"].append({"id": "ops", "workspace": str(self.root / "ws-ops")})
+        g = G.Gate(emit=lambda s: None)
+        g.cfg = cfg
+        ap = g.archive_plan()
+        self.assertEqual(ap["symlinks"], [])
+        self.assertEqual(ap["roots"][:2], [".openclaw", "clawd"])
+
+    def gate_for_archive(self, run_id):
+        g = G.Gate(emit=lambda s: None)
+        g.pkg = C.runtime_package()
+        g.cfg = json.loads(json.dumps(CFG_735))
+        g.j = {"run_id": run_id, "mode": "from-7x", "history": [], "source": {}, "auth_profiles": []}
+        return g
+
+    def test_F1_archive_invariant_every_known_db_is_archived(self):
+        make_735_state(self.state)
+        self.write_cfg(CFG_735)
+        self.move_aside(self.state / "agents" / "main" / "agent", self.tmp / "media" / "agent")
+        g = self.gate_for_archive("r-inv")  # the precheck is bypassed: the archive phase refuses by itself
+        with self.assertRaises(G.HoldError) as cm:
+            g.phase_archive()
+        f = cm.exception.findings[0]
+        self.assertEqual(f["code"], "archive-verify-failed")
+        self.assertIn(".openclaw/agents/main/agent/openclaw-agent.sqlite", f["message"])
+        self.assertIsNone(g.j.get("archive"))
+        self.assertEqual(list((self.share / "openclaw-upgrade" / "r-inv").glob("*.tar.gz*")), [])
+
+    def test_F1_archive_invariant_after_verification(self):
+        make_735_state(self.state)
+        self.write_cfg(CFG_735)
+        g = self.gate_for_archive("r-inv2")
+        real_verify = G.verify_archive
+
+        def drop_agent_db(path, expected, stop=None):
+            v = real_verify(path, expected, stop)
+            v["matched"] = [m for m in v["matched"] if "/agents/" not in m]
+            return v
+        with mock.patch.object(G, "verify_archive", side_effect=drop_agent_db):
+            with self.assertRaises(G.HoldError) as cm:
+                g.phase_archive()
+        self.assertEqual(cm.exception.findings[0]["code"], "archive-verify-failed")
+        self.assertIn("agents/main/agent/openclaw-agent.sqlite", cm.exception.findings[0]["message"])
+        self.assertEqual(list((self.share / "openclaw-upgrade" / "r-inv2").glob("*.tar.gz*")), [])
+
+    def test_F4_pins_retry_applies_pins_to_the_current_config(self):
+        """Reviewer repro pins_stale.py: the retry used the first attempt's snapshot."""
+        cfgp = self.state / "openclaw.json"
+        self.write_cfg({"channels": {"telegram": {"streaming": "on"}}, "gateway": {"mode": "local"}})
+        g = G.Gate(emit=lambda s: None)
+        g.pkg = C.runtime_package()
+        g.j = {"run_id": "r-pins", "mode": "from-7x", "history": []}
+        G.ensure_dirs()
+        answers = iter([(False, "rc 1: channels.telegram.streaming invalid"), (True, "rc 0")])
+        with mock.patch.object(g, "config_validate", side_effect=lambda tag: next(answers)):
+            with self.assertRaises(G.HoldError) as cm:
+                g.phase_pins()
+            self.assertEqual(cm.exception.findings[0]["code"], "pins-invalid")
+            self.assertEqual(json.loads(cfgp.read_text())["channels"]["telegram"]["streaming"], "on")  # restored
+            cur = json.loads(cfgp.read_text())
+            cur["channels"]["telegram"]["streaming"] = {"mode": "partial"}
+            cur["userFix"] = True
+            cfgp.write_text(json.dumps(cur))
+            g.phase_pins()
+        final = json.loads(cfgp.read_text())
+        self.assertTrue(final["userFix"])
+        self.assertEqual(final["channels"]["telegram"]["streaming"]["mode"], "partial")
+        self.assertEqual(final["agents"]["defaults"]["maxConcurrent"], 4)
+        pre = json.loads((self.upg / "gate" / "runs" / "r-pins" / "config.pre-pins.json").read_text())
+        self.assertTrue(pre["userFix"])
+
+    def test_F5_lone_surrogates_in_config_and_sessions(self):
+        """Reviewer repro surrogate.py: Node writes "\\ud83d" for a label cut mid-emoji."""
+        self.build_735()
+        cfg = json.loads(json.dumps(CFG_735))
+        cfg["ui"] = {"assistant": {"name": "Volt \ud83d"}}
+        self.write_cfg(cfg)
+        sp = self.state / "agents" / "main" / "sessions" / "sessions.json"
+        store = json.loads(sp.read_text())
+        store["agent:main:main"]["label"] = "Hallo \ud83d"
+        sp.write_text(json.dumps(store))
+        # 9.9 (Node's JSON.stringify) writes lone surrogates as \\u escapes too
+        doc = self.bin / "ascii-doctor"
+        doc.write_text(FAKE_DOCTOR.replace("ensure_ascii=False", "ensure_ascii=True"))
+        doc.chmod(0o755)
+        self.hooks(doctor_cmd=[str(doc)])
+        self.assertEqual(self.run_gate(), 0, self.out)
+        new = json.loads((self.state / "openclaw.json").read_bytes().decode("utf-8"))
+        self.assertEqual(new["ui"]["assistant"]["name"], "Volt \ud83d")
+        sess = json.loads(sp.read_bytes().decode("utf-8"))
+        self.assertEqual((sess["agent:main:main"]["agentRuntimeOverride"], sess["agent:main:main"]["label"]),
+                         ("openclaw", "Hallo \ud83d"))
+
+    def test_F5_premigrate_value_error_is_premigrate_failed(self):
+        self.build_735()
+        cfg = json.loads(json.dumps(CFG_735))
+        cfg["agents"]["defaults"]["models"] = ["openai-codex/gpt-5.5"]  # not an object: R2 cannot pin
+        self.write_cfg(cfg)
+        self.hooks()
+        self.assertEqual(self.run_gate(), 20, self.out)
+        self.assertEqual(self.journal()["hold"]["code"], "premigrate-failed")
+
+    def test_F15_cron_jobs_on_openai_models_mean_codex_in_use(self):
+        make_735_state(self.state)
+        db = self.state / "state" / "openclaw.sqlite"
+        c = sqlite3.connect(str(db))
+        c.execute("INSERT INTO cron_jobs VALUES ('j1','openai/gpt-5.5',NULL)")
+        c.execute("INSERT INTO cron_jobs VALUES ('j2','vllm/q',?)", (json.dumps(["OpenAI/gpt-5.4-mini"]),))
+        c.execute("INSERT INTO cron_jobs VALUES ('j3','openai-codex/gpt-5.4',NULL)")
+        c.commit()
+        c.close()
+        self.assertEqual(G.codex_cron_ids(db, "openai")[1], ["gpt-5.4-mini", "gpt-5.5"])
+        self.assertEqual(G.codex_cron_ids(db)[1], ["gpt-5.4"])
+        g = G.Gate(emit=lambda s: None)
+        g.j = {"plugins_before": [], "cron_openai_ids": []}
+        self.assertFalse(g.codex_pkg_before())
+        g.j["cron_openai_ids"] = ["gpt-5.5"]
+        self.assertTrue(g.codex_pkg_before())
+        self.write_cfg(CFG_735)
+        self.hooks()
+        self.assertEqual(self.run_gate(), 0, self.out)
+        j = self.journal()
+        self.assertEqual(j["cron_openai_ids"], ["gpt-5.4-mini", "gpt-5.5"])
+        self.assertTrue(j["fixups"]["codex_needed"])
 
 
 class DryRunTests(GateEnv):

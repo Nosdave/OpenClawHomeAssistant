@@ -971,8 +971,9 @@ if [ "$STATE_HOLD" != "true" ]; then
   # A HOLD from an earlier boot no longer applies. Before a gate run the gate
   # (and run_migration_gate) delete it themselves.
   if [ "$GATE_NEEDED" != "true" ]; then rm -f "${UPG_DIR}/hold.txt"; fi
-  # From 2026.8 on the migration gate owns the pre-migration archive.
-  if ! runtime_at_least 2026.8.0; then require_upgrade_backup; fi
+  # From 2026.8 on the migration gate owns the pre-migration archive. Not
+  # started when a stop request arrived meanwhile (the Supervisor would kill it).
+  if ! runtime_at_least 2026.8.0 && [ "$SHUTTING_DOWN" != "true" ]; then require_upgrade_backup; fi
 fi
 
 # ------------------------------------------------------------------------------
@@ -1050,7 +1051,11 @@ process_export_request() {
   fi
   return 0
 }
-process_export_request
+# A stop request that arrived during the state guard or `gate --plan` must not
+# start a multi-GB export the Supervisor kills (its one-shot request would be lost).
+if [ "$SHUTTING_DOWN" != "true" ]; then
+  process_export_request
+fi
 
 # ------------------------------------------------------------------------------
 # Session lock cleanup helpers
@@ -2130,7 +2135,8 @@ while true; do
     # Poll with kill -0 until it exits.
     while kill -0 "$GW_PID" 2>/dev/null; do
       if [ "$SHUTTING_DOWN" = "true" ]; then break 2; fi
-      sleep 5
+      sleep 5 &
+      wait "$!" || true
     done
     GW_EXIT_CODE=0
   fi
@@ -2195,16 +2201,26 @@ ${hold_out}" "$hold_keep"
   # Tier 3 (/proc scan) usually finds the daemon on the very first attempt
   # because the process exists immediately after fork, even before port bind
   # or process.title. The retries cover edge cases on extremely slow I/O.
+  # Every sleep in this crash-restart window is `sleep & wait`, so a stop
+  # request runs the shutdown trap at once, and SHUTTING_DOWN is checked again
+  # after the detection, after the backoff and right before a restart: a
+  # gateway started after shutdown() would never be stopped.
   RESTARTED_PID=""
   if [ "$GATEWAY_MODE" != "remote" ]; then
     for _attempt in 1 2 3 4 5 6 7 8 9 10; do
       RESTARTED_PID=$(find_gateway_daemon_pid 2>/dev/null || true)
       [ -n "$RESTARTED_PID" ] && break
-      sleep 2
+      [ "$SHUTTING_DOWN" = "true" ] && break
+      sleep 2 &
+      wait "$!" || true
     done
   else
-    sleep 2
+    sleep 2 &
+    wait "$!" || true
     RESTARTED_PID=$(pgrep -f "openclaw.*node.*run" 2>/dev/null | head -1 || true)
+  fi
+  if [ "$SHUTTING_DOWN" = "true" ]; then
+    break
   fi
 
   if [ -n "$RESTARTED_PID" ]; then
@@ -2275,16 +2291,24 @@ ${hold_out}" "$hold_keep"
   fi
 
   echo "WARN: OpenClaw runtime exited with code ${GW_EXIT_CODE}. Restarting in ${GW_BACKOFF}s..."
-  sleep "$GW_BACKOFF"
+  sleep "$GW_BACKOFF" &
+  wait "$!" || true
+  if [ "$SHUTTING_DOWN" = "true" ]; then
+    break
+  fi
 
   # Stop the loopback relay BEFORE restarting the gateway (tailnet mode only).
   # The relay holds 127.0.0.1:GATEWAY_PORT — leaving it up causes the new gateway
   # to detect the port as occupied and exit with code 1, re-entering the loop.
   stop_gw_relay
 
+  if [ "$SHUTTING_DOWN" = "true" ]; then
+    break
+  fi
   if ! start_openclaw_runtime; then
     echo "ERROR: Failed to restart OpenClaw runtime; retrying in 5s..."
-    sleep 5
+    sleep 5 &
+    wait "$!" || true
   else
     GW_IS_CHILD=true
     start_gw_relay

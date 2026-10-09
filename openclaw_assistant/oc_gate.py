@@ -62,6 +62,7 @@ DOCTOR_PHASES = ("doctor1", "fixups", "doctor2")
 ACCEPTABLE = frozenset({
     "checkpoint-not-735", "legacy-db-unimported", "active-memory-optouts", "telegram-bindings-nonempty",
     "oauth-json-only", "legacy-memory-sidecar", "models-platform-only", "canonical-openai-refs",
+    "models-route-collision",
     "sqlite-check-timeout", "no-network", "orphan-agent-db",
     "doctor-not-idempotent", "doctor-warnings",
     "pc-schema-meta", "pc-legacy-files", "pc-lint-errors", "pc-lint-failed", "pc-legacy-refs",
@@ -101,13 +102,17 @@ ADVICE = {
     "config-missing": "restore openclaw.json from the Home Assistant backup, then oc-upgrade retry",
     "config-unreadable": "fix openclaw.json (strict JSON required; JSON5 comments are unsupported), then oc-upgrade retry",
     "config-includes": "inline the $include files into openclaw.json, then oc-upgrade retry",
+    "state-symlink": "replace the symlink by the real directory (or bind-mount it), then oc-upgrade retry",
     "newer-state": "restore the Home Assistant backup that matches this add-on version",
     "not-pre-journal": "restore the 0.5.93 backup (the state is not a clean 2026.7.x state)",
     "legacy-state-dir": "move /config/.clawdbot out of /config (or merge it manually), then oc-upgrade retry",
     "custom-session-store": "remove session.store from openclaw.json (custom session stores are not migrated), then oc-upgrade retry",
     "sessions-unreadable": "repair or move the unreadable sessions.json files, then oc-upgrade retry",
     "models-codex-provider": "replace codex/... or codex-cli/... model refs and the models.providers.codex block, then oc-upgrade retry",
-    "models-codex-runtime": "remove agentRuntime ids codex/codex-app-server/codex-cli from openclaw.json, then oc-upgrade retry",
+    "models-codex-runtime": "remove the Codex agentRuntime pins from the openai-codex/... (or codex/...) entries in openclaw.json "
+                            "(a Codex pin on an openai/... entry is kept), then oc-upgrade retry",
+    "models-route-collision": "use one form per model on 0.5.93 (openai-codex/<model> or openai/<model>, not both), "
+                              "then oc-upgrade retry",
     "models-provider-merge": "merge models.providers[\"openai-codex\"].models into models.providers.openai by hand, then oc-upgrade retry",
     "models-wildcard-pinned": "remove the agentRuntime pin from the openai-codex/* wildcard entry, then oc-upgrade retry",
     "low-disk-config": "free space on the /config disk, then oc-upgrade retry",
@@ -263,7 +268,7 @@ def q(path, sql, params=()):
         return C.query_ro(path, sql, params)
     except sqlite3.DatabaseError as exc:
         try:
-            rows = C.node_query(path, sql, params=params)
+            rows = C.node_query(path, sql, params=params, stop_event=STOP)
         except C.NodeQueryError as nexc:
             raise sqlite3.DatabaseError(f"{exc} (node fallback: {nexc})") from exc
         NODE_FALLBACKS.append(str(path))
@@ -284,7 +289,7 @@ def db_uv(path):
         return C.user_version(path)
     except C.SchemaUnknown:
         try:
-            rows = C.node_query(path, "PRAGMA user_version")
+            rows = C.node_query(path, "PRAGMA user_version", stop_event=STOP)
         except C.NodeQueryError:
             raise
         NODE_FALLBACKS.append(str(path))
@@ -532,15 +537,13 @@ def classify(state_dir, cfg, s_target, a_target, runtime):
 
 
 def infer_mode(cls, cfg):
-    uv = cls.get("state_uv")
-    if uv == 1:
+    """from-7x when the state DB or any target agent DB is at schema 1, or openclaw.json was last
+    written by OpenClaw < 2026.8 (whatever the state DB says); else bump."""
+    if cls.get("state_uv") == 1 or any(v == 1 for v in (cls.get("agents") or {}).values()):
         return "from-7x"
-    if uv is None:
-        if any(v == 1 for v in cls.get("agents", {}).values()):
-            return "from-7x"
-        lt = C.version_tuple(_cfg_get(cfg, "meta", "lastTouchedVersion"))
-        if lt and lt < (2026, 8, 0, 0):
-            return "from-7x"
+    lt = C.version_tuple(_cfg_get(cfg, "meta", "lastTouchedVersion"))
+    if lt and lt < (2026, 8, 0, 0):
+        return "from-7x"
     return "bump"
 
 
@@ -638,8 +641,9 @@ def decide(ctx):
         consume()
         if code in POST_RUN_HOLDS:
             if gate_needed or retry.get("doctor"):
-                return R(10, "run", f"retry after {code}: maintenance gate (new archive, doctor)", mode="maintenance",
-                         new_run=True)
+                # a 2026.7.x state (rollback) needs the full from-7x run, never a maintenance doctor
+                m = "from-7x" if mode_new == "from-7x" else "maintenance"
+                return R(10, "run", f"retry after {code}: {m} gate (new archive, doctor)", mode=m, new_run=True)
             bk["journal_status"] = "done"
             status = "done"
         elif j.get("first_write_at") is None and j.get("mode") != "maintenance":
@@ -697,12 +701,12 @@ def decide(ctx):
             warnings.append("legacy files still present after migration (ignored): " + ", ".join(cls["files"][:5]))
         return R(0, "none", f"migrated ({marker.get('mode')}, run {marker.get('run_id')})", marker=mk)
     if isinstance(marker, dict):
-        return R(10, "run", f"marker is for {marker.get('runtime')}; version bump to {runtime}", mode="bump",
+        return R(10, "run", f"marker is for {marker.get('runtime')}; version bump to {runtime}", mode=mode_new,
                  new_run=True)
     lt = _cfg_get(cfg, "meta", "lastTouchedVersion")
     if not lt or C.version_tuple(lt) == C.version_tuple(runtime):
         return R(0, "none", "no marker; state matches the runtime -> adopted", marker="adopt")
-    return R(10, "run", f"openclaw.json last written by {lt}; version bump to {runtime}", mode="bump", new_run=True)
+    return R(10, "run", f"openclaw.json last written by {lt}; version bump to {runtime}", mode=mode_new, new_run=True)
 
 
 def _read_cfg_lenient():
@@ -748,8 +752,16 @@ def plan(apply=False, emit=out):
         binding = current_binding(gp["STATE"], cls)
         d = decide({"fresh": False, "runtime": pkg["version"], "cls": cls, "journal": journal, "marker": marker,
                     "retry": retry, "cfg": cfg, "binding": binding})
+    except C.Stopped:
+        raise
     except Exception as exc:  # B11: a planning bug must not brick a migrated install
-        if marker and pkg and marker.get("runtime") == pkg["version"]:
+        # ... but must not bypass a gate run that is still open (sticky HOLD, interrupted run)
+        try:
+            jst = load_journal()
+            settled = jst is None or jst.get("status") in ("done", "abandoned")
+        except (OSError, ValueError):
+            settled = False
+        if marker and pkg and marker.get("runtime") == pkg["version"] and settled:
             emit(f"WARN [gate] planning failed ({type(exc).__name__}: {exc}); a migration marker for "
                  f"{pkg['version']} exists -> starting OpenClaw (exit 78 would still HOLD)")
             emit(f"[gate] plan: runtime={pkg['version']} planning error ignored (marker {marker.get('mode')}) -> no gate")
@@ -1030,7 +1042,8 @@ def find_openclaw_processes(entry, proc_dir="/proc", self_pid=None):
         hit = (entry and entry in args) or any(a.endswith("/openclaw.mjs") for a in args) \
             or first.split(" ")[0] == "openclaw-gateway" or os.path.basename(first.split(" ")[0]) == "openclaw"
         if hit:
-            found.append({"pid": pid, "cmd": " ".join(args)[:120]})
+            # argv[0..2] only, redacted: the rest may carry secrets (--token ...) into hold.txt and the journal
+            found.append({"pid": pid, "cmd": C.redact_text(" ".join(args[:3]))[:120]})
     return found
 
 
@@ -1423,7 +1436,7 @@ class Gate:
         return self.cfg
 
     def write_config(self, cfg):
-        C.atomic_write_text(self.gp["CONFIG_PATH"], json.dumps(cfg, indent=2, ensure_ascii=False) + "\n")
+        C.atomic_write_text(self.gp["CONFIG_PATH"], C.json_dumps(cfg))
         self.cfg = cfg
 
     def copy_once(self, src, dst):
@@ -1470,7 +1483,7 @@ class Gate:
         roots = [srel]
         excludes = [f"{srel}/{d}" for d in STATE_EXCLUDES]
         warns, ws_info = [], []
-        included = []
+        included, symlinks = [], []
         for ws in workspaces(self.cfg):
             if not os.path.isdir(ws):
                 continue
@@ -1482,6 +1495,12 @@ class Gate:
                 continue
             if str(wrel) in ("", ".") or state == ws or str(state).startswith(str(ws) + "/"):
                 warns.append(f"workspace {ws} contains the state directory: archived only through {srel}")
+                continue
+            # F1: tar would store a symlinked workspace as a bare link (precheck: state-symlink), unless
+            # its target is archived anyway (inside the state dir or another workspace root)
+            if os.path.islink(ws) and not any(str(real) == str(r) or str(real).startswith(str(r) + "/")
+                                              for r in included + [Path(os.path.realpath(state))]):
+                symlinks.append(str(ws))
                 continue
             if str(ws).startswith(str(state) + "/"):
                 continue
@@ -1515,7 +1534,17 @@ class Gate:
             for sib in sorted(ws.parent.glob(ws.name + ".attested*")):
                 if os.path.lexists(sib):
                     roots.append(str(sib.relative_to(root)))
-        return {"roots": roots, "excludes": excludes, "warnings": warns, "workspaces": ws_info, "state_rel": srel}
+        return {"roots": roots, "excludes": excludes, "warnings": warns, "workspaces": ws_info, "state_rel": srel,
+                "symlinks": symlinks}
+
+    def known_db_members(self, ap):
+        """Archive member names of the state DB and of every target agent DB the predicate knows (F1)."""
+        if self.cls is None:
+            self.cls = classify(self.gp["STATE"], self.cfg, self.pkg["schema_state"], self.pkg["schema_agent"],
+                                self.pkg["version"])
+        rels = ["state/openclaw.sqlite"] if os.path.lexists(self.gp["STATE"] / "state" / "openclaw.sqlite") else []
+        rels += sorted(set((self.cls.get("agent_paths") or {}).values()) - set(rels))
+        return [r if os.path.isabs(r) else f"{ap['state_rel']}/{r}" for r in rels]
 
     def iter_archive_inputs(self, ap):
         """(path, member_name, lstat) of every input (same rules as the tar excludes)."""
@@ -1668,8 +1697,12 @@ class Gate:
             self.facts["cleanup_plan"] = sf.get("plan", [])
             _stores, sess_f = M.scan_sessions_files(str(p["STATE"]))
             F += [dict(f) for f in sess_f]
-        # 7 sizes
+        # 7 sizes (and F1: a symlinked state/agent directory or workspace root would be archived as a bare link)
         ap = self.archive_plan()
+        links = state_symlinks(p["STATE"], self.cls) + ap["symlinks"]
+        if links:
+            F.append(finding("state-symlink", "hard", "symlinked director(ies) would be archived as bare links, "
+                             "without the data they point to: " + ", ".join(links[:6]), "precheck"))
         sizes = self.measure(ap)
         # 8 space
         if self.hooks.get("skip_space_check"):
@@ -1799,6 +1832,8 @@ class Gate:
         n, cron_ids = codex_cron_ids(state / "state" / "openclaw.sqlite")
         if self.j is not None and not self.j.get("first_write_at"):
             self.j["cron_legacy_ids"] = cron_ids  # F1/PC2: doctor pins these for "migrated cron runtime intent"
+            # F15: cron jobs on canonical openai/ models mean Codex was in use (codex_pkg_before)
+            self.j["cron_openai_ids"] = codex_cron_ids(state / "state" / "openclaw.sqlite", "openai")[1]
         if n:
             self.warn(f"{n} cron job(s) use openai-codex models: doctor may install the @openclaw/codex plugin "
                       "for them (it stays installed); the fixups revert doctor's codex runtime pins to openclaw")
@@ -1858,6 +1893,14 @@ class Gate:
                         if qc:
                             entry["quick_check"] = qc
                     sqlite_meta.append(entry)
+            # F1 invariant: every database the predicate knows is a hashed archive member
+            known = self.known_db_members(ap)
+            absent = [m for m in known if m not in expected]
+            if absent:
+                why = "outside the state directory" if any(os.path.isabs(m) for m in absent) else "symlinked directory?"
+                raise HoldError([finding("archive-verify-failed", "hard",
+                                         f"database(s) the migration needs would not be in the archive ({why}): "
+                                         + ", ".join(absent[:5]), "archive")], "archive")
             argv = ["tar", "--create", f"--file={tmp}", "--use-compress-program=gzip -1",
                     f"--directory={p['CONFIG_ROOT']}", "--anchored", "--wildcards"]
             argv += [f"--exclude={e}" for e in ap["excludes"]]
@@ -1909,9 +1952,10 @@ class Gate:
             _unlink(tmp)
             raise HoldError([finding("archive-verify-failed", "hard",
                                      f"archive cannot be read back: {type(exc).__name__}: {exc}", "archive")], "archive")
-        if v["mismatched"] or v["missing"] or v["members"] == 0:
+        unmatched = [m for m in known if m not in v["matched"]]
+        if v["mismatched"] or v["missing"] or v["members"] == 0 or unmatched:
             _unlink(tmp)
-            bad = (v["mismatched"] + v["missing"])[:5]
+            bad = list(dict.fromkeys(v["mismatched"] + v["missing"] + unmatched))[:5]
             raise HoldError([finding("archive-verify-failed", "hard",
                                      f"{len(v['matched'])}/{len(expected)} sqlite files match; differing or missing: "
                                      + ", ".join(bad), "archive")], "archive")
@@ -2035,9 +2079,9 @@ class Gate:
             C.atomic_write_json(rd / "config.post-transform.json", new_cfg)
             self.write_config(new_cfg)
             for src, store in sess_writes:
-                C.atomic_write_text(src, json.dumps(store, indent=2, ensure_ascii=False) + "\n")
+                C.atomic_write_text(src, C.json_dumps(store))
             self.ledger_add(list(ledger) + sess_led, {"R1", "R2", "R3", "R4", "R5"})
-        except (OSError, C.ConfigReadError) as exc:
+        except (OSError, ValueError, C.ConfigReadError) as exc:  # ValueError: a map that is not an object
             raise HoldError([finding("premigrate-failed", "hard", f"{type(exc).__name__}: {exc}", "premigrate")],
                             "premigrate")
         self.j["transform"] = {"legacy_slots": summary.get("legacy_slots", []), "explicit_ids": summary.get("explicit", []),
@@ -2154,8 +2198,10 @@ class Gate:
                          "doctor1", resume_after=True)
 
     def codex_pkg_before(self):
-        """A codex plugin package existed before doctor pass 1 (contract addendum 2 rule 4)."""
-        return any(str(x).startswith("npm/projects/openclaw-codex-") for x in self.j.get("plugins_before") or [])
+        """Codex was in use before doctor pass 1 outside openclaw.json (contract addendum 2 rule 4): a codex
+        plugin package existed, or cron jobs used canonical openai/ models (F15; recorded by the precheck)."""
+        return any(str(x).startswith("npm/projects/openclaw-codex-") for x in self.j.get("plugins_before") or []) \
+            or bool(self.j.get("cron_openai_ids"))
 
     def phase_fixups(self):
         """F1-F3 (from-7x) or F1b (bump/maintenance), then F4 (contract addendum 2)."""
@@ -2171,10 +2217,14 @@ class Gate:
                                                 extra_legacy_ids=self.j.get("cron_legacy_ids") or [])
         else:
             new_cfg, ledger, summary = M.post_doctor_fixups(cfg_now, pre_pass1, codex_pkg_before=self.codex_pkg_before())
-        if ledger:
-            self.write_config(new_cfg)
-        self.ledger_add(ledger, {"F1", "F1b", "F1c", "F2", "F3"})
-        C.atomic_write_json(rd / "config.post-fixups.json", new_cfg)
+        try:
+            if ledger:
+                self.write_config(new_cfg)
+            self.ledger_add(ledger, {"F1", "F1b", "F1c", "F2", "F3"})
+            C.atomic_write_json(rd / "config.post-fixups.json", new_cfg)
+        except ValueError as exc:
+            raise HoldError([finding("fixups-invalid", "hard", f"the fixups could not be written "
+                                     f"({type(exc).__name__}: {exc}); openclaw.json unchanged", "fixups")], "fixups")
         ok, detail = self.config_validate("pc-fixups-validate")
         if not ok:
             post1 = rd / "config.post-pass1.json"
@@ -2214,10 +2264,16 @@ class Gate:
             return False
         before = rd / f"config.post-pass{n}.raw.json"
         self.save_copy(p["CONFIG_PATH"], before)
-        self.write_config(new_cfg)
         for e in ledger:
             e["step"] = f"{e['step']}@pass{n}"
-        self.ledger_add(ledger, {f"F1b@pass{n}"})
+        try:
+            self.write_config(new_cfg)
+            self.ledger_add(ledger, {f"F1b@pass{n}"})
+        except ValueError as exc:
+            C.atomic_write_bytes(p["CONFIG_PATH"], before.read_bytes())
+            raise HoldError([finding("fixups-invalid", "hard", f"the pass-{n} fixups could not be written "
+                                     f"({type(exc).__name__}: {exc}); doctor's pass-{n} config restored", "doctor2")],
+                            "doctor2")
         ok, detail = self.config_validate(f"pc-pass{n}-fixups-validate")
         if not ok:
             C.atomic_write_bytes(p["CONFIG_PATH"], before.read_bytes())
@@ -2470,10 +2526,22 @@ class Gate:
             led = {"schema": 1, "entries": [], "skipped": [], "reset_for": self.j["run_id"]}
             C.atomic_write_json(p["LEDGER"], led)
         ledgered = {e.get("path") for e in led.get("entries", []) if e.get("run_id") != self.j["run_id"]}
-        self.copy_once(p["CONFIG_PATH"], rd / "config.pre-pins.json")
-        base = C.read_json_strict(rd / "config.pre-pins.json")
+        # a fresh snapshot on every attempt: a retry after pins-invalid applies the pins to the config as
+        # the user fixed it (and to what a re-run doctor / fixups / auth order wrote), never to an old copy
+        self.save_copy(p["CONFIG_PATH"], rd / "config.pre-pins.json")
+        try:
+            base = C.read_json_strict(rd / "config.pre-pins.json")
+        except C.ConfigReadError as exc:
+            raise HoldError([finding("pc-config", "hard", f"openclaw.json cannot be read before the pins: {exc}",
+                                     "pins")], "pins")
         new_cfg, written, skipped = M.apply_pins(base, set(ledgered))
-        self.write_config(new_cfg)
+        try:
+            self.write_config(new_cfg)
+        except ValueError as exc:
+            C.atomic_write_bytes(p["CONFIG_PATH"], (rd / "config.pre-pins.json").read_bytes())
+            raise HoldError([finding("pins-invalid", "acceptable",
+                                     f"the behaviour pins could not be written ({type(exc).__name__}: {exc}); "
+                                     "restored. Accepting skips the pins.", "pins")], "pins")
         ok, detail = self.config_validate("pc-pins-validate")
         if not ok:
             C.atomic_write_bytes(p["CONFIG_PATH"], (rd / "config.pre-pins.json").read_bytes())
@@ -2650,6 +2718,25 @@ def _unlink(p):
         pass
 
 
+def state_symlinks(state_dir, cls):
+    """Symlinks on the way to every database the predicate knows (F1): the state dir, state/, agents/
+    and each target agent's directories and DB file. tar archives a symlink as a bare link."""
+    state_dir = Path(state_dir)
+    cands = [state_dir, state_dir / "state", state_dir / "state" / "openclaw.sqlite", state_dir / "agents"]
+    for relp in sorted(set(((cls or {}).get("agent_paths") or {}).values())):
+        if os.path.isabs(relp):
+            continue  # outside the state dir: the archive invariant reports it
+        cur = state_dir
+        for part in Path(relp).parts:
+            cur = cur / part
+            cands.append(cur)
+    out = []
+    for c in cands:
+        if os.path.islink(c) and str(c) not in out:
+            out.append(str(c))
+    return out
+
+
 def _is_git_pack_tmp(p):
     s = str(p)
     return s.endswith(".tmp") and "/.git/objects/pack/" in s
@@ -2731,7 +2818,7 @@ def quick_check(path, budget_s=None):
 
 def _node_quick_check(path, budget_s, exc):
     try:
-        rows = C.node_query(path, "PRAGMA quick_check", timeout=budget_s)
+        rows = C.node_query(path, "PRAGMA quick_check", timeout=budget_s, stop_event=STOP)
     except C.NodeQueryError as nexc:
         return f"unreadable ({type(exc).__name__}: {exc}; node fallback: {nexc})"
     NODE_FALLBACKS.append(str(path))
@@ -2812,23 +2899,22 @@ def read_auth_profiles(state_dir, agent_paths):
     return outl
 
 
-_CRON_LEGACY_RE = re.compile(r"\A\s*openai-codex\s*/\s*([^\s@*][^\s@]*)", re.I)
-
-
-def codex_cron_ids(state_db):
-    """(number of cron jobs, sorted model ids) of 7.x cron payloads that use openai-codex/<id> models."""
+def codex_cron_ids(state_db, provider="openai-codex"):
+    """(number of cron jobs, sorted model ids) of cron payloads that use <provider>/<id> models
+    (openai-codex: 7.x legacy refs; openai: canonical refs, which 7.35 ran on the Codex app-server)."""
+    ref_re = re.compile(r"\A\s*" + re.escape(provider) + r"\s*/\s*([^\s@*][^\s@]*)", re.I)
     try:
         if not state_db.exists() or "cron_jobs" not in table_names(state_db):
             return 0, []
         cols = {r[1] for r in q(state_db, "PRAGMA table_info(cron_jobs)")}
         conds, sel = [], []
         if "payload_model" in cols:
-            conds.append("lower(trim(coalesce(payload_model,''))) LIKE 'openai-codex/%'")
+            conds.append(f"lower(trim(coalesce(payload_model,''))) LIKE '{provider}/%'")
             sel.append("payload_model")
         else:
             sel.append("NULL")
         if "payload_fallbacks_json" in cols:
-            conds.append("lower(coalesce(payload_fallbacks_json,'')) LIKE '%openai-codex/%'")
+            conds.append(f"lower(coalesce(payload_fallbacks_json,'')) LIKE '%{provider}/%'")
             sel.append("payload_fallbacks_json")
         else:
             sel.append("NULL")
@@ -2847,7 +2933,7 @@ def codex_cron_ids(state_db):
         if isinstance(fb, list):
             refs += [x for x in fb if isinstance(x, str)]
         for r in refs:
-            m = _CRON_LEGACY_RE.match(r)
+            m = ref_re.match(r)
             if m:
                 ids.add(m.group(1)[:120])
     return len(rows), sorted(ids)[:200]

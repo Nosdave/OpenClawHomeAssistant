@@ -18,9 +18,11 @@
 #   - while the add-on holds OpenClaw (hold.txt present), every command except
 #     a small read-only allow-list.
 # OC_ADDON_UNSAFE=1 bypasses the doctor and HOLD checks (support-guided
-# recovery only). Everything that is allowed is exec'd unchanged — no extra
-# process is left behind for run.sh's gateway detection to see. The migration
-# gate calls the package entry with node directly and never comes through here.
+# recovery only); an OC_UPGRADE_DIR other than the add-on's hides its HOLD
+# marker, so it gets the same warning. Everything that is allowed is exec'd
+# unchanged, with the image's Node — no extra process is left behind for
+# run.sh's gateway detection to see. The migration gate calls the package
+# entry with that Node directly and never comes through here.
 set -u
 
 # The directory this wrapper was installed into (the image installs it as
@@ -34,7 +36,13 @@ if [ -z "$entry" ] || [ ! -f "$entry" ]; then
   echo "openclaw: package entry not found (expected path in ${OC_ADDON_DIR}/openclaw-entry)" >&2
   exit 127
 fi
-node_bin="$(command -v node 2>/dev/null || true)"
+# The image's Node (recorded at build time): a Homebrew `node` may come first on
+# PATH, but OpenClaw must run on the Node the image checked. PATH is only the
+# fallback for an install without the record.
+node_bin="$(head -n 1 "${OC_ADDON_DIR}/openclaw-node" 2>/dev/null || true)"
+if [ -z "$node_bin" ] || [ ! -x "$node_bin" ]; then
+  node_bin="$(command -v node 2>/dev/null || true)"
+fi
 if [ -z "$node_bin" ]; then
   echo "openclaw: node not found on PATH" >&2
   exit 127
@@ -103,6 +111,11 @@ fi
 if [ "${OC_ADDON_UNSAFE:-}" = "1" ]; then
   echo "openclaw: OC_ADDON_UNSAFE=1 — add-on safety checks bypassed" >&2
   exec "$node_bin" "$entry" "$@"
+fi
+
+# Another OC_UPGRADE_DIR hides the add-on's hold.txt from the HOLD check below.
+if [ "${UPG_DIR%/}" != "/config/.openclaw-upgrade" ]; then
+  echo "openclaw: OC_UPGRADE_DIR=${UPG_DIR} — add-on safety checks bypassed (HOLD marker not read from /config/.openclaw-upgrade)" >&2
 fi
 
 # True when `rest` contains one of the given flags (also as --flag=value).

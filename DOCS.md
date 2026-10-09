@@ -1002,20 +1002,29 @@ numbered `1/9` … `9/9`.
    [Safe rollback](#safe-rollback-after-an-openclaw-database-upgrade)). After that,
    delete `/share/openclaw-upgrade/*` — it contains secrets.
 
+The add-on never deletes gate archives: every gate run (also later 9.x updates and
+`oc-upgrade retry --doctor`) writes a new one. Delete old
+`/share/openclaw-upgrade/<run>/` directories after each gate run once you no longer
+need them (they contain secrets).
+
 **What the gate does**
 
 | Phase | What happens |
 |---|---|
-| 1 precheck | Read-only checks: runtime package, Node/SQLite, no other OpenClaw process, readable config, state not newer than the image, clean 2026.7 state, model preflight, legacy files, sessions, free space, SQLite `quick_check`, npm reachable. All findings are collected, then one HOLD if needed. |
+| 1 precheck | Read-only checks: runtime package, Node/SQLite, no other OpenClaw process, readable config, state not newer than the image, clean 2026.7 state, no symlinked state or workspace directory (the archive would hold only the link), model preflight, legacy files, sessions, free space, SQLite `quick_check`, npm reachable. All findings are collected, then one HOLD if needed. |
 | 2 archive | `/config/.openclaw` + workspace → `/share/openclaw-upgrade/<run>/openclaw-state-<ts>-before-2026.9.9.tar.gz`, with `manifest.json` and `SHA256SUMS`; verified by re-reading it. |
 | 3 cleanup | Transient SQLite sidecars and legacy Telegram caches are moved to `/config/.openclaw-upgrade/gate/quarantine/<run>/` (kept, listed in the log). |
 | 4 pre-migrate | Only for legacy `openai-codex/…` refs: wildcards → explicit models; these refs keep the OpenClaw runtime they used on 2026.7. |
-| 5–7 doctor | `openclaw doctor --fix --non-interactive` twice (a third time only if the second still changed the config), each with a time limit and a progress line every minute; scoped fixups in between. Canonical `openai/*` refs keep their runtime (Codex app-server by default, as on 2026.7). |
+| 5–7 doctor | `openclaw doctor --fix --non-interactive` twice (a third time only if the second still changed the config), each with a time limit and a progress line every minute; scoped fixups in between. Canonical `openai/*` refs keep their runtime (Codex app-server by default, as on 2026.7; an `agentRuntime` pin on an `openai/…` entry is kept). A model used both as `openai-codex/<model>` and as `openai/<model>` gets one route in 2026.9: the precheck holds with the acceptable code `models-route-collision`. |
 | 8 postconditions | Schema versions, `config validate`, `doctor --lint`, no legacy refs, runtime of migrated refs, `models status`, sessions. |
 | 9 pins | Keeps 2026.7 defaults where you have not set the key (see the 0.5.94-full1 changelog), recorded in `/config/.openclaw-upgrade/gate/pins-ledger.json` and never re-applied. |
 
 Later OpenClaw updates (9.x → 9.y) run the same gate in a shorter form: archive,
 doctor twice, postconditions; no pre-migration and no pins.
+
+The gate, the gateway and every `openclaw` command run on the image's Node.js (the
+one the image build checked), even if Homebrew installed another `node` that comes
+first on `PATH`.
 
 **HOLD and retry.** If anything fails, OpenClaw is not started and the add-on page
 and terminal come up. The log shows two lines:
@@ -1380,10 +1389,14 @@ and the add-on is in HOLD (`exit78`) instead of restarting in a loop.
 **Cause**: OpenClaw 2026.9 refuses to start when the configuration is invalid,
 the state needs a migration, or another gateway holds the lock.
 
-**Fix**: `oc-upgrade status` shows which of these the add-on found. For a
-configuration problem run `openclaw config validate` (allowed in HOLD), fix the
-reported key, then `oc-upgrade retry` and restart. If the state needs a migration,
-`oc-upgrade retry` runs a maintenance gate (new archive, doctor twice, checks).
+**Fix**: `oc-upgrade status` shows which case the add-on found: "needs
+migration", "newer state", or "configuration, lock or gateway.mode problem" (the
+last one is not narrowed down further). For a configuration problem run
+`openclaw config validate` (allowed in HOLD), fix the reported key, then
+`oc-upgrade retry` and restart. If the state needs a migration, `oc-upgrade retry`
+runs a maintenance gate (new archive, doctor twice, checks); a 2026.7 state gets the
+full migration gate instead. "Newer state" means a backup that matches this add-on
+version has to be restored.
 The gateway's own log is `/tmp/openclaw/openclaw-<date>.log`.
 
 > On OpenClaw 2026.7 (up to `0.5.93-full2`) a gateway that cannot start is
@@ -1401,13 +1414,26 @@ There are two rollback points for the 2026.9 update:
    log must show `OpenClaw runtime version: 2026.7.35`. A Codex/ChatGPT login may
    have to be repeated, because 2026.9 refreshes tokens.
 2. **The gate archive** under `/share/openclaw-upgrade/<run>/` (a Home Assistant
-   restore of the add-on does not touch `/share`). With the add-on stopped and
-   `0.5.93-full2` installed: move the current `/config/.openclaw` and the workspace
-   aside (for example to `/config/.openclaw.9x-failed`), create empty directories,
-   and extract the archive into `/config` (`tar -xzf … -C /config`) after checking
-   `sha256sum -c SHA256SUMS` in its directory. **Never extract over the migrated
-   directory**: leftover 2026.9 `*.sqlite-wal`/`-shm` files would be replayed onto
-   the restored databases.
+   restore of the add-on does not touch `/share`). Work from the **add-on's own
+   terminal**:
+   1. Install `0.5.93-full2` again. That is only possible by restoring a Home
+      Assistant backup of the add-on that has this version.
+   2. If the restored add-on finds the 2026.9 state, it holds
+      (`HOLD — OpenClaw will NOT be started`, state newer than the runtime). Its
+      page and terminal stay up. In that terminal `/config` is the add-on's own
+      configuration directory.
+   3. Move the current `/config/.openclaw` and the workspace aside, for example
+      `mv /config/.openclaw /config/.openclaw.9x-failed` and
+      `mv /config/clawd /config/clawd.9x-failed`.
+   4. Check the archive: `cd /share/openclaw-upgrade/<run> && sha256sum -c SHA256SUMS`.
+   5. Extract it: `tar -xzf /share/openclaw-upgrade/<run>/openclaw-state-<ts>-before-2026.9.9.tar.gz -C /config`.
+   6. Restart the add-on.
+
+   **Never extract over the migrated directory**: leftover 2026.9
+   `*.sqlite-wal`/`-shm` files would be replayed onto the restored databases. In the
+   SSH add-on `/config` is Home Assistant's own configuration, not this add-on's;
+   use `/addon_configs/<slug>/` there instead of `/config`, otherwise the archive's
+   secrets land in Home Assistant's config.
 
 Before 2026.8 runtimes start for the first time, the add-on also keeps a compressed
 archive under `/config/.openclaw/upgrade-backups/` (the three newest are kept);
