@@ -1571,5 +1571,30 @@ class DryRunTests(GateEnv):
         self.assertFalse((self.upg / "gate" / "journal.json").exists())
 
 
+class CodexAllowedPostconditionTests(unittest.TestCase):
+    """Harness TU: on the live-like install Codex runs canonical openai/* routes already on 7.35."""
+
+    ROUTES = {"auth": {"runtimeAuthRoutes": [{"provider": "openai", "runtime": "codex",
+                                                 "authProvider": "openai", "status": "indeterminate"}],
+                       "modelRouteIssues": [], "missingProvidersInUse": []}}
+
+    def test_models_status_codex_route_fails_when_codex_was_not_in_use(self):
+        probs = G.models_status_problems(0, self.ROUTES, [])
+        self.assertIn("pc-codex-runtime", [c for c, _ in probs])
+
+    def test_models_status_codex_route_ok_when_codex_was_in_use(self):
+        self.assertEqual(G.models_status_problems(0, self.ROUTES, [], codex_allowed=True), [])
+
+    def test_sessions_codex_rows(self):
+        data = {"sessions": [
+            {"key": "agent:main:main", "modelProvider": "openai", "agentRuntime": {"id": "codex"}},
+            {"key": "agent:main:legacy", "modelProvider": "openai", "agentRuntime": {"id": "codex"}},
+        ]}
+        self.assertEqual(len(G.sessions_problems(0, data, [], set())), 2)
+        # canonical sessions may stay on Codex, but sessions R5 pinned to openclaw must not
+        probs = G.sessions_problems(0, data, ["agent:main:legacy"], set(), codex_allowed=True)
+        self.assertEqual(probs, ["session agent:main:legacy: runtime codex"])
+
+
 if __name__ == "__main__":
     unittest.main()

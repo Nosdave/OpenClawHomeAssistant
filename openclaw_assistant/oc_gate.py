@@ -2406,7 +2406,8 @@ class Gate:
             summary.append("models/sessions/probe skipped (remote gateway)")
         else:
             res, data = self.oc_json(["models", "status", "--json", "--check"], 300, "pc-models-status")
-            ms = models_status_problems(res.rc, data, self.j.get("auth_profiles") or [])
+            codex_ok = bool((self.j.get("fixups") or {}).get("codex_needed"))
+            ms = models_status_problems(res.rc, data, self.j.get("auth_profiles") or [], codex_allowed=codex_ok)
             for code, msg in ms:
                 pol(code, msg)
             if res.rc == 2:
@@ -2417,7 +2418,8 @@ class Gate:
             tr = self.j.get("transform") or {}
             res, data = self.oc_json(["sessions", "--all-agents", "--json", "--limit", "all"], 600, "pc-sessions")
             sp = sessions_problems(res.rc, data, tr.get("sessions_pinned") or [],
-                                   set(tr.get("sessions_user_explicit") or []) | set(tr.get("sessions_harness") or []))
+                                   set(tr.get("sessions_user_explicit") or []) | set(tr.get("sessions_harness") or []),
+                                   codex_allowed=codex_ok)
             if sp:
                 pol("pc-sessions-runtime", "; ".join(sp[:6]))
             else:
@@ -2881,7 +2883,10 @@ def schema_meta_problems(state_dir, cls, pkg):
     return probs
 
 
-def models_status_problems(rc, data, auth_profiles):
+def models_status_problems(rc, data, auth_profiles, codex_allowed=False):
+    """codex_allowed: Codex was in use before the migration (canonical openai/* refs or the codex
+    package), so openai routes on the Codex app-server are the 7.35 behaviour, not a regression
+    (contract addendum 2). Migrated legacy refs are checked separately (PC2/PC3 on the config)."""
     probs = []
     if rc not in (0, 2):
         probs.append(("pc-models-status", f"models status --check rc {rc}"))
@@ -2892,7 +2897,7 @@ def models_status_problems(rc, data, auth_profiles):
     auth = data.get("auth") if isinstance(data.get("auth"), dict) else {}
     routes = auth.get("runtimeAuthRoutes") if isinstance(auth.get("runtimeAuthRoutes"), list) else []
     codex = [r for r in routes if isinstance(r, dict) and r.get("runtime") == "codex"]
-    if codex:
+    if codex and not codex_allowed:
         probs.append(("pc-codex-runtime", f"{len(codex)} model route(s) resolve to the codex runtime"))
     issues = auth.get("modelRouteIssues")
     if isinstance(issues, list) and issues:
@@ -2911,7 +2916,7 @@ def models_status_problems(rc, data, auth_profiles):
     return probs
 
 
-def sessions_problems(rc, data, pinned, excluded):
+def sessions_problems(rc, data, pinned, excluded, codex_allowed=False):
     if not isinstance(data, dict) or not isinstance(data.get("sessions"), list):
         return [f"sessions --json returned no usable result (rc {rc})"]
     probs = []
@@ -2930,7 +2935,8 @@ def sessions_problems(rc, data, pinned, excluded):
     for key, r in rows.items():
         if key in excluded:
             continue
-        if r.get("modelProvider") == "openai" and not r.get("acpRuntime") and rid(r) == "codex":
+        if not codex_allowed and r.get("modelProvider") == "openai" and not r.get("acpRuntime") \
+                and rid(r) == "codex":
             probs.append(f"session {key}: openai on codex runtime")
     return probs
 
