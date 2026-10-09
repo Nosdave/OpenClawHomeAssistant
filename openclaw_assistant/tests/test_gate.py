@@ -1596,5 +1596,40 @@ class CodexAllowedPostconditionTests(unittest.TestCase):
         self.assertEqual(probs, ["session agent:main:legacy: runtime codex"])
 
 
+class ModelsStatusRegressionOnlyTests(unittest.TestCase):
+    """`models status --check` exits 1 for merely indeterminate readiness (v99 docs/cli/models.md:91)."""
+
+    def issues(self, *items):
+        return {"auth": {"runtimeAuthRoutes": [], "missingProvidersInUse": [],
+                         "modelRouteIssues": [{"kind": k, "provider": pr, "model": m} for k, pr, m in items]}}
+
+    def test_indeterminate_and_fallback_issues_only_warn(self):
+        data = self.issues(("indeterminate", "openai", "gpt-5.5"), ("missing", "anthropic", "claude-opus-4-8"))
+        probs = G.models_status_problems(1, data, [], primaries={"vllm/qwen3.5-122b"})
+        self.assertTrue(probs)
+        self.assertEqual({c for c, _ in probs}, {"warn"})
+
+    def test_primary_route_issue_holds(self):
+        data = self.issues(("missing", "openai", "gpt-5.5"))
+        probs = G.models_status_problems(1, data, [], primaries={"openai/gpt-5.5"})
+        self.assertIn("pc-models-status", [c for c, _ in probs])
+
+    def test_indeterminate_primary_only_warns(self):
+        data = self.issues(("indeterminate", "openai", "gpt-5.5"))
+        probs = G.models_status_problems(1, data, [], primaries={"openai/gpt-5.5"})
+        self.assertEqual({c for c, _ in probs}, {"warn"})
+
+    def test_lost_oauth_login_holds(self):
+        data = {"auth": {"oauth": {"profiles": []}, "modelRouteIssues": []}}
+        probs = G.models_status_problems(0, data, [{"type": "oauth", "provider": "openai-codex"}])
+        self.assertIn("pc-models-status", [c for c, _ in probs])
+
+    def test_primary_model_refs(self):
+        cfg = {"agents": {"defaults": {"model": {"primary": "vllm/Qwen3.5-122b"}},
+                          "entries": {"mail_reader": {"model": "vllm/qwen3.5-122b"},
+                                      "x": {"model": {"primary": "openai/gpt-5.5"}}}}}
+        self.assertEqual(G.primary_model_refs(cfg), {"vllm/qwen3.5-122b", "openai/gpt-5.5"})
+
+
 if __name__ == "__main__":
     unittest.main()

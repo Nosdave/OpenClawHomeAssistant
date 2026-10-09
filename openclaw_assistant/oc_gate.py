@@ -2407,9 +2407,19 @@ class Gate:
         else:
             res, data = self.oc_json(["models", "status", "--json", "--check"], 300, "pc-models-status")
             codex_ok = bool((self.j.get("fixups") or {}).get("codex_needed"))
-            ms = models_status_problems(res.rc, data, self.j.get("auth_profiles") or [], codex_allowed=codex_ok)
+            cur_cfg = {}
+            try:
+                cur_cfg = C.read_json_strict(p["CONFIG_PATH"])
+            except Exception:  # noqa: BLE001 - pc-config reports an unreadable config
+                cur_cfg = {}
+            ms = models_status_problems(res.rc, data, self.j.get("auth_profiles") or [], codex_allowed=codex_ok,
+                                        primaries=primary_model_refs(cur_cfg))
             for code, msg in ms:
-                pol(code, msg)
+                if code == "warn":
+                    self.warn(msg)
+                else:
+                    pol(code, msg)
+            ms = [m for m in ms if m[0] != "warn"]
             if res.rc == 2:
                 self.warn("models status: a credential is expiring")
             if not ms:
@@ -2883,15 +2893,45 @@ def schema_meta_problems(state_dir, cls, pkg):
     return probs
 
 
-def models_status_problems(rc, data, auth_profiles, codex_allowed=False):
-    """codex_allowed: Codex was in use before the migration (canonical openai/* refs or the codex
-    package), so openai routes on the Codex app-server are the 7.35 behaviour, not a regression
-    (contract addendum 2). Migrated legacy refs are checked separately (PC2/PC3 on the config)."""
+def primary_model_refs(cfg):
+    """provider/model refs used as a primary model (defaults and per-agent), lower-cased."""
+    out = set()
+
+    def add(v):
+        if isinstance(v, dict):
+            v = v.get("primary")
+        if isinstance(v, str) and "/" in v:
+            out.add(v.strip().lower())
+    agents = cfg.get("agents") if isinstance(cfg, dict) and isinstance(cfg.get("agents"), dict) else {}
+    defaults = agents.get("defaults") if isinstance(agents.get("defaults"), dict) else {}
+    add(defaults.get("model"))
+    entries = agents.get("entries") if isinstance(agents.get("entries"), dict) else {}
+    for e in entries.values():
+        if isinstance(e, dict):
+            add(e.get("model"))
+    for e in agents.get("list") or []:
+        if isinstance(e, dict):
+            add(e.get("model"))
+    return out
+
+
+def models_status_problems(rc, data, auth_profiles, codex_allowed=False, primaries=None):
+    """Returns [(code, message)]; code "warn" means log only (never HOLD).
+
+    `models status --check` exits 1 for any route whose auth readiness is merely "indeterminate"
+    (v99 docs/cli/models.md:91,108) — normal for Codex native logins and fallback providers, and the
+    same on 2026.7. So only real regressions hold: a lost OpenAI/Codex OAuth login, or a non-
+    indeterminate issue on a PRIMARY model route. Everything else is a WARN.
+    codex_allowed: Codex was in use before the migration (canonical openai/* refs or the codex
+    package), so openai routes on the Codex app-server are the 7.35 behaviour (contract addendum 2).
+    """
     probs = []
-    if rc not in (0, 2):
-        probs.append(("pc-models-status", f"models status --check rc {rc}"))
+    primaries = {p.lower() for p in (primaries or set())}
+    primary_providers = {p.split("/", 1)[0] for p in primaries}
     if not isinstance(data, dict):
-        if rc in (0, 2):
+        if rc not in (0, 2):
+            probs.append(("pc-models-status", f"models status --check rc {rc} without a usable JSON result"))
+        else:
             probs.append(("pc-models-status", "models status returned no JSON"))
         return probs
     auth = data.get("auth") if isinstance(data.get("auth"), dict) else {}
@@ -2900,12 +2940,28 @@ def models_status_problems(rc, data, auth_profiles, codex_allowed=False):
     if codex and not codex_allowed:
         probs.append(("pc-codex-runtime", f"{len(codex)} model route(s) resolve to the codex runtime"))
     issues = auth.get("modelRouteIssues")
-    if isinstance(issues, list) and issues:
-        probs.append(("pc-models-status", "model route issues: " + "; ".join(
-            f"{i.get('provider')}/{i.get('model')}: {i.get('kind')}" if isinstance(i, dict) else str(i) for i in issues[:4])))
+    for i in (issues if isinstance(issues, list) else []):
+        if not isinstance(i, dict):
+            probs.append(("warn", f"models status: route issue {i}"))
+            continue
+        ref = f"{i.get('provider')}/{i.get('model')}"
+        kind = str(i.get("kind") or "")
+        text = f"models status: {ref}: {kind}"
+        if kind != "indeterminate" and ref.lower() in primaries:
+            probs.append(("pc-models-status", f"primary model route {ref}: {kind}"))
+        else:
+            probs.append(("warn", text))
     missing = auth.get("missingProvidersInUse")
     if isinstance(missing, list) and missing:
-        probs.append(("pc-models-status", "providers in use without credentials: " + ", ".join(map(str, missing[:6]))))
+        prim_missing = [m for m in missing if str(m).lower() in primary_providers]
+        if prim_missing:
+            probs.append(("pc-models-status", "primary model provider(s) without credentials: "
+                          + ", ".join(map(str, prim_missing[:6]))))
+        rest = [m for m in missing if m not in prim_missing]
+        if rest:
+            probs.append(("warn", "models status: providers in use without credentials: " + ", ".join(map(str, rest[:6]))))
+    if rc not in (0, 2) and not any(c != "warn" for c, _ in probs):
+        probs.append(("warn", f"models status --check rc {rc} (readiness not confirmed for some routes; not a migration regression)"))
     had_oauth = any(p.get("type") == "oauth" and p.get("provider") in ("openai", "openai-codex") for p in auth_profiles)
     if had_oauth:
         oauth = auth.get("oauth") if isinstance(auth.get("oauth"), dict) else {}
