@@ -103,48 +103,49 @@ def header_user_version(path):
     return int.from_bytes(head[60:64], "big")
 
 
-def _is_wal_mode(path):
-    """Header bytes 18/19 == 2 mark a WAL-mode database."""
-    try:
-        with open(path, "rb") as f:
-            head = f.read(20)
-    except OSError:
-        return False
-    return len(head) >= 20 and head[18] == 2 and head[19] == 2
+def _query_private_copy(path, sql):
+    """Query a private copy of the database (+ its WAL, if any)."""
+    wal = Path(f"{path}-wal")
+    with tempfile.TemporaryDirectory(prefix="oc-upgrade-") as tmp:
+        copy = Path(tmp) / "db.sqlite"
+        shutil.copyfile(path, copy)
+        if wal.exists():
+            shutil.copyfile(wal, Path(f"{copy}-wal"))
+        con = sqlite3.connect(str(copy), timeout=2)
+        try:
+            return con.execute(sql).fetchall()
+        finally:
+            con.close()
 
 
 def _query_ro(path, sql):
-    """Run a read-only query without creating or modifying any file.
+    """Run a read-only query without creating or modifying any file next to the database.
 
-    - WAL database without -wal/-shm (closed and fully checkpointed): open with
-      immutable=1 — there is nothing to replay, and SQLite then creates no
-      -shm/-wal companions.
-    - Companions present, or not a WAL database: plain mode=ro uses what exists
-      and creates nothing new.
-    - Non-empty -wal but no -shm: query a private copy of database + WAL.
+    - No WAL content: everything is in the main file; open it with immutable=1,
+      so SQLite neither creates nor touches -wal/-shm companions.
+    - WAL content and an -shm index (normally: the gateway is running): read
+      through the existing index with readonly_shm=1, so the index is not
+      rewritten; fall back to a private copy if SQLite cannot use it read-only.
+    - WAL content without -shm: query a private copy of database + WAL.
     """
     wal, shm = Path(f"{path}-wal"), Path(f"{path}-shm")
     wal_has_data = wal.exists() and wal.stat().st_size > 0
-    if wal_has_data and not shm.exists():
-        with tempfile.TemporaryDirectory(prefix="oc-upgrade-") as tmp:
-            copy = Path(tmp) / "db.sqlite"
-            shutil.copyfile(path, copy)
-            shutil.copyfile(wal, Path(f"{copy}-wal"))
-            con = sqlite3.connect(str(copy), timeout=2)
-            try:
-                return con.execute(sql).fetchall()
-            finally:
-                con.close()
-    if _is_wal_mode(path) and not wal.exists() and not shm.exists():
+    if not wal_has_data:
         uri = f"file:{path}?mode=ro&immutable=1"
+    elif shm.exists():
+        uri = f"file:{path}?mode=ro&readonly_shm=1"
     else:
-        uri = f"file:{path}?mode=ro"
-    con = sqlite3.connect(uri, uri=True, timeout=2)
+        return _query_private_copy(path, sql)
     try:
-        return con.execute(sql).fetchall()
-    finally:
-        con.close()
-
+        con = sqlite3.connect(uri, uri=True, timeout=2)
+        try:
+            return con.execute(sql).fetchall()
+        finally:
+            con.close()
+    except sqlite3.Error:
+        if not wal_has_data:
+            raise
+        return _query_private_copy(path, sql)
 
 def user_version(path):
     """Schema version of a SQLite file without writing to it.

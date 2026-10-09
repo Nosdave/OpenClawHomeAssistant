@@ -717,21 +717,43 @@ echo "INFO: OpenClaw runtime version: ${OPENCLAW_RUNTIME_VERSION:-unknown}"
 # the runtime (e.g. an `npm install -g openclaw@...` run by an agent), the
 # swapped runtime could migrate the state without the add-on's backup steps.
 runtime_integrity_problem() {
-  local wrapper="/usr/local/libexec/oc-addon/openclaw" pinned entry actual resolved
+  local wrapper="/usr/local/libexec/oc-addon/openclaw" wrapper_real pinned entry pkg_dir actual d candidate
   [ -f /usr/local/libexec/oc-addon/openclaw-pinned-version ] || return 0
+  wrapper_real="$(readlink -f "$wrapper" 2>/dev/null || true)"
   pinned="$(head -n 1 /usr/local/libexec/oc-addon/openclaw-pinned-version 2>/dev/null || true)"
   entry="$(head -n 1 /usr/local/libexec/oc-addon/openclaw-entry 2>/dev/null || true)"
   if [ -z "$entry" ]; then
     echo "the add-on's record of the pinned OpenClaw package is missing (broken image?)"
     return 0
   fi
-  actual="$(jq -r '.version // empty' "$(dirname "$entry")/package.json" 2>/dev/null || true)"
-  resolved="$(readlink -f "$(command -v openclaw 2>/dev/null || true)" 2>/dev/null || true)"
+  pkg_dir="$(dirname "$entry")"
+  actual="$(jq -r '.version // empty' "${pkg_dir}/package.json" 2>/dev/null || true)"
   if [ -n "$pinned" ] && [ "$actual" != "$pinned" ]; then
     echo "the OpenClaw package in the container is ${actual:-missing}, but this image pins ${pinned} (changed by npm inside the container?)"
-  elif [ "$resolved" != "$(readlink -f "$wrapper")" ]; then
-    echo "'openclaw' resolves to ${resolved:-nothing} instead of the add-on wrapper (another OpenClaw installed inside the container?)"
+    return 0
   fi
+  # Every place an agent's shell or npm could put another `openclaw`: the
+  # standard bin directories (login PATH), the runtime npm/pnpm prefixes, and the
+  # persistent node-global prefix when it is enabled. Checked explicitly instead
+  # of via run.sh's PATH, where the wrapper always comes first.
+  for d in /usr/local/sbin /usr/local/bin /usr/sbin /usr/bin /sbin /bin \
+           "${npm_config_prefix:+${npm_config_prefix}/bin}" "${PNPM_HOME:-}" \
+           "$( [ "$PERSIST_NODE_GLOBAL" = "true" ] || [ "$PERSIST_NODE_GLOBAL" = "1" ] && echo "${PERSISTENT_NODE_GLOBAL}/bin" )"; do
+    [ -n "$d" ] && [ -e "${d}/openclaw" ] || continue
+    if [ "$(readlink -f "${d}/openclaw" 2>/dev/null || true)" != "$wrapper_real" ]; then
+      echo "${d}/openclaw is not the add-on wrapper (another OpenClaw installed inside the container?)"
+      return 0
+    fi
+  done
+  for candidate in /usr/local/lib/node_modules/openclaw \
+                   "${npm_config_prefix:+${npm_config_prefix}/lib/node_modules/openclaw}" \
+                   "$( [ "$PERSIST_NODE_GLOBAL" = "true" ] || [ "$PERSIST_NODE_GLOBAL" = "1" ] && echo "${PERSISTENT_NODE_GLOBAL}/lib/node_modules/openclaw" )"; do
+    [ -n "$candidate" ] && [ -f "${candidate}/package.json" ] || continue
+    if [ "$(readlink -f "$candidate")" != "$(readlink -f "$pkg_dir")" ]; then
+      echo "a second OpenClaw package exists at ${candidate} (installed inside the container?)"
+      return 0
+    fi
+  done
   return 0
 }
 
@@ -767,20 +789,27 @@ if command -v oc-upgrade >/dev/null 2>&1; then
 else
   echo "WARN: oc-upgrade is missing from the add-on image; state guard skipped."
 fi
+STATE_NEWER="$STATE_HOLD"
 RUNTIME_PROBLEM="$(runtime_integrity_problem)"
 if [ -n "$RUNTIME_PROBLEM" ]; then
   STATE_HOLD=true
   STATE_HOLD_REASON="${STATE_HOLD_REASON:+${STATE_HOLD_REASON}
-}${RUNTIME_PROBLEM}. Reinstall or rebuild the add-on in Home Assistant to restore the pinned OpenClaw."
+}${RUNTIME_PROBLEM}."
 fi
 
 if [ "$STATE_HOLD" = "true" ]; then
   {
     echo "OpenClaw is held (bundled runtime ${OPENCLAW_RUNTIME_VERSION:-unknown}):"
     printf '%s\n' "$STATE_HOLD_REASON"
-    echo "Restore the Home Assistant backup that matches this add-on version (or update to the add-on"
-    echo "version that wrote the state). OpenClaw is not started, and its config, databases, sessions and"
-    echo "plugins are not modified (built-in skill files are still refreshed from the image)."
+    if [ "$STATE_NEWER" = "true" ]; then
+      echo "Restore the Home Assistant backup that matches this add-on version (or update to the add-on"
+      echo "version that wrote the state)."
+    fi
+    if [ -n "$RUNTIME_PROBLEM" ]; then
+      echo "Reinstall or rebuild the add-on in Home Assistant to restore the pinned OpenClaw runtime."
+    fi
+    echo "OpenClaw is not started, and its config, databases, sessions and plugins are not modified"
+    echo "(built-in skill files are still refreshed from the image)."
   } > "${UPG_DIR}/hold.txt"
   echo "ERROR: ================================================================"
   echo "ERROR: HOLD — OpenClaw will NOT be started."
@@ -803,7 +832,7 @@ process_export_request() {
   for stale in /share/openclaw-rehearsal/*/openclaw-rehearsal.tar.gz.tmp; do
     [ -e "$stale" ] || continue
     echo "WARN: Removing incomplete rehearsal export ${stale}."
-    rm -f "$stale"
+    rm -f "$stale" 2>/dev/null || echo "WARN: Could not remove ${stale}; delete it manually (it contains secrets)."
     rmdir "$(dirname "$stale")" 2>/dev/null || true
   done
   [ -f "$request" ] || return 0
@@ -1910,6 +1939,32 @@ while true; do
   if [ "$GW_UPTIME" -ge 120 ]; then
     GW_FAIL_STREAK=0
   fi
+  # A runtime swapped inside the container (e.g. `npm install -g openclaw@...`)
+  # must not be (re)started: hold here, without counting it as a crash.
+  RUNTIME_PROBLEM="$(runtime_integrity_problem)"
+  if [ -n "$RUNTIME_PROBLEM" ]; then
+    if [ "$RUNTIME_PROBLEM" != "${LAST_RUNTIME_PROBLEM:-}" ]; then
+      {
+        echo "OpenClaw is held (bundled runtime ${OPENCLAW_RUNTIME_VERSION:-unknown}):"
+        echo "${RUNTIME_PROBLEM}."
+        echo "Reinstall or rebuild the add-on in Home Assistant to restore the pinned OpenClaw runtime."
+      } > "${UPG_DIR}/hold.txt"
+      echo "ERROR: HOLD — not restarting OpenClaw: ${RUNTIME_PROBLEM}."
+      echo "ERROR: Reinstall or rebuild the add-on in Home Assistant. Details: oc-upgrade status"
+      LAST_RUNTIME_PROBLEM="$RUNTIME_PROBLEM"
+    fi
+    stop_gw_relay
+    sleep 60 &
+    wait "$!" || true
+    if [ "$SHUTTING_DOWN" = "true" ]; then
+      break
+    fi
+    GW_IS_CHILD=true
+    GW_PID=""
+    continue
+  fi
+  LAST_RUNTIME_PROBLEM=""
+
   GW_FAIL_STREAK=$((GW_FAIL_STREAK + 1))
   GW_BACKOFF=$((2 ** (GW_FAIL_STREAK < 6 ? GW_FAIL_STREAK : 6)))
   if [ "$GW_BACKOFF" -gt 60 ]; then
@@ -1933,14 +1988,6 @@ while true; do
   # The relay holds 127.0.0.1:GATEWAY_PORT — leaving it up causes the new gateway
   # to detect the port as occupied and exit with code 1, re-entering the loop.
   stop_gw_relay
-
-  RUNTIME_PROBLEM="$(runtime_integrity_problem)"
-  if [ -n "$RUNTIME_PROBLEM" ]; then
-    echo "ERROR: Not restarting OpenClaw: ${RUNTIME_PROBLEM}."
-    echo "ERROR: Reinstall or rebuild the add-on in Home Assistant to restore the pinned OpenClaw."
-    sleep 60
-    continue
-  fi
 
   if ! start_openclaw_runtime; then
     echo "ERROR: Failed to restart OpenClaw runtime; retrying in 5s..."

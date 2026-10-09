@@ -925,10 +925,15 @@ in the image goes through a small add-on wrapper that refuses `openclaw update`
 (and `openclaw --update ...`). Update the **add-on** in Home Assistant instead.
 OpenClaw's own automatic updates are disabled as well (`OPENCLAW_NO_AUTO_UPDATE=1`).
 
-The wrapper cannot stop someone (or an agent) from replacing OpenClaw with
-`npm install -g openclaw@...` inside the container. The add-on detects that: if
-the installed OpenClaw differs from the version pinned in the image, it does not
-(re)start OpenClaw and logs why. Reinstall or rebuild the add-on to recover.
+The wrapper sits in every standard bin directory, so a plain
+`npm install -g openclaw@...` inside the container fails (`EEXIST`) instead of
+installing a second OpenClaw next to it. If one is forced in anyway (`--force`,
+another prefix, an in-place replacement of the pinned package), the add-on
+notices at start and before every gateway restart — another `openclaw` in a bin
+directory, a second OpenClaw package, or a package version that differs from the
+image pin — and holds instead of (re)starting OpenClaw. A CLI forced in that way
+can still be run by hand or by an agent until then. Reinstall or rebuild the
+add-on to recover.
 
 ### Upgrade checks and rehearsal export (`oc-upgrade`)
 

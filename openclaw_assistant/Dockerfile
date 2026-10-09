@@ -173,7 +173,9 @@ RUN chmod +x /run.sh /oc_config_helper.py /render_nginx.py /usr/local/bin/oc-cle
 
 # Route every `openclaw` executable through the add-on wrapper (refuses
 # `openclaw update`, independent of the caller's PATH order) and record the
-# pinned package entry and version it runs.
+# pinned package entry and version it runs. The wrapper is also placed in every
+# standard bin directory, so a later `npm install -g openclaw@...` (runtime npm
+# prefix /usr/local) collides with it (EEXIST) instead of silently shadowing it.
 RUN set -eu; \
     W=/usr/local/libexec/oc-addon/openclaw; \
     pkg="$(npm root -g)/openclaw"; \
@@ -182,6 +184,10 @@ RUN set -eu; \
     jq -r .version "$pkg/package.json" > /usr/local/libexec/oc-addon/openclaw-pinned-version; \
     for bin in $(IFS=:; for d in $PATH; do [ -e "$d/openclaw" ] && echo "$d/openclaw"; done | sort -u); do \
       if [ "$(readlink -f "$bin")" != "$(readlink -f "$W")" ]; then ln -sf "$W" "$bin"; fi; \
+    done; \
+    for d in /usr/local/sbin /usr/local/bin /usr/sbin /usr/bin; do \
+      mkdir -p "$d"; \
+      if [ "$(readlink -f "$d/openclaw" 2>/dev/null || true)" != "$(readlink -f "$W")" ]; then ln -sf "$W" "$d/openclaw"; fi; \
     done; \
     test "$(readlink -f "$(command -v openclaw)")" = "$(readlink -f "$W")"; \
     openclaw --version; \

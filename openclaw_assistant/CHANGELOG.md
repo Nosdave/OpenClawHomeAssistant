@@ -18,7 +18,7 @@ On the first start the archive captures the 7.1-2 state (`…-before-2026.7.35.t
 
 ### Added
 - **`oc-upgrade`** helper:
-  - `oc-upgrade check` — read-only inventory before an OpenClaw upgrade. Prints names, sizes and versions only, never secret values. Exit code 0 / 4 notes / 2 possible bridge case / 3 state newer than this image. SQLite files are opened so that no `-wal`/`-shm` files are created. It covers:
+  - `oc-upgrade check` — read-only inventory before an OpenClaw upgrade. Prints names, sizes and versions only, never secret values. Exit code 0 / 4 notes / 2 possible bridge case / 3 state newer than this image. SQLite files are read without creating or changing any file next to them: immutable when there is no WAL content, a read-only `-shm` otherwise, or a private copy. It covers:
     - versions and database schema versions;
     - pre-June-2026 leftovers: old task/flow/plugin databases and whether they were imported, legacy Telegram/Active Memory files, `credentials/oauth.json`;
     - memory sidecar databases;
@@ -38,11 +38,11 @@ On the first start the archive captures the 7.1-2 state (`…-before-2026.7.35.t
   - **Fail-safe:** the guard holds if it cannot complete.
   - **Why:** a Home Assistant restore after the 9.x upgrade becomes safe, because a mismatched image/data pair can no longer corrupt the data.
 - **`openclaw update` is refused.**
-  - At image build time every `openclaw` executable is replaced by a wrapper that refuses `openclaw update` and `openclaw --update …`. Everything else is exec'd unchanged, regardless of the caller's PATH, including tools the agent runs.
-  - If the OpenClaw package inside the container is swapped anyway (e.g. `npm install -g openclaw@…`), the add-on detects that it no longer matches the image pin and does not (re)start OpenClaw.
+  - At image build time every `openclaw` executable is replaced by a wrapper that refuses `openclaw update` and `openclaw --update …`. Everything else is exec'd unchanged. The wrapper is also placed in every standard bin directory, so it applies whatever the caller's PATH, including tools the agent runs, and a plain `npm install -g openclaw@…` fails with `EEXIST` instead of shadowing it.
+  - If another OpenClaw is forced into the container anyway, the add-on holds instead of (re)starting OpenClaw. It checks at start and before every gateway restart for an extra `openclaw` in a bin directory, a second package, or a pinned package whose version changed. Until the next check, such a CLI can still be run by hand or by an agent.
 - **GHCR version tags are not rebuilt.**
   - The build workflow skips a version tag that is already published: a push without a version bump builds nothing and leaves a warning.
-  - Runs are serialized, and only `main` publishes.
+  - Publishing runs are serialized (job-level concurrency), and only `main` publishes.
   - Why: Home Assistant's backup restore re-pulls the add-on image by its version tag, so a rebuilt tag would silently change what a rollback restores.
 
 ## [0.5.93-full1] - 2026-09-27
