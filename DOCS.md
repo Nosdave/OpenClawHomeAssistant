@@ -127,10 +127,10 @@ The Gateway Web UI (Control UI) is OpenClaw's main web interface. It opens in a 
 
 The reason is asset paths, not WebSockets — Ingress proxies WebSockets fine, which is how the embedded terminal works. Home Assistant serves add-on pages under a per-add-on prefix (`/api/hassio_ingress/<token>/`), while the Control UI emits its assets from the origin root unless `gateway.controlUi.basePath` matches that prefix exactly. Serving it under Ingress would therefore require pinning the gateway to that prefix, which would break direct LAN access at the same time.
 
-> **Depends on the bundled OpenClaw version.** This fork currently ships **OpenClaw `2026.7.35`**:
+> **Depends on the bundled OpenClaw version.** This fork currently ships **OpenClaw `2026.9.9`** (since `0.5.94-full1`; `0.5.93-full2` shipped `2026.7.35`):
 >
-> - **On `2026.7.x` (current):** plain HTTP from the LAN is a non-secure browser context, WebCrypto is blocked, and OpenClaw rejects Control UI connections without device identity. **Use HTTPS** (`lan_https`, a reverse proxy or Tailscale Serve) or `http://127.0.0.1` on the host. The only built-in exception is `controlui_disable_device_auth: true` (default), which sets the break-glass `gateway.controlUi.dangerouslyDisableDeviceAuth` — token auth is still enforced, but over plain HTTP the token travels in clear text.
-> - **From OpenClaw `2026.8.2` on:** the Control UI no longer requires a secure context — device identity is signed with pure-JS Ed25519 on any origin. `dangerouslyDisableDeviceAuth` is retired (inert), so **every browser must be paired once**; see [Device pairing](#device-pairing-first-connection) below. HTTPS remains strongly recommended because a plaintext page exposes the gateway token.
+> - **On `2026.7.x` (up to `0.5.93-full2`):** plain HTTP from the LAN is a non-secure browser context, WebCrypto is blocked, and OpenClaw rejects Control UI connections without device identity. **Use HTTPS** (`lan_https`, a reverse proxy or Tailscale Serve) or `http://127.0.0.1` on the host. The only built-in exception is `controlui_disable_device_auth: true` (default), which sets the break-glass `gateway.controlUi.dangerouslyDisableDeviceAuth` — token auth is still enforced, but over plain HTTP the token travels in clear text.
+> - **From OpenClaw `2026.8.2` on (current):** the Control UI no longer requires a secure context — device identity is signed with pure-JS Ed25519 on any origin. `dangerouslyDisableDeviceAuth` is retired (inert), so **every browser must be paired once**; see [Device pairing](#device-pairing-first-connection) below. HTTPS remains strongly recommended because a plaintext page exposes the gateway token.
 
 ### Choosing an access mode
 
@@ -303,7 +303,7 @@ All options are set via **Settings → Apps/Add-ons → OpenClaw Assistant → C
 | `gateway_auth_mode` | `token` / `trusted-proxy` | `token` | Gateway auth mode. Use `trusted-proxy` when terminating HTTPS in a reverse proxy and forwarding trusted auth headers. |
 | `gateway_trusted_proxies` | string | _(empty)_ | Comma-separated trusted proxy IP/CIDR list used with `gateway_auth_mode: trusted-proxy`. |
 | `gateway_additional_allowed_origins` | string | _(empty)_ | Comma-separated additional origins merged into `gateway.controlUi.allowedOrigins` in `lan_https` mode (example: `https://ha.example.com:8443,capacitor://localhost`). |
-| `controlui_disable_device_auth` | bool | `true` | Skips the one-time Control UI browser pairing by setting `gateway.controlUi.dangerouslyDisableDeviceAuth` (token auth is still enforced). **Only effective while the bundled OpenClaw is `2026.7.x`** (this fork currently ships `2026.7.35`). OpenClaw retired the key in the `2026.8.x` line — it is inert there and `openclaw doctor --fix` removes it — so on those runtimes the add-on strips it and every browser pairs once; see [Device pairing](#device-pairing-first-connection). |
+| `controlui_disable_device_auth` | bool | `true` | Skips the one-time Control UI browser pairing by setting `gateway.controlUi.dangerouslyDisableDeviceAuth` (token auth is still enforced). **Only effective while the bundled OpenClaw is `2026.7.x`** (up to `0.5.93-full2`; this fork now ships `2026.9.9`). OpenClaw retired the key in the `2026.8.x` line — it is inert there and doctor removes it during the migration — so on those runtimes the add-on strips it and every browser pairs once; see [Device pairing](#device-pairing-first-connection). |
 | `force_ipv4_dns` | bool | `true` | Force IPv4-first DNS ordering for Node network calls. **Recommended ON** — most HAOS VMs lack IPv6 egress, causing `web_fetch` and Telegram timeouts. Set to `false` only if your network has working IPv6. |
 | `gateway_env_vars` | list of `{name, value}` | `[]` | Environment variables exported to the gateway process at startup. UI format: list entries with `name` and `value` (example: `name=OPENAI_API_KEY`, `value=sk-...`). Limits: max 50 vars, key length 255, value length 10000. Reserved runtime keys are blocked (for example `PATH`, `HOME`, `NODE_OPTIONS`, `NODE_PATH`, `OPENCLAW_*`, proxy vars). Legacy string/object formats are still accepted for backward compatibility. |
 | `nginx_log_level` | `full` / `minimal` | `minimal` | Nginx access log verbosity. `minimal` suppresses repetitive Home Assistant health-check and polling requests (`GET /`, `GET /v1/models`). `full` logs everything. |
@@ -935,12 +935,25 @@ image pin — and holds instead of (re)starting OpenClaw. A CLI forced in that w
 can still be run by hand or by an agent until then. Reinstall or rebuild the
 add-on to recover.
 
-### Upgrade checks and rehearsal export (`oc-upgrade`)
+### `openclaw doctor` only read-only
+
+On OpenClaw 2026.8+ even a plain `openclaw doctor` migrates configuration and
+state, without a backup. The wrapper therefore only lets read-only forms through
+(`--lint`, `--json`, `--post-upgrade`, `--help`, e.g. `openclaw doctor --lint`).
+To run doctor's repairs, use `oc-upgrade retry --doctor` and restart the add-on:
+the migration gate archives the state first, runs `doctor --fix` twice and checks
+the result. For support-guided recovery, `OC_ADDON_UNSAFE=1 openclaw …` bypasses
+the wrapper's checks (`openclaw update` stays refused).
+
+### Upgrade checks, migration gate and rehearsal export (`oc-upgrade`)
 
 ```sh
-oc-upgrade check     # read-only inventory before an OpenClaw upgrade
-oc-upgrade status    # hold reason, upgrade archives, pending export
-oc-upgrade export    # request a cold copy of the state for an upgrade rehearsal
+oc-upgrade check            # read-only inventory before an OpenClaw upgrade
+oc-upgrade status           # hold reason, gate run, archives, marker, pending retry
+oc-upgrade gate --dry-run   # read-only preview of what the migration gate would do
+oc-upgrade retry            # continue after fixing a HOLD (then restart the add-on)
+oc-upgrade log              # tail of the last gate run's doctor log (redacted)
+oc-upgrade export           # request a cold copy of the state for an upgrade rehearsal
 ```
 
 `oc-upgrade check` only reads. It prints versions, database schema versions,
@@ -960,6 +973,60 @@ out. An interrupted export is removed on the next start. **The copy contains
 secrets** (tokens, OAuth logins):
 move it only to a machine you trust and delete it after the rehearsal.
 `oc-upgrade export --cancel` withdraws the request.
+
+### Upgrading to OpenClaw 2026.9 (`0.5.94-full1`) — the migration gate
+
+OpenClaw 2026.9.7+ refuses to start on 2026.7 state (exit code 78) until
+`openclaw doctor --fix` has migrated it, and doctor's model-route repair can
+damage a 2026.7 configuration (for example, an `openai-codex/*` wildcard makes it
+replace the primary model). The add-on therefore runs a **migration gate** once,
+before the first 2026.9 gateway start. Its log lines start with `[gate]` and are
+numbered `1/9` … `9/9`.
+
+**Runbook**
+
+1. On `0.5.93-full2`: `oc-upgrade check` → exit code `0` or `4`, and
+   `startup-migrations checkpoint: 2026.7.35`. Exit code `2` or `3`: do not update, ask first.
+2. Turn **auto-update off** for the add-on and pause automatic Home Assistant
+   backups for the window (a backup taken mid-migration is not a rollback point).
+3. **Stop the add-on**, create a Home Assistant backup of it (**Settings → System →
+   Backups**) and download it. Plan 1–3 hours.
+4. Update to `0.5.94-full1` and start it. Leave the log open. While the gate runs
+   the add-on page is not available yet; **do not stop the add-on while
+   `[gate] … doctor pass … running` is shown** (it would resume once on the next
+   start, but it costs time).
+5. Success ends with `[gate] done: MIGRATED 2026.9.9 …`, then the gateway starts.
+   Pair each browser once (`openclaw devices list`, `openclaw devices approve <id>`),
+   then test Telegram, your models, MCP and cron jobs.
+6. Decide about a rollback within ~48 h (see
+   [Safe rollback](#safe-rollback-after-an-openclaw-database-upgrade)). After that,
+   delete `/share/openclaw-upgrade/*` — it contains secrets.
+
+**What the gate does**
+
+| Phase | What happens |
+|---|---|
+| 1 precheck | Read-only checks: runtime package, Node/SQLite, no other OpenClaw process, readable config, state not newer than the image, clean 2026.7 state, model preflight, legacy files, sessions, free space, SQLite `quick_check`, npm reachable. All findings are collected, then one HOLD if needed. |
+| 2 archive | `/config/.openclaw` + workspace → `/share/openclaw-upgrade/<run>/openclaw-state-<ts>-before-2026.9.9.tar.gz`, with `manifest.json` and `SHA256SUMS`; verified by re-reading it. |
+| 3 cleanup | Transient SQLite sidecars and legacy Telegram caches are moved to `/config/.openclaw-upgrade/gate/quarantine/<run>/` (kept, listed in the log). |
+| 4 pre-migrate | Only for legacy `openai-codex/…` refs: wildcards → explicit models; these refs keep the OpenClaw runtime they used on 2026.7. |
+| 5–7 doctor | `openclaw doctor --fix --non-interactive` twice (a third time only if the second still changed the config), each with a time limit and a progress line every minute; scoped fixups in between. Canonical `openai/*` refs keep their runtime (Codex app-server by default, as on 2026.7). |
+| 8 postconditions | Schema versions, `config validate`, `doctor --lint`, no legacy refs, runtime of migrated refs, `models status`, sessions. |
+| 9 pins | Keeps 2026.7 defaults where you have not set the key (see the 0.5.94-full1 changelog), recorded in `/config/.openclaw-upgrade/gate/pins-ledger.json` and never re-applied. |
+
+Later OpenClaw updates (9.x → 9.y) run the same gate in a shorter form: archive,
+doctor twice, postconditions; no pre-migration and no pins.
+
+**HOLD and retry.** If anything fails, OpenClaw is not started and the add-on page
+and terminal come up. The log shows two lines:
+`[gate] HOLD <code> in <phase>: <message>` and `[gate] next: <advice>`;
+`oc-upgrade status` shows the same. Fix the cause, run `oc-upgrade retry` and
+restart the add-on. Some codes can be accepted when you understand the
+consequence: `oc-upgrade retry --accept <code>`. `newer-state` and
+`runtime-integrity` cannot be retried — restore the matching backup instead.
+After the migration, a gateway exit 78 or 10 failed starts in a row also lead to
+a HOLD (instead of a restart loop); `oc-upgrade retry` then starts the gateway
+again, or runs a maintenance gate (new archive + doctor) if the state needs it.
 
 ### Backup
 
@@ -1281,54 +1348,72 @@ proxy_set_header X-Forwarded-Proto $scheme;
 Do not append an untrusted incoming chain with `$proxy_add_x_forwarded_for`
 unless every preceding proxy is known and validates or rebuilds that chain.
 
-### Gateway restart loop after an OpenClaw upgrade (`requires migration`)
+### The add-on is in HOLD after the OpenClaw 2026.9 update (migration gate)
 
-**Symptom**: after an add-on update the gateway never comes up, and the log repeats:
+**Symptom**: the add-on page and terminal work, OpenClaw does not, and the log ends
+with `[gate] HOLD <code> in <phase>: …` followed by `[gate] next: …`.
 
-```
-Gateway failed to start: Legacy workspace setup state requires migration for
-/config/.openclaw/workspace; run openclaw doctor --fix.
-WARN: OpenClaw runtime exited with code 1. Restarting in 2s...
-```
+**Cause**: the [migration gate](#upgrading-to-openclaw-20269-0594-full1--the-migration-gate)
+stopped before or during the one-way migration because a check failed. Nothing
+was written yet if the HOLD happened in `precheck` or `archive`.
 
-**Cause**: some OpenClaw releases gate startup behind a one-time data migration and refuse to boot until it has run. This is an upstream requirement, not an add-on misconfiguration.
-
-**Fix**: upstream v0.5.90+ runs `openclaw doctor --fix` automatically after repeated failed starts. **This fork does not** — Doctor migrates configuration and state (including the `openai-codex/*` → `openai/*` model route) and that must not happen unattended without a backup. The fork currently ships OpenClaw `2026.7.35`, which has no such startup gate. If you hit it anyway (e.g. after a manual `openclaw update`), the web terminal stays available during the loop:
-
-1. Stop the add-on and create a Home Assistant backup of it (**Settings → System → Backups**), then download it.
-2. Start the add-on again, open the terminal and run:
+**Fix**:
 
 ```sh
-openclaw doctor --fix --non-interactive --yes
+oc-upgrade status      # reason, phase, whether state was already changed, next step
+oc-upgrade log         # doctor output of the run (redacted)
 ```
 
-Then restart the add-on. If the gateway still refuses to start:
+Fix what the `next:` line says (for example free disk space or restore network
+access), then `oc-upgrade retry` and restart the add-on. If the code is marked as
+acceptable and you understand the consequence, `oc-upgrade retry --accept <code>`.
+If the HOLD happened after doctor started (`State: partially migrated`), either
+retry forward or roll back with the backup (next section). Do not run
+`openclaw doctor --fix` by hand — the wrapper refuses it; `oc-upgrade retry --doctor`
+does the same with an archive first.
 
-```sh
-openclaw doctor          # full report
-oc-gateway status        # add-on-native status
-ls /config/.openclaw/logs/stability/   # per-failure diagnostic bundles
-```
+### Gateway exited with code 78
 
-> The add-on backs off between restart attempts (2s doubling to a 60s cap) so a gateway that cannot start does not spin the CPU or fill the disk with stability bundles. The terminal, landing page and Ingress remain usable throughout.
+**Symptom**: after a successful migration the gateway stopped with exit code 78
+and the add-on is in HOLD (`exit78`) instead of restarting in a loop.
+
+**Cause**: OpenClaw 2026.9 refuses to start when the configuration is invalid,
+the state needs a migration, or another gateway holds the lock.
+
+**Fix**: `oc-upgrade status` shows which of these the add-on found. For a
+configuration problem run `openclaw config validate` (allowed in HOLD), fix the
+reported key, then `oc-upgrade retry` and restart. If the state needs a migration,
+`oc-upgrade retry` runs a maintenance gate (new archive, doctor twice, checks).
+The gateway's own log is `/tmp/openclaw/openclaw-<date>.log`.
+
+> On OpenClaw 2026.7 (up to `0.5.93-full2`) a gateway that cannot start is
+> restarted with a backoff (2 s doubling to 60 s); the terminal, landing page and
+> Ingress remain usable.
 
 ### Safe rollback after an OpenClaw database upgrade
 
-Before the add-on starts a new OpenClaw version, it saves one compressed state
-archive under `/config/.openclaw/upgrade-backups/`. This includes `openclaw.json`,
-agent/session databases (including SQLite WAL files), pairing records and channel
-delivery state. It excludes regenerable or bulky content such as built-in skills,
-media, npm projects and logs. The add-on keeps the three newest upgrade archives.
+OpenClaw database migrations are one-way: 2026.7 cannot open a 2026.9 state.
+There are two rollback points for the 2026.9 update:
 
-If the archive cannot be created, the new gateway does **not** start. This avoids
-an irreversible schema migration when disk space or permissions are unhealthy.
+1. **The Home Assistant backup** you made with the add-on stopped, before
+   updating (preferred). Stop the add-on, restore only the add-on from that
+   backup, check that the add-on page shows **0.5.93-full2**, then start it. The
+   log must show `OpenClaw runtime version: 2026.7.35`. A Codex/ChatGPT login may
+   have to be repeated, because 2026.9 refreshes tokens.
+2. **The gate archive** under `/share/openclaw-upgrade/<run>/` (a Home Assistant
+   restore of the add-on does not touch `/share`). With the add-on stopped and
+   `0.5.93-full2` installed: move the current `/config/.openclaw` and the workspace
+   aside (for example to `/config/.openclaw.9x-failed`), create empty directories,
+   and extract the archive into `/config` (`tar -xzf … -C /config`) after checking
+   `sha256sum -c SHA256SUMS` in its directory. **Never extract over the migrated
+   directory**: leftover 2026.9 `*.sqlite-wal`/`-shm` files would be replayed onto
+   the restored databases.
 
-OpenClaw database schema upgrades are not downgrade-compatible. To roll back to
-an older add-on release, first stop the add-on and move the current
-`/config/.openclaw` directory aside. Create a new `/config/.openclaw` directory,
-extract the desired archive into it, then start the older release. Do not extract
-over the upgraded directory: its newer database files would remain in place.
-Work created after that archive will not be present after the rollback.
+Before 2026.8 runtimes start for the first time, the add-on also keeps a compressed
+archive under `/config/.openclaw/upgrade-backups/` (the three newest are kept);
+for the 2026.9 update the gate's `/share` archive replaces it. Work created after
+the archive is not present after a rollback, and Telegram messages that 2026.9
+already processed are not delivered again.
 
 ### HOLD: "Persistent OpenClaw state is newer than the bundled runtime"
 

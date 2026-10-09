@@ -5,6 +5,43 @@ All notable changes to the OpenClaw Assistant Home Assistant Add-on will be docu
 > **Private fork** (`Nosdave/OpenClawHomeAssistant`): `-ghcrN` / `-fullN` suffixes are fork build iterations on top of the upstream `techartdev` base version. The image is pre-built on GitHub Actions (native `aarch64`) and pulled from GHCR. `-fullN` marks the un-stripped "full" build line (see `0.5.80-full1`).
 
 
+## [0.5.94-full1] - 2026-10-10
+
+**OpenClaw `2026.7.35` → `2026.9.9`. One-way state migration.** Merges upstream `techartdev` 0.5.94 (which only bumps OpenClaw). Since OpenClaw 2026.9.7 the gateway no longer migrates 2026.7.x state on its own: it exits with code 78 until `openclaw doctor --fix` has run, and doctor's model-route repair can damage a 2026.7 config. The add-on therefore runs a **migration gate** once, before the first 9.9 gateway start.
+
+**Before updating:** set auto-update off, stop the add-on, create a Home Assistant backup of the add-on and download it. Plan 1–3 hours. Do not stop the add-on while the log shows `[gate] … doctor pass … running`. Rollback is only through that backup (or the `/share` archive below) together with 0.5.93-full2: a 9.9 state cannot be opened by 7.35.
+
+### Added
+- **Migration gate** (`oc-upgrade gate`, run by the add-on at startup; every line starts with `[gate]`):
+  1. **precheck** (read-only): bundled runtime and schema targets, Node/SQLite capability, no other OpenClaw process, readable `openclaw.json`, state not newer than the image, clean 2026.7 state, no legacy `/config/.clawdbot` dir, model preflight, legacy files, sessions, free space, SQLite `quick_check`, npm reachable (doctor updates official plugins).
+  2. **archive**: `/config/.openclaw` and the workspace are written to `/share/openclaw-upgrade/<run>/openclaw-state-<ts>-before-2026.9.9.tar.gz` with `manifest.json` and `SHA256SUMS`, verified by re-reading the archive and comparing the sha256 of every SQLite file. **It contains secrets** (tokens, logins); delete it once you no longer need the rollback.
+  3. **cleanup**: memory-search transient SQLite sidecars (e.g. `openclaw-agent.sqlite.reindex-lock.sqlite`) and legacy Telegram caches are moved to `/config/.openclaw-upgrade/gate/quarantine/<run>/` (logged per file, kept).
+  4. **pre-migration** (only for legacy `openai-codex/…` refs): `openai-codex/*` wildcards become explicit model entries, and legacy Codex refs keep the OpenClaw runtime they used on 2026.7 (otherwise doctor replaces the primary model with a default or switches it to the Codex harness).
+  5. **doctor** `--fix --non-interactive`, twice (a third pass only if the second still changes the config), with a time limit and a progress line every minute.
+  6. **fixups** limited to migrated legacy refs; canonical `openai/*` refs keep their runtime (the Codex app-server by default, as on 2026.7). Retired model ids that doctor replaces are accepted and listed (`[gate] info: doctor replaced retired model X with Y`).
+  7. **postconditions**: database schema, `config validate`, `doctor --lint`, no legacy refs, runtime of migrated refs, `models status`, sessions.
+  8. **behaviour pins** (below), only where you have not set the key yourself, recorded in a ledger and never re-applied.
+- **HOLD instead of a restart loop.** Any gate failure — and, after the migration, a gateway exit 78 or 10 failed starts in a row — stops OpenClaw while the add-on page and terminal stay up. `oc-upgrade status` shows the reason and the next step.
+- **New commands:** `oc-upgrade retry [--doctor] [--accept CODE]` (continue on the next start; `--accept` passes an acceptable HOLD; `--doctor` re-runs doctor with a new archive), `oc-upgrade log` (redacted doctor log), `oc-upgrade gate --dry-run` (read-only preview). `oc-upgrade check` gains a "migration gate readiness" section.
+- A `WARN` after 60 s when the gateway is still stopping (see "Changed").
+
+### Changed
+- **`openclaw doctor` is refused in the terminal unless read-only** (`--lint`, `--json`, `--post-upgrade`, `--help`): plain `doctor` migrates without a backup. Use `oc-upgrade retry --doctor` and restart the add-on. In HOLD only read-only commands are allowed (`--version`, `config validate|get|file|schema`, `doctor --lint`, `logs`). `OC_ADDON_UNSAFE=1 openclaw …` bypasses this for guided recovery.
+- **Behaviour pins** that keep 2026.7 defaults (only where unset): `agents.defaults.maxConcurrent` 4; subagents `maxSpawnDepth` 1 and `delegationMode` `suggest`; gateway terminal and CLI agents off; session visibility `tree`; agent-to-agent and cross-provider messages off; code mode, tool search and swarm off; skill workshop `pending` / autonomous `off`; dreaming off (only if not set — an explicit `true` stays), transcripts off, no utility model, no cross-conversation memory; Telegram `streaming.mode` `partial`, raw command preview, no join intro; groups may stay silent; daily session reset at 04:00; **heartbeat target `none`** (9.9's default `owner` would send every heartbeat to your DM); session maintenance 500 entries, no new-session notice; Control UI session observer and favicon fetching off; geolocation and GitHub plugins off; no automatic model failover on cyber refusals.
+- Environment for 9.x: `OPENCLAW_NO_RESPAWN=1`, `OPENCLAW_SUPERVISOR_MODE=external`, `OPENCLAW_SERVICE_REPAIR_POLICY=external`, Node `--disable-sigusr1` (a stray SIGUSR1 no longer opens the Node inspector). `oc-gateway restart` uses SIGUSR2.
+- Brave web-search plugin `2026.9.9`; image requires Node ≥ 24.16 and checks the OpenClaw package, the doctor flags and the wrapper at build time.
+- Add-on helper failures and a failed gateway start now HOLD instead of stopping the add-on.
+- `oc-cleanup` keeps OpenClaw's `/tmp/openclaw*` logs.
+
+### Unavoidable changes in OpenClaw 2026.9 (not reverted by the add-on)
+- **Every browser must be paired once** for the Control UI; `controlui_disable_device_auth` is inert (`openclaw devices list` / `openclaw devices approve <id>`).
+- Model names show as `openai/<model>`; retired ids are upgraded by doctor (e.g. `claude-opus-4-5` → `4-7`, `claude-sonnet-4-5` → `4-6`, `gpt-5.1-codex` → `gpt-5.3-codex`, aliases kept).
+- `agents.list` becomes `agents.entries`; `imageGenerationModel` becomes `mediaModels.image`.
+- Doctor disables skills whose binaries or credentials are missing (`openclaw skills check`), creates a heartbeat job and a disabled weekly skill-review job per agent (`openclaw cron list --all`), archives an untouched `TOOLS.md` and moves `HEARTBEAT.md` into the heartbeat job.
+- Plaintext API keys in the config are additionally copied into the agent database.
+- Stopping can take up to ~4.5 minutes when the Telegram plugin's cleanup hangs (the add-on stops waiting after 270 s, within Home Assistant's 300 s limit).
+- Undelivered messages in the 2026.7 Telegram file spool are not processed by 9.9 (their number is logged).
+
 ## [0.5.93-full2] - 2026-10-09
 
 Preparation release ("stage A") for the later jump to OpenClaw 2026.9.x. No OpenClaw change compared with `0.5.93-full1` (still `2026.7.35`).
