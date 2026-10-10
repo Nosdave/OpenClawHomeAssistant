@@ -21,6 +21,7 @@
  {"path": ["channels","telegram","joinIntro"], "value": false},
  {"path": ["agents","defaults","silentReply","group"], "value": "allow"},
  {"path": ["session","reset"], "value": {"mode": "daily", "atHour": 4}},
+ {"path": ["agents","defaults","heartbeat","agentId"], "value": "@agents.defaults.systemAgent.agentId"},
  {"path": ["agents","defaults","heartbeat","target"], "value": "none"},
  {"path": ["session","maintenance","maxEntries"], "value": 500},
  {"path": ["session","notifyOnCreate"], "value": false},

@@ -128,6 +128,8 @@ QUARANTINE_KINDS = ("telegram-cache", "telegram-session-cache", "sqlite-transien
 
 # §7.9 pins (validated against the 9.9 schema: specwf/config-keys/pins_final.json).
 # The leaf is written only if absent from its parent dict; "cond" names an extra condition.
+SYSTEM_AGENT = "@agents.defaults.systemAgent.agentId"  # pin value resolved at apply time
+
 PINS = [
     {"path": ["agents", "defaults", "maxConcurrent"], "value": 4, "cond": None},
     {"path": ["agents", "defaults", "subagents", "maxSpawnDepth"], "value": 1, "cond": None},
@@ -155,6 +157,10 @@ PINS = [
     {"path": ["agents", "defaults", "silentReply", "group"], "value": "allow", "cond": None},
     # whole-object rule: written only if session.reset is absent (leaf-absent rule on "reset")
     {"path": ["session", "reset"], "value": {"mode": "daily", "atHour": 4}, "cond": None},
+    # multi-agent roster without a heartbeat block: 9.9 runs the heartbeat for the system agent only,
+    # but creating agents.defaults.heartbeat without agentId would enroll every agent
+    # (heartbeat-config-CEn374Nf.mjs:62-69), so name the system agent explicitly first
+    {"path": ["agents", "defaults", "heartbeat", "agentId"], "value": SYSTEM_AGENT, "cond": "heartbeat-system-agent"},
     {"path": ["agents", "defaults", "heartbeat", "target"], "value": "none", "cond": "heartbeat-roster"},
     {"path": ["session", "maintenance", "maxEntries"], "value": 500, "cond": None},
     {"path": ["session", "notifyOnCreate"], "value": False, "cond": None},
@@ -1695,16 +1701,29 @@ def _pin_condition(cfg, cond):
             if isinstance(progress, dict) and "commandText" in progress:
                 return "channels.telegram.streaming.progress.commandText is set"
         return None
-    if cond == "heartbeat-roster":
-        if isinstance(_get(cfg, ["agents", "defaults", "heartbeat"], None), dict):
-            return None
+    if cond in ("heartbeat-roster", "heartbeat-system-agent"):
+        has_defaults = isinstance(_get(cfg, ["agents", "defaults", "heartbeat"], None), dict)
         ents = _get(cfg, ["agents", "entries"], None)
         lst = _get(cfg, ["agents", "list"], None)
-        n = len(ents) if isinstance(ents, dict) else (len(lst) if isinstance(lst, list) else 0)
-        if n == 1:
-            return None
-        return "agents.defaults.heartbeat absent and roster has %d agents" % n
+        roster = list(ents.values()) if isinstance(ents, dict) else (lst if isinstance(lst, list) else [])
+        n = len(roster)
+        # agents with their own heartbeat block are the only ones enrolled; defaults only fill them in
+        explicit = any(isinstance(e, dict) and e.get("heartbeat") not in (None, False, 0, "") for e in roster)
+        if cond == "heartbeat-roster":
+            if has_defaults or n == 1 or explicit:
+                return None
+            return "agents.defaults.heartbeat absent and roster has %d agents" % n
+        if has_defaults or n <= 1 or explicit:
+            return "not needed"
+        if not _system_agent_id(cfg):
+            return "agents.defaults.systemAgent.agentId not set"
+        return None
     raise ValueError("unknown pin condition %r" % cond)
+
+
+def _system_agent_id(cfg):
+    v = _get(cfg, ["agents", "defaults", "systemAgent", "agentId"], None)
+    return v.strip() if isinstance(v, str) and v.strip() else None
 
 
 def apply_pins(cfg, ledgered_paths):
@@ -1744,9 +1763,10 @@ def apply_pins(cfg, ledgered_paths):
         if isinstance(parent, dict) and parts[-1] in parent:
             skipped.append({"path": path, "reason": "already-set"})
             continue
+        value = _system_agent_id(new) if pin["value"] == SYSTEM_AGENT else pin["value"]
         parent = _ensure_dict_path(new, parts[:-1])
-        parent[parts[-1]] = copy.deepcopy(pin["value"])
-        written.append({"path": path, "value": copy.deepcopy(pin["value"])})
+        parent[parts[-1]] = copy.deepcopy(value)
+        written.append({"path": path, "value": copy.deepcopy(value)})
     return new, written, skipped
 
 

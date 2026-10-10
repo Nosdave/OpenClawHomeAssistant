@@ -1901,6 +1901,22 @@ class ModelsStatusRegressionOnlyTests(unittest.TestCase):
         probs = G.models_status_problems(0, data, [{"type": "oauth", "provider": "openai-codex"}])
         self.assertIn("pc-models-status", [c for c, _ in probs])
 
+    def oauth(self, *profiles):
+        return {"auth": {"oauth": {"profiles": [{"type": "oauth", "provider": pr, "status": st}
+                                                for pr, st in profiles]}, "modelRouteIssues": []}}
+
+    def test_expired_oauth_access_token_only_warns(self):
+        # live box 2026-10-10: the idle 7.35 install already reports the Codex login as "expired"
+        before = [{"type": "oauth", "provider": "openai-codex"}]
+        probs = G.models_status_problems(0, self.oauth(("openai", "expired")), before)
+        self.assertEqual({c for c, _ in probs}, {"warn"})
+        self.assertEqual(G.models_status_problems(0, self.oauth(("openai-codex", "ok")), before), [])
+
+    def test_missing_oauth_profile_holds(self):
+        before = [{"type": "oauth", "provider": "openai-codex"}]
+        probs = G.models_status_problems(0, self.oauth(("openai", "missing"), ("xai", "ok")), before)
+        self.assertIn("pc-models-status", [c for c, _ in probs])
+
     def test_primary_model_refs(self):
         cfg = {"agents": {"defaults": {"model": {"primary": "vllm/Qwen3.5-122b"}},
                           "entries": {"mail_reader": {"model": "vllm/qwen3.5-122b"},

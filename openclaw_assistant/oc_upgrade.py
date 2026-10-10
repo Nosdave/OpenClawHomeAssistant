@@ -36,6 +36,7 @@ Commands:
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -203,6 +204,9 @@ def legacy_db_rows(path):
         return total
     except (OSError, sqlite3.Error):
         return None
+
+
+_LEGACY_WILDCARD_RE = re.compile(r"\A\s*openai-codex\s*/\s*\*\s*\Z", re.I)
 
 
 def _scan_model_wildcards(agents):
@@ -416,7 +420,8 @@ def cmd_check(_args):
         agents = None
     wildcards = _scan_model_wildcards(agents) if isinstance(agents, dict) else []
     print(f"  wildcards: {wildcards if wildcards else 'none'}")
-    if wildcards and not info_only:
+    legacy_wildcards = [w for w in wildcards if _LEGACY_WILDCARD_RE.match(w.rsplit(": ", 1)[-1])]
+    if legacy_wildcards and not info_only:
         notes.append("openai-codex/* wildcards are expanded into explicit entries by the migration gate")
         bump(RC_NOTES)
     if M is not None and isinstance(cfg, dict):

@@ -1266,7 +1266,7 @@ class TestPins(unittest.TestCase):
     def test_table_matches_validated_pins(self):
         ref = fix("pins_final_99.json")
         self.assertEqual([(p["path"], p["value"]) for p in m.PINS], [(p["path"], p["value"]) for p in ref])
-        self.assertEqual(len(m.PINS), 30)
+        self.assertEqual(len(m.PINS), 31)
         paths = {m.fmt_path(p["path"]) for p in m.PINS}
         for dropped in ("dreaming.enabled", "heartbeat.target", "cyberFailover.mode", "utilityModel", "agentRuntime.id",
                         "agents.defaults.agentRuntime.id", "skills.workshop.autonomous.enabled"):
@@ -1296,7 +1296,7 @@ class TestPins(unittest.TestCase):
     def test_empty_config(self):
         new, written, skipped = self.apply({})
         sk = self.skipped(skipped)
-        self.assertEqual(len(written) + len(skipped), 30)
+        self.assertEqual(len(written) + len(skipped), 31)
         self.assertEqual(new["agents"]["defaults"]["maxConcurrent"], 4)
         self.assertEqual(new["session"]["reset"], {"mode": "daily", "atHour": 4})
         self.assertFalse(new["plugins"]["entries"]["memory-core"]["config"]["dreaming"]["enabled"])
@@ -1315,8 +1315,36 @@ class TestPins(unittest.TestCase):
         self.assertEqual(new["channels"]["telegram"]["streaming"], {"mode": "partial", "preview": {"commandText": "raw"}})
         self.assertFalse(new["channels"]["telegram"]["joinIntro"])
         self.assertEqual(len(written), 30)
-        self.assertEqual(skipped, [])
+        self.assertEqual(skipped, [{"path": "agents.defaults.heartbeat.agentId", "reason": "condition:not needed"}])
         self.assertEqual(new["channels"]["telegram"]["botToken"], after["channels"]["telegram"]["botToken"])
+
+    def test_heartbeat_multi_agent_roster(self):
+        # live box: main + mail_reader, no heartbeat block; doctor seeds systemAgent "main".
+        # 9.9 then runs the heartbeat for main only, with target "owner" (DM) unless pinned.
+        base = {"agents": {"defaults": {"systemAgent": {"agentId": "main"}},
+                           "entries": {"main": {}, "mail_reader": {"sandbox": {"mode": "all"}}}}}
+        new, written, skipped = self.apply(base)
+        self.assertEqual(new["agents"]["defaults"]["heartbeat"], {"agentId": "main", "target": "none"})
+        self.assertIn({"path": "agents.defaults.heartbeat.agentId", "value": "main"}, written)
+        # an agent with its own heartbeat block: only those agents are enrolled, so no agentId is needed
+        expl = json.loads(json.dumps(base))
+        expl["agents"]["entries"]["mail_reader"]["heartbeat"] = {"every": "2h"}
+        new, written, skipped = self.apply(expl)
+        self.assertEqual(new["agents"]["defaults"]["heartbeat"], {"target": "none"})
+        # no system agent: 9.9 leaves heartbeats disabled for an ownerless roster -> nothing to pin
+        orphan = json.loads(json.dumps(base))
+        del orphan["agents"]["defaults"]["systemAgent"]
+        new, written, skipped = self.apply(orphan)
+        sk = self.skipped(skipped)
+        self.assertNotIn("heartbeat", new["agents"]["defaults"])
+        self.assertEqual(sk["agents.defaults.heartbeat.agentId"],
+                         "condition:agents.defaults.systemAgent.agentId not set")
+        self.assertTrue(sk["agents.defaults.heartbeat.target"].startswith("condition:"))
+        # an existing defaults block is left alone apart from the missing target
+        own = json.loads(json.dumps(base))
+        own["agents"]["defaults"]["heartbeat"] = {"every": "1h"}
+        new, written, skipped = self.apply(own)
+        self.assertEqual(new["agents"]["defaults"]["heartbeat"], {"every": "1h", "target": "none"})
 
     def test_union_keys_any_value_counts(self):
         for v in ({"enabled": True}, "auto", True, None, {}):

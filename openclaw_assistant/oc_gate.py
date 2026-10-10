@@ -3090,9 +3090,15 @@ def models_status_problems(rc, data, auth_profiles, codex_allowed=False, primari
     if had_oauth:
         oauth = auth.get("oauth") if isinstance(auth.get("oauth"), dict) else {}
         profs = oauth.get("profiles") if isinstance(oauth.get("profiles"), list) else []
-        if not any(isinstance(x, dict) and x.get("provider") == "openai" and x.get("type") == "oauth"
-                   and x.get("status") in ("ok", "expiring") for x in profs):
+        openai = [x for x in profs if isinstance(x, dict) and x.get("type") == "oauth"
+                  and x.get("provider") in ("openai", "openai-codex")]
+        # "expired" only means the stored access token ran out (an idle install shows it before the
+        # migration too); the gateway refreshes it on first use. Only a lost profile is a regression.
+        if not any(x.get("status") in ("ok", "expiring", "expired") for x in openai):
             probs.append(("pc-models-status", "no usable OpenAI OAuth profile after migration (was present before)"))
+        elif not any(x.get("status") in ("ok", "expiring") for x in openai):
+            probs.append(("warn", "OpenAI OAuth access token is expired; OpenClaw refreshes it on first use - "
+                                  "send one test message to an openai/* model after the upgrade"))
     return probs
 
 

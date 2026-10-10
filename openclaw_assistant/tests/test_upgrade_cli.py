@@ -161,6 +161,22 @@ class StateGuardCheckTests(CliEnv):
             self.assertIn(s, self.stdout)
         self.assertNotIn("SECRET", self.stdout)
 
+    def test_check_wildcard_note_only_for_legacy_codex_wildcards(self):
+        # live box: canonical wildcards only -> no "expanded" note (they stay as they are)
+        self.build_735()
+        cfg = json.loads((self.state / "openclaw.json").read_text())
+        models = cfg["agents"]["defaults"]["models"]
+        models.pop("openai-codex/*")
+        models.update({"ollama/*": {}, "anthropic/*": {}, "openai/*": {}})
+        self.write_cfg(cfg)
+        self.cli("check", env={"OPENCLAW_RUNTIME_VERSION": T.RUNTIME})
+        self.assertIn("openai/*", self.stdout)
+        self.assertNotIn("wildcards are expanded", self.stdout)
+        cfg["agents"]["defaults"]["models"]["openai-codex/*"] = {}
+        self.write_cfg(cfg)
+        self.cli("check", env={"OPENCLAW_RUNTIME_VERSION": T.RUNTIME})
+        self.assertIn("openai-codex/* wildcards are expanded", self.stdout)
+
 
 if __name__ == "__main__":
     unittest.main()
