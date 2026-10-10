@@ -105,6 +105,7 @@ ADVICE = {
     "state-symlink": "replace the symlink by the real directory (or bind-mount it), then oc-upgrade retry",
     "newer-state": "restore the Home Assistant backup that matches this add-on version",
     "not-pre-journal": "restore the 0.5.93 backup (the state is not a clean 2026.7.x state)",
+    "archive-missing": "put the archive back (same path, unchanged) and oc-upgrade retry, or restore the Home Assistant backup and start over",
     "legacy-state-dir": "move /config/.clawdbot out of /config (or merge it manually), then oc-upgrade retry",
     "custom-session-store": "remove session.store from openclaw.json (custom session stores are not migrated), then oc-upgrade retry",
     "sessions-unreadable": "repair or move the unreadable sessions.json files, then oc-upgrade retry",
@@ -704,9 +705,28 @@ def decide(ctx):
         return R(10, "run", f"marker is for {marker.get('runtime')}; version bump to {runtime}", mode=mode_new,
                  new_run=True)
     lt = _cfg_get(cfg, "meta", "lastTouchedVersion")
+    if not lt and _has_legacy_codex_refs(cfg):
+        # Every config OpenClaw wrote carries meta.lastTouchedVersion; an unversioned one with legacy
+        # routes was written by hand. Do not record it as migrated (no marker), so it is re-checked on
+        # every start, and say why the gate cannot help (no 2026.7 state to migrate).
+        warnings.append("openclaw.json has no meta.lastTouchedVersion but still uses openai-codex/codex model "
+                        "refs; 2026.9 does not run them. Change them to openai/<model> (or restore a 2026.7 "
+                        "state and let the gate migrate it). Not recorded as migrated.")
+        return R(0, "none", "unversioned config with legacy Codex refs; not adopted")
     if not lt or C.version_tuple(lt) == C.version_tuple(runtime):
         return R(0, "none", "no marker; state matches the runtime -> adopted", marker="adopt")
     return R(10, "run", f"openclaw.json last written by {lt}; version bump to {runtime}", mode=mode_new, new_run=True)
+
+
+_LEGACY_CODEX_REF = re.compile(r'"\s*(?:openai-codex|codex|codex-cli)\s*/', re.I)
+
+
+def _has_legacy_codex_refs(cfg):
+    """Cheap scan (plan must not import oc_migrate): any legacy Codex model ref or key in the config."""
+    try:
+        return bool(_LEGACY_CODEX_REF.search(json.dumps(cfg or {})))
+    except (TypeError, ValueError):
+        return False
 
 
 def _read_cfg_lenient():
@@ -1864,6 +1884,16 @@ class Gate:
         except OSError:
             return False
 
+    def archive_intact(self):
+        """Resume after the first write: the archive must still exist with the recorded size and sha256."""
+        if not self.archive_reusable():
+            return False
+        a = self.j.get("archive") or {}
+        if not a.get("sha256"):
+            return True
+        self.say("2/9 archive: re-checking the recorded archive before continuing (sha256)")
+        return _sha_or_none(Path(a.get("dir", "")) / a.get("file", "")) == a.get("sha256")
+
     def phase_archive(self):
         p = self.gp
         ap = self.archive_plan()
@@ -2682,6 +2712,13 @@ class Gate:
             if phase != "precheck" and phase in done:
                 if phase == "archive" and not self.j.get("first_write_at") and not self.archive_reusable():
                     done.remove("archive")
+                elif phase == "archive" and not self.archive_intact():
+                    # State was already changed: never continue the one-way migration without its rollback copy.
+                    a = self.j.get("archive") or {}
+                    raise HoldError([finding(
+                        "archive-missing", "hard",
+                        f"the verified pre-migration archive {a.get('dir')}/{a.get('file')} is missing or changed, "
+                        "and the state was already partially migrated", "archive")], "archive")
                 else:
                     if phase == "archive":
                         a = self.j.get("archive") or {}
@@ -2722,7 +2759,8 @@ def state_symlinks(state_dir, cls):
     """Symlinks on the way to every database the predicate knows (F1): the state dir, state/, agents/
     and each target agent's directories and DB file. tar archives a symlink as a bare link."""
     state_dir = Path(state_dir)
-    cands = [state_dir, state_dir / "state", state_dir / "state" / "openclaw.sqlite", state_dir / "agents"]
+    cands = [state_dir, C.paths()["CONFIG_PATH"], state_dir / "state", state_dir / "state" / "openclaw.sqlite",
+             state_dir / "agents"]
     for relp in sorted(set(((cls or {}).get("agent_paths") or {}).values())):
         if os.path.isabs(relp):
             continue  # outside the state dir: the archive invariant reports it

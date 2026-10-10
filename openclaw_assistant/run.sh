@@ -940,8 +940,32 @@ fi
 GATE_NEEDED=false
 GATE_PLAN_OUT=""
 if [ "$STATE_HOLD" != "true" ] && runtime_at_least 2026.8.0; then
-  if plan_out="$(timeout --kill-after=30 600 oc-upgrade gate --plan 2>&1)"; then plan_rc=0; else plan_rc=$?; fi
+  # In the background with the same wait loop as the gate: run.sh is PID 1 and bash defers
+  # the TERM trap while a foreground command runs, so a stop during a slow plan would
+  # otherwise wait for the 600 s timeout and get SIGKILLed by the Supervisor (300 s).
+  plan_file="$(mktemp)"
+  timeout --kill-after=30 600 oc-upgrade gate --plan >"$plan_file" 2>&1 &
+  GATE_PID=$!
+  plan_rc=0
+  plan_rc_known=false
+  GATE_WAIT_INTERRUPTED=true
+  while [ "$GATE_WAIT_INTERRUPTED" = "true" ]; do
+    GATE_WAIT_INTERRUPTED=false
+    if wait "$GATE_PID" 2>/dev/null; then r=0; else r=$?; fi
+    if [ "$r" -eq 127 ] && [ "$plan_rc_known" = "true" ]; then
+      break
+    fi
+    plan_rc=$r
+    plan_rc_known=true
+  done
+  GATE_PID=""
+  plan_out="$(cat "$plan_file" 2>/dev/null || true)"
+  rm -f "$plan_file"
   if [ -n "$plan_out" ]; then printf '%s\n' "$plan_out"; fi
+  if [ "$SHUTTING_DOWN" = "true" ]; then
+    echo "INFO: Stop requested during migration planning; exiting."
+    exit 0
+  fi
   case "$plan_rc" in
     0)  ;;
     10) GATE_NEEDED=true; GATE_PLAN_OUT="$plan_out" ;;

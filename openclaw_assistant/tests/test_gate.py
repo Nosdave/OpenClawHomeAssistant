@@ -616,6 +616,14 @@ class PlanTests(GateEnv):
         m = json.loads((self.upg / "gate" / "migrated.json").read_text())
         self.assertEqual((m["runtime"], m["mode"]), (RUNTIME, "adopted"))
 
+    def test_unversioned_config_with_legacy_refs_is_not_adopted(self):
+        """Codex review: an unversioned config that still uses openai-codex refs must not get a marker."""
+        make_99_state(self.state)
+        self.write_cfg({"agents": {"defaults": {"model": {"primary": "openai-codex/gpt-5.5"}}}})
+        self.assertEqual(self.plan()["rc"], 0)
+        self.assertFalse((self.upg / "gate" / "migrated.json").exists())
+        self.assertIn("not recorded as migrated", self.out.lower())
+
     def test_B11_plan_error_with_marker_starts(self):
         make_99_state(self.state)
         self.write_cfg({})
@@ -1334,6 +1342,23 @@ class GateRunTests(GateEnv):
         self.assertEqual(self.journal()["doctor"][-1]["pass"], 2)  # pass 1 not repeated
         self.assertEqual(sum(1 for d in self.journal()["doctor"] if d["pass"] == 1), 1)
 
+    def test_resume_after_first_write_refuses_a_missing_archive(self):
+        """Codex review: never continue a partially migrated state without its verified archive."""
+        self.build_735()
+        self.hooks(raise_in_phase="fixups")
+        self.assertEqual(self.run_gate(), 1)
+        a = self.journal()["archive"]
+        arch = Path(a["dir"]) / a["file"]
+        moved = arch.with_name(arch.name + ".away")
+        os.rename(arch, moved)
+        self.hooks()
+        G.retry_cmd([], emit=lambda s: None)
+        self.assertEqual(self.run_gate(), 20, self.out)
+        self.assertEqual(self.journal()["hold"]["code"], "archive-missing")
+        os.rename(moved, arch)  # put it back: the retry continues
+        G.retry_cmd([], emit=lambda s: None)
+        self.assertEqual(self.run_gate(), 0, self.out)
+
     def test_postcondition_policy_hold_and_accept(self):
         self.build_735()
         self.hooks()
@@ -1638,6 +1663,12 @@ class ReviewFixTests(GateEnv):
             finally:
                 os.unlink(src)
                 os.rename(dst, src)
+        cfg = self.state / "openclaw.json"
+        cfg.write_text("{}")
+        self.move_aside(cfg, self.tmp / "elsewhere" / "openclaw.json")
+        self.assertEqual(G.state_symlinks(self.state, cls), [str(cfg)])  # Codex review: config symlink
+        os.unlink(cfg)
+        os.rename(self.tmp / "elsewhere" / "openclaw.json", cfg)
         self.move_aside(self.state, self.tmp / "big-disk" / ".openclaw")
         self.assertEqual(G.state_symlinks(self.state, cls), [str(self.state)])
 

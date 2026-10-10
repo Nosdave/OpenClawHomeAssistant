@@ -457,11 +457,15 @@ OPENCLAW_RUNTIME_VERSION="2026.9.9"
 STATE_HOLD=false
 STATE_HOLD_REASON=""
 STATE_NEWER=false
+SHUTTING_DOWN=false
+GATE_PID=""
 runtime_at_least() { return 0; }
 EOF
+  extract_function early_stop
+  echo 'trap early_stop INT TERM'
   extract_function enter_hold
-  # the real 600 s / 30 s budget, shortened for the test
-  printf '%s\n' "$plan_block" | sed 's/timeout --kill-after=30 600 /timeout --kill-after=1 1 /'
+  # the real 600 s / 30 s budget, shortened for the test (PLAN_TIMEOUT, default 1 s)
+  printf '%s\n' "$plan_block" | sed 's/timeout --kill-after=30 600 /timeout --kill-after=1 "${PLAN_TIMEOUT:-1}" /'
   echo 'echo "RESULT STATE_HOLD=${STATE_HOLD} GATE_NEEDED=${GATE_NEEDED} PLAN_OUT=${GATE_PLAN_OUT}"'
 } > "$T/plan/runner.sh"
 cat > "$T/plan/bin/oc-upgrade" <<'EOF'
@@ -497,6 +501,18 @@ plan_case gate-needed "RESULT STATE_HOLD=false GATE_NEEDED=true PLAN_OUT=[gate] 
   FAKE_RC=10
 check "plan 10: plan line not printed exactly once" [ "$(grep -c '^\[gate\] plan:' "$PLAN_CASE_DIR/log")" -eq 1 ]
 plan_case no-gate "RESULT STATE_HOLD=false GATE_NEEDED=false PLAN_OUT=" FAKE_RC=0
+# A stop during a slow plan is honoured at once (PID 1 must not sit in a foreground command).
+d="$T/plan/term"; rm -rf "$d"; mkdir -p "$d/upg"
+env PATH="$T/plan/bin:$PATH" FAKE_SLEEP=30 PLAN_TIMEOUT=60 bash "$T/plan/runner.sh" "$d/upg" > "$d/log" 2>&1 &
+runner=$!
+sleep 1
+start=$SECONDS
+kill -TERM "$runner"
+wait "$runner" 2>/dev/null || true
+check "plan TERM: runner exits within 5 s" [ $((SECONDS - start)) -le 5 ]
+check "plan TERM: stop reported" grep -q "Stop requested during migration planning" "$d/log"
+check "plan TERM: TERM forwarded to the planner" grep -q "forwarding SIGTERM" "$d/log"
+check "plan TERM: no HOLD" bash -c '! grep -q "RESULT STATE_HOLD=true" "$1"' _ "$d/log"
 
 # ------------------------------------------------------------------------------
 # 4. run.sh shutdown(): one WARN after 60 s, SIGKILL at 270 s (sleep sped up)
