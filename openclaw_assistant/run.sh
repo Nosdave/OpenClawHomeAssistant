@@ -595,8 +595,8 @@ trap early_stop INT TERM
 # ------------------------------------------------------------------------------
 # Upgrade-state backup (OpenClaw 2026.7.x runtimes only)
 #
-# OpenClaw 2026.8+ migrates the persistent databases one-way (2026.9.9: state
-# schema 19, agent schema 24); older OpenClaw builds cannot open them. For those
+# OpenClaw 2026.8+ migrates the persistent databases one-way (2026.10.2: state
+# schema 20, agent schema 24); older OpenClaw builds cannot open them. For those
 # runtimes the migration gate (`oc-upgrade gate`, below) owns the pre-migration
 # archive: it writes a verified archive to /share/openclaw-upgrade/<run>/ and
 # only then runs `openclaw doctor --fix`. The local archive below is kept for
@@ -1188,7 +1188,7 @@ heal_telegram_ingress_spool() {
 BRAVE_PLUGIN_VERSION="$(head -n 1 /usr/local/libexec/oc-addon/brave-plugin-version 2>/dev/null || true)"
 if [ -z "$BRAVE_PLUGIN_VERSION" ]; then
   # Older image without the record: CalVer lockstep with the bundled runtime.
-  BRAVE_PLUGIN_VERSION="${OPENCLAW_RUNTIME_VERSION:-2026.9.9}"
+  BRAVE_PLUGIN_VERSION="${OPENCLAW_RUNTIME_VERSION:-2026.10.2}"
 fi
 ensure_brave_plugin() {
   local marker="/config/.openclaw/.brave_plugin_${BRAVE_PLUGIN_VERSION}"
