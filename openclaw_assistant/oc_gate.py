@@ -2334,8 +2334,8 @@ class Gate:
         self.say(f"5/9 doctor pass 1 rc={ev['rc']} in {C.fmt_duration(ev['duration'])}: Doctor complete. "
                  f"({len(baks)} pre-migration SQLite backups, {C.human(total)})")
         self.complete_phase("doctor1")
-        if ev["code"] == "doctor-warnings":
-            self.resolve([finding("doctor-warnings", "acceptable", f"pass 1: {ev['message']}", "doctor1")],
+        if ev["code"] and ev["cls"] == "acceptable":  # doctor-warnings, doctor-held-back (2026.10: rc 0)
+            self.resolve([finding(ev["code"], "acceptable", f"pass 1: {ev['message']}", "doctor1")],
                          "doctor1", resume_after=True)
 
     def codex_pkg_before(self):
@@ -2435,7 +2435,7 @@ class Gate:
         sha0 = _sha_or_none(p["CONFIG_PATH"])
         ev = self.run_doctor_pass(2, "doctor2")
         self.doctor_failure(ev, "doctor2", 2)
-        warnings = [ev] if ev["code"] == "doctor-warnings" else []
+        warnings = [ev] if ev["code"] and ev["cls"] == "acceptable" else []
         if "Saved pre-migration SQLite backup" in normalize_doctor_text(ev["text"]):
             self.warn("doctor pass 2 saved another pre-migration SQLite backup")
         sha1 = _sha_or_none(p["CONFIG_PATH"])
@@ -2450,8 +2450,9 @@ class Gate:
             ev3 = self.run_doctor_pass(3, "doctor2")
             self.doctor_failure(ev3, "doctor2", 3)
             # pass 3 is the last pass now: pass-2 warnings that only rest on a final-pass marker are superseded
-            warnings = [w for w in warnings if set(w.get("markers") or []) - set(FINAL_PASS_SUSPICIOUS)]
-            if ev3["code"] == "doctor-warnings":
+            warnings = [w for w in warnings if w["code"] != "doctor-warnings"
+                        or set(w.get("markers") or []) - set(FINAL_PASS_SUSPICIOUS)]
+            if ev3["code"] and ev3["cls"] == "acceptable":
                 warnings.append(ev3)
             sha2 = _sha_or_none(p["CONFIG_PATH"])
             self.post_pass_fixups(3)
@@ -2475,7 +2476,10 @@ class Gate:
             self.warn("doctor installed new plugin package(s): " + ", ".join(others) + " (left in place)")
         self.say(f"7/9 doctor pass 2 rc={ev['rc']} in {C.fmt_duration(ev['duration'])}: Doctor complete.; {result}")
         self.complete_phase("doctor2")
-        F = [finding("doctor-warnings", "acceptable", w["message"], "doctor2") for w in warnings[:1]]
+        F = []
+        for w in warnings:  # one finding per code, the first pass that reported it
+            if w["code"] not in {f["code"] for f in F}:
+                F.append(finding(w["code"], "acceptable", w["message"], "doctor2"))
         if hold:
             F.append(hold)
         if F:

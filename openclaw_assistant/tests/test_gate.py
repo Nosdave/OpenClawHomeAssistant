@@ -1543,6 +1543,40 @@ class GateRunMoreTests(GateEnv):
         self.assertEqual(self.run_gate(), 0, self.out)
         self.assertEqual([d["pass"] for d in self.journal()["doctor"]], [1, 2, 3])  # not re-run
 
+    def test_rc0_held_back_holds_in_doctor1_until_accepted(self):
+        self.build_735()
+        doc = self.bin / "held-doctor"
+        doc.write_text(FAKE_DOCTOR + "\nprint('│  Warning: 1 agent database store held back (unverified registration) │')\n")
+        doc.chmod(0o755)
+        self.hooks(doctor_cmd=[str(doc)])
+        self.assertEqual(self.run_gate(), 20, self.out)
+        j = self.journal()
+        self.assertEqual((j["hold"]["code"], j["phase"]), ("doctor-held-back", "doctor1"))
+        self.assertIn("doctor1", j["phases_done"])
+        self.assertIn("--accept doctor-held-back", (self.upg / "hold.txt").read_text())
+        G.retry_cmd(["--accept", "doctor-held-back"], emit=lambda s: None)
+        self.assertEqual(self.run_gate(), 0, self.out)
+        self.assertEqual([d["pass"] for d in self.journal()["doctor"]], [1, 2])  # pass 1 not re-run
+        self.assertIn("WARN [gate] accepted doctor-held-back", self.out)
+
+    def test_rc0_held_back_first_in_pass2_holds_in_doctor2(self):
+        self.build_735()
+        doc = self.bin / "late-held-doctor"
+        doc.write_text(FAKE_DOCTOR + "\ncnt = os.path.join(os.path.dirname(os.path.abspath(sys.argv[0])), 'passes')\n"
+                       "k = int(open(cnt).read()) + 1 if os.path.exists(cnt) else 1\n"
+                       "open(cnt, 'w').write(str(k))\n"
+                       "if k >= 2:\n    print('Held agent ops: unverified-agent-databases')\n")
+        doc.chmod(0o755)
+        self.hooks(doctor_cmd=[str(doc)])
+        self.assertEqual(self.run_gate(), 20, self.out)
+        j = self.journal()
+        self.assertEqual(j["hold"]["code"], "doctor-held-back")
+        self.assertIn("doctor2", j["phases_done"])
+        self.assertEqual([d["pass"] for d in j["doctor"]], [1, 2])
+        G.retry_cmd(["--accept", "doctor-held-back"], emit=lambda s: None)
+        self.assertEqual(self.run_gate(), 0, self.out)
+        self.assertEqual([d["pass"] for d in self.journal()["doctor"]], [1, 2])
+
     def test_maintenance_run_after_migration(self):
         self.build_735()
         self.hooks()
