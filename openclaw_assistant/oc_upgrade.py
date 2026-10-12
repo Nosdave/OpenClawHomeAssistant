@@ -269,7 +269,7 @@ def cmd_check(_args):
         except Exception as exc:  # noqa: BLE001
             print(f"  NOTE: migration gate module unavailable ({type(exc).__name__}: {exc})")
     migrated = bool(pkg and migrated_for(pkg["version"]))
-    info_only = migrated  # after a migration, leftovers 9.x ignores are informational only
+    info_only = migrated  # after a migration, leftovers 2026.9+ ignores are informational only
 
     print("\n== A Versions")
     print(f"  bundled OpenClaw:      {fmt_version(runtime)}")
@@ -352,7 +352,7 @@ def cmd_check(_args):
     except Exception as exc:  # noqa: BLE001
         print(f"\n  NOTE: oc_migrate unavailable ({type(exc).__name__}: {exc}); sections C/E/F use basic rules")
 
-    print("\n== C Legacy Telegram / Active Memory files (9.9 rules)" + ("  [informational: migrated]" if info_only else ""))
+    print("\n== C Legacy Telegram / Active Memory files (2026.9+ rules)" + ("  [informational: migrated]" if info_only else ""))
     shown = 0
     if M is not None:
         try:
@@ -378,6 +378,37 @@ def cmd_check(_args):
                 bump(RC_NOTES, info_only)
             if shown:
                 notes.append("legacy Telegram/Active Memory files are set aside by the migration gate (quarantine)")
+        except Exception as exc:  # noqa: BLE001
+            print(f"  n/a ({type(exc).__name__}: {exc})")
+    if not shown:
+        print("  none")
+
+    print("\n== C2 Pre-July-2026 files and settings (OpenClaw 2026.10 refuses them)"
+          + ("  [informational: migrated]" if info_only else ""))
+    shown = 0
+    if M is not None:
+        try:
+            ccfg = cfg if isinstance(cfg, dict) else {}
+            keys, _bridge = M.retired_config_keys(ccfg)
+            for k in keys:
+                shown += 1
+                print(f"  openclaw.json {k}: retired setting"
+                      + (" (removed by the gate when its records are in SQLite)" if k == "plugins.installs" else ""))
+                bump(RC_NOTES, info_only)
+            rs = M.classify_retired_state(str(state), ccfg, accepted=set(), home=str(p["CONFIG_ROOT"]))
+            for e in rs.get("plan", []):
+                shown += 1
+                print(f"  {e.get('rel')} ({e.get('size', 0)} B) {e.get('kind')}: {e.get('action')}"
+                      + (f" — {e['reason']}" if e.get("reason") else ""))
+                bump(RC_NOTES, info_only)
+            for f in rs.get("findings", []):
+                shown += 1
+                print(f"  {f.get('cls', '').upper()} {f.get('code')}: {f.get('message')}")
+                bump(RC_NOTES, info_only)
+            for i in rs.get("info", []):
+                print(f"  info: {i}")
+            if shown:
+                notes.append("pre-July-2026 leftovers: the migration gate quarantines what is safe and holds on the rest")
         except Exception as exc:  # noqa: BLE001
             print(f"  n/a ({type(exc).__name__}: {exc})")
     if not shown:
@@ -473,7 +504,7 @@ def cmd_check(_args):
     print("\n== Result")
     meaning = {
         RC_OK: "OK — nothing to note.",
-        RC_NOTES: "Notes only — items to handle as part of the 2026.9 upgrade; nothing blocks the current version.",
+        RC_NOTES: "Notes only — items to handle as part of the 2026.10 upgrade; nothing blocks the current version.",
         RC_BRIDGE: "POSSIBLE BRIDGE CASE — a legacy database with data was never imported. Do not upgrade; send this output.",
         RC_NEWER: "STATE IS NEWER THAN THIS IMAGE — restore the matching backup; do not start OpenClaw on it.",
     }

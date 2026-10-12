@@ -1625,13 +1625,17 @@ class TestClassify(unittest.TestCase):
         self.assertEqual(plan["flows/registry.sqlite"], ("legacy-db", "leave"))
         self.assertEqual(plan["flows/registry.sqlite.migrated"], ("migrated-archive", "leave"))
         self.assertEqual(plan["memory/main.sqlite"], ("legacy-memory-sidecar", "leave"))
+        out_acc = self.classify(accepted={"legacy-memory-sidecar"})
+        self.assertEqual(self.plan(out_acc)["memory/main.sqlite"], ("legacy-memory-sidecar", "quarantine"))
         codes = self.codes(out)
         self.assertEqual(codes, {"legacy-db-unimported": "acceptable", "legacy-memory-sidecar": "acceptable"})
         msg = [f["message"] for f in out["findings"] if f["code"] == "legacy-db-unimported"][0]
         self.assertIn("tasks/runs.sqlite (1 rows)", msg)
         self.assertIn("plugin-state/state.sqlite (unreadable)", msg)
         self.assertNotIn("flows/registry.sqlite", msg)
-        self.assertTrue(any("2 undelivered legacy Telegram update" in i for i in out["info"]), out["info"])
+        # the 7.x spool is reported by classify_retired_state (2026.10 doctor imports it); "1.json" is no
+        # 2026.10 spool file name, so nothing is counted here
+        self.assertFalse(any("spool" in i for i in out["info"]), out["info"])
         for p in out["plan"]:
             self.assertEqual(set(p), {"rel", "kind", "action", "reason", "size"})
             self.assertIn(p["action"], ("quarantine", "leave"))
@@ -1744,6 +1748,225 @@ class TestClassify(unittest.TestCase):
         out = m.classify_state_files(os.path.join(self.root, "nope"), {}, from_checkpoint=None, accepted=None,
                                      mode="from-7x")
         self.assertEqual(out, {"plan": [], "findings": [], "info": []})
+
+
+class TestRetiredFormats(unittest.TestCase):
+    """OpenClaw 2026.10 refuses pre-July-2026 settings/files that 2026.9.9 still imported (classify_retired_state,
+    retired_config_keys, retired_db_findings, retired_tuning_dropped; mirrors of the 10.2 dist)."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = self.tmp.name
+        _sqlite(os.path.join(self.root, "state/openclaw.sqlite"), [
+            "CREATE TABLE installed_plugin_index (index_key TEXT PRIMARY KEY, install_records_json TEXT)",
+            "INSERT INTO installed_plugin_index VALUES ('installed-plugin-index', '{\"brave\":{},\"acpx\":{}}')",
+            "CREATE TABLE migration_sources (migration_kind TEXT, source_path TEXT, source_sha256 TEXT, status TEXT)",
+            "CREATE TABLE cron_jobs (store_key TEXT, job_id TEXT)",
+        ])
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def run_cls(self, cfg=None, **kw):
+        before = _snapshot(self.root)
+        out = m.classify_retired_state(self.root, cfg or {}, accepted=kw.pop("accepted", set()), home="/config", **kw)
+        self.assertEqual(_snapshot(self.root), before, "classification must not touch the state dir")
+        json.dumps(out)
+        return out
+
+    def plan(self, out):
+        return {p["rel"]: (p["kind"], p["action"]) for p in out["plan"]}
+
+    def codes(self, out):
+        return {f["code"]: f["cls"] for f in out["findings"]}
+
+    def test_config_keys_port(self):
+        cfg = {"heartbeat": {}, "plugins": {"installs": {}}, "messages": {"queue": {"mode": "steer-backlog",
+               "byChannel": {"telegram": "queue", "discord": "collect"}}},
+               "agents": {"defaults": {"model": {"primary": "a/b", "timeoutMs": 1}, "llm": {}},
+                          "list": [{"id": "x", "agentRuntime": {"id": "codex"}}]},
+               "channels": {"telegram": {"streaming": "partial", "dm": {}, "accounts": {"b": {"streamMode": "x"}}},
+                            "feishu": {"botName": "root ok", "accounts": {"a": {"botName": "n"}}}}}
+        keys, bridge = m.retired_config_keys(cfg)
+        for k in ("heartbeat", "plugins.installs", "messages.queue.mode", "messages.queue.byChannel.telegram",
+                  "agents.defaults.model.timeoutMs", "agents.defaults.llm", "agents.list[0].agentRuntime",
+                  "channels.telegram.streaming", "channels.telegram.dm", "channels.telegram.accounts.b.streamMode",
+                  "channels.feishu.accounts.a.botName"):
+            self.assertIn(k, keys)
+        self.assertNotIn("messages.queue.byChannel.discord", keys)
+        self.assertNotIn("channels.feishu.botName", keys)
+        self.assertEqual(bridge, "2026.9.5")
+        self.assertEqual(m.retired_config_keys({"channels": {"discord": {"voice": {"tts": {"edge": {}}}}}})[1], "2026.9.7")
+        # agents.entries wins over agents.list; the object form of Telegram streaming is current
+        keys, _ = m.retired_config_keys({"agents": {"entries": {"main": {}}, "list": [{"agentRuntime": {}}]},
+                                         "channels": {"telegram": {"streaming": {"mode": "partial"}}}})
+        self.assertEqual(keys, [])
+
+    def test_config_findings_modes(self):
+        cfg = {"plugins": {"installs": {"x": {}}}}
+        self.assertEqual(m.retired_config_findings(cfg, "from-7x"), [])
+        f = m.retired_config_findings(cfg, "bump")
+        self.assertEqual([(x["code"], x["cls"]) for x in f], [("config-retired-keys", "hard")])
+        f = m.retired_config_findings({"talk": {"voice": "x"}}, "from-7x")
+        self.assertIn("talk.voice", f[0]["message"])
+        self.assertEqual(m.retired_config_findings(live_like(), "from-7x"), [])
+
+    def test_cron_files(self):
+        store = os.path.join(self.root, "cron/jobs.json")
+        _write(self.root, "cron/jobs.json", json.dumps({"jobs": [{"id": "j1"}]}))
+        _write(self.root, "cron/jobs-state.json", "{}")
+        _write(self.root, "cron/runs/j1.jsonl", "{}\n")
+        _write(self.root, "cron/runs/j0.jsonl.migrated", "{}\n")
+        out = self.run_cls()
+        plan = self.plan(out)
+        self.assertEqual(plan["cron/jobs.json"], ("cron-json", "leave"))
+        self.assertEqual(self.codes(out), {"cron-json-unimported": "acceptable"})
+        self.assertEqual(plan["cron/jobs-state.json"], ("cron-json-state", "quarantine"))
+        self.assertEqual(plan["cron/runs/j1.jsonl"], ("cron-run-log", "quarantine"))
+        self.assertNotIn("cron/runs/j0.jsonl.migrated", plan)
+        self.assertEqual(self.plan(self.run_cls(accepted={"cron-json-unimported"}))["cron/jobs.json"],
+                         ("cron-json", "quarantine"))
+        # every job already in SQLite -> safe
+        _sqlite(os.path.join(self.root, "state/openclaw.sqlite"),
+                ["INSERT INTO cron_jobs VALUES ('%s', 'j1')" % store])
+        out = self.run_cls()
+        self.assertEqual(self.plan(out)["cron/jobs.json"], ("cron-json", "quarantine"))
+        self.assertEqual(out["findings"], [])
+
+    def test_cron_receipt_and_custom_store(self):
+        import hashlib
+        _write(self.root, "x/my-jobs.json", "garbage")
+        store = os.path.join(self.root, "x/my-jobs.json")
+        sha = hashlib.sha256(b"garbage").hexdigest()
+        _sqlite(os.path.join(self.root, "state/openclaw.sqlite"),
+                ["INSERT INTO migration_sources VALUES ('legacy-cron-json', '%s', '%s', 'ok')" % (store, sha)])
+        out = self.run_cls({"cron": {"store": store}})
+        self.assertEqual(self.plan(out)["x/my-jobs.json"], ("cron-json", "quarantine"))
+        out = self.run_cls({"cron": {"store": "/elsewhere/jobs.json"}})
+        self.assertEqual(out["findings"], [])  # nothing there
+        with tempfile.TemporaryDirectory() as other:
+            _write(other, "jobs.json", "{}")
+            out = self.run_cls({"cron": {"store": os.path.join(other, "jobs.json")}})
+            self.assertEqual(self.codes(out).get("retired-state-outside"), "hard")
+
+    def test_delivery_queue_rules(self):
+        for n in ("a.json", "b.delivered", "c.json.doctor-importing",
+                  "d.json.doctor-importing-12-01234567-89ab-cdef-0123-456789abcdef", ".h.json", "failed/e.json"):
+            _write(self.root, "delivery-queue/" + n, "{}")
+        for n in ("y.json.migrated", "z.json.doctor-importing.2", "q.txt"):
+            _write(self.root, "delivery-queue/" + n, "{}")
+        os.makedirs(os.path.join(self.root, "delivery-queue/sub.json"))
+        out = self.run_cls()
+        plan = self.plan(out)
+        got = sorted(r for r, (k, a) in plan.items() if k == "delivery-queue-json" and a == "quarantine")
+        self.assertEqual(got, sorted("delivery-queue/" + n for n in (
+            "a.json", "b.delivered", "c.json.doctor-importing",
+            "d.json.doctor-importing-12-01234567-89ab-cdef-0123-456789abcdef", ".h.json", "failed/e.json")))
+        self.assertTrue(any("6 retired JSON delivery queue" in i for i in out["info"]), out["info"])
+        _write(self.root, "session-delivery-queue", "not a dir")
+        self.assertEqual(self.codes(self.run_cls())["retired-state-uninspectable"], "hard")
+
+    def test_oauth_sidecars(self):
+        hex1, hex2 = "0123456789abcdef" * 2, "fedcba9876543210" * 2
+        _write(self.root, "credentials/auth-profiles/%s.json" % hex1, "{}")
+        _write(self.root, "credentials/auth-profiles/%s.json" % hex2, "{}")
+        _write(self.root, "credentials/auth-profiles/%s.json" % hex1.upper(), "{}")
+        _write(self.root, "credentials/auth-profiles/%s.json.migrated" % hex1, "{}")
+        _agent_db(self.root, {"openai-codex:default": {"type": "oauth", "provider": "openai-codex",
+                                                       "oauthRef": {"id": hex1}}})
+        out = self.run_cls()
+        plan = self.plan(out)
+        self.assertEqual(plan["credentials/auth-profiles/%s.json" % hex1], ("oauth-sidecar", "leave"))
+        self.assertEqual(plan["credentials/auth-profiles/%s.json" % hex2], ("oauth-sidecar", "quarantine"))
+        self.assertEqual(len([r for r in plan if r.startswith("credentials/")]), 2)
+        self.assertEqual(self.codes(out), {"oauth-sidecar-referenced": "acceptable"})
+        out = self.run_cls(accepted={"oauth-sidecar-referenced"})
+        self.assertEqual(self.plan(out)["credentials/auth-profiles/%s.json" % hex1], ("oauth-sidecar", "quarantine"))
+        # OPENCLAW_OAUTH_DIR outside the state dir -> hard (cannot quarantine relative to the state)
+        with tempfile.TemporaryDirectory() as other:
+            _write(other, "auth-profiles/%s.json" % hex2, "{}")
+            out = self.run_cls(env={"OPENCLAW_OAUTH_DIR": other})
+            self.assertEqual(self.codes(out).get("retired-state-outside"), "hard")
+
+    def test_plugin_index_and_config_installs(self):
+        _write(self.root, "plugins/installs.json", json.dumps({"installRecords": {"brave": {}}}))
+        out = self.run_cls({"plugins": {"installs": {"acpx": {"spec": "x"}}}})
+        self.assertEqual(self.plan(out)["plugins/installs.json"], ("plugin-install-index", "quarantine"))
+        self.assertEqual(out["config_removals"], [["plugins", "installs"]])
+        self.assertEqual(out["findings"], [])
+        _write(self.root, "plugins/installs.json", json.dumps({"plugins": [{"pluginId": "zz", "installRecord": {}}]}))
+        out = self.run_cls({"plugins": {"installs": {"zz": {}}}})
+        self.assertEqual(self.plan(out)["plugins/installs.json"], ("plugin-install-index", "leave"))
+        self.assertEqual(self.codes(out), {"plugin-index-unimported": "acceptable",
+                                           "plugins-installs-unindexed": "acceptable"})
+        self.assertEqual(out["config_removals"], [])
+        out = self.run_cls({"plugins": {"installs": {"zz": {}}}}, accepted={"plugins-installs-unindexed"})
+        self.assertEqual(out["config_removals"], [["plugins", "installs"]])
+        out = self.run_cls({"plugins": {"installs": {}}}, mode="bump")
+        self.assertEqual(out["config_removals"], [])
+
+    def test_device_pair_voice_call_spool(self):
+        _write(self.root, "device-pair-notify.json", '{"subscribers": []}')
+        self.assertEqual(self.plan(self.run_cls())["device-pair-notify.json"], ("device-pair-notify", "quarantine"))
+        _write(self.root, "device-pair-notify.json", '{"subscribers": [{"id": 1}]}')
+        out = self.run_cls()
+        self.assertEqual(self.plan(out)["device-pair-notify.json"], ("device-pair-notify", "leave"))
+        self.assertEqual(self.codes(out)["device-pair-subscribers"], "acceptable")
+        os.remove(os.path.join(self.root, "device-pair-notify.json"))
+        _write(self.root, "voice-calls/calls.jsonl", "{}\n")
+        self.assertEqual(self.codes(self.run_cls())["voice-call-log"], "acceptable")
+        os.remove(os.path.join(self.root, "voice-calls/calls.jsonl"))
+        ok = json.dumps({"version": 1, "updateId": 7, "receivedAt": 1, "update": {"update_id": 7}})
+        _write(self.root, "telegram/ingress-spool-default/0000000000000007.json", ok)
+        _write(self.root, "telegram/ingress-spool-default/0000000000000008.json",
+               json.dumps({"version": 1, "updateId": 9, "receivedAt": 1, "update": {"update_id": 9}}))
+        _write(self.root, "telegram/ingress-spool-default/1.json", "{}")  # not a 2026.10 spool name: ignored
+        out = self.run_cls()
+        self.assertEqual(self.plan(out)["telegram/ingress-spool-default/0000000000000008.json"],
+                         ("telegram-spool-invalid", "leave"))
+        self.assertEqual(self.codes(out), {"telegram-spool-invalid": "acceptable"})
+        self.assertTrue(any("1 legacy Telegram update" in i for i in out["info"]), out["info"])
+        os.makedirs(os.path.join(self.root, "telegram/ingress-spool-bad name"))
+        self.assertEqual(self.codes(self.run_cls())["telegram-spool-unsupported"], "hard")
+
+    def test_db_findings(self):
+        mem = os.path.join(self.root, "agents/main/agent/openclaw-agent.sqlite")
+        _sqlite(mem, ["CREATE TABLE meta(key, value)", "CREATE TABLE files(path, source, hash, mtime, size)",
+                      "CREATE TABLE chunks(id, path, source, start_line, end_line, hash, model, text, embedding, "
+                      "updated_at)", "PRAGMA user_version=1"])
+        other = os.path.join(self.root, "agents/other/agent/openclaw-agent.sqlite")
+        _sqlite(other, ["CREATE TABLE session_transcript_files(x)", "PRAGMA user_version=1"])
+        done = os.path.join(self.root, "agents/done/agent/openclaw-agent.sqlite")
+        _sqlite(done, ["CREATE TABLE session_transcript_files(x)", "PRAGMA user_version=24"])
+        _sqlite(os.path.join(self.root, "state/openclaw.sqlite"),
+                ["CREATE TABLE agent_databases(agent_id TEXT, path TEXT, PRIMARY KEY(agent_id))"])
+        out = m.retired_db_findings([("main", mem, 1, 24), ("other", other, 1, 24), ("done", done, 24, 24)],
+                                    os.path.join(self.root, "state/openclaw.sqlite"))
+        codes = {f["code"]: f for f in out}
+        self.assertEqual(set(codes), {"retired-memory-index", "pre-july-schema"})
+        self.assertIn("main", codes["retired-memory-index"]["message"])
+        self.assertIn("other (agent DB schema 1)", codes["pre-july-schema"]["message"])
+        self.assertNotIn("done", codes["pre-july-schema"]["message"])
+        self.assertIn("agent_databases primary key ['agent_id']", codes["pre-july-schema"]["message"])
+        # a canonical 7.35 state passes
+        ok = os.path.join(self.root, "ok.sqlite")
+        _sqlite(ok, ["CREATE TABLE agent_databases(agent_id TEXT, path TEXT, PRIMARY KEY(agent_id, path))",
+                     "CREATE TABLE memory_index_sources(path TEXT)"])
+        self.assertEqual(m.retired_db_findings([("main", ok, 1, 24)], ok), [])
+
+    def test_tuning_dropped_and_r0(self):
+        pre = {"agents": {"defaults": {"memorySearch": {"model": "m", "query": {"hybrid": {
+            "vectorWeight": 0.95, "textWeight": 0.05, "mmr": {"lambda": 0.5}}}}}}}
+        moved = {"memory": {"search": {"model": "m", "query": {"hybrid": {"mmr": {"lambda": 0.5}}}}}}
+        self.assertEqual(m.retired_tuning_dropped(pre, moved),
+                         ["agents.defaults.memorySearch.query.hybrid.vectorWeight=0.95",
+                          "agents.defaults.memorySearch.query.hybrid.textWeight=0.05"])
+        self.assertEqual(m.retired_tuning_dropped(moved, moved), [])
+        cfg = {"plugins": {"installs": {"a": {"spec": "x"}}, "entries": {}}}
+        new, ledger, _s = m.premigrate_config(cfg, removals=[["plugins", "installs"]])
+        self.assertNotIn("installs", new["plugins"])
+        self.assertEqual([(e["step"], e["path"], e["after"]) for e in ledger], [("R0", "plugins.installs", None)])
+        self.assertIn("installs", cfg["plugins"], "input must not be mutated")
 
 
 class TestVllmUntouched(unittest.TestCase):

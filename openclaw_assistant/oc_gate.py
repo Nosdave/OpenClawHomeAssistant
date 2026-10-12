@@ -1,5 +1,5 @@
 """
-Migration gate for the bundled OpenClaw runtime (2026.7.x -> 2026.9.x, later 9.x bumps).
+Migration gate for the bundled OpenClaw runtime (2026.7.x -> 2026.9+/2026.10.x, later bumps).
 
 Phases (spec §7): 1 precheck, 2 archive (/share), 3 cleanup/quarantine, 4 pre-migrate
 (R1-R5, from-7x), 5 doctor pass 1, 6 fixups (F1-F4, from-7x), 7 doctor pass 2 (+3),
@@ -68,6 +68,9 @@ ACCEPTABLE = frozenset({
     "pc-schema-meta", "pc-legacy-files", "pc-lint-errors", "pc-lint-failed", "pc-legacy-refs",
     "pc-codex-runtime", "pc-runtime-pin", "pc-models-status", "pc-sessions-runtime", "pc-auth-order",
     "pc-probe", "pc-legacy-state", "pins-invalid",
+    # retired pre-July-2026 state that OpenClaw 2026.10 refuses (oc_migrate.classify_retired_state)
+    "cron-json-unimported", "oauth-sidecar-referenced", "plugin-index-unimported", "plugins-installs-unindexed",
+    "device-pair-subscribers", "voice-call-log", "telegram-spool-invalid",
 })
 NO_RETRY = frozenset({"newer-state", "runtime-integrity"})
 POST_RUN_HOLDS = frozenset({"exit78", "crash-loop"})
@@ -125,6 +128,17 @@ ADVICE = {
     "archive-timeout": "check /share performance, then oc-upgrade retry",
     "cleanup-failed": "check permissions under /config/.openclaw-upgrade, then oc-upgrade retry",
     "premigrate-failed": "check free space and permissions, then oc-upgrade retry",
+    "config-retired-keys": "remove the listed settings from openclaw.json on 0.5.93 (OpenClaw 2026.7.35 does not use "
+                           "them), then oc-upgrade retry",
+    "retired-state-outside": "move the listed pre-July-2026 files away by hand (they are in your backup), then oc-upgrade retry",
+    "retired-state-uninspectable": "fix or remove the listed paths (they must be directories or absent), then oc-upgrade retry",
+    "retired-memory-index": "on 0.5.93 run `openclaw memory index --agent <id>` for each listed agent (2026.7.35 converts "
+                            "the index), then oc-upgrade retry",
+    "pre-july-schema": "restore a backup taken after a clean 0.5.93 start (pre-July-2026 databases are not migrated by "
+                       "OpenClaw 2026.10)",
+    "telegram-spool-unsupported": "rename or move the listed telegram/ingress-spool-* entries, then oc-upgrade retry",
+    "doctor-retired-format": "doctor refused pre-July-2026 settings or files (see the reason): remove or move them "
+                             "(they are in the gate archive), then oc-upgrade retry; a plain retry repeats the refusal",
     "doctor-held-back": "doctor held back agent databases: re-register the agent (OC_ADDON_UNSAFE=1 openclaw agents add <id> --workspace <ws> --agent-dir <dir> --non-interactive) or restore the backup, then oc-upgrade retry",
     "doctor-migration-refused": "fix the item doctor reported (oc-upgrade log), then oc-upgrade retry",
     "doctor-maintenance-refused": "oc-upgrade retry (doctor resumes from its last committed step)",
@@ -150,10 +164,24 @@ ADVICE = {
 # Doctor output classification (spec §7.5 with critique B3/B8)
 ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
 BOX_RE = re.compile("[─-╿■-◿]")
+# 2026.10 refusals of pre-July-2026 settings/files/schemas (a retry cannot pass them; checked first).
+RETIRED_FORMAT_MARKERS = (
+    "retired pre-July-2026 settings", "retired pre-June keys", "predates July 1, 2026",
+    "retired pre-July 2026 format", "predates the July 2026 upgrade support window",
+    "pre-July-2026 state are no longer migrated", "Retired memory index format detected",
+    "unreleased session schema", "unsupported agent database registry schema",
+    "Unsupported Telegram spool directory", "Telegram state must be a directory",
+    "Cannot inspect potentially retired state",
+)
+# Held agent stores: 9.9 failed doctor on them; 2026.10 only warns and exits 0 (doctor-health-BmFjJGcU.mjs:185-187).
+HELD_BACK_MARKERS = ("held back", "Held agent ")
 FATAL_MARKERS = (
-    ("doctor-held-back", ("held back", "Held agent ", "unverified-agent-databases", "Agent deletion journal"), None),
+    ("doctor-retired-format", RETIRED_FORMAT_MARKERS, None),
+    ("doctor-held-back", HELD_BACK_MARKERS + ("unverified-agent-databases", "Agent deletion journal"), None),
     ("doctor-migration-refused", ("Doctor stopped because",), None),
-    ("doctor-maintenance-refused", ("Doctor could not enter maintenance", "Doctor could not"), None),
+    ("doctor-maintenance-refused", ("Doctor could not enter maintenance", "Doctor could not complete",
+                                    "Doctor could not acquire", "Doctor could not reacquire",
+                                    "Doctor could not apply", "Doctor could not promote"), None),
     ("doctor-plugin-load", ("plugin load errors",), None),
     ("doctor-config-write", ("config fixes were not applied",), None),
     ("doctor-backup-unverifiable", ("Cannot verify pre-migration SQLite backup", "backup group is missing"), None),
@@ -161,6 +189,9 @@ FATAL_MARKERS = (
     ("doctor-failed", ("Failing check ",), None),
 )
 SUSPICIOUS_MARKERS = ("Preserved retired", "may contain unmigrated data", "Pre-June OAuth credentials")
+# Only in the last doctor pass: pass 1 reports plugins pinned to the 7.x package as unfinished until doctor
+# has updated them (deferred-plugin-migrations-DtqETF3J.mjs:220; gone in pass 2 in every rehearsal).
+FINAL_PASS_SUSPICIOUS = ("data/settings upgrade is unfinished",)
 
 STOP = threading.Event()
 _STOP_SIG = [None]
@@ -439,7 +470,9 @@ def legacy_files(state_dir, cfg, state_tables):
                 found.append(str(c))
     att_dirs = [state_dir / "workspace-attestations", p["CONFIG_ROOT"] / ".clawdbot" / "workspace-attestations"]
     for ws in workspaces(cfg):
-        for f in (ws / "openclaw-workspace-state.json", ws / ".openclaw" / "workspace-state.json"):
+        # <ws>/.openclaw/workspace-state.json (last written by 2026.6.8) is ignored by 2026.10 doctor
+        # (docs/cli/doctor/state-migrations.md:318-323), so it no longer counts as unmigrated state.
+        for f in (ws / "openclaw-workspace-state.json",):
             for c in (f, Path(f"{f}.doctor-importing")):
                 if os.path.lexists(c):
                     found.append(str(c))
@@ -1080,8 +1113,10 @@ def _snippet(norm, idx, width=160):
     return C.redact_text(s)
 
 
-def evaluate_doctor(rc, text, *, timed_out=False, stopping=False):
-    """Classify one doctor pass (B3: markers only when rc != 0; B8: signals/OOM -> doctor-crashed)."""
+def evaluate_doctor(rc, text, *, timed_out=False, stopping=False, final=False):
+    """Classify one doctor pass (B3: markers only when rc != 0, except held-back stores, which 2026.10
+    reports with rc 0; B8: signals/OOM -> doctor-crashed). final: the pass that should leave nothing
+    pending (pass 2 or 3)."""
     norm = normalize_doctor_text(text)
     low = norm.lower()
     complete = "Doctor complete." in norm
@@ -1096,7 +1131,13 @@ def evaluate_doctor(rc, text, *, timed_out=False, stopping=False):
         if not complete:
             res.update(code="doctor-incomplete", cls="hard", message="doctor exited 0 without 'Doctor complete.'")
             return res
-        sus = [m for m in SUSPICIOUS_MARKERS if m.lower() in low]
+        for s in HELD_BACK_MARKERS:
+            idx = low.find(s.lower())
+            if idx >= 0:
+                res.update(code="doctor-held-back", cls="hard", markers=[s],
+                           message=f"doctor completed but held back agent databases: ...{_snippet(norm, idx)}...")
+                return res
+        sus = [m for m in SUSPICIOUS_MARKERS + (FINAL_PASS_SUSPICIOUS if final else ()) if m.lower() in low]
         if sus:
             idx = low.find(sus[0].lower())
             res.update(code="doctor-warnings", cls="acceptable", markers=sus,
@@ -1137,11 +1178,14 @@ _NOTE_RES = (
     ("info", re.compile(r'(agents\.(?:entries|list)\S*?\.model) is .{1,200}? At runtime this clobbers '
                         r'agents\.defaults\.model\.fallbacks'),
      lambda m: f"{m.group(1)} has no explicit \"fallbacks\" (no fallbacks for that agent; 2026.7.35 behaved the "
-               "same, 9.x only reports it)"),
-    ("warn", re.compile(r'Agent "([^"]{1,80})": Memory search provider is set to "([^"]{1,40})" but no API key'),
+               "same, 2026.9+ only reports it)"),
+    # "... but no API key was found." or "... but the API key was not found in the CLI environment."
+    # (doctor-memory-search-CPASCeub.mjs:370/379; the agent prefix only appears with several agents)
+    ("warn", re.compile(r'Agent "([^"]{1,80})": Memory search provider is set to "([^"]{1,40})" but '
+                        r'(?:no API key|the API key was not found)'),
      lambda m: f"memory search of agent {m.group(1)} uses provider {m.group(2)} without an API key: semantic "
                "recall does not work until one is configured"),
-    ("warn", re.compile(r'Agent "([^"]{1,80})": (\d+) allowed skills are not usable in this environment'),
+    ("warn", re.compile(r'Agent "([^"]{1,80})": (\d+) allowed skills? (?:is|are) not usable in this environment'),
      lambda m: f"{m.group(2)} skill(s) of agent {m.group(1)} are not usable in this environment and were disabled "
                "(openclaw skills check)"),
     ("warn", re.compile(r'Create heartbeat monitor for agent "([^"]{1,80})" at (\S{1,20}?)\.(?:\s|$)'),
@@ -1169,7 +1213,9 @@ def doctor_notes(text):
 # Templates verified in the 9.9 dist: retired-model-ref-repair-BeQCC1zw.mjs:612 (Replaced retired /
 # Preserved ... as ... after config repair), :676 (Preserved inherited), :694 (Moved retired / Preserved
 # ... for other authentication routes and added), :712 (modelPolicy.allow), and
-# legacy-config-migrations.runtime.models-j-YXRZQK.mjs:332, :399, :411-412, :552 (Upgraded / Merged).
+# legacy-config-migrations.runtime.models-j-YXRZQK.mjs:332, :399, :411-412, :552 (Upgraded / Merged);
+# unchanged in 10.2: retired-model-ref-repair-TouY-fr5.mjs:637/701/719/737,
+# legacy-config-migrations.runtime.models-zfo-BeDg.mjs:225/292/304-305/445.
 # Values are JSON.stringify'd (quoted) except in the :676/:694 templates. "Replaced stale ... with default"
 # (raw-path damage, exp1raw) deliberately does not match.
 _RQ = r'"([^"\s]+)"'
@@ -1717,6 +1763,9 @@ class Gate:
             self.facts["cleanup_plan"] = sf.get("plan", [])
             _stores, sess_f = M.scan_sessions_files(str(p["STATE"]))
             F += [dict(f) for f in sess_f]
+        # 6b every gate mode, before the first write: pre-July-2026 formats OpenClaw 2026.10 refuses
+        if not generic_only:
+            F += self.retired_format_findings(mode, cfg_ok)
         # 7 sizes (and F1: a symlinked state/agent directory or workspace root would be archived as a bare link)
         ap = self.archive_plan()
         links = state_symlinks(p["STATE"], self.cls) + ap["symlinks"]
@@ -1857,11 +1906,13 @@ class Gate:
         if n:
             self.warn(f"{n} cron job(s) use openai-codex models: doctor may install the @openclaw/codex plugin "
                       "for them (it stays installed); the fixups revert doctor's codex runtime pins to openclaw")
-        spool = [x for x in state.glob("telegram/ingress-spool-*/*.json*") if x.is_file()]
-        # from-7x before the first write: classify_state_files already reported the spool
-        if spool and (mode != "from-7x" or generic_only):
-            self.say(f"{self.pn('precheck')} info: {len(spool)} undelivered legacy Telegram update(s) in "
-                     "telegram/ingress-spool-* will not be processed by 9.x (left in place)")
+        # telegram/ingress-spool-*: reported by retired_format_findings (2026.10 doctor imports the spool)
+        for ws in workspaces(self.cfg):
+            nested = ws / ".openclaw" / "workspace-state.json"
+            if os.path.lexists(nested) and not os.path.lexists(ws / "openclaw-workspace-state.json"):
+                self.warn(f"{nested} holds the workspace setup state in the pre-July layout, which OpenClaw 2026.10 "
+                          "ignores (2026.7.35 copies it to openclaw-workspace-state.json when the workspace is "
+                          "used); the agent may offer its first-run setup again")
 
     def phase_precheck(self):
         mode = self.j["mode"]
@@ -2014,6 +2065,28 @@ class Gate:
                  f"sha256 {v['sha256'][:12]}… -> {adir}/")
 
     # ----- phase 3: cleanup -----
+    def retired_state(self, mode):
+        return mig().classify_retired_state(str(self.gp["STATE"]), self.cfg, accepted=set(self.accepted), query=_mq,
+                                            home=str(self.gp["CONFIG_ROOT"]), mode=mode)
+
+    def retired_format_findings(self, mode, cfg_ok):
+        """Mirror of the 2026.10 refusals (oc_migrate.classify_retired_state / retired_*): HOLD before any write."""
+        M = mig()
+        F = [dict(f) for f in M.retired_config_findings(self.cfg, mode)] if cfg_ok else []
+        rs = self.retired_state(mode)
+        F += [dict(f) for f in rs["findings"]]
+        for i in rs["info"]:
+            self.say(f"{self.pn('precheck')} info: {i}")
+        n = sum(1 for e in rs["plan"] if e["action"] == "quarantine")
+        if n:
+            self.say(f"{self.pn('precheck')} info: {n} retired pre-July-2026 file(s) will be moved to quarantine "
+                     "(OpenClaw 2026.10 refuses them; their content is in SQLite or disposable)")
+        dbs = [(aid, str(self.gp["STATE"] / rel), (self.cls.get("agents") or {}).get(aid), self.pkg["schema_agent"])
+               for aid, rel in sorted((self.cls.get("agent_paths") or {}).items())]
+        F += [dict(f) for f in M.retired_db_findings(dbs, str(self.gp["STATE"] / "state" / "openclaw.sqlite"),
+                                                     query=_mq)]
+        return F
+
     def phase_cleanup(self):
         M = mig()
         p = self.gp
@@ -2023,11 +2096,12 @@ class Gate:
         src = self.j.get("source") or {}
         sf = M.classify_state_files(str(p["STATE"]), self.cfg, from_checkpoint=src.get("from_checkpoint"),
                                     accepted=set(self.accepted), mode=cmode, query=_mq)
+        plan = list(sf.get("plan", [])) + list(self.retired_state(cmode)["plan"])
         skip = set(self.hooks.get("skip_cleanup_kinds") or [])
         qdir = p["QUAR"] / self.j["run_id"]
         mpath = qdir / "MANIFEST.json"
         counts = {}
-        for e in sf.get("plan", []):
+        for e in plan:
             self.check_stop()
             relp, kind = e.get("rel"), e.get("kind")
             if e.get("action") != "quarantine":
@@ -2088,7 +2162,9 @@ class Gate:
             self.mark_first_write()
             self.copy_once(p["CONFIG_PATH"], rd / "config.pre-gate.json")
             cfg_pre = C.read_json_strict(rd / "config.pre-gate.json")
-            new_cfg, ledger, summary = M.premigrate_config(cfg_pre)
+            removals = M.classify_retired_state(str(p["STATE"]), cfg_pre, accepted=set(self.accepted), query=_mq,
+                                                home=str(p["CONFIG_ROOT"]))["config_removals"]
+            new_cfg, ledger, summary = M.premigrate_config(cfg_pre, removals=removals)
             stores, _f = M.scan_sessions_files(str(p["STATE"]))
             sess_led, pinned, user_explicit, harness = [], [], [], []
             sess_writes = []
@@ -2110,7 +2186,7 @@ class Gate:
             self.write_config(new_cfg)
             for src, store in sess_writes:
                 C.atomic_write_text(src, C.json_dumps(store))
-            self.ledger_add(list(ledger) + sess_led, {"R1", "R2", "R3", "R4", "R5"})
+            self.ledger_add(list(ledger) + sess_led, {"R0", "R1", "R2", "R3", "R4", "R5"})
         except (OSError, ValueError, C.ConfigReadError) as exc:  # ValueError: a map that is not an object
             raise HoldError([finding("premigrate-failed", "hard", f"{type(exc).__name__}: {exc}", "premigrate")],
                             "premigrate")
@@ -2125,6 +2201,9 @@ class Gate:
                  f"(scopes: {scopes}); runtime pinned to openclaw on {summary.get('pinned', 0)} entries; "
                  f"{len(pinned)} sessions pinned; modelPolicy {{}} written: "
                  f"{'yes' if summary.get('model_policy_written') else 'no'}")
+        r0 = [e["path"] for e in ledger if e.get("step") == "R0"]
+        if r0:
+            self.say("4/9 pre-migrate: removed retired key(s) OpenClaw 2026.10 refuses: " + ", ".join(r0))
 
     # ----- doctor -----
     def run_doctor_pass(self, n, phase):
@@ -2160,7 +2239,7 @@ class Gate:
         with open(log, "rb") as f:
             f.seek(off)
             text = f.read().decode("utf-8", "replace")
-        ev = evaluate_doctor(res.rc, text, timed_out=res.timed_out, stopping=STOP.is_set())
+        ev = evaluate_doctor(res.rc, text, timed_out=res.timed_out, stopping=STOP.is_set(), final=n >= 2)
         rec = {"pass": n, "started": started, "ended": C.utc_iso(), "rc": res.rc, "duration_s": round(res.duration),
                "complete": ev["complete"], "markers": ev["markers"], "code": ev["code"],
                "log": str(log.relative_to(self.gp["GATE"])) if str(log).startswith(str(self.gp["GATE"])) else str(log),
@@ -2217,6 +2296,11 @@ class Gate:
             if removed:
                 self.say(f"5/9 doctor removed {len(removed)} config key(s): " + ", ".join(removed[:40])
                          + (" …" if len(removed) > 40 else ""))
+            tuning = mig().retired_tuning_dropped(pre, post)
+            if tuning:
+                self.warn("doctor removed memory search tuning that OpenClaw 2026.9+ no longer supports (recall now "
+                          "uses fixed values: hybrid vector/text 0.7/0.3, MMR 0.7, 30-day recency decay): "
+                          + ", ".join(tuning[:8]))
         except C.ConfigReadError as exc:
             self.warn(f"cannot compare config before/after pass 1: {exc}")
         total = sum(x["size"] for x in baks)
@@ -2994,19 +3078,28 @@ def plugin_snapshot(state_dir):
 def schema_meta_problems(state_dir, cls, pkg):
     probs = []
     sdb = Path(state_dir) / "state" / "openclaw.sqlite"
+
+    def app_ok(v):
+        # Measured on real 2026.9.9 and 2026.10.2 migrations (doctor + gateway): the state DB's primary row keeps
+        # app_version NULL while agent DBs get the runtime version. A version written by an earlier 9.x gateway
+        # (non-fast path) or kept on an agent DB already at the target schema is not a regression either.
+        if v is None or v == pkg["version"]:
+            return True
+        try:
+            return C.version_tuple(str(v)) <= C.version_tuple(pkg["version"])
+        except (ValueError, TypeError):
+            return False
     try:
-        # Measured on a real 2026.9.9 migration (doctor + gateway): the state DB's primary row keeps
-        # app_version NULL while agent DBs get the runtime version, so NULL is accepted (spec said "likely").
         prim = schema_meta_primary(sdb) if sdb.exists() else None
         if not prim or prim.get("role") != "global" or prim.get("schema_version") != pkg["schema_state"] \
-                or prim.get("app_version") not in (None, pkg["version"]):
+                or not app_ok(prim.get("app_version")):
             probs.append(f"state schema_meta primary {prim}")
         for aid, relp in sorted(cls.get("agent_paths", {}).items()):
             ap = schema_meta_primary(Path(state_dir) / relp)
             dirname = Path(relp).parent.parent.name
             if not ap or ap.get("role") != "agent" or ap.get("agent_id") != dirname \
                     or ap.get("schema_version") != pkg["schema_agent"] \
-                    or ap.get("app_version") not in (None, pkg["version"]):
+                    or not app_ok(ap.get("app_version")):
                 probs.append(f"{relp} schema_meta primary {ap}")
         if sdb.exists() and "agent_databases" in table_names(sdb):
             for aid, sv in q(sdb, "SELECT agent_id, schema_version FROM agent_databases"):

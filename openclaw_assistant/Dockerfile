@@ -132,8 +132,10 @@ USER root
 #                         openclaw ships no npm-shrinkwrap.json, so this limits
 #                         dependency drift between rebuilds. Must be after the
 #                         publish times of the pins (openclaw@2026.10.2
-#                         2026-10-12T05:28:25Z, @openclaw/brave-plugin@2026.10.2
-#                         2026-10-12T02:25:53Z).
+#                         2026-10-12T05:28:25Z, its newest exact dependency
+#                         @openclaw/ai 05:23:36Z; @openclaw/brave-plugin@2026.10.2
+#                         2026-10-12T02:25:53Z is installed at runtime by run.sh
+#                         and checked here only for existence).
 ARG OPENCLAW_VERSION=2026.10.2
 ARG BRAVE_PLUGIN_VERSION=2026.10.2
 ARG NPM_BEFORE=2026-10-12T08:00:00Z

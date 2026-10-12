@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""oc_migrate -- transforms and checks for the OpenClaw 2026.7.x -> 2026.9.x migration gate.
+"""oc_migrate -- transforms and checks for the OpenClaw 2026.7.x -> 2026.9+/2026.10 migration gate.
 
 Every function in this module is pure with respect to its arguments: inputs are
 deep-copied and never mutated, nothing runs a subprocess and nothing writes a file.
-Read-only filesystem access happens only in classify_state_files() and
-scan_sessions_files() (lstat-based; symlinks are never followed into files and
-sockets/FIFOs are never opened).
+Read-only filesystem access happens only in classify_state_files(),
+classify_retired_state(), retired_db_findings() and scan_sessions_files() (lstat-based; symlinks
+are never followed into files and sockets/FIFOs are never opened).
 
 Stage B spec references: §7.3 (cleanup table), §7.4 (models preflight, R1-R5),
 §7.6 (fixups F1-F3; F4 validation is a subprocess owned by oc_gate), §7.8
@@ -39,6 +39,8 @@ __all__ = [
     "legacy_key_context", "is_migrated_legacy_key",
     "check_legacy_refs", "check_codex_runtime", "check_runtime_pins", "apply_pins", "auth_order_adjust",
     "classify_state_files", "scan_sessions_files", "config_precheck", "flatten_paths",
+    "retired_config_keys", "retired_config_findings", "classify_retired_state", "retired_db_findings",
+    "retired_tuning_dropped", "RETIRED_QUARANTINE_KINDS",
 ]
 
 CONFIG_FILE = "openclaw.json"
@@ -124,9 +126,10 @@ _AGENT_DB_FAMILY = frozenset({"openclaw-agent.sqlite", "openclaw-agent.sqlite-wa
 
 # Quarantine kinds (§7.3) -- exactly these produce action "quarantine".
 QUARANTINE_KINDS = ("telegram-cache", "telegram-session-cache", "sqlite-transient",
-                    "active-memory-toggles", "oauth-json")
+                    "active-memory-toggles", "oauth-json", "legacy-memory-sidecar")
 
-# §7.9 pins (validated against the 9.9 schema: specwf/config-keys/pins_final.json).
+# §7.9 pins (validated against the 9.9 schema: specwf/config-keys/pins_final.json; types, values and
+# defaults unchanged in 10.2, and `config validate` runs after the pins on every gate run).
 # The leaf is written only if absent from its parent dict; "cond" names an extra condition.
 SYSTEM_AGENT = "@agents.defaults.systemAgent.agentId"  # pin value resolved at apply time
 
@@ -159,7 +162,7 @@ PINS = [
     {"path": ["session", "reset"], "value": {"mode": "daily", "atHour": 4}, "cond": None},
     # multi-agent roster without a heartbeat block: 9.9 runs the heartbeat for the system agent only,
     # but creating agents.defaults.heartbeat without agentId would enroll every agent
-    # (heartbeat-config-CEn374Nf.mjs:62-69), so name the system agent explicitly first
+    # (heartbeat-config-CEn374Nf.mjs:62-69; v102 heartbeat-config--CDRLwW6.mjs:57-65), so name the system agent first
     {"path": ["agents", "defaults", "heartbeat", "agentId"], "value": SYSTEM_AGENT, "cond": "heartbeat-system-agent"},
     {"path": ["agents", "defaults", "heartbeat", "target"], "value": "none", "cond": "heartbeat-roster"},
     {"path": ["session", "maintenance", "maxEntries"], "value": 500, "cond": None},
@@ -503,7 +506,7 @@ def models_preflight(cfg):
     if codex_refs or codex_prov:
         findings.append(_finding(
             "models-codex-provider", "hard",
-            "config uses the retired 'codex'/'codex-cli' provider (%s); 9.9 cannot migrate it automatically. "
+            "config uses the retired 'codex'/'codex-cli' provider (%s); OpenClaw 2026.9+ cannot migrate it automatically. "
             "Switch these to openai-codex/<model> (or remove them) on 0.5.93 first."
             % _brief(codex_refs + codex_prov), phase))
     runtime_hits, runtime_kept = [], []
@@ -538,7 +541,7 @@ def models_preflight(cfg):
             findings.append(_finding(
                 "models-provider-merge", "hard",
                 "models.providers has both an 'openai-codex' and an 'openai' block and the legacy block defines "
-                "models the canonical one lacks (%s); 9.9 refuses to merge them and would strand every "
+                "models the canonical one lacks (%s); OpenClaw 2026.9+ refuses to merge them and would strand every "
                 "openai-codex ref. Merge the blocks by hand on 0.5.93 first." % _brief(sorted(set(missing))), phase))
     wild_pinned = []
     for _label, parts, _aid, mmap in _models_map_scopes(cfg):
@@ -557,13 +560,13 @@ def models_preflight(cfg):
     if platform:
         findings.append(_finding(
             "models-platform-only", "acceptable",
-            "legacy refs name models that 9.9 serves only with an OpenAI API key (metered), not with the "
+            "legacy refs name models that OpenClaw 2026.9+ serves only with an OpenAI API key (metered), not with the "
             "ChatGPT subscription: %s" % _brief(platform), phase))
     collisions = route_collisions(cfg)
     if collisions:
         findings.append(_finding(
             "models-route-collision", "acceptable",
-            "openai-codex model(s) also used as canonical openai/ refs: %s. 9.9 has one openai/<model> route per "
+            "openai-codex model(s) also used as canonical openai/ refs: %s. OpenClaw 2026.9+ has one openai/<model> route per "
             "model, so after the migration these openai/ refs run on the OpenClaw runtime like the migrated "
             "openai-codex refs (on 7.35 they used the Codex app-server)"
             % _brief("%s (%s)" % (mid, _brief(paths, 3)) for mid, paths in sorted(collisions.items())), phase))
@@ -690,8 +693,9 @@ def _pin_entry(mmap, key, parts, ledger, step):
     return True
 
 
-def premigrate_config(cfg):
-    """R1 (wildcards), R2 (openclaw runtime pins), R3 (modelPolicy {}) -- §7.4.2. R4: nothing.
+def premigrate_config(cfg, removals=()):
+    """R0 (retired keys from classify_retired_state), R1 (wildcards), R2 (openclaw runtime pins),
+    R3 (modelPolicy {}) -- §7.4.2. R4: nothing.
 
     Pass the run's write-once config.pre-gate.json (critique B2): R3 and EXPLICIT are evaluated on the
     input, so the result is the same on every re-run. `meta` is never touched.
@@ -703,6 +707,13 @@ def premigrate_config(cfg):
         raise ValueError("openclaw.json top-level value is not an object")
     new = copy.deepcopy(cfg)
     ledger = []
+    # R0: retired keys 2026.10 refuses whose content 7.x keeps elsewhere (plugins.installs: SQLite index).
+    for parts in removals:
+        parent = _get(new, list(parts[:-1]))
+        if isinstance(parent, dict) and parts[-1] in parent:
+            ledger.append({"step": "R0", "file": CONFIG_FILE, "path": fmt_path(list(parts)),
+                           "before": copy.deepcopy(parent[parts[-1]]), "after": None})
+            del parent[parts[-1]]
     refs = scan_legacy_refs(cfg)
     legacy_slots = [{k: copy.deepcopy(r[k]) for k in ("path", "value", "where", "id", "profile", "parts", "agent_id")}
                     for r in refs if r["id"] != "*"]
@@ -1975,13 +1986,13 @@ def classify_state_files(state_dir, cfg, *, from_checkpoint, accepted, mode, que
                 continue
             if TRANSIENT_SQLITE_RE.match(e.name):
                 if stat.S_ISREG(st.st_mode):
-                    add(rel, "sqlite-transient", "quarantine", "transient SQLite file (9.9 backup rules)")
+                    add(rel, "sqlite-transient", "quarantine", "transient SQLite file (2026.9+ backup rules)")
                 else:
                     add(rel, "sqlite-other", "leave", "transient name but not a regular file")
             elif e.name in _AGENT_DB_FAMILY:
                 continue
             elif ".migrated" in e.name:
-                add(rel, "migrated-archive", "leave", "archive of an imported file; 9.9 ignores it")
+                add(rel, "migrated-archive", "leave", "archive of an imported file; 2026.9+ ignores it")
             elif ".sqlite" in e.name.lower():
                 add(rel, "sqlite-other", "leave", "other SQLite file next to the agent DB")
     if not from7:
@@ -1991,7 +2002,6 @@ def classify_state_files(state_dir, cfg, *, from_checkpoint, accepted, mode, que
     bindings_ok = from_checkpoint == "2026.7.35" and tg_dict
 
     # Telegram retired JSON state.
-    spool = 0
     for e in _scandir_sorted(os.path.join(state_dir, "telegram")):
         rel = "telegram/" + e.name
         st = _lstat(os.path.join(state_dir, rel))
@@ -2001,7 +2011,7 @@ def classify_state_files(state_dir, cfg, *, from_checkpoint, accepted, mode, que
         if TELEGRAM_CACHE_RE.match(e.name) and regular_or_link:
             if e.name.startswith("thread-bindings-"):
                 if _verified_empty_bindings(os.path.join(state_dir, rel)):
-                    add(rel, "telegram-cache", "leave", "verified-empty thread bindings; 9.9 archives it itself")
+                    add(rel, "telegram-cache", "leave", "verified-empty thread bindings; 2026.10 ignores it")
                 elif bindings_ok or "telegram-bindings-nonempty" in accepted:
                     if not bindings_ok:
                         flag("telegram-bindings-nonempty", rel)
@@ -2012,16 +2022,10 @@ def classify_state_files(state_dir, cfg, *, from_checkpoint, accepted, mode, que
                     flag("telegram-bindings-nonempty", rel)
                     add(rel, "telegram-cache", "leave", "non-empty thread bindings without a clean 7.35 checkpoint")
             else:
-                add(rel, "telegram-cache", "quarantine", "retired Telegram cache; 9.9 doctor refuses while it exists")
+                add(rel, "telegram-cache", "quarantine", "retired Telegram cache (2026.9 refused it, 2026.10 ignores it)")
         elif ".migrated" in e.name:
-            add(rel, "migrated-archive", "leave", "archive of an imported file; 9.9 ignores it")
-        elif e.name.startswith("ingress-spool-") and stat.S_ISDIR(st.st_mode):
-            for f in _scandir_sorted(os.path.join(state_dir, rel)):
-                if ".json" in f.name and f.is_file(follow_symlinks=False):
-                    spool += 1
-    if spool:
-        info.append("telegram ingress spool: %d undelivered legacy Telegram update file(s) will not be "
-                    "processed by 9.9 (left in place)" % spool)
+            add(rel, "migrated-archive", "leave", "archive of an imported file; 2026.9+ ignores it")
+    # telegram/ingress-spool-*: classify_retired_state() (2026.10 doctor imports the spool)
 
     # Telegram session caches next to every session store.
     store_dirs = ["sessions"] + ["agents/%s/sessions" % n for n in agent_names]
@@ -2031,12 +2035,12 @@ def classify_state_files(state_dir, cfg, *, from_checkpoint, accepted, mode, que
             st = _lstat(os.path.join(state_dir, rel))
             if st is not None and (stat.S_ISREG(st.st_mode) or stat.S_ISLNK(st.st_mode)):
                 add(rel, "telegram-session-cache", "quarantine",
-                    "retired Telegram session cache; 9.9 doctor refuses while it exists")
+                    "retired Telegram session cache (2026.9 refused it, 2026.10 ignores it)")
         for e in _scandir_sorted(os.path.join(state_dir, sdir)):
             if e.name.startswith("sessions.json.telegram-message-dispatch-") and e.name.endswith(".json"):
-                add(sdir + "/" + e.name, "telegram-dispatch", "leave", "dispatch file; 9.9 ignores it")
+                add(sdir + "/" + e.name, "telegram-dispatch", "leave", "dispatch file; 2026.9+ ignores it")
             elif e.name.startswith("sessions.json.telegram-") and ".migrated" in e.name:
-                add(sdir + "/" + e.name, "migrated-archive", "leave", "archive of an imported file; 9.9 ignores it")
+                add(sdir + "/" + e.name, "migrated-archive", "leave", "archive of an imported file; 2026.9+ ignores it")
 
     # Active Memory per-session toggles.
     rel = "plugins/active-memory/session-toggles.json"
@@ -2050,10 +2054,10 @@ def classify_state_files(state_dir, cfg, *, from_checkpoint, accepted, mode, que
                 add(rel, "active-memory-toggles", "leave", "%d per-session opt-out(s) would be lost" % n)
         else:
             add(rel, "active-memory-toggles", "quarantine",
-                "no disabled entries; 9.9 doctor refuses while it exists" if ok
-                else "unreadable or invalid JSON; 9.9 doctor refuses while it exists")
+                "no disabled entries; 2026.9+ doctor refuses while it exists" if ok
+                else "unreadable or invalid JSON; 2026.9+ doctor refuses while it exists")
 
-    # credentials/oauth.json (9.9 never reads it; startup may fence on it).
+    # credentials/oauth.json (2026.9+ never reads it; startup may fence on it).
     rel = "credentials/oauth.json"
     if _lstat(os.path.join(state_dir, rel)) is not None:
         count = _main_auth_profile_count(state_dir, q)
@@ -2067,43 +2071,679 @@ def classify_state_files(state_dir, cfg, *, from_checkpoint, accepted, mode, que
             else:
                 add(rel, "oauth-json", "leave", "credentials may exist only in oauth.json")
 
-    # Pre-June legacy databases 9.9 never imports.
+    # Pre-June legacy databases 2026.9+ never imports.
     for dbrel in LEGACY_DATABASES:
         path = os.path.join(state_dir, dbrel)
         if _lstat(path) is not None:
             rows = _legacy_db_rows(path, q)
             if rows is None or rows > 0:
                 flag("legacy-db-unimported", "%s (%s)" % (dbrel, "unreadable" if rows is None else "%d rows" % rows))
-                add(dbrel, "legacy-db", "leave", "not imported; 9.9 ignores it")
+                add(dbrel, "legacy-db", "leave", "not imported; 2026.9+ ignores it")
             else:
                 add(dbrel, "legacy-db", "leave", "empty")
         ddir = os.path.dirname(dbrel)
         base = os.path.basename(dbrel)
         for e in _scandir_sorted(os.path.join(state_dir, ddir)):
             if e.name.startswith(base) and ".migrated" in e.name:
-                add(ddir + "/" + e.name, "migrated-archive", "leave", "archive of an imported file; 9.9 ignores it")
+                add(ddir + "/" + e.name, "migrated-archive", "leave", "archive of an imported file; 2026.9+ ignores it")
 
-    # Legacy memory sidecars (memory/<agentId>.sqlite).
+    # Legacy memory sidecars (memory/<agentId>.sqlite): 2026.10 doctor imports them but refuses the
+    # pre-July index format inside (memory-schema-BA04oCjG.mjs:822-841); the index is derived data.
     for e in _scandir_sorted(os.path.join(state_dir, "memory")):
         if e.name.endswith(".sqlite"):
             flag("legacy-memory-sidecar", "memory/" + e.name)
-            add("memory/" + e.name, "legacy-memory-sidecar", "leave", "legacy memory sidecar")
+            if "legacy-memory-sidecar" in accepted:
+                add("memory/" + e.name, "legacy-memory-sidecar", "quarantine", "accepted: legacy-memory-sidecar")
+            else:
+                add("memory/" + e.name, "legacy-memory-sidecar", "leave", "legacy memory sidecar")
 
     messages = {
         "telegram-bindings-nonempty": ("non-empty Telegram thread-bindings file(s) without a clean 2026.7.35 "
                                        "checkpoint and a configured channels.telegram: %s; accepting moves them "
                                        "to quarantine (bindings are not imported)"),
-        "active-memory-optouts": ("Active Memory per-session opt-outs would be lost (9.9 cannot import them): %s; "
+        "active-memory-optouts": ("Active Memory per-session opt-outs would be lost (2026.9+ cannot import them): %s; "
                                   "accepting re-enables recall for those sessions"),
         "oauth-json-only": ("credentials/oauth.json exists but the main agent auth store has no profiles: %s; "
-                            "the credentials may exist only there and 9.9 never reads it"),
-        "legacy-db-unimported": ("pre-June database(s) with data 9.9 never imports: %s; upgrade through 2026.9.5 "
+                            "the credentials may exist only there and 2026.9+ never reads it"),
+        "legacy-db-unimported": ("pre-June database(s) with data 2026.9+ never imports: %s; upgrade through 2026.9.5 "
                                  "first or accept losing these records"),
-        "legacy-memory-sidecar": ("legacy memory sidecar database(s) %s; 9.9 may leave them unimported"),
+        "legacy-memory-sidecar": ("legacy memory sidecar database(s) %s: 2026.10 doctor imports them but stops on "
+                                  "the pre-July index format; accepting moves them to quarantine (the memory index "
+                                  "is rebuilt from the memory files, which re-embeds them)"),
     }
     findings = [_finding(code, "acceptable", messages[code] % _brief(items), "precheck")
                 for code, items in by_code.items()]
     return {"plan": plan, "findings": findings, "info": info}
+
+
+# --- OpenClaw 2026.10: retired pre-July-2026 formats --------------------------------------------
+# 2026.9.9 still imported these; 2026.10.2 doctor refuses them ("Upgrade through OpenClaw 2026.9.7" /
+# "Install OpenClaw 2026.9.5") after the gate's first write, and a retry cannot help. 2026.7.35 writes
+# none of them, but a long-lived install can carry leftovers from 2026.2.x-2026.6.x. The gate mirrors
+# the 10.2 checks before the first write: files whose content 7.x already holds in SQLite (or that are
+# disposable) go to quarantine, everything else HOLDs with an explicit code.
+# v102 sources: retired-config-formats-yKg5AICE.mjs:5-125 (config keys; visitors in
+# legacy-config-record-shared-C4da1YWQ.mjs:13-58), state-migrations.retired-files-Dlsbs5FH.mjs:14-26,
+# state-migrations.retired-cron-files-BfwwvNnu.mjs:6-22, state-migrations.retired-delivery-files-
+# BgPaIG3K.mjs:7-25 (+ state-migrations.source-path-Dt78NFQz.mjs:3-5), doctor-auth-legacy-paths-
+# BtYQLXx6.mjs:96-110, installed-plugin-index-store-path-vGDuKHrq.mjs:32-40, extensions/device-pair/
+# doctor-contract-api.js, memory-schema-BA04oCjG.mjs:822-841, openclaw-agent-db-schema-helpers-
+# Dtb5qs6q.mjs:50-60, openclaw-state-db-fast-path-CgrBDAvP.mjs:2106-2110,
+# telegram-ingress-spool-migration-BabmmEJC.mjs:12-75 (+ state-account-id-CdS1ON70.mjs).
+RETIRED_FORMAT_BRIDGE = "2026.9.7"
+RETIRED_QUARANTINE_KINDS = ("cron-json", "cron-json-state", "cron-run-log", "delivery-queue-json",
+                            "oauth-sidecar", "plugin-install-index", "device-pair-notify",
+                            "voice-call-log", "telegram-spool-invalid")
+_OAUTH_SIDECAR_RE = re.compile(r"\A[a-f0-9]{32}\.json\Z")
+_DOCTOR_CLAIM_SUFFIX_RE = re.compile(
+    r"\.doctor-importing(?:-\d+-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})?\Z")
+_TELEGRAM_SPOOL_FILE_RE = re.compile(r"\A(\d{16})\.json(?:\.(processing|failed))?\Z")
+_TELEGRAM_ACCOUNT_BAD_RE = re.compile(r"[^a-z0-9._-]+", re.I)
+_RETIRED_QUEUE_MODES = ("queue", "steer-backlog", "steer+backlog")
+_BLOCKED_IDS = ("__proto__", "prototype", "constructor")
+# Memory tuning and other keys 2026.9+ doctor deletes without a message (v102 legacy-87xJ1JJq.mjs:2380-2475
+# RETIRED_MEMORY_SEARCH_PATHS / RETIRED_TUNING_PATHS; 9.9 has the same memory list). Values are fixed now.
+RETIRED_MEMORY_TUNING = (
+    ("chunking",), ("sync", "watchDebounceMs"), ("sync", "intervalMinutes"),
+    ("query", "hybrid", "vectorWeight"), ("query", "hybrid", "textWeight"),
+    ("query", "hybrid", "candidateMultiplier"), ("query", "hybrid", "mmr", "lambda"),
+    ("query", "hybrid", "temporalDecay", "halfLifeDays"), ("cache", "maxEntries"),
+)
+
+
+def _rec(v):
+    return isinstance(v, dict)
+
+
+def _visit_agent_scopes(cfg, visitor):
+    """visitAgentConfigScopes: agents.defaults, then agents.entries.<id> (or agents.list[i] without entries)."""
+    agents = cfg.get("agents") if _rec(cfg.get("agents")) else None
+    if agents is None:
+        return
+    if _rec(agents.get("defaults")):
+        visitor(agents["defaults"], "agents.defaults")
+    if _rec(agents.get("entries")):
+        for aid, entry in agents["entries"].items():
+            if aid not in _BLOCKED_IDS and _rec(entry):
+                visitor(entry, "agents.entries.%s" % aid)
+        return
+    if isinstance(agents.get("list"), list):
+        for i, entry in enumerate(agents["list"]):
+            if _rec(entry) and not (isinstance(entry.get("id"), str) and entry["id"] in _BLOCKED_IDS):
+                visitor(entry, "agents.list[%d]" % i)
+
+
+def _visit_channel(cfg, channel_id, visitor):
+    """visitChannelEntries: channels.<id> and every record under channels.<id>.accounts."""
+    ch = cfg.get("channels") if _rec(cfg.get("channels")) else None
+    ch = ch.get(channel_id) if ch is not None else None
+    if not _rec(ch):
+        return
+    visitor(ch, "channels.%s" % channel_id)
+    if _rec(ch.get("accounts")):
+        for acc_id, acc in ch["accounts"].items():
+            if _rec(acc):
+                visitor(acc, "channels.%s.accounts.%s" % (channel_id, acc_id))
+
+
+def retired_config_keys(cfg):
+    """Port of 10.2 findRetiredConfigUpgradeRequirement: ([paths], bridge version)."""
+    if not _rec(cfg):
+        return [], "2026.9.5"
+    out = []
+
+    def check(scope, path, keys):
+        if _rec(scope):
+            out.extend(("%s.%s" % (path, k) if path else k) for k in keys if k in scope)
+
+    def sub(obj, *keys):
+        for k in keys:
+            if not _rec(obj):
+                return None
+            obj = obj.get(k)
+        return obj
+
+    def memory_store(scope, prefix):
+        check(sub(scope, "memorySearch", "store"), prefix + "memorySearch.store", ["path"])
+        check(sub(scope, "memory", "search", "store"), prefix + "memory.search.store", ["path"])
+
+    check(cfg, "", ["heartbeat"])
+    check(cfg.get("routing"), "routing", ["allowFrom", "groupChat"])
+    check(cfg.get("plugins"), "plugins", ["installs"])
+    check(cfg.get("browser"), "browser", ["relayBindHost"])
+    check(sub(cfg, "browser", "ssrfPolicy"), "browser.ssrfPolicy", ["allowPrivateNetwork"])
+    memory_store(cfg, "")
+
+    def agent(scope, p):
+        check(scope, p, ["systemPromptOverride", "silentReplyRewrite", "embeddedPi", "embeddedHarness", "agentRuntime"])
+        check(scope.get("sandbox"), p + ".sandbox", ["perSession"])
+        check(scope.get("silentReply"), p + ".silentReply", ["direct"])
+        check(scope.get("model"), p + ".model", ["timeoutMs"])
+        check(sub(scope, "subagents", "model"), p + ".subagents.model", ["timeoutMs"])
+        memory_store(scope, p + ".")
+
+    _visit_agent_scopes(cfg, agent)
+    if _rec(cfg.get("surfaces")):
+        for sid, surface in cfg["surfaces"].items():
+            check(surface, "surfaces.%s" % sid, ["silentReplyRewrite"])
+            check(sub(surface, "silentReply"), "surfaces.%s.silentReply" % sid, ["direct"])
+    queue = sub(cfg, "messages", "queue")
+    if _rec(queue):
+        if isinstance(queue.get("mode"), str) and queue["mode"] in _RETIRED_QUEUE_MODES:
+            out.append("messages.queue.mode")
+        if _rec(queue.get("byChannel")):
+            out.extend("messages.queue.byChannel.%s" % c for c, m in queue["byChannel"].items()
+                       if isinstance(m, str) and m in _RETIRED_QUEUE_MODES)
+    check(cfg.get("talk"), "talk", ["mode", "transport", "brain", "model", "voice"])
+    check(cfg.get("gateway"), "gateway", ["webchat"])
+    check(cfg.get("channels"), "channels", ["webchat"])
+    check(sub(cfg, "channels", "telegram"), "channels.telegram", ["requireMention", "groupMentionsOnly"])
+    _visit_channel(cfg, "whatsapp", lambda s, p: check(s, p, ["exposeErrorText"]))
+    before_discord = len(out)
+
+    def discord(s, p):
+        check(sub(s, "voice", "tts"), p + ".voice.tts", ["openai", "elevenlabs", "microsoft", "edge"])
+        for gid, guild in (s["guilds"].items() if _rec(s.get("guilds")) else ()):
+            for cid, chan in (guild["channels"].items() if _rec(guild) and _rec(guild.get("channels")) else ()):
+                check(chan, "%s.guilds.%s.channels.%s" % (p, gid, cid), ["allow", "agentId"])
+
+    _visit_channel(cfg, "discord", discord)
+    bridge = "2026.9.7" if len(out) > before_discord else "2026.9.5"
+
+    def telegram(s, p):
+        check(s, p, ["streamMode", "chunkMode", "blockStreaming", "blockStreamingCoalesce", "draftChunk"])
+        if _rec(s.get("dm")):
+            out.append(p + ".dm")
+        if isinstance(s.get("streaming"), (bool, str)):
+            out.append(p + ".streaming")
+        check(sub(s, "streaming", "preview"), p + ".streaming.preview",
+              ["nativeToolProgress", "nativeToolProgressAllowFrom"])
+        for chat, direct in (s["direct"].items() if _rec(s.get("direct")) else ()):
+            check(direct, "%s.direct.%s" % (p, chat), ["threadReplies"])
+
+    _visit_channel(cfg, "telegram", telegram)
+    _visit_channel(cfg, "nextcloud-talk", lambda s, p: check(s, p, ["allowPrivateNetwork"]))
+
+    def matrix(s, p):
+        check(s, p, ["allowPrivateNetwork"])
+        if _rec(s.get("dm")) and s["dm"].get("policy") == "trusted":
+            out.append(p + ".dm.policy")
+        for section in ("groups", "rooms"):
+            for rid, room in (s[section].items() if _rec(s.get(section)) else ()):
+                check(room, "%s.%s.%s" % (p, section, rid), ["allow"])
+
+    _visit_channel(cfg, "matrix", matrix)
+    _visit_channel(cfg, "slack", lambda s, p: [check(c, "%s.channels.%s" % (p, cid), ["allow"])
+                                               for cid, c in (s["channels"].items() if _rec(s.get("channels")) else ())])
+    for cid in ("discord", "line", "matrix", "telegram"):
+        _visit_channel(cfg, cid, lambda s, p: check(s.get("threadBindings"), p + ".threadBindings", ["ttlHours"]))
+    _visit_channel(cfg, "feishu", lambda s, p: check(s, p, ["botName"]) if p != "channels.feishu" else None)
+    check(cfg.get("session"), "session", ["parentForkMaxTokens"])
+    check(sub(cfg, "session", "threadBindings"), "session.threadBindings", ["ttlHours"])
+    check(sub(cfg, "agents", "defaults"), "agents.defaults", ["llm"])
+    return out, bridge
+
+
+def _sql_str(s):
+    return "'" + str(s).replace("'", "''") + "'"
+
+
+def _table_cols(query, db, table):
+    try:
+        return {str(_cell(r, 1)) for r in query(db, "PRAGMA table_info(%s)" % _sql_str(table))}
+    except Exception:  # unreadable: treated as "no such table"
+        return set()
+
+
+def _json_file(path, limit=64 * 1024 * 1024):
+    raw = _read_regular_text(path, limit)
+    if raw is None:
+        return _MISSING
+    try:
+        return json.loads(raw)
+    except ValueError:
+        return _MISSING
+
+
+def _installed_plugin_index_ids(state_dir, query):
+    db = os.path.join(state_dir, "state", "openclaw.sqlite")
+    if _lstat(db) is None:
+        return set()
+    try:
+        rows = query(db, "SELECT install_records_json FROM installed_plugin_index "
+                         "WHERE index_key='installed-plugin-index'")
+        data = json.loads(_cell(rows[0])) if rows else {}
+    except Exception:  # missing table or unreadable: nothing indexed
+        return set()
+    return set(data) if isinstance(data, dict) else set()
+
+
+def _legacy_plugin_index_ids(doc):
+    """ids of a retired plugins/installs.json (7.35 readLegacyInstalledPluginIndex, state-migrations-D4BL2s8k.js:
+    665-704: installRecords ?? records, else plugins[] with a pluginId and an object installRecord); None when
+    7.35 could not read it either."""
+    if not _rec(doc):
+        return None
+    recs = doc.get("installRecords")
+    if recs is None:
+        recs = doc.get("records")
+    if recs is not None:
+        return set(recs) if _rec(recs) else None
+    if isinstance(doc.get("plugins"), list):
+        ids = {p["pluginId"] for p in doc["plugins"] if _rec(p) and isinstance(p.get("pluginId"), str)
+               and p["pluginId"].strip() and _rec(p.get("installRecord"))}
+        return ids or None
+    return None
+
+
+def _auth_store_blobs(state_dir, query):
+    blobs = []
+    for e in _scandir_sorted(os.path.join(state_dir, "agents")):
+        adir = os.path.join(state_dir, "agents", e.name, "agent")
+        for f in _scandir_sorted(adir):
+            if f.name.endswith(".json"):
+                t = _read_regular_text(os.path.join(adir, f.name))
+                if t:
+                    blobs.append(t)
+        db = os.path.join(adir, "openclaw-agent.sqlite")
+        if _lstat(db) is not None:
+            try:
+                blobs += [str(_cell(r)) for r in query(db, "SELECT store_json FROM auth_profile_store")]
+            except Exception:  # noqa: BLE001 - no auth store table
+                pass
+    sdb = os.path.join(state_dir, "state", "openclaw.sqlite")
+    if _lstat(sdb) is not None:
+        try:
+            blobs += [str(_cell(r)) for r in query(sdb, "SELECT store_json FROM auth_profile_stores")]
+        except Exception:  # noqa: BLE001 - table absent on 7.x
+            pass
+    return "\n".join(blobs)
+
+
+def _within(state_dir, path):
+    rel = os.path.relpath(os.path.abspath(path), os.path.abspath(state_dir))
+    return None if rel == ".." or rel.startswith(".." + os.sep) else rel.replace(os.sep, "/")
+
+
+def _expand_home(p, home):
+    p = p.strip()
+    if p == "~" or p.startswith("~/"):
+        p = home + p[1:]
+    return os.path.abspath(p)
+
+
+def _spool_entry_problem(path, file_id, failed):
+    """Mirror of 10.2 parseSource for one 7.x Telegram spool file; None when 10.2 imports it."""
+    raw = _read_regular_text(path)
+    if raw is None:
+        return "unreadable or not a regular UTF-8 file"
+    try:
+        v = json.loads(raw)
+    except ValueError:
+        return "invalid JSON"
+    ok_int = lambda x: isinstance(x, int) and not isinstance(x, bool) and 0 <= x <= 2 ** 53 - 1  # noqa: E731
+    if not _rec(v) or v.get("version") != 1 or not ok_int(v.get("updateId")) \
+            or str(v["updateId"]).rjust(16, "0") != file_id or not ok_int(v.get("receivedAt")):
+        return "invalid version, update ID, or receipt timestamp"
+    if failed:
+        f = v.get("failure")
+        if not _rec(f) or not isinstance(f.get("reason"), str) or not f["reason"] \
+                or not isinstance(f.get("message"), str) or not ok_int(f.get("failedAt")):
+            return "invalid failure tombstone"
+        return None
+    if not _rec(v.get("update")) or v["update"].get("update_id") != v["updateId"]:
+        return "update payload does not match its spool ID"
+    return None
+
+
+def classify_retired_state(state_dir, cfg, *, accepted, query=None, home="/config", env=None, mode="from-7x"):
+    """Retired pre-July-2026 files and config keys that 10.2 doctor refuses (every gate mode).
+
+    Returns {"plan": [{rel, kind, action, reason, size}], "findings": [...], "info": [...],
+    "config_removals": [path parts]} -- config_removals are applied by the from-7x pre-migrate step.
+    """
+    q = query or _query_ro_local
+    accepted = set(accepted or ())
+    env = os.environ if env is None else env
+    cfg = cfg if _rec(cfg) else {}
+    plan, info, removals = [], [], []
+    by_code = {}
+
+    def add(abs_path, kind, action, reason):
+        rel = _within(state_dir, abs_path)
+        if rel is None:
+            flag("retired-state-outside", abs_path)
+            return
+        st = _lstat(abs_path)
+        plan.append({"rel": rel, "kind": kind, "action": action, "reason": reason,
+                     "size": st.st_size if st is not None else 0})
+
+    def flag(code, item):
+        by_code.setdefault(code, []).append(item)
+
+    def acceptable(code, abs_path, kind, reason_ok, reason_leave, item):
+        flag(code, item)
+        if code in accepted:
+            add(abs_path, kind, "quarantine", reason_ok)
+        else:
+            add(abs_path, kind, "leave", reason_leave)
+
+    def must_be_dir(path, label):
+        st = _lstat(path)
+        if st is None:
+            return False
+        if not stat.S_ISDIR(st.st_mode):
+            flag("retired-state-uninspectable", "%s (%s exists but is not a directory)" % (path, label))
+            return False
+        return True
+
+    state_db = os.path.join(state_dir, "state", "openclaw.sqlite")
+    index_ids = _installed_plugin_index_ids(state_dir, q)
+
+    # Cron state: <store>, <store>-state.json, <store dir>/runs/*.jsonl
+    store = _get(cfg, ["cron", "store"], None)
+    store = _expand_home(store, home) if isinstance(store, str) and store.strip() \
+        else os.path.join(state_dir, "cron", "jobs.json")
+    if _lstat(store) is not None:
+        raw = None
+        st = _lstat(store)
+        if st is not None and stat.S_ISREG(st.st_mode):
+            try:
+                with open(store, "rb") as fh:
+                    raw = fh.read()
+            except OSError:
+                raw = None
+        imported = False
+        if raw is not None:
+            import hashlib
+            sha = hashlib.sha256(raw).hexdigest()
+            try:
+                imported = bool(q(state_db, "SELECT 1 FROM migration_sources WHERE migration_kind='legacy-cron-json' "
+                                            "AND source_path=%s AND source_sha256=%s" % (_sql_str(store), _sql_str(sha))))
+            except Exception:  # noqa: BLE001 - no receipts table
+                imported = False
+            if not imported:
+                try:
+                    doc = json.loads(raw.decode("utf-8"))
+                    jobs = doc.get("jobs") if _rec(doc) else None
+                    ids = {str(j.get("id") or j.get("jobId")) for j in jobs if _rec(j)} if isinstance(jobs, list) else None
+                    have = {str(_cell(r)) for r in q(state_db, "SELECT job_id FROM cron_jobs WHERE store_key=%s"
+                                                     % _sql_str(store))}
+                    imported = ids is not None and ids <= have
+                except Exception:  # noqa: BLE001 - unparseable store or no cron_jobs table
+                    imported = False
+        if imported:
+            add(store, "cron-json", "quarantine", "retired cron JSON store; its jobs are in SQLite")
+        else:
+            acceptable("cron-json-unimported", store, "cron-json", "accepted: cron-json-unimported",
+                       "retired cron JSON store with jobs that are not in SQLite", store)
+    sstore = store[:-5] + "-state.json" if store.endswith(".json") else store + "-state.json"
+    if _lstat(sstore) is not None:
+        add(sstore, "cron-json-state", "quarantine", "retired cron run state (next/last run times only)")
+    runs = os.path.join(os.path.dirname(store), "runs")
+    if must_be_dir(runs, "cron runs"):
+        for e in _scandir_sorted(runs):
+            if e.name.endswith(".jsonl"):
+                add(os.path.join(runs, e.name), "cron-run-log", "quarantine", "retired cron run log (history only)")
+
+    # JSON delivery queues (pre-July outbound messages; 7.x imports and removes them).
+    nq = 0
+    for qname in ("delivery-queue", "session-delivery-queue"):
+        for d in (os.path.join(state_dir, qname), os.path.join(state_dir, qname, "failed")):
+            if not must_be_dir(d, "delivery queue"):
+                continue
+            for e in _scandir_sorted(d):
+                st = _lstat(os.path.join(d, e.name))
+                if st is None or stat.S_ISDIR(st.st_mode):
+                    continue
+                src = _DOCTOR_CLAIM_SUFFIX_RE.sub("", e.name)
+                if src.endswith(".json") or src.endswith(".delivered"):
+                    add(os.path.join(d, e.name), "delivery-queue-json", "quarantine",
+                        "retired JSON delivery queue entry (older than July 2026; never replayed)")
+                    nq += 1
+    if nq:
+        info.append("%d retired JSON delivery queue file(s) from before July 2026 go to quarantine "
+                    "(OpenClaw 2026.9+ would not replay them either)" % nq)
+
+    # OAuth credential sidecars (credentials/auth-profiles/<32 hex>.json).
+    oauth_dir = env.get("OPENCLAW_OAUTH_DIR") or _get(cfg, ["env", "vars", "OPENCLAW_OAUTH_DIR"], None)
+    oauth_dir = _expand_home(oauth_dir, home) if isinstance(oauth_dir, str) and oauth_dir.strip() \
+        else os.path.join(state_dir, "credentials")
+    sdir = os.path.join(oauth_dir, "auth-profiles")
+    if must_be_dir(sdir, "OAuth sidecars"):
+        side = [e.name for e in _scandir_sorted(sdir) if _OAUTH_SIDECAR_RE.match(e.name)]
+        blobs = _auth_store_blobs(state_dir, q) if side else ""
+        for name in side:
+            path = os.path.join(sdir, name)
+            if name[:32] in blobs:
+                acceptable("oauth-sidecar-referenced", path, "oauth-sidecar",
+                           "accepted: oauth-sidecar-referenced (the profile needs a new login)",
+                           "an auth profile still references it", path)
+            else:
+                add(path, "oauth-sidecar", "quarantine", "unreferenced pre-June OAuth sidecar")
+
+    # Plugin install index file and the plugins.installs config key.
+    pidx = os.path.join(state_dir, "plugins", "installs.json")
+    if os.path.isfile(pidx):
+        ids = _legacy_plugin_index_ids(_json_file(pidx))
+        missing = sorted(str(x) for x in (ids or set()) - index_ids)
+        if not missing:
+            add(pidx, "plugin-install-index", "quarantine", "retired plugin install index; records are in SQLite")
+        else:
+            acceptable("plugin-index-unimported", pidx, "plugin-install-index", "accepted: plugin-index-unimported",
+                       "install records missing from the SQLite index", "%s (%s)" % (pidx, _brief(missing)))
+    installs = _get(cfg, ["plugins", "installs"], _MISSING)
+    if installs is not _MISSING:
+        missing = sorted(str(x) for x in set(installs if _rec(installs) else ()) - index_ids)
+        if mode != "from-7x":
+            pass  # reported by retired_config_findings as a hard config key
+        elif not missing or "plugins-installs-unindexed" in accepted:
+            removals.append(["plugins", "installs"])
+            if missing:
+                flag("plugins-installs-unindexed", "plugins.installs (%s)" % _brief(missing))
+        else:
+            flag("plugins-installs-unindexed", "plugins.installs (%s)" % _brief(missing))
+
+    # Device Pair notify state (7.35 imports subscribers and archives the file; an empty file stays).
+    dpn = os.path.join(state_dir, "device-pair-notify.json")
+    if _lstat(dpn) is not None:
+        doc = _json_file(dpn)
+        subs = doc.get("subscribers") if _rec(doc) else None
+        if isinstance(subs, list) and subs:
+            acceptable("device-pair-subscribers", dpn, "device-pair-notify", "accepted: device-pair-subscribers",
+                       "Device Pair notify subscribers not imported", "%s (%d subscriber(s))" % (dpn, len(subs)))
+        else:
+            add(dpn, "device-pair-notify", "quarantine", "retired Device Pair notify state without subscribers")
+
+    # Voice Call JSONL call log (refused when the voice-call plugin runs its migrations).
+    vc_store = _get(cfg, ["plugins", "entries", "voice-call", "config", "store"], None)
+    vc_dir = _expand_home(vc_store, home) if isinstance(vc_store, str) and vc_store.strip() \
+        else os.path.join(state_dir, "voice-calls")
+    vcl = os.path.join(vc_dir, "calls.jsonl")
+    if _lstat(vcl) is not None:
+        acceptable("voice-call-log", vcl, "voice-call-log", "accepted: voice-call-log",
+                   "retired Voice Call JSONL call log", vcl)
+
+    # Telegram ingress spool: 10.2 doctor imports valid 7.x spool files into SQLite and throws on
+    # unsupported directory names; malformed files leave doctor with a refusal.
+    tdir = os.path.join(state_dir, "telegram")
+    tst = _lstat(tdir)
+    if tst is not None and not stat.S_ISDIR(tst.st_mode):
+        flag("telegram-spool-unsupported", "%s is not a directory" % tdir)
+    elif tst is not None:
+        spool_ok = 0
+        for e in _scandir_sorted(tdir):
+            if not e.name.startswith("ingress-spool-"):
+                continue
+            acc = e.name[len("ingress-spool-"):]
+            norm = _TELEGRAM_ACCOUNT_BAD_RE.sub("_", acc.strip()) if acc.strip() else "default"
+            est = _lstat(os.path.join(tdir, e.name))
+            if est is None or not stat.S_ISDIR(est.st_mode) or norm != acc:
+                flag("telegram-spool-unsupported", "telegram/" + e.name)
+                continue
+            for f in _scandir_sorted(os.path.join(tdir, e.name)):
+                m = _TELEGRAM_SPOOL_FILE_RE.match(_DOCTOR_CLAIM_SUFFIX_RE.sub("", f.name))
+                if not m:
+                    continue
+                path = os.path.join(tdir, e.name, f.name)
+                prob = _spool_entry_problem(path, m.group(1), m.group(2) == "failed")
+                if prob:
+                    acceptable("telegram-spool-invalid", path, "telegram-spool-invalid",
+                               "accepted: telegram-spool-invalid", "spool file 10.2 cannot import",
+                               "telegram/%s/%s (%s)" % (e.name, f.name, prob))
+                else:
+                    spool_ok += 1
+        if spool_ok:
+            info.append("telegram ingress spool: %d legacy Telegram update file(s); doctor imports them into the "
+                        "SQLite ingress queue" % spool_ok)
+
+    messages = {
+        "retired-state-outside": ("retired pre-July-2026 file(s) outside the state directory: %s; OpenClaw 2026.10 "
+                                  "refuses them: move them away by hand (after a backup)"),
+        "retired-state-uninspectable": ("%s; OpenClaw 2026.10 refuses to migrate while it cannot inspect these "
+                                        "paths: fix or remove them"),
+        "cron-json-unimported": ("retired cron JSON store %s holds jobs that are not in the SQLite cron table; "
+                                 "OpenClaw 2026.10 refuses it. 2026.7.35 does not run these jobs either; "
+                                 "accepting moves the file to quarantine"),
+        "oauth-sidecar-referenced": ("pre-June OAuth credential sidecar(s) still referenced by an auth profile: %s; "
+                                     "OpenClaw 2026.10 refuses them and those profiles are already unusable on "
+                                     "2026.7.35; accepting moves them to quarantine (log in again afterwards)"),
+        "plugin-index-unimported": ("retired plugins/installs.json with install records missing from the SQLite "
+                                    "index: %s; accepting moves it to quarantine (the plugins stay installed, only "
+                                    "their install provenance is lost)"),
+        "plugins-installs-unindexed": ("openclaw.json plugins.installs holds install records missing from the SQLite "
+                                       "index: %s; OpenClaw 2026.10 refuses the key; accepting removes it (only the "
+                                       "install provenance of those plugins is lost)"),
+        "device-pair-subscribers": ("retired device-pair-notify.json with Device Pair subscribers: %s; accepting "
+                                    "moves it to quarantine (re-subscribe afterwards)"),
+        "voice-call-log": ("retired Voice Call JSONL call log %s; OpenClaw 2026.10 refuses it; accepting moves it to "
+                           "quarantine (old call history only)"),
+        "telegram-spool-unsupported": ("Telegram ingress spool entry OpenClaw 2026.10 cannot import: %s; doctor "
+                                       "stops on it: rename it to telegram/ingress-spool-<account id> "
+                                       "(letters, digits, . _ -) or move it away"),
+        "telegram-spool-invalid": ("Telegram spool file(s) OpenClaw 2026.10 cannot import: %s; accepting moves them "
+                                   "to quarantine (those old updates are not processed)"),
+    }
+    hard = {"retired-state-outside", "retired-state-uninspectable", "telegram-spool-unsupported"}
+    findings = [_finding(code, "hard" if code in hard else "acceptable", messages[code] % _brief(items), "precheck")
+                for code, items in by_code.items()]
+    return {"plan": plan, "findings": findings, "info": info, "config_removals": removals}
+
+
+def retired_config_findings(cfg, mode="from-7x"):
+    """Hard finding for retired config keys 10.2 doctor refuses (plugins.installs: see classify_retired_state)."""
+    paths, bridge = retired_config_keys(cfg)
+    if mode == "from-7x":
+        paths = [p for p in paths if p != "plugins.installs"]
+    if not paths:
+        return []
+    return [_finding(
+        "config-retired-keys", "hard",
+        "openclaw.json contains settings OpenClaw 2026.10 refuses (retired before July 2026): %s. OpenClaw "
+        "2026.7.35 does not accept them either; remove them on 0.5.93 (or migrate them with OpenClaw %s), then "
+        "oc-upgrade retry" % (_brief(paths, 10), bridge), "precheck")]
+
+
+def _exact_cols(cols, expected):
+    return len(cols) == len(expected) and set(expected) <= cols
+
+
+def retired_db_findings(agent_dbs, state_db, query=None):
+    """Pre-July-2026 SQLite shapes 10.2 refuses (9.9 converted or dropped them).
+
+    agent_dbs: [(agent_id, path, user_version, target_version)] for the configured/registered agents.
+    """
+    q = query or _query_ro_local
+    mem, shape = [], []
+    for aid, path, uv, target in agent_dbs:
+        if _lstat(path) is None:
+            continue
+
+        def cols(t):
+            return _table_cols(q, path, t)
+        try:
+            names = {str(_cell(r)) for r in q(path, "SELECT name FROM sqlite_master WHERE type='table'")}
+        except Exception:  # unreadable DBs are reported by quick_check
+            continue
+        if {"meta", "files", "chunks"} <= names \
+                and _exact_cols(cols("meta"), ["key", "value"]) \
+                and _exact_cols(cols("files"), ["path", "source", "hash", "mtime", "size"]) \
+                and _exact_cols(cols("chunks"), ["id", "path", "source", "start_line", "end_line", "hash", "model",
+                                                 "text", "embedding", "updated_at"]):
+            mem.append(aid)
+        if isinstance(uv, int) and isinstance(target, int) and uv >= target:
+            continue
+        bad = ((isinstance(uv, int) and uv < 8 and bool(names & {"sessions", "session_entries", "transcript_events"}))
+               or "session_transcript_files" in names
+               or ("session_transcript_fts" in names and "session_key" in cols("session_transcript_fts"))
+               or ("acp_parent_stream_events" in names and "session_id" not in cols("acp_parent_stream_events"))
+               or ("trajectory_runtime_events" in names and "event_id" in cols("trajectory_runtime_events"))
+               or ("memory_index_sources" in names and "source_kind" in cols("memory_index_sources")))
+        if bad:
+            shape.append("%s (agent DB schema %s)" % (aid, uv))
+    if _lstat(state_db) is not None:
+        try:
+            rows = q(state_db, "PRAGMA table_info('agent_databases')")
+            pk = [str(_cell(r, 1)) for r in sorted((r for r in rows if int(_cell(r, 5) or 0) > 0),
+                                                   key=lambda r: int(_cell(r, 5)))]
+            if rows and pk != ["agent_id", "path"]:
+                shape.append("state DB agent_databases primary key %s" % (pk or "missing"))
+        except Exception:  # noqa: BLE001 - reported by quick_check
+            pass
+    out = []
+    if mem:
+        out.append(_finding(
+            "retired-memory-index", "hard",
+            "agent database(s) still hold the pre-July memory index tables (meta/files/chunks): %s; OpenClaw "
+            "2026.10 refuses them. On 0.5.93 run `openclaw memory index --agent <id>` for each (2026.7.35 converts "
+            "the index when it opens it), then oc-upgrade retry" % _brief(mem), "precheck"))
+    if shape:
+        out.append(_finding(
+            "pre-july-schema", "hard",
+            "database shape(s) OpenClaw 2026.10 no longer migrates (pre-July 2026): %s; restore a backup made by "
+            "0.5.93 after a clean start, or migrate with OpenClaw %s first" % (_brief(shape), RETIRED_FORMAT_BRIDGE),
+            "precheck"))
+    return out
+
+
+def _memory_scopes(cfg):
+    """(label, memory search dict) for every scope that can carry memory search tuning."""
+    out = []
+    if _rec(cfg.get("memory")) and _rec(cfg["memory"].get("search")):
+        out.append(("memory.search", cfg["memory"]["search"]))
+
+    def agent(scope, p):
+        if _rec(scope.get("memorySearch")):
+            out.append((p + ".memorySearch", scope["memorySearch"]))
+        if _rec(scope.get("memory")) and _rec(scope["memory"].get("search")):
+            out.append((p + ".memory.search", scope["memory"]["search"]))
+    if _rec(cfg):
+        _visit_agent_scopes(cfg, agent)
+    return out
+
+
+def retired_tuning_dropped(cfg_before, cfg_after):
+    """Memory search tuning set before doctor that 2026.9+ no longer supports and doctor removed.
+
+    Doctor also moves memorySearch to memory.search, so a value counts as kept when the same tuning key
+    holds the same value in any scope afterwards. Returns ["<path>=<value>", ...] (numbers/short strings;
+    tuning keys hold no secrets)."""
+    after = {(parts, json.dumps(v, sort_keys=True)) for _l, parts, v in _memory_tuning_values(cfg_after)}
+    return ["%s.%s=%s" % (label, ".".join(parts), json.dumps(v)[:40])
+            for label, parts, v in _memory_tuning_values(cfg_before)
+            if (parts, json.dumps(v, sort_keys=True)) not in after]
+
+
+def _memory_tuning_values(cfg):
+    vals = []
+    if not _rec(cfg):
+        return vals
+    for label, scope in _memory_scopes(cfg):
+        for parts in RETIRED_MEMORY_TUNING:
+            v = _get(scope, list(parts), _MISSING)
+            if v is not _MISSING:
+                vals.append((label, parts, v))
+    return vals
 
 
 def scan_sessions_files(state_dir):

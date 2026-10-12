@@ -732,7 +732,7 @@ Free disk space or repair permissions, then restart the add-on."
 # ------------------------------------------------------------------------------
 unset INVOCATION_ID JOURNAL_STREAM SYSTEMD_EXEC_PID OPENCLAW_SYSTEMD_UNIT OPENCLAW_SERVICE_MARKER \
       OPENCLAW_SERVICE_KIND OPENCLAW_LAUNCHD_LABEL OPENCLAW_CONTAINER NODE_COMPILE_CACHE \
-      OPENCLAW_COMPATIBILITY_HOST_VERSION
+      OPENCLAW_COMPATIBILITY_HOST_VERSION OPENCLAW_GATEWAY_HOST_LIFELINE OPENCLAW_DOCTOR_SQLITE_NOCOW_REPAIR
 while IFS= read -r _v; do
   [ -n "$_v" ] && unset "$_v"
 done < <(compgen -e | grep '^OPENCLAW_UPDATE_' || true)
@@ -1357,7 +1357,7 @@ shutdown() {
       done
       [ "$_alive" = "true" ] || break
       if [ "$_i" -eq 60 ]; then
-        echo "WARN: gateway still stopping after 60 s (9.9 waits for plugin cleanup; up to 270 s)"
+        echo "WARN: gateway still stopping after 60 s (OpenClaw 2026.9+ waits for plugin cleanup; up to 270 s)"
       fi
       if [ $((_i % 15)) -eq 0 ]; then
         echo "Waiting for the gateway to stop (${_i}s)..."
@@ -1365,7 +1365,7 @@ shutdown() {
       sleep 1
     done
     # The Supervisor kills the whole add-on 300 s after the stop request, while
-    # OpenClaw 2026.9's own stop budget is 325 s: end it here, logged.
+    # OpenClaw 2026.9+'s own stop budget is 325 s (unchanged in 2026.10): end it here, logged.
     for _p in $_gw_pids; do
       if kill -0 "$_p" 2>/dev/null; then
         echo "WARN: gateway PID ${_p} did not stop within 270 s; sending SIGKILL."

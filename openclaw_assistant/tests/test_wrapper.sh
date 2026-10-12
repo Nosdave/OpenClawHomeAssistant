@@ -548,7 +548,7 @@ EOF
 } > "$T/stop/runner.sh"
 env STUBBORN=1 bash "$T/stop/runner.sh" > "$T/stop/stubborn.log" 2>&1 || true
 check "shutdown: 60 s warning missing" \
-  grep -qxF "WARN: gateway still stopping after 60 s (9.9 waits for plugin cleanup; up to 270 s)" "$T/stop/stubborn.log"
+  grep -qxF "WARN: gateway still stopping after 60 s (OpenClaw 2026.9+ waits for plugin cleanup; up to 270 s)" "$T/stop/stubborn.log"
 check "shutdown: 60 s warning not printed exactly once" \
   [ "$(grep -c 'still stopping after 60 s' "$T/stop/stubborn.log")" -eq 1 ]
 check "shutdown: no SIGKILL at 270 s" grep -q "did not stop within 270 s; sending SIGKILL" "$T/stop/stubborn.log"

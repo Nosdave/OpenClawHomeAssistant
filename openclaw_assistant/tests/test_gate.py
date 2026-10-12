@@ -487,6 +487,23 @@ class ClassifyTests(GateEnv):
         c = G.classify(self.state, {"meta": {"lastTouchedVersion": "2026.10.1"}}, 19, 24, RUNTIME)
         self.assertEqual(c["verdict"], "newer")
 
+    def test_99_state_against_2026_10_targets(self):
+        # a state migrated by 2026.9.9 (19/24) meets the 2026.10.2 package (20/24): bump gate, agents current
+        make_99_state(self.state, app="2026.9.9")
+        c = G.classify(self.state, {"meta": {"lastTouchedVersion": "2026.9.9"}}, 20, 24, "2026.10.2")
+        self.assertEqual((c["verdict"], c["schema_verdict"]), ("gate", "gate"), c)
+        self.assertIn("state schema 19 < 20", c["gate"])
+        self.assertEqual(c["agents"], {"main": 24})
+        self.assertEqual(G.infer_mode(c, {"meta": {"lastTouchedVersion": "2026.9.9"}}), "bump")
+        # app_version written by 9.9 is not a schema_meta problem for the 10.2 runtime
+        con = sqlite3.connect(str(self.state / "state" / "openclaw.sqlite"))
+        con.execute("UPDATE schema_meta SET schema_version=20 WHERE meta_key='primary'")
+        con.commit()
+        con.close()
+        pkg = {"version": "2026.10.2", "schema_state": 20, "schema_agent": 24}
+        probs = G.schema_meta_problems(self.state, G.classify(self.state, {}, 20, 24, "2026.10.2"), pkg)
+        self.assertFalse([x for x in probs if "app_version" in x or "primary {" in x and "'2026.9.9'" in x], probs)
+
     def test_content_version_and_cron_run_logs(self):
         make_99_state(self.state, s=18)
         con = sqlite3.connect(str(self.state / "state" / "openclaw.sqlite"))
@@ -577,11 +594,13 @@ class ClassifyTests(GateEnv):
         pkg = {"version": RUNTIME, "schema_state": 19, "schema_agent": 24}
         c = G.classify(self.state, {}, 19, 24, RUNTIME)
         self.assertEqual(G.schema_meta_problems(self.state, c, pkg), [])
-        con = sqlite3.connect(str(self.state / "state" / "openclaw.sqlite"))
-        con.execute("UPDATE schema_meta SET app_version='2026.9.5' WHERE meta_key='primary'")
-        con.commit()
-        con.close()
-        self.assertEqual(len(G.schema_meta_problems(self.state, c, pkg)), 1)
+        # an older writer (a 9.x gateway, or an agent DB already at the target) is fine; a newer one or junk is not
+        for app, n in (("2026.9.5", 0), ("2099.1.1", 1), ("junk", 1)):
+            con = sqlite3.connect(str(self.state / "state" / "openclaw.sqlite"))
+            con.execute("UPDATE schema_meta SET app_version=? WHERE meta_key='primary'", (app,))
+            con.commit()
+            con.close()
+            self.assertEqual(len(G.schema_meta_problems(self.state, c, pkg)), n, app)
 
     def test_workspaces_from_config(self):
         cfg = {"agents": {"defaults": {"workspace": "~/clawd"}, "list": [{"id": "a", "workspace": "~/ws-a"}],
@@ -847,6 +866,30 @@ class DoctorEvalTests(unittest.TestCase):
         }
         for text, code in cases.items():
             self.assertEqual(G.evaluate_doctor(1, text)["code"], code, text)
+
+    def test_2026_10_doctor_texts(self):
+        # held stores: 2026.10 warns and exits 0 (9.9 failed doctor)
+        ev = G.evaluate_doctor(0, "Warning: Agent deletion journal reconstructed; 1 store held back. Updates can "
+                                  "continue; held stores remain untouched.\nDoctor complete.\n")
+        self.assertEqual((ev["code"], ev["cls"]), ("doctor-held-back", "hard"))
+        # refusals of pre-July-2026 settings/files win over the generic markers
+        for text in ("Config contains retired pre-July-2026 settings: plugins.installs. Doctor cannot remove",
+                     "Cron state: retired files whose last writer predates July 1, 2026: /config/.openclaw/cron/jobs.json",
+                     "Retired memory index format detected. Preserve a complete copy",
+                     "Doctor stopped because a state migration refused to continue. Plugin install index x predates "
+                     "the July 2026 upgrade support window",
+                     "Unsupported Telegram spool directory: ingress-spool-a b"):
+            self.assertEqual(G.evaluate_doctor(1, text)["code"], "doctor-retired-format", text)
+        # benign 2026.10 note is no maintenance refusal any more
+        self.assertEqual(G.evaluate_doctor(1, "Doctor could not verify the Codex bwrap network sandbox.")["code"],
+                         "doctor-failed")
+        self.assertEqual(G.evaluate_doctor(1, "Doctor could not complete maintenance")["code"],
+                         "doctor-maintenance-refused")
+        # unfinished plugin upgrades only count in the final pass
+        text = 'Plugin "codex" data/settings upgrade is unfinished: x\nDoctor complete.\n'
+        self.assertIsNone(G.evaluate_doctor(0, text)["code"])
+        ev = G.evaluate_doctor(0, text, final=True)
+        self.assertEqual((ev["code"], ev["cls"]), ("doctor-warnings", "acceptable"))
 
     def test_wrapped_clack_box(self):
         text = "│  Doctor stopped     │\n│  because the step refused │\n"
@@ -1608,10 +1651,13 @@ print("Doctor complete.")
         self.hooks()
         sp = self.state / "telegram" / "ingress-spool-default"
         sp.mkdir(parents=True)
-        (sp / "1.json").write_text("{}")
+        (sp / "1.json").write_text("{}")  # not a 2026.10 spool name: neither imported nor counted
+        (sp / "0000000000000007.json").write_text(
+            json.dumps({"version": 1, "updateId": 7, "receivedAt": 1, "update": {"update_id": 7}}))
         self.assertEqual(self.run_gate(), 0, self.out)
-        self.assertEqual(sum(1 for x in self.out.splitlines() if "undelivered legacy Telegram update" in x), 1,
-                         self.out)
+        lines = [x for x in self.out.splitlines() if "legacy Telegram update file(s)" in x]
+        self.assertEqual(len(lines), 1, self.out)
+        self.assertIn("1 legacy Telegram update file(s); doctor imports them into the SQLite ingress queue", lines[0])
 
     def test_gate_run_does_not_repeat_plan_lines(self):
         """Addendum 2 item 11: run.sh prints `gate --plan`; the gate run must not print it again."""

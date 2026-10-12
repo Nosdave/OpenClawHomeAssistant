@@ -472,6 +472,8 @@ ENV_REMOVE = {
     "OPENCLAW_COMPATIBILITY_HOST_VERSION", "OPENCLAW_CONTAINER", "INVOCATION_ID", "JOURNAL_STREAM",
     "SYSTEMD_EXEC_PID", "OPENCLAW_SYSTEMD_UNIT", "OPENCLAW_SERVICE_MARKER", "OPENCLAW_SERVICE_KIND",
     "OPENCLAW_LAUNCHD_LABEL", "NODE_COMPILE_CACHE",
+    # 2026.10: a host lifeline on stdin would stop a background gateway at once; NOCOW repair is update-only
+    "OPENCLAW_GATEWAY_HOST_LIFELINE", "OPENCLAW_DOCTOR_SQLITE_NOCOW_REPAIR",
 }
 _HEAP_CAP_RE = re.compile(r"(?:^|\s)--max[-_]old[-_]space[-_]size(?:=\S*|\s+\d+)")
 
