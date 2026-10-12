@@ -1929,6 +1929,39 @@ class TestRetiredFormats(unittest.TestCase):
         os.makedirs(os.path.join(self.root, "telegram/ingress-spool-bad name"))
         self.assertEqual(self.codes(self.run_cls())["telegram-spool-unsupported"], "hard")
 
+    def test_dreaming_json(self):
+        import hashlib
+        with tempfile.TemporaryDirectory() as cfgroot:
+            ws = os.path.join(cfgroot, "clawd")
+            _write(ws, "memory/.dreams/daily-ingestion.json", "{}")
+            _write(ws, "memory/.dreams/short-term-recall.json", "{}")
+            _write(ws, "memory/.dreams/notes.json", "{}")  # not a retired source
+            out = self.run_cls(workspaces=[ws], config_root=cfgroot)
+            plan = {p["rel"]: (p["kind"], p["action"], p.get("root")) for p in out["plan"]}
+            self.assertEqual(plan["clawd/memory/.dreams/daily-ingestion.json"], ("dreaming-json", "leave", "config"))
+            self.assertEqual(plan["clawd/memory/.dreams/short-term-recall.json"], ("dreaming-json", "leave", "config"))
+            self.assertNotIn("clawd/memory/.dreams/notes.json", plan)
+            self.assertEqual(self.codes(out), {"dreaming-json-unmigrated": "acceptable"})
+            out = self.run_cls(workspaces=[ws], config_root=cfgroot, accepted={"dreaming-json-unmigrated"})
+            self.assertTrue(all(p["action"] == "quarantine" for p in out["plan"]))
+            # SQLite already holds that workspace's recall rows (and a meta row) -> 2026.10 skips those files
+            wk = hashlib.sha256(os.path.abspath(ws).encode()).hexdigest()
+            _sqlite(os.path.join(self.root, "state/openclaw.sqlite"), [
+                "CREATE TABLE plugin_state_entries (plugin_id TEXT, namespace TEXT, entry_key TEXT, value_json TEXT)",
+                "INSERT INTO plugin_state_entries VALUES ('memory-core', 'dreaming-daily-ingestion', '%s:x', '%s')"
+                % (wk, json.dumps({"workspaceKey": wk, "key": "a", "value": 1})),
+                "INSERT INTO plugin_state_entries VALUES ('memory-core', 'short-term-meta', '%s:y', '%s')"
+                % (wk, json.dumps({"workspaceKey": wk, "key": "recall", "value": 1})),
+            ])
+            out = self.run_cls(workspaces=[ws], config_root=cfgroot)
+            self.assertEqual(out["plan"], [])
+            self.assertEqual(out["findings"], [])
+            # a workspace outside the config root cannot be quarantined
+            with tempfile.TemporaryDirectory() as other:
+                _write(other, "memory/.dreams/phase-signals.json", "{}")
+                out = self.run_cls(workspaces=[other], config_root=cfgroot)
+                self.assertEqual(self.codes(out).get("retired-state-outside"), "hard")
+
     def test_db_findings(self):
         mem = os.path.join(self.root, "agents/main/agent/openclaw-agent.sqlite")
         _sqlite(mem, ["CREATE TABLE meta(key, value)", "CREATE TABLE files(path, source, hash, mtime, size)",

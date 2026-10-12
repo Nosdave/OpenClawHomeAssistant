@@ -2054,8 +2054,8 @@ def classify_state_files(state_dir, cfg, *, from_checkpoint, accepted, mode, que
                 add(rel, "active-memory-toggles", "leave", "%d per-session opt-out(s) would be lost" % n)
         else:
             add(rel, "active-memory-toggles", "quarantine",
-                "no disabled entries; 2026.9+ doctor refuses while it exists" if ok
-                else "unreadable or invalid JSON; 2026.9+ doctor refuses while it exists")
+                "no disabled entries; 2026.10 ignores the file" if ok
+                else "unreadable or invalid JSON; 2026.10 ignores the file")
 
     # credentials/oauth.json (2026.9+ never reads it; startup may fence on it).
     rel = "credentials/oauth.json"
@@ -2101,7 +2101,7 @@ def classify_state_files(state_dir, cfg, *, from_checkpoint, accepted, mode, que
         "telegram-bindings-nonempty": ("non-empty Telegram thread-bindings file(s) without a clean 2026.7.35 "
                                        "checkpoint and a configured channels.telegram: %s; accepting moves them "
                                        "to quarantine (bindings are not imported)"),
-        "active-memory-optouts": ("Active Memory per-session opt-outs would be lost (2026.9+ cannot import them): %s; "
+        "active-memory-optouts": ("Active Memory per-session opt-outs would be lost (2026.10 no longer imports them): %s; "
                                   "accepting re-enables recall for those sessions"),
         "oauth-json-only": ("credentials/oauth.json exists but the main agent auth store has no profiles: %s; "
                             "the credentials may exist only there and 2026.9+ never reads it"),
@@ -2133,7 +2133,17 @@ def classify_state_files(state_dir, cfg, *, from_checkpoint, accepted, mode, que
 RETIRED_FORMAT_BRIDGE = "2026.9.7"
 RETIRED_QUARANTINE_KINDS = ("cron-json", "cron-json-state", "cron-run-log", "delivery-queue-json",
                             "oauth-sidecar", "plugin-install-index", "device-pair-notify",
-                            "voice-call-log", "telegram-spool-invalid")
+                            "voice-call-log", "telegram-spool-invalid", "dreaming-json")
+# Memory Core dreaming JSON in <workspace>/memory/.dreams/ (label, file, plugin-state namespaces, meta key):
+# 2026.10 doctor stops on a file unless memory-core plugin state already holds that workspace's rows
+# (extensions/memory-core/doctor-contract-api.js:159-226; 7.35 uses the same keys, dreaming-state-DLMGVRgZ.js).
+_DREAMING_SOURCES = (
+    ("daily ingestion", "daily-ingestion.json", ("dreaming-daily-ingestion",), None),
+    ("session ingestion", "session-ingestion.json",
+     ("dreaming-session-ingestion-files", "dreaming-session-ingestion-seen"), None),
+    ("short-term recall", "short-term-recall.json", ("short-term-recall",), "recall"),
+    ("phase signals", "phase-signals.json", ("short-term-phase-signals",), "phase"),
+)
 _OAUTH_SIDECAR_RE = re.compile(r"\A[a-f0-9]{32}\.json\Z")
 _DOCTOR_CLAIM_SUFFIX_RE = re.compile(
     r"\.doctor-importing(?:-\d+-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})?\Z")
@@ -2372,6 +2382,32 @@ def _expand_home(p, home):
     return os.path.abspath(p)
 
 
+def _memory_core_workspace_rows(state_db, query, workspace):
+    """{namespace: [value dicts]} of memory-core plugin-state rows for one workspace (read-only)."""
+    import hashlib
+    wk = hashlib.sha256(os.path.abspath(workspace).encode("utf-8")).hexdigest()
+    names = {"legacy-dreaming-source-acknowledgements", "short-term-meta"}
+    for src in _DREAMING_SOURCES:
+        names.update(src[2])
+    out = {}
+    if _lstat(state_db) is None:
+        return out
+    try:
+        rows = query(state_db, "SELECT namespace, value_json FROM plugin_state_entries WHERE plugin_id='memory-core' "
+                               "AND namespace IN (%s) AND entry_key LIKE %s"
+                     % (", ".join(_sql_str(n) for n in sorted(names)), _sql_str(wk + ":%")))
+    except Exception:  # noqa: BLE001 - no plugin state table: nothing migrated
+        return out
+    for r in rows:
+        try:
+            v = json.loads(_cell(r, 1))
+        except (TypeError, ValueError):
+            continue
+        if _rec(v) and v.get("workspaceKey") == wk:
+            out.setdefault(str(_cell(r, 0)), []).append(v)
+    return out
+
+
 def _spool_entry_problem(path, file_id, failed):
     """Mirror of 10.2 parseSource for one 7.x Telegram spool file; None when 10.2 imports it."""
     raw = _read_regular_text(path)
@@ -2396,10 +2432,13 @@ def _spool_entry_problem(path, file_id, failed):
     return None
 
 
-def classify_retired_state(state_dir, cfg, *, accepted, query=None, home="/config", env=None, mode="from-7x"):
+def classify_retired_state(state_dir, cfg, *, accepted, query=None, home="/config", env=None, mode="from-7x",
+                           workspaces=(), config_root=None):
     """Retired pre-July-2026 files and config keys that 10.2 doctor refuses (every gate mode).
 
-    Returns {"plan": [{rel, kind, action, reason, size}], "findings": [...], "info": [...],
+    workspaces: absolute agent workspace dirs (dreaming JSON); config_root: the directory workspace files are
+    quarantined relative to (plan entries then carry "root": "config").
+    Returns {"plan": [{rel, kind, action, reason, size[, root]}], "findings": [...], "info": [...],
     "config_removals": [path parts]} -- config_removals are applied by the from-7x pre-migrate step.
     """
     q = query or _query_ro_local
@@ -2409,24 +2448,27 @@ def classify_retired_state(state_dir, cfg, *, accepted, query=None, home="/confi
     plan, info, removals = [], [], []
     by_code = {}
 
-    def add(abs_path, kind, action, reason):
-        rel = _within(state_dir, abs_path)
+    def add(abs_path, kind, action, reason, root="state"):
+        rel = _within(config_root if root == "config" else state_dir, abs_path) \
+            if root == "state" or config_root else None
         if rel is None:
             flag("retired-state-outside", abs_path)
             return
         st = _lstat(abs_path)
-        plan.append({"rel": rel, "kind": kind, "action": action, "reason": reason,
-                     "size": st.st_size if st is not None else 0})
+        e = {"rel": rel, "kind": kind, "action": action, "reason": reason, "size": st.st_size if st is not None else 0}
+        if root == "config":
+            e["root"] = "config"
+        plan.append(e)
 
     def flag(code, item):
         by_code.setdefault(code, []).append(item)
 
-    def acceptable(code, abs_path, kind, reason_ok, reason_leave, item):
+    def acceptable(code, abs_path, kind, reason_ok, reason_leave, item, root="state"):
         flag(code, item)
         if code in accepted:
-            add(abs_path, kind, "quarantine", reason_ok)
+            add(abs_path, kind, "quarantine", reason_ok, root)
         else:
-            add(abs_path, kind, "leave", reason_leave)
+            add(abs_path, kind, "leave", reason_leave, root)
 
     def must_be_dir(path, label):
         st = _lstat(path)
@@ -2564,6 +2606,21 @@ def classify_retired_state(state_dir, cfg, *, accepted, query=None, home="/confi
         acceptable("voice-call-log", vcl, "voice-call-log", "accepted: voice-call-log",
                    "retired Voice Call JSONL call log", vcl)
 
+    # Memory Core dreaming JSON per agent workspace (dreaming is per workspace).
+    for ws in sorted({os.path.abspath(str(w)) for w in workspaces or ()}):
+        found = [src for src in _DREAMING_SOURCES if os.path.isfile(os.path.join(ws, "memory", ".dreams", src[1]))]
+        if not found:
+            continue
+        rows = _memory_core_workspace_rows(state_db, q, ws)
+        for label, fname, namespaces, meta in found:
+            if any(v.get("key") == "legacy-source:" + label for v in rows.get("legacy-dreaming-source-acknowledgements", [])) \
+                    or (meta and any(v.get("key") == meta for v in rows.get("short-term-meta", []))) \
+                    or any(rows.get(n) for n in namespaces):
+                continue  # 2026.10 skips it: the dreaming state is already in SQLite
+            path = os.path.join(ws, "memory", ".dreams", fname)
+            acceptable("dreaming-json-unmigrated", path, "dreaming-json", "accepted: dreaming-json-unmigrated",
+                       "pre-July dreaming JSON without SQLite state", path, root="config")
+
     # Telegram ingress spool: 10.2 doctor imports valid 7.x spool files into SQLite and throws on
     # unsupported directory names; malformed files leave doctor with a refusal.
     tdir = os.path.join(state_dir, "telegram")
@@ -2623,6 +2680,9 @@ def classify_retired_state(state_dir, cfg, *, accepted, query=None, home="/confi
                                        "(letters, digits, . _ -) or move it away"),
         "telegram-spool-invalid": ("Telegram spool file(s) OpenClaw 2026.10 cannot import: %s; accepting moves them "
                                    "to quarantine (those old updates are not processed)"),
+        "dreaming-json-unmigrated": ("pre-July-2026 dreaming file(s) whose state is not in SQLite: %s; OpenClaw 2026.10 "
+                                     "stops on them. Accepting moves them to quarantine: dreaming starts its ingestion "
+                                     "and short-term recall history afresh (MEMORY.md and memory notes are untouched)"),
     }
     hard = {"retired-state-outside", "retired-state-uninspectable", "telegram-spool-unsupported"}
     findings = [_finding(code, "hard" if code in hard else "acceptable", messages[code] % _brief(items), "precheck")

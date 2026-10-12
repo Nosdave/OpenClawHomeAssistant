@@ -871,7 +871,20 @@ class DoctorEvalTests(unittest.TestCase):
         # held stores: 2026.10 warns and exits 0 (9.9 failed doctor)
         ev = G.evaluate_doctor(0, "Warning: Agent deletion journal reconstructed; 1 store held back. Updates can "
                                   "continue; held stores remain untouched.\nDoctor complete.\n")
-        self.assertEqual((ev["code"], ev["cls"]), ("doctor-held-back", "hard"))
+        self.assertEqual((ev["code"], ev["cls"]), ("doctor-held-back", "acceptable"))
+        # an agent deleted with its files kept is no problem (10.2 docs); nor are held lines without a cause
+        ok = ("Held agent old database /x/openclaw-agent.sqlite (retained-by-deletion); skipped session retention.\n"
+              "Doctor complete.\n")
+        self.assertIsNone(G.evaluate_doctor(0, ok)["code"])
+        ev = G.evaluate_doctor(0, "Held agent w database /x.sqlite; deletion history needs repair.\nDoctor complete.\n")
+        self.assertEqual(ev["code"], "doctor-held-back")
+        # rc != 0: a specific failure wins over held-back warnings printed earlier in the same run
+        text = "Warning: Agent deletion journal reconstructed; 1 store held back.\nconfig fixes were not applied"
+        self.assertEqual(G.evaluate_doctor(1, text)["code"], "doctor-config-write")
+        self.assertEqual(G.evaluate_doctor(1, "Agent deletion journal changed before quarantine; stores were "
+                                              "left untouched.")["code"], "doctor-incomplete")
+        self.assertEqual(G.evaluate_doctor(1, "Session field room predates July 2026; install OpenClaw 2026.9.5")["code"],
+                         "doctor-retired-format")
         # refusals of pre-July-2026 settings/files win over the generic markers
         for text in ("Config contains retired pre-July-2026 settings: plugins.installs. Doctor cannot remove",
                      "Cron state: retired files whose last writer predates July 1, 2026: /config/.openclaw/cron/jobs.json",
@@ -890,6 +903,9 @@ class DoctorEvalTests(unittest.TestCase):
         self.assertIsNone(G.evaluate_doctor(0, text)["code"])
         ev = G.evaluate_doctor(0, text, final=True)
         self.assertEqual((ev["code"], ev["cls"]), ("doctor-warnings", "acceptable"))
+        kept = "Kept auth profile openai-codex:default unchanged because its provider realm is unresolved.\nDoctor complete.\n"
+        self.assertIsNone(G.evaluate_doctor(0, kept)["code"])
+        self.assertEqual(G.evaluate_doctor(0, kept, final=True)["code"], "doctor-warnings")
 
     def test_wrapped_clack_box(self):
         text = "│  Doctor stopped     │\n│  because the step refused │\n"

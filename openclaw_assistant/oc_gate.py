@@ -70,7 +70,8 @@ ACCEPTABLE = frozenset({
     "pc-probe", "pc-legacy-state", "pins-invalid",
     # retired pre-July-2026 state that OpenClaw 2026.10 refuses (oc_migrate.classify_retired_state)
     "cron-json-unimported", "oauth-sidecar-referenced", "plugin-index-unimported", "plugins-installs-unindexed",
-    "device-pair-subscribers", "voice-call-log", "telegram-spool-invalid",
+    "device-pair-subscribers", "voice-call-log", "telegram-spool-invalid", "dreaming-json-unmigrated",
+    "doctor-held-back",  # acceptable only on rc 0 (2026.10 reports held stores without failing doctor)
 })
 NO_RETRY = frozenset({"newer-state", "runtime-integrity"})
 POST_RUN_HOLDS = frozenset({"exit78", "crash-loop"})
@@ -141,7 +142,8 @@ ADVICE = {
                              "(they are in the gate archive), then oc-upgrade retry; a plain retry repeats the refusal",
     "doctor-held-back": "doctor held back agent databases: re-register the agent (OC_ADDON_UNSAFE=1 openclaw agents add <id> --workspace <ws> --agent-dir <dir> --non-interactive) or restore the backup, then oc-upgrade retry",
     "doctor-migration-refused": "fix the item doctor reported (oc-upgrade log), then oc-upgrade retry",
-    "doctor-maintenance-refused": "oc-upgrade retry (doctor resumes from its last committed step)",
+    "doctor-maintenance-refused": "oc-upgrade retry (doctor resumes from its last committed step); if the reason mentions "
+                                  "a different PID namespace, wait 90 s after the previous stop first",
     "doctor-plugin-load": "make sure the network is available, then oc-upgrade retry",
     "doctor-config-write": "oc-upgrade retry",
     "doctor-backup-unverifiable": "data at risk: restoring the backup is recommended; oc-upgrade retry is allowed",
@@ -168,16 +170,22 @@ BOX_RE = re.compile("[─-╿■-◿]")
 RETIRED_FORMAT_MARKERS = (
     "retired pre-July-2026 settings", "retired pre-June keys", "predates July 1, 2026",
     "retired pre-July 2026 format", "predates the July 2026 upgrade support window",
-    "pre-July-2026 state are no longer migrated", "Retired memory index format detected",
+    "pre-July-2026 state are no longer migrated", "Retired memory index format detected", "predates July 2026",
+    "upgrades from pre-July-2026",
     "unreleased session schema", "unsupported agent database registry schema",
     "Unsupported Telegram spool directory", "Telegram state must be a directory",
     "Cannot inspect potentially retired state",
 )
 # Held agent stores: 9.9 failed doctor on them; 2026.10 only warns and exits 0 (doctor-health-BmFjJGcU.mjs:185-187).
-HELD_BACK_MARKERS = ("held back", "Held agent ")
+# "Held agent <id> database ... (retained-by-deletion)" is an agent deleted with its files kept: not a problem
+# (docs/cli/doctor/state-migrations.md:171-174), so that line is ignored on rc 0.
+HELD_BACK_MARKERS = ("held back", "remain held")
+_HELD_AGENT_RE = re.compile(r"Held agent (?:(?!\(retained-by-deletion\)).){1,300}?(?:deletion history needs repair|"
+                            r"deletion journal|unverified)", re.I)
 FATAL_MARKERS = (
     ("doctor-retired-format", RETIRED_FORMAT_MARKERS, None),
-    ("doctor-held-back", HELD_BACK_MARKERS + ("unverified-agent-databases", "Agent deletion journal"), None),
+    # a race doctor reports when the journal changed while it quarantined: a retry passes
+    ("doctor-incomplete", ("Agent deletion journal changed before quarantine",), None),
     ("doctor-migration-refused", ("Doctor stopped because",), None),
     ("doctor-maintenance-refused", ("Doctor could not enter maintenance", "Doctor could not complete",
                                     "Doctor could not acquire", "Doctor could not reacquire",
@@ -185,13 +193,19 @@ FATAL_MARKERS = (
     ("doctor-plugin-load", ("plugin load errors",), None),
     ("doctor-config-write", ("config fixes were not applied",), None),
     ("doctor-backup-unverifiable", ("Cannot verify pre-migration SQLite backup", "backup group is missing"), None),
+    # after the specific failures: 2026.10 prints held-back warnings on otherwise normal runs
+    ("doctor-held-back", HELD_BACK_MARKERS + ("Held agent ", "unverified-agent-databases", "Agent deletion journal"),
+     None),
     ("doctor-incomplete", ("schema migration required",), re.compile(r"SQLite .{0,200}?timed out after", re.I)),
     ("doctor-failed", ("Failing check ",), None),
 )
 SUSPICIOUS_MARKERS = ("Preserved retired", "may contain unmigrated data", "Pre-June OAuth credentials")
 # Only in the last doctor pass: pass 1 reports plugins pinned to the 7.x package as unfinished until doctor
 # has updated them (deferred-plugin-migrations-DtqETF3J.mjs:220; gone in pass 2 in every rehearsal).
-FINAL_PASS_SUSPICIOUS = ("data/settings upgrade is unfinished",)
+# The same for auth profile renames: pass 1 always prints "Kept auth profile openai-codex:... unchanged" before
+# the alias step renames it (repair-sequencing-DFs-UYNz.mjs:408-413); in the last pass it is a real deferral.
+FINAL_PASS_SUSPICIOUS = ("data/settings upgrade is unfinished", "Deferred auth profile alias",
+                         "Deferred stale auth profile alias", "Kept auth profile ")
 
 STOP = threading.Event()
 _STOP_SIG = [None]
@@ -1131,12 +1145,16 @@ def evaluate_doctor(rc, text, *, timed_out=False, stopping=False, final=False):
         if not complete:
             res.update(code="doctor-incomplete", cls="hard", message="doctor exited 0 without 'Doctor complete.'")
             return res
-        for s in HELD_BACK_MARKERS:
-            idx = low.find(s.lower())
-            if idx >= 0:
-                res.update(code="doctor-held-back", cls="hard", markers=[s],
-                           message=f"doctor completed but held back agent databases: ...{_snippet(norm, idx)}...")
-                return res
+        held = [(low.find(s.lower()), s) for s in HELD_BACK_MARKERS if s.lower() in low]
+        m = _HELD_AGENT_RE.search(norm)
+        if m:
+            held.append((m.start(), "Held agent"))
+        if held:
+            idx, s = min(held)
+            res.update(code="doctor-held-back", cls="acceptable", markers=[s],
+                       message=f"doctor completed but held back agent databases (they stay unmigrated): "
+                               f"...{_snippet(norm, idx)}...")
+            return res
         sus = [m for m in SUSPICIOUS_MARKERS + (FINAL_PASS_SUSPICIOUS if final else ()) if m.lower() in low]
         if sus:
             idx = low.find(sus[0].lower())
@@ -1194,6 +1212,10 @@ _NOTE_RES = (
      lambda m: f"doctor archived and removed the untouched {m.group(1)}"),
     ("warn", re.compile(r"Migrated (\S{1,200}HEARTBEAT\.md) into cron scratch"),
      lambda m: f"doctor moved {m.group(1)} into the heartbeat cron job"),
+    # retired-model-ref-repair-TouY-fr5.mjs:452/469/514/551: a retired model kept because no successor fits
+    ("warn", re.compile(r'Retained (?:model reference )?"?([^"\s]{1,120}?)"? for agent "([^"]{1,80})": (.{1,160}?)\.'),
+     lambda m: f"doctor kept the retired model {m.group(1)} for agent {m.group(2)} ({m.group(3)}); choose a current "
+               "model for it"),
 )
 
 
@@ -2065,9 +2087,12 @@ class Gate:
                  f"sha256 {v['sha256'][:12]}… -> {adir}/")
 
     # ----- phase 3: cleanup -----
-    def retired_state(self, mode):
-        return mig().classify_retired_state(str(self.gp["STATE"]), self.cfg, accepted=set(self.accepted), query=_mq,
-                                            home=str(self.gp["CONFIG_ROOT"]), mode=mode)
+    def retired_state(self, mode, cfg=None):
+        cfg = self.cfg if cfg is None else cfg
+        return mig().classify_retired_state(str(self.gp["STATE"]), cfg, accepted=set(self.accepted), query=_mq,
+                                            home=str(self.gp["CONFIG_ROOT"]), mode=mode,
+                                            workspaces=[str(w) for w in workspaces(cfg)],
+                                            config_root=str(self.gp["CONFIG_ROOT"]))
 
     def retired_format_findings(self, mode, cfg_ok):
         """Mirror of the 2026.10 refusals (oc_migrate.classify_retired_state / retired_*): HOLD before any write."""
@@ -2110,13 +2135,14 @@ class Gate:
             if kind in skip:
                 self.warn(f"test hook: not quarantining {kind}: {relp}")
                 continue
-            src_p = p["STATE"] / relp
+            in_cfg = e.get("root") == "config"
+            src_p = (p["CONFIG_ROOT"] if in_cfg else p["STATE"]) / relp
             try:
                 st = os.lstat(src_p)
             except FileNotFoundError:
                 continue
             self.mark_first_write()
-            dst = qdir / relp
+            dst = qdir / ("config-root/" + relp if in_cfg else relp)
             n = 0
             while os.path.lexists(dst):
                 n += 1
@@ -2140,7 +2166,7 @@ class Gate:
                 man = C.load_json_or_none(mpath)
                 man = man if isinstance(man, list) else []
                 man.append({"src": relp, "dst": str(dst), "kind": kind, "size": st.st_size, "sha256": sha,
-                            "reason": e.get("reason", ""), "at": C.utc_iso()})
+                            "reason": e.get("reason", ""), "at": C.utc_iso(), **({"root": "config"} if in_cfg else {})})
                 C.atomic_write_json(mpath, man)
             except OSError as exc:
                 raise HoldError([finding("cleanup-failed", "hard", f"cannot quarantine {relp}: {exc}", "cleanup")],
@@ -2162,8 +2188,7 @@ class Gate:
             self.mark_first_write()
             self.copy_once(p["CONFIG_PATH"], rd / "config.pre-gate.json")
             cfg_pre = C.read_json_strict(rd / "config.pre-gate.json")
-            removals = M.classify_retired_state(str(p["STATE"]), cfg_pre, accepted=set(self.accepted), query=_mq,
-                                                home=str(p["CONFIG_ROOT"]))["config_removals"]
+            removals = self.retired_state("from-7x", cfg_pre)["config_removals"]
             new_cfg, ledger, summary = M.premigrate_config(cfg_pre, removals=removals)
             stores, _f = M.scan_sessions_files(str(p["STATE"]))
             sess_led, pinned, user_explicit, harness = [], [], [], []
