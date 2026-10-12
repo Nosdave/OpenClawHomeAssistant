@@ -187,12 +187,13 @@ FATAL_MARKERS = (
     # a race doctor reports when the journal changed while it quarantined: a retry passes
     ("doctor-incomplete", ("Agent deletion journal changed before quarantine",), None),
     ("doctor-migration-refused", ("Doctor stopped because",), None),
-    ("doctor-maintenance-refused", ("Doctor could not enter maintenance", "Doctor could not complete",
-                                    "Doctor could not acquire", "Doctor could not reacquire",
-                                    "Doctor could not apply", "Doctor could not promote"), None),
+    # specific failures before "Doctor could not complete ...", which 2026.10 prints as a wrapper around them
     ("doctor-plugin-load", ("plugin load errors",), None),
     ("doctor-config-write", ("config fixes were not applied",), None),
     ("doctor-backup-unverifiable", ("Cannot verify pre-migration SQLite backup", "backup group is missing"), None),
+    ("doctor-maintenance-refused", ("Doctor could not enter maintenance", "Doctor could not complete",
+                                    "Doctor could not acquire", "Doctor could not reacquire",
+                                    "Doctor could not promote"), None),
     # after the specific failures: 2026.10 prints held-back warnings on otherwise normal runs
     ("doctor-held-back", HELD_BACK_MARKERS + ("Held agent ", "unverified-agent-databases", "Agent deletion journal"),
      None),
@@ -1786,7 +1787,7 @@ class Gate:
             _stores, sess_f = M.scan_sessions_files(str(p["STATE"]))
             F += [dict(f) for f in sess_f]
         # 6b every gate mode, before the first write: pre-July-2026 formats OpenClaw 2026.10 refuses
-        if not generic_only:
+        if not (self.j or {}).get("first_write_at"):
             F += self.retired_format_findings(mode, cfg_ok)
         # 7 sizes (and F1: a symlinked state/agent directory or workspace root would be archived as a bare link)
         ap = self.archive_plan()
@@ -2098,7 +2099,8 @@ class Gate:
         """Mirror of the 2026.10 refusals (oc_migrate.classify_retired_state / retired_*): HOLD before any write."""
         M = mig()
         F = [dict(f) for f in M.retired_config_findings(self.cfg, mode)] if cfg_ok else []
-        rs = self.retired_state(mode)
+        rs = self.retired_state("from-7x" if mode == "from-7x" else "bump")
+        self.facts["retired_state"] = rs
         F += [dict(f) for f in rs["findings"]]
         for i in rs["info"]:
             self.say(f"{self.pn('precheck')} info: {i}")
@@ -2447,6 +2449,8 @@ class Gate:
             sha1f = _sha_or_none(p["CONFIG_PATH"])
             ev3 = self.run_doctor_pass(3, "doctor2")
             self.doctor_failure(ev3, "doctor2", 3)
+            # pass 3 is the last pass now: pass-2 warnings that only rest on a final-pass marker are superseded
+            warnings = [w for w in warnings if set(w.get("markers") or []) - set(FINAL_PASS_SUSPICIOUS)]
             if ev3["code"] == "doctor-warnings":
                 warnings.append(ev3)
             sha2 = _sha_or_none(p["CONFIG_PATH"])
@@ -3426,13 +3430,15 @@ def readiness(g, mode):
         sf = M.classify_state_files(str(g.gp["STATE"]), g.cfg, from_checkpoint=startup_checkpoint(
             g.gp["STATE"] / "state" / "openclaw.sqlite"), accepted=set(), mode="from-7x" if mode == "from-7x" else "bump", query=_mq)
         plan_entries = sf.get("plan", [])
+    rs = g.facts.get("retired_state") or g.retired_state("from-7x" if mode == "from-7x" else "bump")
+    plan_entries = list(plan_entries) + list(rs.get("plan", []))
     counts = {}
     for e in plan_entries:
         if e.get("action") == "quarantine":
             counts[e.get("kind")] = counts.get(e.get("kind"), 0) + 1
     lines.append("[gate]   cleanup plan: " + (", ".join(f"{v} {k}" for k, v in sorted(counts.items())) or "nothing to move"))
     if mode == "from-7x" and g.cfg:
-        _new, ledger, summary = M.premigrate_config(g.cfg)
+        _new, ledger, summary = M.premigrate_config(g.cfg, removals=rs.get("config_removals") or [])
         lines.append(f"[gate]   pre-migrate: explicit ids {', '.join(summary.get('explicit') or []) or 'none'}; "
                      f"{len(ledger)} config change(s); modelPolicy {{}}: "
                      f"{'yes' if summary.get('model_policy_written') else 'no'}")

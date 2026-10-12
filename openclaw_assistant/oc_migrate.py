@@ -2107,9 +2107,10 @@ def classify_state_files(state_dir, cfg, *, from_checkpoint, accepted, mode, que
                             "the credentials may exist only there and 2026.9+ never reads it"),
         "legacy-db-unimported": ("pre-June database(s) with data 2026.9+ never imports: %s; upgrade through 2026.9.5 "
                                  "first or accept losing these records"),
-        "legacy-memory-sidecar": ("legacy memory sidecar database(s) %s: 2026.10 doctor imports them but stops on "
-                                  "the pre-July index format; accepting moves them to quarantine (the memory index "
-                                  "is rebuilt from the memory files, which re-embeds them)"),
+        "legacy-memory-sidecar": ("legacy memory sidecar database(s) %s: 2026.10 doctor imports them into the agent "
+                                  "database and stops when it cannot (unknown schema, vector rows without sqlite-vec); "
+                                  "accepting moves them to quarantine (the memory index is rebuilt from the memory "
+                                  "files, which re-embeds them)"),
     }
     findings = [_finding(code, "acceptable", messages[code] % _brief(items), "precheck")
                 for code, items in by_code.items()]
@@ -2346,10 +2347,33 @@ def _legacy_plugin_index_ids(doc):
     return None
 
 
-def _auth_store_blobs(state_dir, query):
+def _auth_store_blobs(state_dir, query, cfg=None, home="/config"):
+    """Text of every auth store an OAuth sidecar could be referenced from, or True when one cannot be read
+    (the caller then treats every sidecar as referenced: never quarantine a credential silently)."""
     blobs = []
-    for e in _scandir_sorted(os.path.join(state_dir, "agents")):
-        adir = os.path.join(state_dir, "agents", e.name, "agent")
+    sdb = os.path.join(state_dir, "state", "openclaw.sqlite")
+    dirs = [os.path.join(state_dir, "agents", e.name, "agent")
+            for e in _scandir_sorted(os.path.join(state_dir, "agents"))]
+    if _lstat(sdb) is not None:
+        try:
+            for r in query(sdb, "SELECT path FROM agent_databases"):
+                p = str(_cell(r))
+                dirs.append(os.path.dirname(p if os.path.isabs(p) else os.path.join(state_dir, p)))
+        except Exception as exc:  # noqa: BLE001 - no registry on a fresh state
+            if "no such table" not in str(exc):
+                return True
+    agents = cfg.get("agents") if _rec(cfg) and _rec(cfg.get("agents")) else {}
+    entries = list(agents["list"]) if isinstance(agents.get("list"), list) else []
+    entries += list(agents["entries"].values()) if _rec(agents.get("entries")) else []
+    for e in entries:
+        if _rec(e) and isinstance(e.get("agentDir"), str) and e["agentDir"].strip():
+            dirs.append(_expand_home(e["agentDir"], home))
+    seen = set()
+    for adir in dirs:
+        adir = os.path.abspath(adir)
+        if adir in seen:
+            continue
+        seen.add(adir)
         for f in _scandir_sorted(adir):
             if f.name.endswith(".json"):
                 t = _read_regular_text(os.path.join(adir, f.name))
@@ -2359,14 +2383,15 @@ def _auth_store_blobs(state_dir, query):
         if _lstat(db) is not None:
             try:
                 blobs += [str(_cell(r)) for r in query(db, "SELECT store_json FROM auth_profile_store")]
-            except Exception:  # noqa: BLE001 - no auth store table
-                pass
-    sdb = os.path.join(state_dir, "state", "openclaw.sqlite")
+            except Exception as exc:  # noqa: BLE001
+                if "no such table" not in str(exc):
+                    return True
     if _lstat(sdb) is not None:
         try:
             blobs += [str(_cell(r)) for r in query(sdb, "SELECT store_json FROM auth_profile_stores")]
-        except Exception:  # noqa: BLE001 - table absent on 7.x
-            pass
+        except Exception as exc:  # noqa: BLE001 - table absent on 7.x
+            if "no such table" not in str(exc):
+                return True
     return "\n".join(blobs)
 
 
@@ -2471,13 +2496,17 @@ def classify_retired_state(state_dir, cfg, *, accepted, query=None, home="/confi
             add(abs_path, kind, "leave", reason_leave, root)
 
     def must_be_dir(path, label):
+        """True when `path` is a directory to scan. 10.2 lists these with readdir, which follows a symlink to
+        a directory; anything else that exists makes 10.2 refuse ("Cannot inspect potentially retired state")."""
         st = _lstat(path)
         if st is None:
             return False
-        if not stat.S_ISDIR(st.st_mode):
-            flag("retired-state-uninspectable", "%s (%s exists but is not a directory)" % (path, label))
-            return False
-        return True
+        if stat.S_ISDIR(st.st_mode):
+            return True
+        if stat.S_ISLNK(st.st_mode) and os.path.isdir(path):
+            return True
+        flag("retired-state-uninspectable", "%s (%s exists but is not a directory)" % (path, label))
+        return False
 
     state_db = os.path.join(state_dir, "state", "openclaw.sqlite")
     index_ids = _installed_plugin_index_ids(state_dir, q)
@@ -2547,17 +2576,29 @@ def classify_retired_state(state_dir, cfg, *, accepted, query=None, home="/confi
         info.append("%d retired JSON delivery queue file(s) from before July 2026 go to quarantine "
                     "(OpenClaw 2026.9+ would not replay them either)" % nq)
 
-    # OAuth credential sidecars (credentials/auth-profiles/<32 hex>.json).
-    oauth_dir = env.get("OPENCLAW_OAUTH_DIR") or _get(cfg, ["env", "vars", "OPENCLAW_OAUTH_DIR"], None)
-    oauth_dir = _expand_home(oauth_dir, home) if isinstance(oauth_dir, str) and oauth_dir.strip() \
-        else os.path.join(state_dir, "credentials")
-    sdir = os.path.join(oauth_dir, "auth-profiles")
-    if must_be_dir(sdir, "OAuth sidecars"):
+    # OAuth credential sidecars (credentials/auth-profiles/<32 hex>.json). 10.2 resolves OPENCLAW_OAUTH_DIR from the
+    # process env, then the config env (env.vars / env; config-env-vars-DjPHKieF.mjs:45-60): check every candidate.
+    oauth_dirs = []
+    for v in (env.get("OPENCLAW_OAUTH_DIR"), _get(cfg, ["env", "vars", "OPENCLAW_OAUTH_DIR"], None),
+              _get(cfg, ["env", "OPENCLAW_OAUTH_DIR"], None)):
+        if isinstance(v, str) and v.strip() and "${" not in v:
+            d = _expand_home(v, home)
+            if d not in oauth_dirs:
+                oauth_dirs.append(d)
+    d = os.path.join(state_dir, "credentials")  # the default; also checked when an override is set (harmless)
+    if d not in oauth_dirs:
+        oauth_dirs.append(d)
+    blobs = None
+    for oauth_dir in oauth_dirs:
+        sdir = os.path.join(oauth_dir, "auth-profiles")
+        if not must_be_dir(sdir, "OAuth sidecars"):
+            continue
         side = [e.name for e in _scandir_sorted(sdir) if _OAUTH_SIDECAR_RE.match(e.name)]
-        blobs = _auth_store_blobs(state_dir, q) if side else ""
+        if side and blobs is None:
+            blobs = _auth_store_blobs(state_dir, q, cfg, home)
         for name in side:
             path = os.path.join(sdir, name)
-            if name[:32] in blobs:
+            if blobs is True or name[:32] in blobs:
                 acceptable("oauth-sidecar-referenced", path, "oauth-sidecar",
                            "accepted: oauth-sidecar-referenced (the profile needs a new login)",
                            "an auth profile still references it", path)
@@ -2599,6 +2640,8 @@ def classify_retired_state(state_dir, cfg, *, accepted, query=None, home="/confi
 
     # Voice Call JSONL call log (refused when the voice-call plugin runs its migrations).
     vc_store = _get(cfg, ["plugins", "entries", "voice-call", "config", "store"], None)
+    if not (isinstance(vc_store, str) and vc_store.strip()):
+        vc_store = _get(cfg, ["plugins", "entries", "@openclaw/voice-call", "config", "store"], None)
     vc_dir = _expand_home(vc_store, home) if isinstance(vc_store, str) and vc_store.strip() \
         else os.path.join(state_dir, "voice-calls")
     vcl = os.path.join(vc_dir, "calls.jsonl")
@@ -2699,9 +2742,11 @@ def retired_config_findings(cfg, mode="from-7x"):
         return []
     return [_finding(
         "config-retired-keys", "hard",
-        "openclaw.json contains settings OpenClaw 2026.10 refuses (retired before July 2026): %s. OpenClaw "
-        "2026.7.35 does not accept them either; remove them on 0.5.93 (or migrate them with OpenClaw %s), then "
-        "oc-upgrade retry" % (_brief(paths, 10), bridge), "precheck")]
+        ("openclaw.json contains settings OpenClaw 2026.10 refuses (retired before July 2026): %s. OpenClaw "
+         "2026.7.35 does not accept them either; remove them on 0.5.93 (or migrate them with OpenClaw %s), then "
+         "oc-upgrade retry" if mode == "from-7x" else
+         "openclaw.json contains settings OpenClaw 2026.10 refuses (retired before July 2026): %s; remove them "
+         "(or migrate them with OpenClaw %s), then oc-upgrade retry") % (_brief(paths, 10), bridge), "precheck")]
 
 
 def _exact_cols(cols, expected):
@@ -2756,7 +2801,8 @@ def retired_db_findings(agent_dbs, state_db, query=None):
             "retired-memory-index", "hard",
             "agent database(s) still hold the pre-July memory index tables (meta/files/chunks): %s; OpenClaw "
             "2026.10 refuses them. On 0.5.93 run `openclaw memory index --agent <id>` for each (2026.7.35 converts "
-            "the index when it opens it), then oc-upgrade retry" % _brief(mem), "precheck"))
+            "the index when it opens it; memory search must be enabled for that agent), then oc-upgrade retry"
+            % _brief(mem), "precheck"))
     if shape:
         out.append(_finding(
             "pre-july-schema", "hard",

@@ -1888,6 +1888,39 @@ class TestRetiredFormats(unittest.TestCase):
             out = self.run_cls(env={"OPENCLAW_OAUTH_DIR": other})
             self.assertEqual(self.codes(out).get("retired-state-outside"), "hard")
 
+    def test_oauth_dir_candidates_symlinks_and_unreadable_stores(self):
+        hexa = "abcdef0123456789" * 2
+        # top-level env.OPENCLAW_OAUTH_DIR (outside the state dir) is checked too
+        with tempfile.TemporaryDirectory() as other:
+            _write(other, "auth-profiles/%s.json" % hexa, "{}")
+            out = self.run_cls({"env": {"OPENCLAW_OAUTH_DIR": other}}, env={})
+            self.assertEqual(self.codes(out).get("retired-state-outside"), "hard")
+            out = self.run_cls({"env": {"OPENCLAW_OAUTH_DIR": "${OAUTH}"}}, env={})  # unresolved reference: skipped
+            self.assertEqual(out["findings"], [])
+            # a symlinked delivery queue directory is followed like 10.2's readdir
+            os.symlink(other, os.path.join(self.root, "delivery-queue"))
+            _write(other, "q.json", "{}")
+            out = self.run_cls(env={})
+            self.assertEqual(self.plan(out).get("delivery-queue/q.json"), ("delivery-queue-json", "quarantine"))
+            os.remove(os.path.join(self.root, "delivery-queue"))
+        # an auth store that cannot be read means "referenced": never quarantine a credential silently
+        _write(self.root, "credentials/auth-profiles/%s.json" % hexa, "{}")
+        _write(self.root, "agents/main/agent/openclaw-agent.sqlite", "not a database")
+        out = self.run_cls(env={})
+        self.assertEqual(self.plan(out)["credentials/auth-profiles/%s.json" % hexa], ("oauth-sidecar", "leave"))
+        self.assertEqual(self.codes(out), {"oauth-sidecar-referenced": "acceptable"})
+        # a reference in an agent DB registered outside agents/<id>/agent counts
+        os.remove(os.path.join(self.root, "agents/main/agent/openclaw-agent.sqlite"))
+        with tempfile.TemporaryDirectory() as adir:
+            db = os.path.join(adir, "openclaw-agent.sqlite")
+            _sqlite(db, ["CREATE TABLE auth_profile_store (store_key TEXT, store_json TEXT)",
+                         "INSERT INTO auth_profile_store VALUES ('primary', '{\"x\": \"%s\"}')" % hexa])
+            _sqlite(os.path.join(self.root, "state/openclaw.sqlite"),
+                    ["CREATE TABLE agent_databases (agent_id TEXT, path TEXT)",
+                     "INSERT INTO agent_databases VALUES ('w', '%s')" % db])
+            out = self.run_cls(env={})
+            self.assertEqual(self.codes(out), {"oauth-sidecar-referenced": "acceptable"})
+
     def test_plugin_index_and_config_installs(self):
         _write(self.root, "plugins/installs.json", json.dumps({"installRecords": {"brave": {}}}))
         out = self.run_cls({"plugins": {"installs": {"acpx": {"spec": "x"}}}})

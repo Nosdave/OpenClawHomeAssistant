@@ -1037,7 +1037,7 @@ them before anything is changed:
 | `cron/jobs.json` with jobs not in SQLite, an OAuth sidecar still referenced by a login (that login no longer works on 2026.7.35 either), `plugins/installs.json` or `plugins.installs` with records missing from SQLite, Device Pair subscribers, `voice-calls/calls.jsonl`, a malformed Telegram spool file, `memory/<agent>.sqlite`, dreaming files in `<workspace>/memory/.dreams/` whose state is not in SQLite | HOLD with an acceptable code; `oc-upgrade retry --accept <code>` moves the file to quarantine (the message says what is lost) |
 | Retired settings in `openclaw.json` (`config-retired-keys`), the old memory index tables in an agent database (`retired-memory-index`), pre-July database shapes (`pre-july-schema`), an unsupported `telegram/ingress-spool-*` entry, leftovers outside `/config/.openclaw` | hard HOLD; the message says what to do (for `retired-memory-index`: run `openclaw memory index --agent <id>` on 0.5.93, which converts the index) |
 
-`oc-upgrade check` lists them in section "C2".
+`oc-upgrade check` of this version (`0.5.94-full1`; not 0.5.93) lists them in section "C2"; database findings and everything that would HOLD appear in its readiness section ("a gate would HOLD with: …"). The gate runs these checks in every mode, also for later OpenClaw updates.
 
 The gate, the gateway and every `openclaw` command run on the image's Node.js (the
 one the image build checked), even if Homebrew installed another `node` that comes

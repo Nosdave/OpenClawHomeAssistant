@@ -885,6 +885,12 @@ class DoctorEvalTests(unittest.TestCase):
                                               "left untouched.")["code"], "doctor-incomplete")
         self.assertEqual(G.evaluate_doctor(1, "Session field room predates July 2026; install OpenClaw 2026.9.5")["code"],
                          "doctor-retired-format")
+        # 2026.10 wraps specific failures in "Doctor could not complete maintenance ..."
+        wrapped = ("Doctor could not complete maintenance: repairs stopped.\n"
+                   "Doctor finished, but config fixes were not applied.")
+        self.assertEqual(G.evaluate_doctor(1, wrapped)["code"], "doctor-config-write")
+        self.assertEqual(G.evaluate_doctor(1, "Doctor could not complete maintenance.\nCannot verify pre-migration "
+                                              "SQLite backup x")["code"], "doctor-backup-unverifiable")
         # refusals of pre-July-2026 settings/files win over the generic markers
         for text in ("Config contains retired pre-July-2026 settings: plugins.installs. Doctor cannot remove",
                      "Cron state: retired files whose last writer predates July 1, 2026: /config/.openclaw/cron/jobs.json",
@@ -1447,6 +1453,60 @@ class GateRunTests(GateEnv):
         con.close()
         d = self.plan()
         self.assertEqual((d["rc"], d["hold"]["code"]), (11, "bump-repeat"))
+
+    def test_bump_mode_runs_retired_format_precheck(self):
+        """Review: the 2026.10 retired-format checks (6b) also run in bump mode, before the first write."""
+        make_99_state(self.state)
+        self.write_cfg({"meta": {"lastTouchedVersion": RUNTIME}, "gateway": {"mode": "local"}})
+        (self.upg / "gate").mkdir(parents=True)
+        (self.upg / "gate" / "migrated.json").write_text(json.dumps({"runtime": "2026.9.5", "mode": "from-7x"}))
+        (self.state / "device-pair-notify.json").write_text('{"subscribers": [{"id": 1}]}')
+        (self.state / "cron" / "runs").mkdir(parents=True)
+        (self.state / "cron" / "runs" / "j.jsonl").write_text("{}\n")
+        self.hooks()
+        self.assertEqual(self.run_gate(), 20, self.out)
+        j = self.journal()
+        self.assertEqual((j["mode"], j["hold"]["code"], j["phase"]), ("bump", "device-pair-subscribers", "precheck"))
+        self.assertIsNone(j.get("first_write_at"))
+        self.assertTrue((self.state / "cron" / "runs" / "j.jsonl").exists(), "nothing moved before the HOLD")
+        G.retry_cmd(["--accept", "device-pair-subscribers"], emit=lambda s: None)
+        self.assertEqual(self.run_gate(), 0, self.out)
+        self.assertFalse((self.state / "device-pair-notify.json").exists())
+        self.assertFalse((self.state / "cron" / "runs" / "j.jsonl").exists())
+        man = next((self.upg / "gate" / "quarantine").glob("*/MANIFEST.json"))
+        kinds = {e["kind"] for e in json.loads(man.read_text())}
+        self.assertEqual(kinds, {"device-pair-notify", "cron-run-log"})
+
+    def test_from7x_retired_files_and_plugins_installs(self):
+        """Gate-level: retired files go to quarantine (state and /config roots), plugins.installs is removed (R0)."""
+        self.build_735()
+        cfg = json.loads((self.state / "openclaw.json").read_text())
+        cfg.setdefault("plugins", {})["installs"] = {"brave": {"source": "npm"}}
+        self.write_cfg(cfg)
+        con = sqlite3.connect(str(self.state / "state" / "openclaw.sqlite"))
+        con.execute("CREATE TABLE IF NOT EXISTS installed_plugin_index (index_key TEXT PRIMARY KEY, "
+                    "install_records_json TEXT)")
+        con.execute("INSERT INTO installed_plugin_index VALUES ('installed-plugin-index', '{\"brave\": {}}')")
+        con.commit()
+        con.close()
+        (self.state / "delivery-queue").mkdir()
+        (self.state / "delivery-queue" / "a.json").write_text("{}")
+        (self.ws / "memory" / ".dreams").mkdir(parents=True)
+        (self.ws / "memory" / ".dreams" / "phase-signals.json").write_text("{}")
+        self.hooks(accept=["dreaming-json-unmigrated"])
+        self.assertEqual(self.run_gate(), 0, self.out)
+        self.assertIn("removed retired key(s) OpenClaw 2026.10 refuses: plugins.installs", self.out)
+        self.assertNotIn("installs", json.loads((self.state / "openclaw.json").read_text()).get("plugins", {}))
+        self.assertFalse((self.state / "delivery-queue" / "a.json").exists())
+        self.assertFalse((self.ws / "memory" / ".dreams" / "phase-signals.json").exists())
+        man = json.loads(next((self.upg / "gate" / "quarantine").glob("*/MANIFEST.json")).read_text())
+        dream = [e for e in man if e["kind"] == "dreaming-json"]
+        self.assertEqual(len(dream), 1)
+        self.assertEqual(dream[0].get("root"), "config")
+        self.assertTrue(Path(dream[0]["dst"]).exists())
+        self.assertIn("/config-root/clawd/memory/.dreams/", dream[0]["dst"])
+        led = json.loads(next((self.upg / "gate" / "runs").glob("*/transform-ledger.json")).read_text())
+        self.assertEqual([e["path"] for e in led if e["step"] == "R0"], ["plugins.installs"])
 
     def test_gate_refuses_without_runsh_and_deletes_stale_hold(self):
         make_99_state(self.state)
