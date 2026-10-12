@@ -1146,6 +1146,12 @@ def evaluate_doctor(rc, text, *, timed_out=False, stopping=False, final=False):
         if not complete:
             res.update(code="doctor-incomplete", cls="hard", message="doctor exited 0 without 'Doctor complete.'")
             return res
+        sus = [m for m in SUSPICIOUS_MARKERS + (FINAL_PASS_SUSPICIOUS if final else ()) if m.lower() in low]
+        warn = None
+        if sus:
+            idx = low.find(sus[0].lower())
+            warn = {"code": "doctor-warnings", "cls": "acceptable", "markers": sus,
+                    "message": f"doctor completed with warnings ({', '.join(sus)}): ...{_snippet(norm, idx)}..."}
         held = [(low.find(s.lower()), s) for s in HELD_BACK_MARKERS if s.lower() in low]
         m = _HELD_AGENT_RE.search(norm)
         if m:
@@ -1155,12 +1161,11 @@ def evaluate_doctor(rc, text, *, timed_out=False, stopping=False, final=False):
             res.update(code="doctor-held-back", cls="acceptable", markers=[s],
                        message=f"doctor completed but held back agent databases (they stay unmigrated): "
                                f"...{_snippet(norm, idx)}...")
+            if warn:  # accepting the held stores must not accept the warnings too
+                res["also"] = [warn]
             return res
-        sus = [m for m in SUSPICIOUS_MARKERS + (FINAL_PASS_SUSPICIOUS if final else ()) if m.lower() in low]
-        if sus:
-            idx = low.find(sus[0].lower())
-            res.update(code="doctor-warnings", cls="acceptable", markers=sus,
-                       message=f"doctor completed with warnings ({', '.join(sus)}): ...{_snippet(norm, idx)}...")
+        if warn:
+            res.update(warn)
         return res
     if rc < 0 or rc in (134, 137):
         sig = -rc if rc < 0 else rc - 128
@@ -1261,6 +1266,12 @@ _LEGACY_PROVIDERS = ("openai-codex", "codex", "codex-cli")
 
 def _clean_ref(s):
     return s.strip().strip("\"'").rstrip(".,;:)")
+
+
+def acceptable_doctor(ev):
+    """The acceptable findings of one evaluated doctor pass: its own code plus any it carries along."""
+    out = [ev] if ev.get("code") and ev.get("cls") == "acceptable" else []
+    return out + list(ev.get("also") or [])
 
 
 def doctor_retirements(text):
@@ -2334,9 +2345,9 @@ class Gate:
         self.say(f"5/9 doctor pass 1 rc={ev['rc']} in {C.fmt_duration(ev['duration'])}: Doctor complete. "
                  f"({len(baks)} pre-migration SQLite backups, {C.human(total)})")
         self.complete_phase("doctor1")
-        if ev["code"] and ev["cls"] == "acceptable":  # doctor-warnings, doctor-held-back (2026.10: rc 0)
-            self.resolve([finding(ev["code"], "acceptable", f"pass 1: {ev['message']}", "doctor1")],
-                         "doctor1", resume_after=True)
+        F = [finding(e["code"], "acceptable", f"pass 1: {e['message']}", "doctor1") for e in acceptable_doctor(ev)]
+        if F:  # doctor-warnings, doctor-held-back (2026.10: rc 0)
+            self.resolve(F, "doctor1", resume_after=True)
 
     def codex_pkg_before(self):
         """Codex was in use before doctor pass 1 outside openclaw.json (contract addendum 2 rule 4): a codex
@@ -2435,7 +2446,7 @@ class Gate:
         sha0 = _sha_or_none(p["CONFIG_PATH"])
         ev = self.run_doctor_pass(2, "doctor2")
         self.doctor_failure(ev, "doctor2", 2)
-        warnings = [ev] if ev["code"] and ev["cls"] == "acceptable" else []
+        warnings = acceptable_doctor(ev)
         if "Saved pre-migration SQLite backup" in normalize_doctor_text(ev["text"]):
             self.warn("doctor pass 2 saved another pre-migration SQLite backup")
         sha1 = _sha_or_none(p["CONFIG_PATH"])
@@ -2452,8 +2463,7 @@ class Gate:
             # pass 3 is the last pass now: pass-2 warnings that only rest on a final-pass marker are superseded
             warnings = [w for w in warnings if w["code"] != "doctor-warnings"
                         or set(w.get("markers") or []) - set(FINAL_PASS_SUSPICIOUS)]
-            if ev3["code"] and ev3["cls"] == "acceptable":
-                warnings.append(ev3)
+            warnings += acceptable_doctor(ev3)
             sha2 = _sha_or_none(p["CONFIG_PATH"])
             self.post_pass_fixups(3)
             result = "config changed in pass 2, unchanged in pass 3" if sha2 == sha1f else "config changed again in pass 3"

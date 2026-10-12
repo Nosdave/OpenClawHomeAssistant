@@ -878,6 +878,11 @@ class DoctorEvalTests(unittest.TestCase):
         self.assertIsNone(G.evaluate_doctor(0, ok)["code"])
         ev = G.evaluate_doctor(0, "Held agent w database /x.sqlite; deletion history needs repair.\nDoctor complete.\n")
         self.assertEqual(ev["code"], "doctor-held-back")
+        self.assertEqual([e["code"] for e in G.acceptable_doctor(ev)], ["doctor-held-back"])
+        # warnings in the same pass ride along, so accepting the held stores does not accept them too
+        ev = G.evaluate_doctor(0, "Preserved retired model ids.\n1 store held back.\nDoctor complete.\n")
+        self.assertEqual([e["code"] for e in G.acceptable_doctor(ev)], ["doctor-held-back", "doctor-warnings"])
+        self.assertEqual(G.acceptable_doctor(G.evaluate_doctor(0, "Doctor complete.\n")), [])
         # rc != 0: a specific failure wins over held-back warnings printed earlier in the same run
         text = "Warning: Agent deletion journal reconstructed; 1 store held back.\nconfig fixes were not applied"
         self.assertEqual(G.evaluate_doctor(1, text)["code"], "doctor-config-write")
@@ -1558,6 +1563,24 @@ class GateRunMoreTests(GateEnv):
         self.assertEqual(self.run_gate(), 0, self.out)
         self.assertEqual([d["pass"] for d in self.journal()["doctor"]], [1, 2])  # pass 1 not re-run
         self.assertIn("WARN [gate] accepted doctor-held-back", self.out)
+
+    def test_rc0_held_back_with_warnings_needs_both_accepted(self):
+        self.build_735()
+        doc = self.bin / "held-warn-doctor"
+        doc.write_text(FAKE_DOCTOR + "\nprint('│  Preserved retired model ids: openai/gpt-4o │')"
+                                     "\nprint('│  1 agent store remain held │')\n")
+        doc.chmod(0o755)
+        self.hooks(doctor_cmd=[str(doc)])
+        self.assertEqual(self.run_gate(), 20, self.out)
+        j = self.journal()
+        self.assertEqual((j["hold"]["codes"], j["phase"]), (["doctor-held-back", "doctor-warnings"], "doctor1"))
+        self.assertIn("--accept doctor-held-back,doctor-warnings", (self.upg / "hold.txt").read_text())
+        G.retry_cmd(["--accept", "doctor-held-back"], emit=lambda s: None)
+        self.assertEqual(self.run_gate(), 20, self.out)  # pass 1 again: the warnings are still unaccepted
+        self.assertEqual(self.journal()["hold"]["codes"], ["doctor-warnings"])
+        G.retry_cmd(["--accept", "doctor-warnings"], emit=lambda s: None)
+        self.assertEqual(self.run_gate(), 0, self.out)
+        self.assertEqual([d["pass"] for d in self.journal()["doctor"]], [1, 1, 2])
 
     def test_rc0_held_back_first_in_pass2_holds_in_doctor2(self):
         self.build_735()
