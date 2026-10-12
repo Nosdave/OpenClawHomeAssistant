@@ -293,7 +293,7 @@ class EnvTests(TmpCase):
 class RedactTests(unittest.TestCase):
     def test_review_patterns(self):
         """F12: secrets in key: value, CLI flag, URL userinfo and Telegram Bot API forms."""
-        tok = "98CQRdpOS9aIqH9zUd6Q0jBQEYcz5bTw"
+        tok = "fakeGatewayTokenForUnitTests0000"  # 32 chars, like a gateway token
         for raw, want in (
                 ("{ mode: 'token', token: '%s' }" % tok, "{ mode: 'token', token: '***' }"),
                 ("token: %s" % tok, "token: ***"),
