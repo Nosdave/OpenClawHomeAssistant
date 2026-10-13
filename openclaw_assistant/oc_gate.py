@@ -2359,6 +2359,7 @@ class Gate:
         """F1-F3 (from-7x) or F1b (bump/maintenance), then F4 (contract addendum 2)."""
         M = mig()
         p, rd = self.gp, self.run_dir()
+        self.glm_recover()
         cfg_now = self.read_config()
         pre_pass1 = C.read_json_strict(rd / "config.pre-pass1.json")
         if self.j["mode"] == "from-7x":
@@ -2403,7 +2404,8 @@ class Gate:
 
     def glm_thinking_step(self):
         """G1 (add-on option glm_thinking_levels, every mode): GLM models send the thinking level as
-        reasoning_effort. Validated on its own; a failure restores the fixups' config and only warns."""
+        reasoning_effort. Validated on its own; a failure restores the fixups' config and only warns.
+        journal glm_thinking.pending marks a write whose validation has not finished (see glm_recover)."""
         M = mig()
         p, rd = self.gp, self.run_dir()
         try:
@@ -2411,39 +2413,64 @@ class Gate:
         except C.ConfigReadError as exc:  # left to pc-config (hard) in the postconditions
             self.warn(f"GLM thinking levels skipped: openclaw.json cannot be read ({exc})")
             return
-        refs = [f"{pid}/{mid}" for pid, _i, mid in M.glm_thinking_candidates(cur)]
+        on = C.addon_options().get("glm_thinking_levels") is True
+        scan = M.glm_thinking_scan(cur)
+        refs = [f"{pid}/{mid}" for pid, _i, mid in scan["convert"]]
+        if on:
+            for ref, why in scan["skip"]:
+                self.say(f"6/9 info: GLM thinking levels: {ref} left as is ({why})")
         if not refs:
             return
-        if C.addon_options().get("glm_thinking_levels") is not True:
+        if not on:
             self.say(f"6/9 info: {', '.join(refs)} only switch thinking on/off (qwen-chat-template); the add-on "
                      "option glm_thinking_levels sends the thinking level instead")
             return
-        new_cfg, ledger, summary = M.glm_thinking_levels(cur)
+        new_cfg, ledger, refs = M.glm_thinking_levels(cur)
         before = rd / "config.pre-g1.json"
         self.save_copy(p["CONFIG_PATH"], before)
-        self.ledger_add(ledger, {"G1"})  # first, so an interrupted write is never left unledgered
+        self.j["glm_thinking"] = {"pending": True, "refs": refs}
+        self.save()
+        self.ledger_add(ledger, {"G1"})
         try:
             self.write_config(new_cfg)
             ok, detail = self.config_validate("pc-g1-validate")
         except ValueError as exc:
             ok, detail = False, f"{type(exc).__name__}: {exc}"
+        except BaseException:  # stop request or crash: never leave an unvalidated G1 write behind
+            self.glm_undo(refs, "interrupted")
+            raise
         if not ok:
-            C.atomic_write_bytes(p["CONFIG_PATH"], before.read_bytes())
-            self.read_config()
-            self.ledger_add([], {"G1"})
-            self.j["glm_thinking"] = {"applied": False, "refs": refs, "reason": detail}
-            self.save()
+            self.glm_undo(refs, detail)
             self.warn(f"GLM thinking levels not applied ({detail}); openclaw.json restored")
             return
         C.atomic_write_json(rd / "config.post-fixups.json", new_cfg)
-        self.j["glm_thinking"] = {"applied": True, "refs": summary["refs"],
-                                  "preserve_skipped": summary["preserve_skipped"]}
+        self.j["glm_thinking"] = {"applied": True, "refs": refs}
         self.save()
-        self.say(f"6/9 GLM thinking levels: {', '.join(summary['refs'])} send the level as reasoning_effort "
-                 "(off -> none, minimal/low -> low, medium/high -> high, xhigh/max -> max)")
-        if summary["preserve_skipped"]:
-            self.warn("GLM thinking levels: preserve_thinking not kept for " + "; ".join(summary["preserve_skipped"])
-                      + " (add it under agents.defaults.models[<ref>].params.chat_template_kwargs if needed)")
+        self.say(f"6/9 GLM thinking levels: {', '.join(refs)} send the level as reasoning_effort "
+                 "(off -> none, minimal/low -> low, medium/high -> high, xhigh/max -> max); "
+                 f"{len(ledger)} change(s) in {rd / 'transform-ledger.json'}")
+
+    def glm_undo(self, refs, reason):
+        """Put back config.pre-g1.json and drop this run's G1 ledger entries."""
+        rd = self.run_dir()
+        C.atomic_write_bytes(self.gp["CONFIG_PATH"], (rd / "config.pre-g1.json").read_bytes())
+        try:
+            self.read_config()
+        except C.ConfigReadError:
+            pass
+        self.ledger_add([], {"G1"})
+        self.j["glm_thinking"] = {"applied": False, "refs": refs, "reason": reason}
+        self.save()
+
+    def glm_recover(self):
+        """Start of the fixups phase: a G1 write that was cut off before its validation finished (SIGKILL,
+        power loss) is undone first, so the fixups' own validate never judges an unvalidated G1 result
+        and G1 runs again with its own validate."""
+        g1 = self.j.get("glm_thinking") or {}
+        if g1.get("pending") and (self.run_dir() / "config.pre-g1.json").exists():
+            self.glm_undo(g1.get("refs") or [], "interrupted")
+            self.say("6/9 GLM thinking levels: the step was interrupted before its check finished; "
+                     "openclaw.json restored, running it again")
 
     def post_pass_fixups(self, n):
         """F1b after doctor pass 2/3 (contract addendum 2 rule 4). Returns True when the config changed."""
@@ -3457,6 +3484,9 @@ def dry_run(network=False, emit=out):
             return 20
         if not gate_needed:
             emit(f"[gate] dry-run: nothing to migrate (marker: {(marker or {}).get('mode') or 'none'})")
+            if isinstance(cfg, dict):  # G1 also runs in a maintenance gate (oc-upgrade retry --doctor + restart)
+                for ln in mig().glm_thinking_preview(cfg, C.addon_options().get("glm_thinking_levels") is True):
+                    emit("[gate] dry-run: " + ln)
             return 0
         mode = infer_mode(cls, cfg)
         emit(f"[gate] dry-run: a gate would run in mode {mode}")
@@ -3509,12 +3539,8 @@ def readiness(g, mode):
             _s, led, _sum = M.premigrate_sessions(store, relp)
             n += len(led)
         lines.append(f"[gate]   sessions: {n} runtime pin(s) would be written")
-    g1 = [f"{pid}/{mid}" for pid, _i, mid in M.glm_thinking_candidates(g.cfg)] if g.cfg else []
-    if g1:
-        on = C.addon_options().get("glm_thinking_levels") is True
-        lines.append(f"[gate]   GLM thinking levels (option glm_thinking_levels {'on' if on else 'off'}): "
-                     + ", ".join(g1) + (" would send the level as reasoning_effort (G1)" if on
-                                        else " keep the on/off thinking switch"))
+    if g.cfg:
+        lines += ["[gate]   " + ln for ln in M.glm_thinking_preview(g.cfg, C.addon_options().get("glm_thinking_levels") is True)]
     b = g.budget()
     lines.append(f"[gate]   doctor budget {C.fmt_duration(b['doctor_pass_seconds'])}/pass (S={b['s_mib']} MiB)")
     return lines, F

@@ -149,4 +149,4 @@ configuration:
 
   glm_thinking_levels:
     name: GLM-Denkstufen
-    description: "Wird vom Migrations-Gate bei seinem nächsten Lauf angewendet (Update auf OpenClaw 2026.9+ oder 'oc-upgrade retry --doctor'). Ein GLM-Modell mit dem Denkformat 'qwen-chat-template' bekommt nur Denken an/aus. Wenn AN, stellt das Gate es auf reasoning_effort um, damit /think- und thinkingDefault-Stufen beim Modell ankommen ('aus' wird als 'none' gesendet; der GLM-Server muss das akzeptieren). Jede Änderung wird im Transform-Ledger des Gates protokolliert."
+    description: "Ein GLM-Modell mit dem Denkformat 'qwen-chat-template' bekommt nur Denken an/aus. Wenn AN, stellt das Migrations-Gate es bei seinem nächsten Lauf auf reasoning_effort um (OpenClaw-Update oder 'oc-upgrade retry --doctor' und ein Neustart; ein normaler Neustart reicht nicht), damit /think- und thinkingDefault-Stufen beim Modell ankommen. 'Aus' wird dann als 'none' statt enable_thinking gesendet: Prüfen Sie vorher Ihren GLM-Server (siehe Dokumentation). Wieder AUS schalten macht die Änderung nicht rückgängig. Jede Änderung wird im Transform-Ledger des Gates protokolliert."

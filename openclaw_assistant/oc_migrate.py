@@ -1786,23 +1786,23 @@ def apply_pins(cfg, ledgered_paths):
 # With compat.thinkingFormat "qwen-chat-template" a custom provider id only ever sends
 # chat_template_kwargs.enable_thinking, never a level (measured on 7.35, 9.9, 10.2 and 10.5-beta.2;
 # the level variant of that format is wired to the bundled `vllm` provider id only, 10.5
-# extensions/vllm/stream.ts). Without thinkingFormat and with supportsReasoningEffort, 9.9+ sends the
-# level as the root reasoning_effort, limited to supportedReasoningEfforts and remapped by
-# reasoningEffortMap (packages/ai openai-completions-policy + openai-reasoning-compat; 7.35 maps
-# "off" to "high", hence only after the migration). preserve_thinking, the chat-template format's
-# companion flag, is added through agents.defaults.models[<ref>].params.chat_template_kwargs (merged into
-# every request, v102 openai-completions-payload-policy), only where that entry already exists: the map
-# is also the model allowlist, so G1 never creates it.
+# extensions/vllm/stream.ts, so `vllm` is left alone). Without thinkingFormat and with
+# supportsReasoningEffort, 9.9+ sends the level as the root reasoning_effort, limited to
+# supportedReasoningEfforts and remapped by reasoningEffortMap (packages/ai openai-completions-policy,
+# openai-reasoning-compat; "off" becomes "none" only when "none" is in the list, so a model that already
+# has its own list or map is not converted). 7.35 maps "off" to "high": the gate only runs on 2026.9+.
 GLM_REASONING_EFFORTS = ["none", "low", "high", "max"]
 GLM_REASONING_EFFORT_MAP = {"minimal": "low", "medium": "high", "xhigh": "max"}
+# "glm" at the start of the id or after a separator: GLM-5.3-Flash, zai-org/glm-4.6 (not chatglm3)
 _GLM_ID_RE = re.compile(r"(?i)(?<![a-z0-9])glm")
 
 
-def glm_thinking_candidates(cfg):
-    """[(provider_id, model_index, model_id)] that G1 converts: a model whose id contains "glm", with
-    api openai-completions (model or provider), reasoning true, compat.thinkingFormat
-    "qwen-chat-template" and supportsReasoningEffort not false."""
-    out = []
+def glm_thinking_scan(cfg):
+    """GLM models (id matches _GLM_ID_RE, reasoning true, compat.thinkingFormat "qwen-chat-template", api
+    openai-completions or unset) -> {"convert": [(provider_id, model_index, model_id)],
+    "skip": [(ref, reason)]}. Skipped: the bundled vllm provider id, a supportsReasoningEffort false,
+    and models that already have their own supportedReasoningEfforts or reasoningEffortMap."""
+    out = {"convert": [], "skip": []}
     provs = _get(cfg, ["models", "providers"], None) if isinstance(cfg, dict) else None
     if not isinstance(provs, dict):
         return out
@@ -1813,62 +1813,60 @@ def glm_thinking_candidates(cfg):
             if not isinstance(m, dict):
                 continue
             mid, compat = m.get("id"), m.get("compat")
-            if (isinstance(mid, str) and _GLM_ID_RE.search(mid)
-                    and (m.get("api") or prov.get("api")) == "openai-completions"
+            # compat.thinkingFormat is an openai-completions setting, and OpenClaw runs a custom provider
+            # without an api as openai-completions
+            if not (isinstance(mid, str) and _GLM_ID_RE.search(mid)
+                    and (m.get("api") or prov.get("api") or "openai-completions") == "openai-completions"
                     and m.get("reasoning") is True and isinstance(compat, dict)
-                    and compat.get("thinkingFormat") == "qwen-chat-template"
-                    and compat.get("supportsReasoningEffort") is not False):
-                out.append((pid, i, mid))
+                    and compat.get("thinkingFormat") == "qwen-chat-template"):
+                continue
+            ref = "%s/%s" % (pid, mid)
+            if str(pid).strip().lower() == "vllm":
+                out["skip"].append((ref, "provider id vllm: OpenClaw 2026.10.5+ sends its levels itself"))
+            elif compat.get("supportsReasoningEffort") is False:
+                out["skip"].append((ref, "compat.supportsReasoningEffort is false"))
+            elif "supportedReasoningEfforts" in compat or "reasoningEffortMap" in compat:
+                out["skip"].append((ref, "has its own supportedReasoningEfforts / reasoningEffortMap"))
+            else:
+                out["convert"].append((pid, i, mid))
     return out
 
 
 def glm_thinking_levels(cfg):
-    """G1: move the glm_thinking_candidates to the root reasoning_effort contract.
-
-    Removes compat.thinkingFormat, sets compat.supportsReasoningEffort, and adds
-    supportedReasoningEfforts / reasoningEffortMap and the preserve_thinking param only where absent.
-    Returns (new_cfg, ledger[{step, file, path, before, after}], summary{refs, preserve_skipped}).
-    """
+    """G1: move the models glm_thinking_scan converts to the root reasoning_effort contract: remove
+    compat.thinkingFormat, set supportsReasoningEffort, add GLM_REASONING_EFFORTS and
+    GLM_REASONING_EFFORT_MAP. Returns (new_cfg, ledger[{step, file, path, before, after}], refs)."""
     if not isinstance(cfg, dict):
         raise ValueError("openclaw.json top-level value is not an object")
     new = copy.deepcopy(cfg)
-    ledger, refs, preserve_skipped = [], [], []
-
-    def log(parts, before, after):
-        ledger.append({"step": "G1", "file": CONFIG_FILE, "path": fmt_path(parts),
-                       "before": copy.deepcopy(before), "after": copy.deepcopy(after)})
-
-    models = _get(new, ["agents", "defaults", "models"], None)
-    for pid, i, mid in glm_thinking_candidates(new):
+    ledger, refs = [], []
+    for pid, i, mid in glm_thinking_scan(new)["convert"]:
         base = ["models", "providers", pid, "models", i, "compat"]
         compat = _get(new, base)
-        log(base + ["thinkingFormat"], compat.pop("thinkingFormat"), None)
-        if compat.get("supportsReasoningEffort") is not True:
-            log(base + ["supportsReasoningEffort"], compat.get("supportsReasoningEffort"), True)
-            compat["supportsReasoningEffort"] = True
-        for key, value in (("supportedReasoningEfforts", GLM_REASONING_EFFORTS),
+        changes = [("thinkingFormat", compat.pop("thinkingFormat"), None)]
+        for key, value in (("supportsReasoningEffort", True), ("supportedReasoningEfforts", GLM_REASONING_EFFORTS),
                            ("reasoningEffortMap", GLM_REASONING_EFFORT_MAP)):
-            if key not in compat:
+            if compat.get(key) != value:
+                changes.append((key, compat.get(key), value))
                 compat[key] = copy.deepcopy(value)
-                log(base + [key], None, value)
-        ref = "%s/%s" % (pid, mid)
-        refs.append(ref)
-        key = next((k for k in (ref, "%s/%s" % (str(pid).strip().lower(), mid))
-                    if isinstance(models, dict) and isinstance(models.get(k), dict)), None)
-        if key is None:
-            preserve_skipped.append("%s (no agents.defaults.models entry)" % ref)
-            continue
-        params = models[key].get("params")
-        # OpenClaw reads the first of chat_template_kwargs / chatTemplateKwargs a source has
-        kw_key = ("chatTemplateKwargs" if isinstance(params, dict) and "chatTemplateKwargs" in params
-                  and "chat_template_kwargs" not in params else "chat_template_kwargs")
-        kw = _ensure_dict_path(models[key], ["params", kw_key])
-        if kw is None:
-            preserve_skipped.append("%s (params.%s is not an object)" % (ref, kw_key))
-        elif "preserve_thinking" not in kw:
-            kw["preserve_thinking"] = True
-            log(["agents", "defaults", "models", key, "params", kw_key, "preserve_thinking"], None, True)
-    return new, ledger, {"refs": refs, "preserve_skipped": preserve_skipped}
+        ledger += [{"step": "G1", "file": CONFIG_FILE, "path": fmt_path(base + [k]),
+                    "before": copy.deepcopy(b), "after": copy.deepcopy(a)} for k, b, a in changes]
+        refs.append("%s/%s" % (pid, mid))
+    return new, ledger, refs
+
+
+def glm_thinking_preview(cfg, option_on):
+    """Read-only lines for `gate --dry-run` / `oc-upgrade check`: what G1 would do (or why not)."""
+    scan = glm_thinking_scan(cfg)
+    lines = []
+    if scan["convert"]:
+        refs = ", ".join("%s/%s" % (pid, mid) for pid, _i, mid in scan["convert"])
+        lines.append("GLM thinking levels (option glm_thinking_levels %s): %s %s" % (
+            "on" if option_on else "off", refs,
+            "would send the level as reasoning_effort at the next gate run (G1)" if option_on
+            else "only switch thinking on/off"))
+    lines += ["GLM thinking levels: %s left as is (%s)" % (ref, why) for ref, why in scan["skip"]]
+    return lines
 
 
 # --- auth order (§7.8 step 0) ---------------------------------------------------------------

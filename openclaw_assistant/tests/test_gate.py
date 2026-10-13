@@ -2033,6 +2033,9 @@ def cfg_735_glm():
 class GlmThinkingLevelsGateTests(GateEnv):
     """G1: add-on option glm_thinking_levels (default off)."""
 
+    CONVERTED = {"supportsReasoningEffort": True, "supportedReasoningEfforts": ["none", "low", "high", "max"],
+                 "reasoningEffortMap": {"minimal": "low", "medium": "high", "xhigh": "max"}}
+
     def setup_glm(self, **options):
         self.build_735()
         self.write_cfg(cfg_735_glm())
@@ -2050,8 +2053,7 @@ class GlmThinkingLevelsGateTests(GateEnv):
     def test_off_by_default_only_informs(self):
         self.setup_glm(timezone="Europe/Vienna")
         self.assertEqual(self.run_gate(), 0, self.out)
-        compat, _cfg = self.glm_compat()
-        self.assertEqual(compat, {"thinkingFormat": "qwen-chat-template"})
+        self.assertEqual(self.glm_compat()[0], {"thinkingFormat": "qwen-chat-template"})
         self.assertIn(f"6/9 info: {GLM_REF} only switch thinking on/off", self.out)
         self.assertNotIn("glm_thinking", self.journal())
         self.assertEqual(self.g1_ledger(), [])
@@ -2060,41 +2062,99 @@ class GlmThinkingLevelsGateTests(GateEnv):
         self.setup_glm(glm_thinking_levels=True)
         self.assertEqual(self.run_gate(), 0, self.out)
         compat, cfg = self.glm_compat()
-        self.assertEqual(compat, {"supportsReasoningEffort": True,
-                                  "supportedReasoningEfforts": ["none", "low", "high", "max"],
-                                  "reasoningEffortMap": {"minimal": "low", "medium": "high", "xhigh": "max"}})
-        self.assertEqual(cfg["agents"]["defaults"]["models"][GLM_REF]["params"],
-                         {"chat_template_kwargs": {"preserve_thinking": True}})
+        self.assertEqual(compat, self.CONVERTED)
+        self.assertEqual(cfg["agents"]["defaults"]["models"][GLM_REF], {"alias": "GLM"})  # no params added
         self.assertIn(f"6/9 GLM thinking levels: {GLM_REF} send the level as reasoning_effort", self.out)
-        self.assertEqual(len(self.g1_ledger()), 5)
+        self.assertIn("4 change(s) in", self.out)
+        self.assertEqual(len(self.g1_ledger()), 4)
         j = self.journal()
-        self.assertEqual(j["glm_thinking"], {"applied": True, "refs": [GLM_REF], "preserve_skipped": []})
+        self.assertEqual(j["glm_thinking"], {"applied": True, "refs": [GLM_REF]})
         rd = self.upg / "gate" / "runs" / j["run_id"]
         post = json.loads((rd / "config.post-fixups.json").read_text())
-        self.assertNotIn("thinkingFormat", post["models"]["providers"]["glm"]["models"][0]["compat"])
+        self.assertEqual(post["models"]["providers"]["glm"]["models"][0]["compat"], self.CONVERTED)
         self.assertEqual(json.loads((rd / "config.pre-g1.json").read_text())["models"]["providers"]["glm"]
                          ["models"][0]["compat"], {"thinkingFormat": "qwen-chat-template"})
+
+    def test_skipped_models_are_named_when_the_option_is_on(self):
+        self.build_735()
+        cfg = cfg_735_glm()
+        cfg["models"]["providers"]["glm"]["models"][0]["compat"]["supportedReasoningEfforts"] = ["low", "high"]
+        self.write_cfg(cfg)
+        self.options(glm_thinking_levels=True)
+        self.hooks()
+        self.assertEqual(self.run_gate(), 0, self.out)
+        self.assertIn(f"6/9 info: GLM thinking levels: {GLM_REF} left as is (has its own supportedReasoningEfforts",
+                      self.out)
+        self.assertEqual(self.glm_compat()[0]["thinkingFormat"], "qwen-chat-template")
 
     def test_validate_failure_restores_and_the_gate_goes_on(self):
         self.setup_glm(glm_thinking_levels=True)
         os.environ["FAKE_OC_MODE"] = "invalid-glm"
         self.assertEqual(self.run_gate(), 0, self.out)
-        compat, _cfg = self.glm_compat()
-        self.assertEqual(compat, {"thinkingFormat": "qwen-chat-template"})
+        self.assertEqual(self.glm_compat()[0], {"thinkingFormat": "qwen-chat-template"})
         self.assertIn("WARN [gate] GLM thinking levels not applied", self.out)
         self.assertEqual(self.g1_ledger(), [])
         self.assertFalse(self.journal()["glm_thinking"]["applied"])
+
+    def test_stop_during_the_g1_check_restores_and_resumes(self):
+        self.setup_glm(glm_thinking_levels=True)
+        real = G.Gate.config_validate
+
+        def stop_in_g1(gate, tag):
+            if tag == "pc-g1-validate":
+                G.STOP.set()
+                raise G.GateStopped()
+            return real(gate, tag)
+        with mock.patch.object(G.Gate, "config_validate", stop_in_g1):
+            self.assertEqual(self.run_gate(), 143, self.out)
+        # the interrupted step left neither the G1 write nor its ledger entries behind
+        self.assertEqual(self.glm_compat()[0], {"thinkingFormat": "qwen-chat-template"})
+        self.assertEqual(self.g1_ledger(), [])
+        G.STOP.clear()
+        os.environ["FAKE_OC_MODE"] = "invalid-glm"  # a rejected G1 result must still only warn on resume
+        self.assertEqual(self.run_gate(), 0, self.out)
+        self.assertIn("WARN [gate] GLM thinking levels not applied", self.out)
+        self.assertNotIn("fixups-invalid", self.out)
+        self.assertEqual(self.glm_compat()[0], {"thinkingFormat": "qwen-chat-template"})
+
+    def test_killed_after_the_write_is_undone_on_resume(self):
+        self.setup_glm(glm_thinking_levels=True)
+        real = G.Gate.config_validate
+
+        def die_in_g1(gate, tag):
+            if tag == "pc-g1-validate":
+                raise SystemExit(137)  # SIGKILL stand-in: nothing after the write runs ...
+            return real(gate, tag)
+        orig_undo = G.Gate.glm_undo
+        with mock.patch.object(G.Gate, "config_validate", die_in_g1), \
+                mock.patch.object(G.Gate, "glm_undo", lambda *a, **k: None):  # ... not even the undo
+            with self.assertRaises(SystemExit):
+                self.run_gate()
+        self.assertEqual(self.glm_compat()[0], self.CONVERTED)  # unvalidated G1 write on disk
+        self.assertTrue(self.journal()["glm_thinking"]["pending"])
+        self.assertIs(G.Gate.glm_undo, orig_undo)
+        os.environ["FAKE_OC_MODE"] = "invalid-glm"
+        self.assertEqual(self.run_gate(), 0, self.out)
+        self.assertIn("6/9 GLM thinking levels: the step was interrupted before its check finished", self.out)
+        self.assertIn("WARN [gate] GLM thinking levels not applied", self.out)
+        self.assertNotIn("fixups-invalid", self.out)
+        self.assertEqual(self.glm_compat()[0], {"thinkingFormat": "qwen-chat-template"})
+        self.assertEqual(self.g1_ledger(), [])
 
     def test_maintenance_run_applies_it_later(self):
         self.setup_glm()
         self.assertEqual(self.run_gate(), 0, self.out)
         self.assertEqual(self.glm_compat()[0], {"thinkingFormat": "qwen-chat-template"})
         self.options(glm_thinking_levels=True)
+        lines = []
+        G.dry_run(network=False, emit=lines.append)  # migrated install: the preview still shows it
+        self.assertIn(f"[gate] dry-run: GLM thinking levels (option glm_thinking_levels on): {GLM_REF} would send",
+                      "\n".join(lines))
         self.assertEqual(G.retry_cmd(["--doctor"], emit=lambda s: None), 0)
         self.assertEqual(self.run_gate(), 0, self.out)
         self.assertEqual(self.journal()["mode"], "maintenance")
-        self.assertTrue(self.glm_compat()[0]["supportsReasoningEffort"])
-        self.assertEqual(len(self.g1_ledger()), 5)
+        self.assertEqual(self.glm_compat()[0], self.CONVERTED)
+        self.assertEqual(len(self.g1_ledger()), 4)
 
     def test_dry_run_preview(self):
         self.setup_glm(glm_thinking_levels=True)

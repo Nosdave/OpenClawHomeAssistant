@@ -352,7 +352,7 @@ To provide the SSH key: place the private key file in the add-on config director
 | `persist_brew_tools` | bool | `false` | Persist Homebrew and brew-installed CLI tools in `/config/.linuxbrew/`. Turn on only if you want those installs to survive add-on rebuilds. |
 | `auto_configure_mcp` | bool | `false` | Auto-register Home Assistant as an MCP server on startup (requires `homeassistant_token`) |
 | `config_backup_keep` | int | `10` | How many `openclaw.json` snapshots to keep in `/config/.openclaw/backups`. See [Config snapshots & rollback](#7a-config-snapshots--rollback). `0` disables snapshots. Range: 0-100 |
-| `glm_thinking_levels` | bool | `false` | GLM models set up with the `qwen-chat-template` thinking format only get thinking on/off. When `true`, the migration gate switches them to `reasoning_effort` on its next run, so `/think` and `thinkingDefault` levels reach the model. See [GLM thinking levels](#glm-thinking-levels-option-glm_thinking_levels) |
+| `glm_thinking_levels` | bool | `false` | GLM models set up with the `qwen-chat-template` thinking format only get thinking on/off. When `true`, the migration gate switches them to `reasoning_effort` at its next run (an OpenClaw update, or `oc-upgrade retry --doctor` and a restart; a normal restart does not apply it). Check your GLM server first; switching the option off does not undo it. See [GLM thinking levels](#glm-thinking-levels-option-glm_thinking_levels) |
 
 ### Performance
 
@@ -996,9 +996,10 @@ lines start with `[gate]` and are numbered `1/9` … `9/9`.
    backups for the window (a backup taken mid-migration is not a rollback point).
 3. **Stop the add-on**, create a Home Assistant backup of it (**Settings → System →
    Backups**) and download it. Plan 1–3 hours.
-4. Update to `0.5.94-full1`. If a GLM model should get thinking levels, turn on
-   `glm_thinking_levels` in the add-on's **Configuration** tab now (see
-   [GLM thinking levels](#glm-thinking-levels-option-glm_thinking_levels)). Start the add-on. Leave the log open. While the gate runs
+4. Update to `0.5.94-full1`. If a GLM model should get thinking levels and your GLM
+   server passed the check in [GLM thinking levels](#glm-thinking-levels-option-glm_thinking_levels),
+   turn on `glm_thinking_levels` in the add-on's **Configuration** tab now. Start the
+   add-on. Leave the log open. While the gate runs
    the add-on page is not available yet; **do not stop the add-on while
    `[gate] … doctor pass … running` is shown** (it would resume once on the next
    start, but it costs time).
@@ -1045,34 +1046,75 @@ them before anything is changed:
 #### GLM thinking levels (option `glm_thinking_levels`)
 
 A GLM model configured with `compat.thinkingFormat: "qwen-chat-template"` only gets
-thinking on or off (`chat_template_kwargs.enable_thinking`): OpenClaw sends no level
-(`/think high`, `thinkingDefault: "low"` and so on) for a provider id of your own.
-Measured on 2026.7.35, 2026.9.9, 2026.10.2 and 2026.10.5-beta; only the bundled
-`vllm` provider id gets levels in that format, and only from 2026.10.5.
+thinking on or off (`chat_template_kwargs.enable_thinking`): for a provider id of
+your own, OpenClaw sends no level (`/think high`, `thinkingDefault: "low"` and so
+on). Measured on 2026.7.35, 2026.9.9, 2026.10.2 and 2026.10.5-beta; in that format
+only the bundled `vllm` provider id gets levels, from 2026.10.5.
 
-With `glm_thinking_levels: true` the gate's next run (phase 6; the update to
-2026.10, or `oc-upgrade retry --doctor` and a restart later) changes every model
-whose id contains `glm`, with `api: "openai-completions"`, `reasoning: true` and that
-thinking format:
+**What the option changes.** With `glm_thinking_levels: true` the gate converts
+each model that has `glm` at the start of its id or after a separator
+(`GLM-5.3-Flash-EXL3`, `zai-org/glm-4.6`; not `chatglm3`), `reasoning: true`, that
+thinking format and `api: "openai-completions"` (or no `api`). It leaves alone, and
+names in the log, models under the provider id `vllm` and models that already have
+their own `supportedReasoningEfforts` or `reasoningEffortMap`. For each converted
+model, `compat.thinkingFormat` is removed and these are set:
 
-- `compat.thinkingFormat` is removed and `compat.supportsReasoningEffort: true` set;
-- `compat.supportedReasoningEfforts: ["none", "low", "high", "max"]` and
-  `compat.reasoningEffortMap: {"minimal": "low", "medium": "high", "xhigh": "max"}`
-  are added unless you set them;
-- `preserve_thinking: true` (the chat-template format's companion flag) is added
-  through `agents.defaults.models["<provider>/<model>"].params.chat_template_kwargs`,
-  but only if that entry exists (the gate never creates the model list; it is also
-  the model allowlist).
+```json
+"supportsReasoningEffort": true,
+"supportedReasoningEfforts": ["none", "low", "high", "max"],
+"reasoningEffortMap": {"minimal": "low", "medium": "high", "xhigh": "max"}
+```
 
-OpenClaw then sends the level as `reasoning_effort` in the request body: off →
-`"none"`, minimal/low → `"low"`, medium/high → `"high"`, xhigh/max → `"max"`, in
-the gateway, chat `/think` and `thinkingDefault` alike. Your GLM server must
-accept `reasoning_effort` (including `"none"` for off; check this on your server
-first). Every change is listed in the gate log and recorded with its old value in
-the run's `transform-ledger.json` (step `G1`). If `config validate` rejects the
-result, the gate restores the file, prints a `WARN` and goes on. `oc-upgrade check`
-shows what the option would change. Do not set these keys on 2026.7: 7.35 sends
-`"high"` for off.
+OpenClaw then sends the level as the root `reasoning_effort` (gateway turns, chat
+`/think`, session levels, `thinkingDefault`, per-agent defaults): off → `"none"`,
+minimal/low → `"low"`, medium/high → `"high"`, xhigh/max → `"max"`. It no longer
+sends `chat_template_kwargs.enable_thinking`.
+
+**Check your GLM server first.** "Off" then works only if the server treats
+`reasoning_effort: "none"` as no thinking, and a server that rejects `"none"` or
+`"max"` makes those turns fail. Test it before turning the option on:
+
+```sh
+curl -s http://<glm-host>:<port>/v1/chat/completions -H 'Content-Type: application/json' \
+  -d '{"model":"<model id>","messages":[{"role":"user","content":"2+2?"}],"reasoning_effort":"none","max_tokens":300}'
+```
+
+The reply must succeed without reasoning (no or an empty `reasoning_content`); the
+same request with `"max"` must succeed too. Add `-H 'Authorization: Bearer <key>'`
+if your server needs a key.
+
+**When it applies.** At the gate's next run: the update to 2026.10 (turn the option
+on after updating and before starting, runbook step 4), or later with
+`oc-upgrade retry --doctor` followed by an add-on restart (a full maintenance gate
+with a new archive). A normal restart does not apply it. While the option is on,
+every later gate run, including each OpenClaw update, converts matching models
+again. `oc-upgrade check` (section F) and `oc-upgrade gate --dry-run` show which
+models it would change.
+
+**Log and ledger.** The gate log names the converted models
+(`[gate] 6/9 GLM thinking levels: …`). Each change, with its old value, is in
+`/config/.openclaw-upgrade/gate/runs/<run>/transform-ledger.json` (step `G1`), and
+the config before the step is in `config.pre-g1.json` next to it. If
+`config validate` rejects the result, or the step is interrupted, the gate puts
+the file back, prints a `WARN` and goes on.
+
+**Undo.** Switching the option off does not undo the change. Switch it off first
+(otherwise the next gate run converts the model again), then restore the old
+values, for example for the first model of the provider `glm`:
+
+```sh
+openclaw config set 'models.providers.glm.models[0].compat.thinkingFormat' qwen-chat-template
+openclaw config unset 'models.providers.glm.models[0].compat.supportsReasoningEffort'
+openclaw config unset 'models.providers.glm.models[0].compat.supportedReasoningEfforts'
+openclaw config unset 'models.providers.glm.models[0].compat.reasoningEffortMap'
+```
+
+**`preserve_thinking`.** The gate does not set it. With a provider id of your own,
+OpenClaw does not send it with either format (measured on 2026.10.2 and
+2026.10.5-beta). If your server needs it, add
+`agents.defaults.models["glm/<model id>"].params.chat_template_kwargs.preserve_thinking: true`
+yourself (provider id in lower case). A `chat_template_kwargs` there replaces one in
+`agents.defaults.params`; it is not merged.
 
 The gate, the gateway and every `openclaw` command run on the image's Node.js (the
 one the image build checked), even if Homebrew installed another `node` that comes

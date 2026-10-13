@@ -148,5 +148,5 @@ configuration:
     description: Quantos snapshots do openclaw.json manter em /config/.openclaw/backups. Um snapshot é criado antes da primeira gravação de configuração de cada inicialização, para que alterações indesejadas possam ser revertidas com 'oc-config restore'. Use 0 para desativar os snapshots.
 
   glm_thinking_levels:
-    name: GLM Thinking Levels
-    description: "Applied by the migration gate on its next run (the update to OpenClaw 2026.9+, or 'oc-upgrade retry --doctor'). A GLM model set up with the 'qwen-chat-template' thinking format only gets thinking on/off. When ON, the gate switches it to reasoning_effort so /think and thinkingDefault levels reach the model (off is sent as 'none'; the GLM server must accept that). Every change is recorded in the gate's transform ledger."
+    name: Níveis de raciocínio do GLM
+    description: "Um modelo GLM configurado com o formato de raciocínio 'qwen-chat-template' só permite ligar ou desligar o raciocínio. Quando LIGADO, o gate de migração o converte para reasoning_effort na próxima execução (uma atualização do OpenClaw, ou 'oc-upgrade retry --doctor' e uma reinicialização; uma reinicialização normal não aplica), para que os níveis de /think e thinkingDefault cheguem ao modelo. 'Desligado' passa a ser enviado como 'none' em vez de enable_thinking: verifique antes o seu servidor GLM (veja a documentação). DESLIGAR a opção novamente não desfaz a alteração. Cada alteração é registrada no registro de transformações do gate."

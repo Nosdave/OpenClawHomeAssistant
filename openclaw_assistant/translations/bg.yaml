@@ -148,5 +148,5 @@ configuration:
     description: Колко копия на openclaw.json да се пазят в /config/.openclaw/backups. Копие се създава преди първия запис на конфигурацията при всяко стартиране, така че нежеланите промени да могат да се отменят с 'oc-config restore'. Задайте 0, за да изключите копията.
 
   glm_thinking_levels:
-    name: GLM Thinking Levels
-    description: "Applied by the migration gate on its next run (the update to OpenClaw 2026.9+, or 'oc-upgrade retry --doctor'). A GLM model set up with the 'qwen-chat-template' thinking format only gets thinking on/off. When ON, the gate switches it to reasoning_effort so /think and thinkingDefault levels reach the model (off is sent as 'none'; the GLM server must accept that). Every change is recorded in the gate's transform ledger."
+    name: Нива на мислене за GLM
+    description: "GLM модел, настроен с формат на мислене 'qwen-chat-template', може само да включва или изключва мисленето. Когато е ВКЛЮЧЕНО, миграционният gate при следващото си изпълнение (обновяване на OpenClaw или 'oc-upgrade retry --doctor' и рестарт; обикновен рестарт не го прилага) го превключва към reasoning_effort, за да достигат нивата от /think и thinkingDefault до модела. 'Изключено' тогава се изпраща като 'none' вместо enable_thinking: първо проверете своя GLM сървър (вижте документацията). Повторното ИЗКЛЮЧВАНЕ на опцията не отменя промяната. Всяка промяна се записва в дневника на трансформациите на gate."

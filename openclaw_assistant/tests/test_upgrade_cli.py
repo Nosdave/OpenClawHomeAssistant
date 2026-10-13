@@ -178,5 +178,23 @@ class StateGuardCheckTests(CliEnv):
         self.assertIn("openai-codex/* wildcards are expanded", self.stdout)
 
 
+    def test_check_glm_preview(self):
+        self.build_735()
+        cfg = json.loads((self.state / "openclaw.json").read_text())
+        cfg["models"]["providers"]["glm"] = {"api": "openai-completions", "baseUrl": "http://192.0.2.10:8888/v1",
+                                             "models": [{"id": "GLM-5.3-Flash-EXL3", "reasoning": True,
+                                                         "compat": {"thinkingFormat": "qwen-chat-template"}}]}
+        self.write_cfg(cfg)
+        opts = self.tmp / "options.json"
+        opts.write_text(json.dumps({"glm_thinking_levels": True}))
+        env = {"OPENCLAW_RUNTIME_VERSION": T.RUNTIME, "OC_ADDON_OPTIONS_FILE": str(opts)}
+        self.cli("check", env=env)
+        self.assertIn("GLM thinking levels (option glm_thinking_levels on): glm/GLM-5.3-Flash-EXL3 would send "
+                      "the level as reasoning_effort", self.stdout)
+        opts.write_text(json.dumps({}))
+        self.cli("check", env=env)
+        self.assertIn("(option glm_thinking_levels off): glm/GLM-5.3-Flash-EXL3 only switch thinking on/off",
+                      self.stdout)
+
 if __name__ == "__main__":
     unittest.main()
