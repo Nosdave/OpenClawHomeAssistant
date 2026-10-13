@@ -1781,6 +1781,96 @@ def apply_pins(cfg, ledgered_paths):
     return new, written, skipped
 
 
+# --- G1 GLM thinking levels (add-on option glm_thinking_levels, opt-in) ----------------------------
+#
+# With compat.thinkingFormat "qwen-chat-template" a custom provider id only ever sends
+# chat_template_kwargs.enable_thinking, never a level (measured on 7.35, 9.9, 10.2 and 10.5-beta.2;
+# the level variant of that format is wired to the bundled `vllm` provider id only, 10.5
+# extensions/vllm/stream.ts). Without thinkingFormat and with supportsReasoningEffort, 9.9+ sends the
+# level as the root reasoning_effort, limited to supportedReasoningEfforts and remapped by
+# reasoningEffortMap (packages/ai openai-completions-policy + openai-reasoning-compat; 7.35 maps
+# "off" to "high", hence only after the migration). preserve_thinking, the chat-template format's
+# companion flag, is added through agents.defaults.models[<ref>].params.chat_template_kwargs (merged into
+# every request, v102 openai-completions-payload-policy), only where that entry already exists: the map
+# is also the model allowlist, so G1 never creates it.
+GLM_REASONING_EFFORTS = ["none", "low", "high", "max"]
+GLM_REASONING_EFFORT_MAP = {"minimal": "low", "medium": "high", "xhigh": "max"}
+_GLM_ID_RE = re.compile(r"(?i)(?<![a-z0-9])glm")
+
+
+def glm_thinking_candidates(cfg):
+    """[(provider_id, model_index, model_id)] that G1 converts: a model whose id contains "glm", with
+    api openai-completions (model or provider), reasoning true, compat.thinkingFormat
+    "qwen-chat-template" and supportsReasoningEffort not false."""
+    out = []
+    provs = _get(cfg, ["models", "providers"], None) if isinstance(cfg, dict) else None
+    if not isinstance(provs, dict):
+        return out
+    for pid, prov in provs.items():
+        if not isinstance(prov, dict) or not isinstance(prov.get("models"), list):
+            continue
+        for i, m in enumerate(prov["models"]):
+            if not isinstance(m, dict):
+                continue
+            mid, compat = m.get("id"), m.get("compat")
+            if (isinstance(mid, str) and _GLM_ID_RE.search(mid)
+                    and (m.get("api") or prov.get("api")) == "openai-completions"
+                    and m.get("reasoning") is True and isinstance(compat, dict)
+                    and compat.get("thinkingFormat") == "qwen-chat-template"
+                    and compat.get("supportsReasoningEffort") is not False):
+                out.append((pid, i, mid))
+    return out
+
+
+def glm_thinking_levels(cfg):
+    """G1: move the glm_thinking_candidates to the root reasoning_effort contract.
+
+    Removes compat.thinkingFormat, sets compat.supportsReasoningEffort, and adds
+    supportedReasoningEfforts / reasoningEffortMap and the preserve_thinking param only where absent.
+    Returns (new_cfg, ledger[{step, file, path, before, after}], summary{refs, preserve_skipped}).
+    """
+    if not isinstance(cfg, dict):
+        raise ValueError("openclaw.json top-level value is not an object")
+    new = copy.deepcopy(cfg)
+    ledger, refs, preserve_skipped = [], [], []
+
+    def log(parts, before, after):
+        ledger.append({"step": "G1", "file": CONFIG_FILE, "path": fmt_path(parts),
+                       "before": copy.deepcopy(before), "after": copy.deepcopy(after)})
+
+    models = _get(new, ["agents", "defaults", "models"], None)
+    for pid, i, mid in glm_thinking_candidates(new):
+        base = ["models", "providers", pid, "models", i, "compat"]
+        compat = _get(new, base)
+        log(base + ["thinkingFormat"], compat.pop("thinkingFormat"), None)
+        if compat.get("supportsReasoningEffort") is not True:
+            log(base + ["supportsReasoningEffort"], compat.get("supportsReasoningEffort"), True)
+            compat["supportsReasoningEffort"] = True
+        for key, value in (("supportedReasoningEfforts", GLM_REASONING_EFFORTS),
+                           ("reasoningEffortMap", GLM_REASONING_EFFORT_MAP)):
+            if key not in compat:
+                compat[key] = copy.deepcopy(value)
+                log(base + [key], None, value)
+        ref = "%s/%s" % (pid, mid)
+        refs.append(ref)
+        key = next((k for k in (ref, "%s/%s" % (str(pid).strip().lower(), mid))
+                    if isinstance(models, dict) and isinstance(models.get(k), dict)), None)
+        if key is None:
+            preserve_skipped.append("%s (no agents.defaults.models entry)" % ref)
+            continue
+        params = models[key].get("params")
+        # OpenClaw reads the first of chat_template_kwargs / chatTemplateKwargs a source has
+        kw_key = ("chatTemplateKwargs" if isinstance(params, dict) and "chatTemplateKwargs" in params
+                  and "chat_template_kwargs" not in params else "chat_template_kwargs")
+        kw = _ensure_dict_path(models[key], ["params", kw_key])
+        if kw is None:
+            preserve_skipped.append("%s (params.%s is not an object)" % (ref, kw_key))
+        elif "preserve_thinking" not in kw:
+            kw["preserve_thinking"] = True
+            log(["agents", "defaults", "models", key, "params", kw_key, "preserve_thinking"], None, True)
+    return new, ledger, {"refs": refs, "preserve_skipped": preserve_skipped}
+
+
 # --- auth order (§7.8 step 0) ---------------------------------------------------------------
 
 

@@ -372,6 +372,13 @@ def load_json_or_none(path):
         return None
 
 
+def addon_options():
+    """The add-on options the Supervisor rendered (/data/options.json; env OC_ADDON_OPTIONS_FILE for
+    tests); {} when the file is missing or unreadable."""
+    data = load_json_or_none(os.environ.get("OC_ADDON_OPTIONS_FILE") or "/data/options.json")
+    return data if isinstance(data, dict) else {}
+
+
 def sha256_file(path, stop_event=None, chunk=MIB):
     """sha256 of a regular file without following a final symlink. Polls stop_event (B17)."""
     flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)

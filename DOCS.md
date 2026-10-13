@@ -352,6 +352,7 @@ To provide the SSH key: place the private key file in the add-on config director
 | `persist_brew_tools` | bool | `false` | Persist Homebrew and brew-installed CLI tools in `/config/.linuxbrew/`. Turn on only if you want those installs to survive add-on rebuilds. |
 | `auto_configure_mcp` | bool | `false` | Auto-register Home Assistant as an MCP server on startup (requires `homeassistant_token`) |
 | `config_backup_keep` | int | `10` | How many `openclaw.json` snapshots to keep in `/config/.openclaw/backups`. See [Config snapshots & rollback](#7a-config-snapshots--rollback). `0` disables snapshots. Range: 0-100 |
+| `glm_thinking_levels` | bool | `false` | GLM models set up with the `qwen-chat-template` thinking format only get thinking on/off. When `true`, the migration gate switches them to `reasoning_effort` on its next run, so `/think` and `thinkingDefault` levels reach the model. See [GLM thinking levels](#glm-thinking-levels-option-glm_thinking_levels) |
 
 ### Performance
 
@@ -995,7 +996,9 @@ lines start with `[gate]` and are numbered `1/9` … `9/9`.
    backups for the window (a backup taken mid-migration is not a rollback point).
 3. **Stop the add-on**, create a Home Assistant backup of it (**Settings → System →
    Backups**) and download it. Plan 1–3 hours.
-4. Update to `0.5.94-full1` and start it. Leave the log open. While the gate runs
+4. Update to `0.5.94-full1`. If a GLM model should get thinking levels, turn on
+   `glm_thinking_levels` in the add-on's **Configuration** tab now (see
+   [GLM thinking levels](#glm-thinking-levels-option-glm_thinking_levels)). Start the add-on. Leave the log open. While the gate runs
    the add-on page is not available yet; **do not stop the add-on while
    `[gate] … doctor pass … running` is shown** (it would resume once on the next
    start, but it costs time).
@@ -1019,7 +1022,7 @@ need them (they contain secrets).
 | 2 archive | `/config/.openclaw` + workspace → `/share/openclaw-upgrade/<run>/openclaw-state-<ts>-before-2026.10.2.tar.gz`, with `manifest.json` and `SHA256SUMS`; verified by re-reading it. |
 | 3 cleanup | Transient SQLite sidecars, legacy Telegram caches and pre-July-2026 files whose content is already in SQLite are moved to `/config/.openclaw-upgrade/gate/quarantine/<run>/` (kept, listed in the log). |
 | 4 pre-migrate | `plugins.installs` is removed from `openclaw.json` when its records are in the SQLite plugin index. For legacy `openai-codex/…` refs: wildcards → explicit models; these refs keep the OpenClaw runtime they used on 2026.7. |
-| 5–7 doctor | `openclaw doctor --fix --non-interactive` twice (a third time only if the second still changed the config), each with a time limit and a progress line every minute; scoped fixups in between. Canonical `openai/*` refs keep their runtime (Codex app-server by default, as on 2026.7; an `agentRuntime` pin on an `openai/…` entry is kept). A model used both as `openai-codex/<model>` and as `openai/<model>` gets one route in 2026.9+: the precheck holds with the acceptable code `models-route-collision`. Agent databases doctor "held back" (acceptable `doctor-held-back`), plugin data upgrades still "unfinished" and login renames still deferred after the last pass hold. |
+| 5–7 doctor | `openclaw doctor --fix --non-interactive` twice (a third time only if the second still changed the config), each with a time limit and a progress line every minute; scoped fixups in between. Canonical `openai/*` refs keep their runtime (Codex app-server by default, as on 2026.7; an `agentRuntime` pin on an `openai/…` entry is kept). A model used both as `openai-codex/<model>` and as `openai/<model>` gets one route in 2026.9+: the precheck holds with the acceptable code `models-route-collision`. Agent databases doctor "held back" (acceptable `doctor-held-back`), plugin data upgrades still "unfinished" and login renames still deferred after the last pass hold. With `glm_thinking_levels` on, GLM models are switched to thinking levels after the fixups (below). |
 | 8 postconditions | Schema versions, `config validate`, `doctor --lint`, no legacy refs, runtime of migrated refs, `models status`, sessions. |
 | 9 pins | Keeps 2026.7 defaults where you have not set the key (see the 0.5.94-full1 changelog), recorded in `/config/.openclaw-upgrade/gate/pins-ledger.json` and never re-applied. |
 
@@ -1038,6 +1041,38 @@ them before anything is changed:
 | Retired settings in `openclaw.json` (`config-retired-keys`), the old memory index tables in an agent database (`retired-memory-index`), pre-July database shapes (`pre-july-schema`), an unsupported `telegram/ingress-spool-*` entry, leftovers outside `/config/.openclaw` | hard HOLD; the message says what to do (for `retired-memory-index`: run `openclaw memory index --agent <id>` on 0.5.93, which converts the index) |
 
 `oc-upgrade check` of this version (`0.5.94-full1`; not 0.5.93) lists them in section "C2"; database findings and everything that would HOLD appear in its readiness section ("a gate would HOLD with: …"). The gate runs these checks in every mode, also for later OpenClaw updates.
+
+#### GLM thinking levels (option `glm_thinking_levels`)
+
+A GLM model configured with `compat.thinkingFormat: "qwen-chat-template"` only gets
+thinking on or off (`chat_template_kwargs.enable_thinking`): OpenClaw sends no level
+(`/think high`, `thinkingDefault: "low"` and so on) for a provider id of your own.
+Measured on 2026.7.35, 2026.9.9, 2026.10.2 and 2026.10.5-beta; only the bundled
+`vllm` provider id gets levels in that format, and only from 2026.10.5.
+
+With `glm_thinking_levels: true` the gate's next run (phase 6; the update to
+2026.10, or `oc-upgrade retry --doctor` and a restart later) changes every model
+whose id contains `glm`, with `api: "openai-completions"`, `reasoning: true` and that
+thinking format:
+
+- `compat.thinkingFormat` is removed and `compat.supportsReasoningEffort: true` set;
+- `compat.supportedReasoningEfforts: ["none", "low", "high", "max"]` and
+  `compat.reasoningEffortMap: {"minimal": "low", "medium": "high", "xhigh": "max"}`
+  are added unless you set them;
+- `preserve_thinking: true` (the chat-template format's companion flag) is added
+  through `agents.defaults.models["<provider>/<model>"].params.chat_template_kwargs`,
+  but only if that entry exists (the gate never creates the model list; it is also
+  the model allowlist).
+
+OpenClaw then sends the level as `reasoning_effort` in the request body: off →
+`"none"`, minimal/low → `"low"`, medium/high → `"high"`, xhigh/max → `"max"`, in
+the gateway, chat `/think` and `thinkingDefault` alike. Your GLM server must
+accept `reasoning_effort` (including `"none"` for off; check this on your server
+first). Every change is listed in the gate log and recorded with its old value in
+the run's `transform-ledger.json` (step `G1`). If `config validate` rejects the
+result, the gate restores the file, prints a `WARN` and goes on. `oc-upgrade check`
+shows what the option would change. Do not set these keys on 2026.7: 7.35 sends
+`"high"` for off.
 
 The gate, the gateway and every `openclaw` command run on the image's Node.js (the
 one the image build checked), even if Homebrew installed another `node` that comes

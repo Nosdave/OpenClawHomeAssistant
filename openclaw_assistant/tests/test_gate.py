@@ -5,6 +5,7 @@ OC_CONFIG_ROOT, OC_ADDON_ENTRY_FILE) with a fake `node` (fake OpenClaw CLI) and 
 passed through the OC_GATE_TEST_HOOKS doctor_cmd hook. The real oc_migrate is used.
 """
 
+import copy
 import io
 import json
 import os
@@ -54,6 +55,8 @@ def out(o, rc=0):
 if cmd[:2] == ["config", "validate"]:
     if "invalid-config" in mode:
         out({"valid": False, "issues": [{"message": "bogus key"}]}, 1)
+    if "invalid-glm" in mode and "supportsReasoningEffort" in open(os.environ["OPENCLAW_CONFIG_PATH"]).read():
+        out({"valid": False, "issues": [{"message": "models.providers.glm.models.0.compat: unknown key"}]}, 1)
     out({"valid": True, "path": "x", "warnings": []})
 if cmd[:1] == ["doctor"] and "--lint" in cmd:
     f = []
@@ -222,7 +225,8 @@ class GateEnv(unittest.TestCase):
             "OPENCLAW_STATE_DIR": str(self.state), "OC_UPGRADE_DIR": str(self.upg),
             "OC_UPGRADE_SHARE_DIR": str(self.share), "OC_CONFIG_ROOT": str(self.root),
             "OC_ADDON_ENTRY_FILE": str(self.tmp / "entry"), "PATH": f"{self.bin}:{os.environ.get('PATH', '')}",
-            "OC_GATE_TEST_HOOKS": "1", "TMPDIR": str(self.tmp), "ADDON_VERSION": "0.5.94-test"})
+            "OC_GATE_TEST_HOOKS": "1", "TMPDIR": str(self.tmp), "ADDON_VERSION": "0.5.94-test",
+            "OC_ADDON_OPTIONS_FILE": str(self.tmp / "options.json")})
         self.env.start()
         for k in ("OPENCLAW_CONFIG_PATH", "OPENCLAW_WORKSPACE_DIR", "OPENCLAW_RUNTIME_VERSION", "FAKE_OC_MODE",
                   "SQLITE_TMPDIR", "OC_GATE_FROM_RUNSH"):
@@ -250,6 +254,9 @@ class GateEnv(unittest.TestCase):
 
     def journal(self):
         return json.loads((self.upg / "gate" / "journal.json").read_text())
+
+    def options(self, **kw):
+        (self.tmp / "options.json").write_text(json.dumps(kw))
 
     def quiet(self, fn, *a, **kw):
         buf, err = io.StringIO(), io.StringIO()
@@ -2009,6 +2016,96 @@ class ReviewFixTests(GateEnv):
         j = self.journal()
         self.assertEqual(j["cron_openai_ids"], ["gpt-5.4-mini", "gpt-5.5"])
         self.assertTrue(j["fixups"]["codex_needed"])
+
+
+GLM_REF = "glm/GLM-5.3-Flash-EXL3"
+
+
+def cfg_735_glm():
+    cfg = copy.deepcopy(CFG_735)
+    cfg["models"]["providers"]["glm"] = {
+        "api": "openai-completions", "baseUrl": "http://192.0.2.10:8888/v1",
+        "models": [{"id": "GLM-5.3-Flash-EXL3", "reasoning": True, "compat": {"thinkingFormat": "qwen-chat-template"}}]}
+    cfg["agents"]["defaults"]["models"][GLM_REF] = {"alias": "GLM"}
+    return cfg
+
+
+class GlmThinkingLevelsGateTests(GateEnv):
+    """G1: add-on option glm_thinking_levels (default off)."""
+
+    def setup_glm(self, **options):
+        self.build_735()
+        self.write_cfg(cfg_735_glm())
+        self.options(**options)
+        self.hooks()
+
+    def glm_compat(self):
+        cfg = json.loads((self.state / "openclaw.json").read_text())
+        return cfg["models"]["providers"]["glm"]["models"][0]["compat"], cfg
+
+    def g1_ledger(self):
+        rd = self.upg / "gate" / "runs" / self.journal()["run_id"]
+        return [e for e in json.loads((rd / "transform-ledger.json").read_text()) if e.get("step") == "G1"]
+
+    def test_off_by_default_only_informs(self):
+        self.setup_glm(timezone="Europe/Vienna")
+        self.assertEqual(self.run_gate(), 0, self.out)
+        compat, _cfg = self.glm_compat()
+        self.assertEqual(compat, {"thinkingFormat": "qwen-chat-template"})
+        self.assertIn(f"6/9 info: {GLM_REF} only switch thinking on/off", self.out)
+        self.assertNotIn("glm_thinking", self.journal())
+        self.assertEqual(self.g1_ledger(), [])
+
+    def test_option_converts_and_ledgers(self):
+        self.setup_glm(glm_thinking_levels=True)
+        self.assertEqual(self.run_gate(), 0, self.out)
+        compat, cfg = self.glm_compat()
+        self.assertEqual(compat, {"supportsReasoningEffort": True,
+                                  "supportedReasoningEfforts": ["none", "low", "high", "max"],
+                                  "reasoningEffortMap": {"minimal": "low", "medium": "high", "xhigh": "max"}})
+        self.assertEqual(cfg["agents"]["defaults"]["models"][GLM_REF]["params"],
+                         {"chat_template_kwargs": {"preserve_thinking": True}})
+        self.assertIn(f"6/9 GLM thinking levels: {GLM_REF} send the level as reasoning_effort", self.out)
+        self.assertEqual(len(self.g1_ledger()), 5)
+        j = self.journal()
+        self.assertEqual(j["glm_thinking"], {"applied": True, "refs": [GLM_REF], "preserve_skipped": []})
+        rd = self.upg / "gate" / "runs" / j["run_id"]
+        post = json.loads((rd / "config.post-fixups.json").read_text())
+        self.assertNotIn("thinkingFormat", post["models"]["providers"]["glm"]["models"][0]["compat"])
+        self.assertEqual(json.loads((rd / "config.pre-g1.json").read_text())["models"]["providers"]["glm"]
+                         ["models"][0]["compat"], {"thinkingFormat": "qwen-chat-template"})
+
+    def test_validate_failure_restores_and_the_gate_goes_on(self):
+        self.setup_glm(glm_thinking_levels=True)
+        os.environ["FAKE_OC_MODE"] = "invalid-glm"
+        self.assertEqual(self.run_gate(), 0, self.out)
+        compat, _cfg = self.glm_compat()
+        self.assertEqual(compat, {"thinkingFormat": "qwen-chat-template"})
+        self.assertIn("WARN [gate] GLM thinking levels not applied", self.out)
+        self.assertEqual(self.g1_ledger(), [])
+        self.assertFalse(self.journal()["glm_thinking"]["applied"])
+
+    def test_maintenance_run_applies_it_later(self):
+        self.setup_glm()
+        self.assertEqual(self.run_gate(), 0, self.out)
+        self.assertEqual(self.glm_compat()[0], {"thinkingFormat": "qwen-chat-template"})
+        self.options(glm_thinking_levels=True)
+        self.assertEqual(G.retry_cmd(["--doctor"], emit=lambda s: None), 0)
+        self.assertEqual(self.run_gate(), 0, self.out)
+        self.assertEqual(self.journal()["mode"], "maintenance")
+        self.assertTrue(self.glm_compat()[0]["supportsReasoningEffort"])
+        self.assertEqual(len(self.g1_ledger()), 5)
+
+    def test_dry_run_preview(self):
+        self.setup_glm(glm_thinking_levels=True)
+        lines = []
+        G.dry_run(network=False, emit=lines.append)
+        self.assertIn(f"GLM thinking levels (option glm_thinking_levels on): {GLM_REF} would send the level",
+                      "\n".join(lines))
+        self.options(glm_thinking_levels=False)
+        lines = []
+        G.dry_run(network=False, emit=lines.append)
+        self.assertIn("(option glm_thinking_levels off)", "\n".join(lines))
 
 
 class DryRunTests(GateEnv):

@@ -146,3 +146,7 @@ configuration:
   config_backup_keep:
     name: Liczba przechowywanych kopii konfiguracji
     description: Ile kopii openclaw.json przechowywać w /config/.openclaw/backups. Kopia powstaje przed pierwszym zapisem konfiguracji przy każdym starcie, dzięki czemu niechciane zmiany można cofnąć poleceniem 'oc-config restore'. Ustaw 0, aby wyłączyć kopie.
+
+  glm_thinking_levels:
+    name: GLM Thinking Levels
+    description: "Applied by the migration gate on its next run (the update to OpenClaw 2026.9+, or 'oc-upgrade retry --doctor'). A GLM model set up with the 'qwen-chat-template' thinking format only gets thinking on/off. When ON, the gate switches it to reasoning_effort so /think and thinkingDefault levels reach the model (off is sent as 'none'; the GLM server must accept that). Every change is recorded in the gate's transform ledger."

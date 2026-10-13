@@ -2083,6 +2083,115 @@ class TestVllmUntouched(unittest.TestCase):
         self.assertEqual(summary, {"pinned": [], "user_explicit": [], "harness": []})
 
 
+def glm_cfg():
+    """Live-shaped GLM block (provider glm, qwen-chat-template) next to a non-GLM qwen model."""
+    return {
+        "agents": {"defaults": {"model": {"primary": "glm/GLM-5.3-Flash-EXL3"}, "thinkingDefault": "low",
+                                "models": {"glm/GLM-5.3-Flash-EXL3": {"alias": "GLM"}, "vllm/qwen3.5-122b": {}}}},
+        "models": {"providers": {
+            "glm": {"api": "openai-completions", "baseUrl": "http://192.0.2.10:8888/v1",
+                    "models": [{"id": "GLM-5.3-Flash-EXL3", "reasoning": True,
+                                "compat": {"thinkingFormat": "qwen-chat-template"}}]},
+            "vllm": {"api": "openai-completions", "baseUrl": "http://192.0.2.10:8000/v1",
+                     "models": [{"id": "qwen3.5-122b", "reasoning": True,
+                                 "compat": {"thinkingFormat": "qwen-chat-template"}}]}}},
+    }
+
+
+class TestGlmThinkingLevels(unittest.TestCase):
+    """G1 (add-on option glm_thinking_levels): the level goes out as the root reasoning_effort."""
+
+    def test_converts_glm_and_keeps_preserve_thinking(self):
+        before = glm_cfg()
+        snap = copy.deepcopy(before)
+        self.assertEqual(m.glm_thinking_candidates(before), [("glm", 0, "GLM-5.3-Flash-EXL3")])
+        new, ledger, summary = m.glm_thinking_levels(before)
+        self.assertEqual(before, snap)  # input untouched
+        compat = new["models"]["providers"]["glm"]["models"][0]["compat"]
+        self.assertEqual(compat, {"supportsReasoningEffort": True,
+                                  "supportedReasoningEfforts": ["none", "low", "high", "max"],
+                                  "reasoningEffortMap": {"minimal": "low", "medium": "high", "xhigh": "max"}})
+        self.assertEqual(new["agents"]["defaults"]["models"]["glm/GLM-5.3-Flash-EXL3"],
+                         {"alias": "GLM", "params": {"chat_template_kwargs": {"preserve_thinking": True}}})
+        self.assertEqual(new["models"]["providers"]["vllm"], snap["models"]["providers"]["vllm"])  # not GLM
+        self.assertEqual(summary, {"refs": ["glm/GLM-5.3-Flash-EXL3"], "preserve_skipped": []})
+        self.assertEqual([(e["step"], e["path"], e["before"], e["after"]) for e in ledger], [
+            ("G1", "models.providers.glm.models[0].compat.thinkingFormat", "qwen-chat-template", None),
+            ("G1", "models.providers.glm.models[0].compat.supportsReasoningEffort", None, True),
+            ("G1", "models.providers.glm.models[0].compat.supportedReasoningEfforts", None,
+             ["none", "low", "high", "max"]),
+            ("G1", "models.providers.glm.models[0].compat.reasoningEffortMap", None,
+             {"minimal": "low", "medium": "high", "xhigh": "max"}),
+            ("G1", 'agents.defaults.models["glm/GLM-5.3-Flash-EXL3"].params.chat_template_kwargs.preserve_thinking',
+             None, True)])
+        # idempotent: a second run (resume, maintenance) finds nothing to do
+        self.assertEqual(m.glm_thinking_candidates(new), [])
+        again, ledger2, summary2 = m.glm_thinking_levels(new)
+        self.assertEqual((again, ledger2, summary2["refs"]), (new, [], []))
+
+    def test_existing_choices_are_kept(self):
+        cfg = glm_cfg()
+        c = cfg["models"]["providers"]["glm"]["models"][0]["compat"]
+        c.update(supportsReasoningEffort=True, supportedReasoningEfforts=["low", "high"],
+                 reasoningEffortMap={"medium": "low"})
+        cfg["agents"]["defaults"]["models"]["glm/GLM-5.3-Flash-EXL3"]["params"] = {
+            "temperature": 0.6, "chat_template_kwargs": {"preserve_thinking": False}}
+        new, ledger, _s = m.glm_thinking_levels(cfg)
+        c2 = new["models"]["providers"]["glm"]["models"][0]["compat"]
+        self.assertEqual(c2, {"supportsReasoningEffort": True, "supportedReasoningEfforts": ["low", "high"],
+                              "reasoningEffortMap": {"medium": "low"}})
+        self.assertEqual(new["agents"]["defaults"]["models"]["glm/GLM-5.3-Flash-EXL3"]["params"],
+                         {"temperature": 0.6, "chat_template_kwargs": {"preserve_thinking": False}})
+        self.assertEqual([e["path"].rsplit(".", 1)[1] for e in ledger], ["thinkingFormat"])
+
+    def test_preserve_thinking_never_creates_the_model_map(self):
+        cfg = glm_cfg()
+        del cfg["agents"]["defaults"]["models"]  # also the model allowlist: never created
+        new, _l, summary = m.glm_thinking_levels(cfg)
+        self.assertNotIn("models", new["agents"]["defaults"])
+        self.assertEqual(summary["preserve_skipped"], ["glm/GLM-5.3-Flash-EXL3 (no agents.defaults.models entry)"])
+        cfg = glm_cfg()
+        cfg["agents"]["defaults"]["models"]["glm/GLM-5.3-Flash-EXL3"]["params"] = "x"
+        _n, _l, summary = m.glm_thinking_levels(cfg)
+        self.assertEqual(summary["preserve_skipped"],
+                         ["glm/GLM-5.3-Flash-EXL3 (params.chat_template_kwargs is not an object)"])
+
+    def test_preserve_thinking_key_forms(self):
+        cfg = glm_cfg()
+        prov = cfg["models"]["providers"].pop("glm")
+        cfg["models"]["providers"]["GLM"] = prov  # provider keys are lower-cased in model refs
+        dm = cfg["agents"]["defaults"]["models"]
+        dm["glm/GLM-5.3-Flash-EXL3"] = {"params": {"chatTemplateKwargs": {"enable_thinking": True}}}
+        new, _l, summary = m.glm_thinking_levels(cfg)
+        self.assertEqual(summary["refs"], ["GLM/GLM-5.3-Flash-EXL3"])
+        # the camelCase alias is the one OpenClaw reads here, so the flag goes there
+        self.assertEqual(new["agents"]["defaults"]["models"]["glm/GLM-5.3-Flash-EXL3"]["params"],
+                         {"chatTemplateKwargs": {"enable_thinking": True, "preserve_thinking": True}})
+
+    def test_only_glm_reasoning_qwen_template_models(self):
+        def cand(**model):
+            cfg = glm_cfg()
+            cfg["models"]["providers"]["glm"]["models"][0].update(model)
+            return [r[2] for r in m.glm_thinking_candidates(cfg)]
+        q = {"thinkingFormat": "qwen-chat-template"}
+        self.assertEqual(cand(), ["GLM-5.3-Flash-EXL3"])
+        self.assertEqual(cand(id="zai-org/glm-4.6", compat=dict(q)), ["zai-org/glm-4.6"])
+        self.assertEqual(cand(id="glm-5.3-flash", api="openai-completions"), ["glm-5.3-flash"])
+        self.assertEqual(cand(id="qwen3.5-122b"), [])                      # not GLM
+        self.assertEqual(cand(id="paraglm-1"), [])                         # "glm" inside a word
+        self.assertEqual(cand(reasoning=False), [])
+        self.assertEqual(cand(compat={"thinkingFormat": "qwen"}), [])
+        self.assertEqual(cand(compat=dict(q, supportsReasoningEffort=False)), [])
+        self.assertEqual(cand(api="anthropic-messages"), [])               # model api wins over the provider's
+        cfg = glm_cfg()
+        del cfg["models"]["providers"]["glm"]["api"]
+        self.assertEqual(m.glm_thinking_candidates(cfg), [])               # api unknown: left alone
+        for bad in (None, [], {"models": []}, {"models": {"providers": []}}):
+            self.assertEqual(m.glm_thinking_candidates(bad), [])
+        with self.assertRaises(ValueError):
+            m.glm_thinking_levels([])
+
+
 class TestPurity(unittest.TestCase):
     def test_all_transforms_leave_inputs_alone(self):
         before = spec_example()

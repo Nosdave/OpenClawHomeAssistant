@@ -202,6 +202,13 @@ options:
   # so a bad change can be rolled back with 'oc-config restore'. 0 disables.
   config_backup_keep: 10
 
+  # GLM thinking levels (applied by the migration gate, OpenClaw 2026.9+ only).
+  # A GLM model configured with compat.thinkingFormat "qwen-chat-template" only
+  # gets thinking on/off. When true, the gate's next run (the update, or
+  # 'oc-upgrade retry --doctor') switches it to reasoning_effort, so /think and
+  # thinkingDefault levels reach the model (off is sent as "none").
+  glm_thinking_levels: false
+
 
 schema:
   timezone: str
@@ -240,3 +247,4 @@ schema:
   ha_health_interval: int(15,3600)?
   ha_base_url: str?
   config_backup_keep: int(0,100)?
+  glm_thinking_levels: bool?
