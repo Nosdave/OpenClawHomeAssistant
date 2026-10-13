@@ -461,7 +461,7 @@ def cmd_check(_args):
                 print(f"  {f.get('cls', '').upper()} {f.get('code')}: {f.get('message')}")
                 bump(RC_NOTES, info_only or f.get("cls") == "info")
             # informational; G1 runs at the next gate run (update, or retry --doctor + restart)
-            for ln in M.glm_thinking_preview(cfg, C.addon_options().get("glm_thinking_levels") is True):
+            for ln in M.glm_thinking_preview(cfg, C.glm_thinking_option()):
                 print("  " + ln)
         except Exception as exc:  # noqa: BLE001
             print(f"  preflight n/a ({type(exc).__name__}: {exc})")

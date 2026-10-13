@@ -379,6 +379,12 @@ def addon_options():
     return data if isinstance(data, dict) else {}
 
 
+def glm_thinking_option():
+    """Add-on option glm_thinking_levels (gate step G1). Default true, as in config.yaml: the Supervisor
+    writes the default into options.json for an option the user never saved."""
+    return addon_options().get("glm_thinking_levels", True) is True
+
+
 def sha256_file(path, stop_event=None, chunk=MIB):
     """sha256 of a regular file without following a final symlink. Polls stop_event (B17)."""
     flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)

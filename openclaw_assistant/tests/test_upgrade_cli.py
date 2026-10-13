@@ -191,7 +191,7 @@ class StateGuardCheckTests(CliEnv):
         self.cli("check", env=env)
         self.assertIn("GLM thinking levels (option glm_thinking_levels on): glm/GLM-5.3-Flash-EXL3 would send "
                       "the level as reasoning_effort", self.stdout)
-        opts.write_text(json.dumps({}))
+        opts.write_text(json.dumps({"glm_thinking_levels": False}))
         self.cli("check", env=env)
         self.assertIn("(option glm_thinking_levels off): glm/GLM-5.3-Flash-EXL3 only switch thinking on/off",
                       self.stdout)

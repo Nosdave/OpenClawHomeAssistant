@@ -2413,7 +2413,7 @@ class Gate:
         except C.ConfigReadError as exc:  # left to pc-config (hard) in the postconditions
             self.warn(f"GLM thinking levels skipped: openclaw.json cannot be read ({exc})")
             return
-        on = C.addon_options().get("glm_thinking_levels") is True
+        on = C.glm_thinking_option()
         scan = M.glm_thinking_scan(cur)
         refs = [f"{pid}/{mid}" for pid, _i, mid in scan["convert"]]
         if on:
@@ -2424,6 +2424,10 @@ class Gate:
         if not on:
             self.say(f"6/9 info: {', '.join(refs)} only switch thinking on/off (qwen-chat-template); the add-on "
                      "option glm_thinking_levels sends the thinking level instead")
+            return
+        if not glm_runtime_ok(self.pkg.get("version")):  # 7.35 sends "high" for off and refuses max
+            self.say(f"6/9 info: GLM thinking levels need OpenClaw 2026.9+ (runtime {self.pkg.get('version')}); "
+                     f"{', '.join(refs)} left as is")
             return
         new_cfg, ledger, refs = M.glm_thinking_levels(cur)
         before = rd / "config.pre-g1.json"
@@ -3464,6 +3468,15 @@ def run_gate():
             pass
 
 
+GLM_MIN_RUNTIME = (2026, 9, 0, 0)
+
+
+def glm_runtime_ok(version):
+    """G1 needs the 2026.9+ reasoning_effort mapping (7.35 sends "high" for off and refuses max)."""
+    v = C.version_tuple(version)
+    return bool(v and v >= GLM_MIN_RUNTIME)
+
+
 def dry_run(network=False, emit=out):
     """Read-only preview of a gate run: rc 0 would pass, 20 would HOLD, 1 error."""
     if not has_upgrade_sensitive_state():
@@ -3485,7 +3498,7 @@ def dry_run(network=False, emit=out):
         if not gate_needed:
             emit(f"[gate] dry-run: nothing to migrate (marker: {(marker or {}).get('mode') or 'none'})")
             if isinstance(cfg, dict):  # G1 also runs in a maintenance gate (oc-upgrade retry --doctor + restart)
-                for ln in mig().glm_thinking_preview(cfg, C.addon_options().get("glm_thinking_levels") is True):
+                for ln in mig().glm_thinking_preview(cfg, C.glm_thinking_option()):
                     emit("[gate] dry-run: " + ln)
             return 0
         mode = infer_mode(cls, cfg)
@@ -3540,7 +3553,7 @@ def readiness(g, mode):
             n += len(led)
         lines.append(f"[gate]   sessions: {n} runtime pin(s) would be written")
     if g.cfg:
-        lines += ["[gate]   " + ln for ln in M.glm_thinking_preview(g.cfg, C.addon_options().get("glm_thinking_levels") is True)]
+        lines += ["[gate]   " + ln for ln in M.glm_thinking_preview(g.cfg, C.glm_thinking_option())]
     b = g.budget()
     lines.append(f"[gate]   doctor budget {C.fmt_duration(b['doctor_pass_seconds'])}/pass (S={b['s_mib']} MiB)")
     return lines, F
@@ -3743,6 +3756,15 @@ def status_lines():
         a = j.get("archive") or {}
         if a:
             L.append(f"  archive: {a.get('dir')}/{a.get('file')} ({C.human(a.get('size'))}, sha256 {str(a.get('sha256'))[:12]}…)")
+        g1 = j.get("glm_thinking")
+        if isinstance(g1, dict):
+            refs = ", ".join(g1.get("refs") or []) or "-"
+            if g1.get("applied"):
+                L.append(f"  GLM thinking levels (G1): applied to {refs} (transform-ledger.json, step G1)")
+            elif g1.get("pending"):
+                L.append(f"  GLM thinking levels (G1): interrupted for {refs}; undone and repeated on the next run")
+            else:
+                L.append(f"  GLM thinking levels (G1): not applied to {refs} ({g1.get('reason')})")
     else:
         L.append("Gate: no run recorded.")
     m = load_marker()

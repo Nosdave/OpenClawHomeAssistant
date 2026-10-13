@@ -2050,17 +2050,51 @@ class GlmThinkingLevelsGateTests(GateEnv):
         rd = self.upg / "gate" / "runs" / self.journal()["run_id"]
         return [e for e in json.loads((rd / "transform-ledger.json").read_text()) if e.get("step") == "G1"]
 
-    def test_off_by_default_only_informs(self):
-        self.setup_glm(timezone="Europe/Vienna")
+    def test_off_only_informs(self):
+        self.setup_glm(timezone="Europe/Vienna", glm_thinking_levels=False)
         self.assertEqual(self.run_gate(), 0, self.out)
         self.assertEqual(self.glm_compat()[0], {"thinkingFormat": "qwen-chat-template"})
         self.assertIn(f"6/9 info: {GLM_REF} only switch thinking on/off", self.out)
         self.assertNotIn("glm_thinking", self.journal())
         self.assertEqual(self.g1_ledger(), [])
 
+    def test_on_by_default(self):
+        # config.yaml default true: the Supervisor writes it; a missing key or file means the same
+        for opts in ({"timezone": "Europe/Vienna"}, None):
+            with self.subTest(opts=opts):
+                self.setUp_again()
+                self.build_735()
+                self.write_cfg(cfg_735_glm())
+                if opts is None:
+                    (self.tmp / "options.json").unlink(missing_ok=True)
+                else:
+                    self.options(**opts)
+                self.hooks()
+                self.assertEqual(self.run_gate(), 0, self.out)
+                self.assertEqual(self.glm_compat()[0], self.CONVERTED)
+
+    def setUp_again(self):
+        self.tearDown()
+        self.setUp()
+
+    def test_runtime_guard(self):
+        self.assertFalse(G.glm_runtime_ok("2026.7.35"))
+        self.assertFalse(G.glm_runtime_ok("2026.8.35"))
+        self.assertFalse(G.glm_runtime_ok(None))
+        self.assertTrue(G.glm_runtime_ok("2026.9.9"))
+        self.assertTrue(G.glm_runtime_ok("2026.10.2"))
+        self.assertTrue(G.glm_runtime_ok("2026.10.5-beta.2"))
+        self.setup_glm(glm_thinking_levels=True)
+        with mock.patch.object(G, "glm_runtime_ok", lambda v: False):
+            self.assertEqual(self.run_gate(), 0, self.out)
+        self.assertIn("6/9 info: GLM thinking levels need OpenClaw 2026.9+", self.out)
+        self.assertEqual(self.glm_compat()[0], {"thinkingFormat": "qwen-chat-template"})
+
     def test_option_converts_and_ledgers(self):
         self.setup_glm(glm_thinking_levels=True)
         self.assertEqual(self.run_gate(), 0, self.out)
+        self.assertIn(f"GLM thinking levels (G1): applied to {GLM_REF} (transform-ledger.json, step G1)",
+                      "\n".join(G.status_lines()))
         compat, cfg = self.glm_compat()
         self.assertEqual(compat, self.CONVERTED)
         self.assertEqual(cfg["agents"]["defaults"]["models"][GLM_REF], {"alias": "GLM"})  # no params added
@@ -2142,7 +2176,7 @@ class GlmThinkingLevelsGateTests(GateEnv):
         self.assertEqual(self.g1_ledger(), [])
 
     def test_maintenance_run_applies_it_later(self):
-        self.setup_glm()
+        self.setup_glm(glm_thinking_levels=False)
         self.assertEqual(self.run_gate(), 0, self.out)
         self.assertEqual(self.glm_compat()[0], {"thinkingFormat": "qwen-chat-template"})
         self.options(glm_thinking_levels=True)

@@ -352,7 +352,7 @@ To provide the SSH key: place the private key file in the add-on config director
 | `persist_brew_tools` | bool | `false` | Persist Homebrew and brew-installed CLI tools in `/config/.linuxbrew/`. Turn on only if you want those installs to survive add-on rebuilds. |
 | `auto_configure_mcp` | bool | `false` | Auto-register Home Assistant as an MCP server on startup (requires `homeassistant_token`) |
 | `config_backup_keep` | int | `10` | How many `openclaw.json` snapshots to keep in `/config/.openclaw/backups`. See [Config snapshots & rollback](#7a-config-snapshots--rollback). `0` disables snapshots. Range: 0-100 |
-| `glm_thinking_levels` | bool | `false` | GLM models set up with the `qwen-chat-template` thinking format only get thinking on/off. When `true`, the migration gate switches them to `reasoning_effort` at its next run (an OpenClaw update, or `oc-upgrade retry --doctor` and a restart; a normal restart does not apply it). Check your GLM server first; switching the option off does not undo it. See [GLM thinking levels](#glm-thinking-levels-option-glm_thinking_levels) |
+| `glm_thinking_levels` | bool | `true` | GLM models set up with the `qwen-chat-template` thinking format only get thinking on/off. When `true`, the migration gate switches them to `reasoning_effort` at its next run (an OpenClaw update, or `oc-upgrade retry --doctor` and a restart; a normal restart does not apply it). Your GLM server must treat `reasoning_effort: "none"` as no thinking. Set it to `false` before the update to keep on/off only; switching it off later does not undo the change. See [GLM thinking levels](#glm-thinking-levels-option-glm_thinking_levels) |
 
 ### Performance
 
@@ -996,10 +996,11 @@ lines start with `[gate]` and are numbered `1/9` … `9/9`.
    backups for the window (a backup taken mid-migration is not a rollback point).
 3. **Stop the add-on**, create a Home Assistant backup of it (**Settings → System →
    Backups**) and download it. Plan 1–3 hours.
-4. Update to `0.5.94-full1`. If a GLM model should get thinking levels and your GLM
-   server passed the check in [GLM thinking levels](#glm-thinking-levels-option-glm_thinking_levels),
-   turn on `glm_thinking_levels` in the add-on's **Configuration** tab now. Start the
-   add-on. Leave the log open. While the gate runs
+4. Update to `0.5.94-full1`. `glm_thinking_levels` is on by default: a GLM model with
+   the `qwen-chat-template` thinking format then gets thinking levels (see
+   [GLM thinking levels](#glm-thinking-levels-option-glm_thinking_levels); check your GLM
+   server first). To keep on/off only, turn it off in the add-on's **Configuration** tab
+   now. Start the add-on. Leave the log open. While the gate runs
    the add-on page is not available yet; **do not stop the add-on while
    `[gate] … doctor pass … running` is shown** (it would resume once on the next
    start, but it costs time).
@@ -1051,7 +1052,7 @@ your own, OpenClaw sends no level (`/think high`, `thinkingDefault: "low"` and s
 on). Measured on 2026.7.35, 2026.9.9, 2026.10.2 and 2026.10.5-beta; in that format
 only the bundled `vllm` provider id gets levels, from 2026.10.5.
 
-**What the option changes.** With `glm_thinking_levels: true` the gate converts
+**What the option changes.** With `glm_thinking_levels: true` (the default) the gate converts
 each model that has `glm` at the start of its id or after a separator
 (`GLM-5.3-Flash-EXL3`, `zai-org/glm-4.6`; not `chatglm3`), `reasoning: true`, that
 thinking format and `api: "openai-completions"` (or no `api`). It leaves alone, and
@@ -1083,8 +1084,9 @@ The reply must succeed without reasoning (no or an empty `reasoning_content`); t
 same request with `"max"` must succeed too. Add `-H 'Authorization: Bearer <key>'`
 if your server needs a key.
 
-**When it applies.** At the gate's next run: the update to 2026.10 (turn the option
-on after updating and before starting, runbook step 4), or later with
+**When it applies.** At the gate's next run: the update to 2026.10 (the option is on
+by default; turn it off after updating and before starting to keep on/off only,
+runbook step 4), or later with
 `oc-upgrade retry --doctor` followed by an add-on restart (a full maintenance gate
 with a new archive). A normal restart does not apply it. While the option is on,
 every later gate run, including each OpenClaw update, converts matching models
@@ -1097,6 +1099,9 @@ models it would change.
 the config before the step is in `config.pre-g1.json` next to it. If
 `config validate` rejects the result, or the step is interrupted, the gate puts
 the file back, prints a `WARN` and goes on.
+
+The gate only applies it with OpenClaw 2026.9 or newer (7.35 would send `"high"` for
+off). `oc-upgrade status` shows whether the last gate run applied it.
 
 **Undo.** Switching the option off does not undo the change. Switch it off first
 (otherwise the next gate run converts the model again), then restore the old

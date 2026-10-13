@@ -204,12 +204,13 @@ options:
 
   # GLM thinking levels (applied by the migration gate, OpenClaw 2026.9+ only).
   # A GLM model configured with compat.thinkingFormat "qwen-chat-template" only
-  # gets thinking on/off. When true, the gate's next run (an OpenClaw update, or
-  # 'oc-upgrade retry --doctor' and a restart; a normal restart does not apply
-  # it) switches it to reasoning_effort, so /think and thinkingDefault levels
-  # reach the model. Off is then sent as "none": check your GLM server first.
-  # Switching this off again does not undo the change (see DOCS: GLM thinking levels).
-  glm_thinking_levels: false
+  # gets thinking on/off. When true (the default), the gate's next run (an
+  # OpenClaw update, or 'oc-upgrade retry --doctor' and a restart; a normal
+  # restart does not apply it) switches it to reasoning_effort, so /think and
+  # thinkingDefault levels reach the model. Off is then sent as "none": the GLM
+  # server must treat that as no thinking. Set false before the update to keep
+  # on/off only; switching it off later does not undo the change (see DOCS).
+  glm_thinking_levels: true
 
 
 schema:
