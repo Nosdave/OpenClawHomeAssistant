@@ -1835,7 +1835,8 @@ def glm_thinking_scan(cfg):
 def glm_thinking_levels(cfg):
     """G1: move the models glm_thinking_scan converts to the root reasoning_effort contract: remove
     compat.thinkingFormat, set supportsReasoningEffort, add GLM_REASONING_EFFORTS and
-    GLM_REASONING_EFFORT_MAP. Returns (new_cfg, ledger[{step, file, path, before, after}], refs)."""
+    GLM_REASONING_EFFORT_MAP, drop a static model-level params.reasoning_effort.
+    Returns (new_cfg, ledger[{step, file, path, before, after}], refs)."""
     if not isinstance(cfg, dict):
         raise ValueError("openclaw.json top-level value is not an object")
     new = copy.deepcopy(cfg)
@@ -1851,6 +1852,18 @@ def glm_thinking_levels(cfg):
                 compat[key] = copy.deepcopy(value)
         ledger += [{"step": "G1", "file": CONFIG_FILE, "path": fmt_path(base + [k]),
                     "before": copy.deepcopy(b), "after": copy.deepcopy(a)} for k, b, a in changes]
+        # a static model-level params.reasoning_effort is not sent by 7.35-10.5 (measured), but it contradicts
+        # the levels and a later release could start sending it: drop it
+        model = _get(new, ["models", "providers", pid, "models", i])
+        params = model.get("params")
+        if isinstance(params, dict):
+            for key in ("reasoning_effort", "reasoningEffort"):
+                if key in params:
+                    ledger.append({"step": "G1", "file": CONFIG_FILE,
+                                   "path": fmt_path(["models", "providers", pid, "models", i, "params", key]),
+                                   "before": copy.deepcopy(params.pop(key)), "after": None})
+            if not params:
+                del model["params"]
         refs.append("%s/%s" % (pid, mid))
     return new, ledger, refs
 

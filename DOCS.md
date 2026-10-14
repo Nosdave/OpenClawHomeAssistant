@@ -1066,6 +1066,9 @@ model, `compat.thinkingFormat` is removed and these are set:
 "reasoningEffortMap": {"minimal": "low", "medium": "high", "xhigh": "max"}
 ```
 
+A static `params.reasoning_effort` on such a model is removed as well: OpenClaw
+2026.7–2026.10 does not send it, but it contradicts the levels.
+
 OpenClaw then sends the level as the root `reasoning_effort` (gateway turns, chat
 `/think`, session levels, `thinkingDefault`, per-agent defaults): off → `"none"`,
 minimal/low → `"low"`, medium/high → `"high"`, xhigh/max → `"max"`. It no longer
@@ -1112,6 +1115,16 @@ openclaw config set 'models.providers.glm.models[0].compat.thinkingFormat' qwen-
 openclaw config unset 'models.providers.glm.models[0].compat.supportsReasoningEffort'
 openclaw config unset 'models.providers.glm.models[0].compat.supportedReasoningEfforts'
 openclaw config unset 'models.providers.glm.models[0].compat.reasoningEffortMap'
+```
+
+**Request fields on the model entry are not sent.** OpenClaw (2026.7.35 to 2026.10.5-beta,
+measured) ignores `params` on `models.providers.<id>.models[]` for request fields. A
+GLM entry meant to never think, such as `params.chat_template_kwargs.enable_thinking: false`
+there, therefore thinks with the server's default. Put it under
+`agents.defaults.models["<provider>/<model id>"].params` instead; that is sent (also on 2026.7.35):
+
+```sh
+openclaw config set 'agents.defaults.models["glm-nothink/<model id>"].params.chat_template_kwargs.enable_thinking' false
 ```
 
 **`preserve_thinking`.** The gate does not set it. With a provider id of your own,

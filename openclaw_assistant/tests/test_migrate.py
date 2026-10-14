@@ -2152,6 +2152,21 @@ class TestGlmThinkingLevels(unittest.TestCase):
         self.assertEqual(new["models"]["providers"]["glm"]["models"][1:], prov["glm"]["models"][1:])
         self.assertEqual(new["models"]["providers"]["vllm"], prov["vllm"])
 
+    def test_static_reasoning_effort_param_is_dropped(self):
+        # live shape (2026-10-14): models.providers.glm.models[0].params = {"reasoning_effort": "low"}
+        cfg = glm_cfg()
+        cfg["models"]["providers"]["glm"]["models"][0]["params"] = {"reasoning_effort": "low"}
+        new, ledger, _r = m.glm_thinking_levels(cfg)
+        self.assertNotIn("params", new["models"]["providers"]["glm"]["models"][0])
+        self.assertEqual(ledger[-1], {"step": "G1", "file": "openclaw.json",
+                                      "path": "models.providers.glm.models[0].params.reasoning_effort",
+                                      "before": "low", "after": None})
+        cfg = glm_cfg()
+        cfg["models"]["providers"]["glm"]["models"][0]["params"] = {"reasoningEffort": "high", "temperature": 0.6}
+        new, ledger, _r = m.glm_thinking_levels(cfg)
+        self.assertEqual(new["models"]["providers"]["glm"]["models"][0]["params"], {"temperature": 0.6})
+        self.assertEqual(len(ledger), 5)
+
     def test_supports_true_already_is_not_ledgered_again(self):
         cfg = glm_cfg()
         cfg["models"]["providers"]["glm"]["models"][0]["compat"]["supportsReasoningEffort"] = True
