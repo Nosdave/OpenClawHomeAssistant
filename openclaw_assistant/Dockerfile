@@ -35,7 +35,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Node.js 24 LTS from NodeSource.
-# OpenClaw 2026.10.2 requires Node >=24.16.0 <25 || >=26.1.0 (package.json
+# OpenClaw 2026.10.3 requires Node >=24.16.0 <25 || >=26.1.0 (package.json
 # engines); on an older Node it refuses to run or tries to install another Node.
 # Use explicit keyring + apt source instead of setup_24.x pipe script for deterministic builds.
 RUN mkdir -p /etc/apt/keyrings \
@@ -131,14 +131,17 @@ USER root
 #   NPM_BEFORE            npm resolves every dependency as of this UTC time.
 #                         openclaw ships no npm-shrinkwrap.json, so this limits
 #                         dependency drift between rebuilds. Must be after the
-#                         publish times of the pins (openclaw@2026.10.2
-#                         2026-10-12T05:28:25Z, its newest exact dependency
-#                         @openclaw/ai 05:23:36Z; @openclaw/brave-plugin@2026.10.2
-#                         2026-10-12T02:25:53Z is installed at runtime by run.sh
-#                         and checked here only for existence).
-ARG OPENCLAW_VERSION=2026.10.2
-ARG BRAVE_PLUGIN_VERSION=2026.10.2
-ARG NPM_BEFORE=2026-10-12T08:00:00Z
+#                         publish times of the pins (openclaw@2026.10.3
+#                         2026-10-13T13:43:36Z, its newest exact dependency
+#                         @openclaw/ai 13:25:51Z; @openclaw/brave-plugin@2026.10.3
+#                         2026-10-13T12:33:59Z is installed at runtime by run.sh
+#                         and checked here only for existence). Keep the exact
+#                         value the rehearsal image was built with: a later
+#                         cutoff resolves a different transitive tree (e.g.
+#                         strtok3 10.5.0 was published 2026-10-13T15:58Z).
+ARG OPENCLAW_VERSION=2026.10.3
+ARG BRAVE_PLUGIN_VERSION=2026.10.3
+ARG NPM_BEFORE=2026-10-13T16:00:00Z
 # Repeated here (cheap) so this part of the build also checks the Node range
 # when it is built on top of another base.
 RUN node -e 'const[a,b]=process.versions.node.split(".").map(Number);if(!((a===24&&b>=16)||(a===26&&b>=1)||a>26)){console.error("Node "+process.versions.node+" does not satisfy >=24.16.0 <25 || >=26.1.0");process.exit(1)}'
@@ -162,7 +165,7 @@ RUN npm config set fund false && npm config set audit false \
 # ACP / ACPX harness: lets OpenClaw drive external coding agents (Codex, Claude Code)
 # via the Agent Client Protocol. Volt authenticates Anthropic + OpenAI via OAuth
 # (not API keys), so the harness must ship in the image. Codex is NOT bundled in
-# OpenClaw (2026.7.35 or 2026.10.2): it is the external @openclaw/codex plugin, and
+# OpenClaw (2026.7.35 or 2026.10.3): it is the external @openclaw/codex plugin, and
 # Brave and acpx are external plugins too; plugins live in the persistent state
 # (/config/.openclaw/npm/projects). acpx + the Claude Code CLI cover the
 # OAuth/ACP path. acpx auto-downloads the codex-acp / claude-agent-acp adapters

@@ -127,7 +127,7 @@ The Gateway Web UI (Control UI) is OpenClaw's main web interface. It opens in a 
 
 The reason is asset paths, not WebSockets — Ingress proxies WebSockets fine, which is how the embedded terminal works. Home Assistant serves add-on pages under a per-add-on prefix (`/api/hassio_ingress/<token>/`), while the Control UI emits its assets from the origin root unless `gateway.controlUi.basePath` matches that prefix exactly. Serving it under Ingress would therefore require pinning the gateway to that prefix, which would break direct LAN access at the same time.
 
-> **Depends on the bundled OpenClaw version.** This fork currently ships **OpenClaw `2026.10.2`** (since `0.5.94-full1`; `0.5.93-full2` shipped `2026.7.35`):
+> **Depends on the bundled OpenClaw version.** This fork currently ships **OpenClaw `2026.10.3`** (since `0.5.94-full1`; `0.5.93-full2` shipped `2026.7.35`):
 >
 > - **On `2026.7.x` (up to `0.5.93-full2`):** plain HTTP from the LAN is a non-secure browser context, WebCrypto is blocked, and OpenClaw rejects Control UI connections without device identity. **Use HTTPS** (`lan_https`, a reverse proxy or Tailscale Serve) or `http://127.0.0.1` on the host. The only built-in exception is `controlui_disable_device_auth: true` (default), which sets the break-glass `gateway.controlUi.dangerouslyDisableDeviceAuth` — token auth is still enforced, but over plain HTTP the token travels in clear text.
 > - **From OpenClaw `2026.8.2` on (current):** the Control UI no longer requires a secure context — device identity is signed with pure-JS Ed25519 on any origin. `dangerouslyDisableDeviceAuth` is retired (inert), so **every browser must be paired once**; see [Device pairing](#device-pairing-first-connection) below. HTTPS remains strongly recommended because a plaintext page exposes the gateway token.
@@ -1004,7 +1004,7 @@ lines start with `[gate]` and are numbered `1/9` … `9/9`.
    the add-on page is not available yet; **do not stop the add-on while
    `[gate] … doctor pass … running` is shown** (it would resume once on the next
    start, but it costs time).
-5. Success ends with `[gate] done: MIGRATED 2026.10.2 …`, then the gateway starts.
+5. Success ends with `[gate] done: MIGRATED 2026.10.3 …`, then the gateway starts.
    Pair each browser once (`openclaw devices list`, `openclaw devices approve <id>`),
    then test Telegram, your models, MCP and cron jobs.
 6. Decide about a rollback within ~48 h (see
@@ -1021,7 +1021,7 @@ need them (they contain secrets).
 | Phase | What happens |
 |---|---|
 | 1 precheck | Read-only checks: runtime package, Node/SQLite, no other OpenClaw process, readable config, state not newer than the image, clean 2026.7 state, no symlinked state or workspace directory (the archive would hold only the link), model preflight, legacy files, sessions, pre-July-2026 leftovers (below), free space, SQLite `quick_check`, npm reachable. All findings are collected, then one HOLD if needed. |
-| 2 archive | `/config/.openclaw` + workspace → `/share/openclaw-upgrade/<run>/openclaw-state-<ts>-before-2026.10.2.tar.gz`, with `manifest.json` and `SHA256SUMS`; verified by re-reading it. |
+| 2 archive | `/config/.openclaw` + workspace → `/share/openclaw-upgrade/<run>/openclaw-state-<ts>-before-2026.10.3.tar.gz`, with `manifest.json` and `SHA256SUMS`; verified by re-reading it. |
 | 3 cleanup | Transient SQLite sidecars, legacy Telegram caches and pre-July-2026 files whose content is already in SQLite are moved to `/config/.openclaw-upgrade/gate/quarantine/<run>/` (kept, listed in the log). |
 | 4 pre-migrate | `plugins.installs` is removed from `openclaw.json` when its records are in the SQLite plugin index. For legacy `openai-codex/…` refs: wildcards → explicit models; these refs keep the OpenClaw runtime they used on 2026.7. |
 | 5–7 doctor | `openclaw doctor --fix --non-interactive` twice (a third time only if the second still changed the config), each with a time limit and a progress line every minute; scoped fixups in between. Canonical `openai/*` refs keep their runtime (Codex app-server by default, as on 2026.7; an `agentRuntime` pin on an `openai/…` entry is kept). A model used both as `openai-codex/<model>` and as `openai/<model>` gets one route in 2026.9+: the precheck holds with the acceptable code `models-route-collision`. Agent databases doctor "held back" (acceptable `doctor-held-back`), plugin data upgrades still "unfinished" and login renames still deferred after the last pass hold. With `glm_thinking_levels` on, GLM models are switched to thinking levels after the fixups (below). |
@@ -1049,7 +1049,7 @@ them before anything is changed:
 A GLM model configured with `compat.thinkingFormat: "qwen-chat-template"` only gets
 thinking on or off (`chat_template_kwargs.enable_thinking`): for a provider id of
 your own, OpenClaw sends no level (`/think high`, `thinkingDefault: "low"` and so
-on). Measured on 2026.7.35, 2026.9.9, 2026.10.2 and 2026.10.5-beta; in that format
+on). Measured on 2026.7.35, 2026.9.9, 2026.10.2, 2026.10.3 and 2026.10.5-beta; in that format
 only the bundled `vllm` provider id gets levels, from 2026.10.5.
 
 **What the option changes.** With `glm_thinking_levels: true` (the default) the gate converts
@@ -1128,8 +1128,8 @@ openclaw config set 'agents.defaults.models["glm-nothink/<model id>"].params.cha
 ```
 
 **`preserve_thinking`.** The gate does not set it. With a provider id of your own,
-OpenClaw does not send it with either format (measured on 2026.10.2 and
-2026.10.5-beta). If your server needs it, add
+OpenClaw does not send it with either format (measured on 2026.10.2, 2026.10.3
+and 2026.10.5-beta). If your server needs it, add
 `agents.defaults.models["glm/<model id>"].params.chat_template_kwargs.preserve_thinking: true`
 yourself (provider id in lower case). A `chat_template_kwargs` there replaces one in
 `agents.defaults.params`; it is not merged.
@@ -1493,6 +1493,15 @@ retry forward or roll back with the backup (next section). Do not run
 `openclaw doctor --fix` by hand — the wrapper refuses it; `oc-upgrade retry --doctor`
 does the same with an archive first.
 
+Messages in the doctor log may advise `openclaw update repair`,
+`openclaw plugins update <id>` or `openclaw doctor --fix`. In the add-on the wrapper
+refuses `openclaw update` and a writing `doctor`, and during a HOLD everything but
+read-only commands; use `oc-upgrade retry` (or `oc-upgrade retry --doctor`) instead.
+Example: started without network access (`--accept no-network`) with the Codex
+plugin from 2026.7, doctor cannot update it ("Official runtime plugin codex
+2026.7.35 is incompatible …") and the gate holds with `doctor-plugin-load`; once npm
+is reachable again, `oc-upgrade retry` and a restart finish the migration.
+
 ### Gateway exited with code 78
 
 **Symptom**: after a successful migration the gateway stopped with exit code 78
@@ -1538,7 +1547,7 @@ There are two rollback points for the 2026.10 update:
       `mv /config/.openclaw /config/.openclaw.10x-failed` and
       `mv /config/clawd /config/clawd.10x-failed`.
    4. Check the archive: `cd /share/openclaw-upgrade/<run> && sha256sum -c SHA256SUMS`.
-   5. Extract it: `tar -xzf /share/openclaw-upgrade/<run>/openclaw-state-<ts>-before-2026.10.2.tar.gz -C /config`.
+   5. Extract it: `tar -xzf /share/openclaw-upgrade/<run>/openclaw-state-<ts>-before-2026.10.3.tar.gz -C /config`.
    6. Restart the add-on.
 
    **Never extract over the migrated directory**: leftover 2026.10

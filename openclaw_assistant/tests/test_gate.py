@@ -2083,6 +2083,7 @@ class GlmThinkingLevelsGateTests(GateEnv):
         self.assertFalse(G.glm_runtime_ok(None))
         self.assertTrue(G.glm_runtime_ok("2026.9.9"))
         self.assertTrue(G.glm_runtime_ok("2026.10.2"))
+        self.assertTrue(G.glm_runtime_ok("2026.10.3"))
         self.assertTrue(G.glm_runtime_ok("2026.10.5-beta.2"))
         self.setup_glm(glm_thinking_levels=True)
         with mock.patch.object(G, "glm_runtime_ok", lambda v: False):
