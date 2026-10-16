@@ -1009,7 +1009,11 @@ lines start with `[gate]` and are numbered `1/9` … `9/9`.
    then test Telegram, your models, MCP and cron jobs.
 6. Decide about a rollback within ~48 h (see
    [Safe rollback](#safe-rollback-after-an-openclaw-database-upgrade)). After that,
-   delete `/share/openclaw-upgrade/*` — it contains secrets.
+   delete `/share/openclaw-upgrade/*` — it contains secrets — and
+   `/config/.openclaw.update-captures/doctor-*`: OpenClaw 2026.10 doctor leaves a copy
+   of the databases there on every pass, removes old ones only during a later doctor
+   run, and every add-on backup includes them (`du -sh /config/.openclaw.update-captures`
+   shows the size).
 
 The add-on never deletes gate archives: every gate run (also later OpenClaw updates and
 `oc-upgrade retry --doctor`) writes a new one. Delete old
