@@ -924,6 +924,11 @@ class DoctorEvalTests(unittest.TestCase):
         kept = "Kept auth profile openai-codex:default unchanged because its provider realm is unresolved.\nDoctor complete.\n"
         self.assertIsNone(G.evaluate_doctor(0, kept)["code"])
         self.assertEqual(G.evaluate_doctor(0, kept, final=True)["code"], "doctor-warnings")
+        cron = ('Plugin session repair: Dreaming cron inspection remains pending; existing cron rows were retained. '
+                'Retry with "openclaw doctor --fix". Error: database is locked\nDoctor complete.\n')
+        self.assertIsNone(G.evaluate_doctor(0, cron)["code"])
+        ev = G.evaluate_doctor(0, cron, final=True)
+        self.assertEqual((ev["code"], ev["cls"]), ("doctor-warnings", "acceptable"))
 
     def test_wrapped_clack_box(self):
         text = "│  Doctor stopped     │\n│  because the step refused │\n"
@@ -2084,6 +2089,7 @@ class GlmThinkingLevelsGateTests(GateEnv):
         self.assertTrue(G.glm_runtime_ok("2026.9.9"))
         self.assertTrue(G.glm_runtime_ok("2026.10.2"))
         self.assertTrue(G.glm_runtime_ok("2026.10.3"))
+        self.assertTrue(G.glm_runtime_ok("2026.10.4"))
         self.assertTrue(G.glm_runtime_ok("2026.10.5-beta.2"))
         self.setup_glm(glm_thinking_levels=True)
         with mock.patch.object(G, "glm_runtime_ok", lambda v: False):

@@ -205,8 +205,11 @@ SUSPICIOUS_MARKERS = ("Preserved retired", "may contain unmigrated data", "Pre-J
 # has updated them (deferred-plugin-migrations-DtqETF3J.mjs:220; gone in pass 2 in every rehearsal).
 # The same for auth profile renames: pass 1 always prints "Kept auth profile openai-codex:... unchanged" before
 # the alias step renames it (repair-sequencing-DFs-UYNz.mjs:408-413); in the last pass it is a real deferral.
+# 2026.10.4 turns a failed dreaming cron inventory into a recoverable warning with rc 0 (memory-core
+# doctor-contract-api.js:119); 2026.10.3 refused the step ("Doctor stopped because"), so it must not pass silently.
 FINAL_PASS_SUSPICIOUS = ("data/settings upgrade is unfinished", "Deferred auth profile alias",
-                         "Deferred stale auth profile alias", "Kept auth profile ")
+                         "Deferred stale auth profile alias", "Kept auth profile ",
+                         "Dreaming cron inspection remains pending")
 
 STOP = threading.Event()
 _STOP_SIG = [None]

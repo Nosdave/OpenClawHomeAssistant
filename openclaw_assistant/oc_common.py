@@ -487,7 +487,7 @@ ENV_REMOVE = {
     "OPENCLAW_LAUNCHD_LABEL", "NODE_COMPILE_CACHE",
     # 2026.10: a host lifeline on stdin would stop a background gateway at once. The NOCOW switch only gates
     # doctor's SQLite NOCOW rewrite during `openclaw update`; a standalone doctor --fix rewrites stores on btrfs
-    # without NOCOW whatever it says (doctor-health in 2026.10.2/10.3).
+    # without NOCOW whatever it says (doctor-health in 2026.10.2 to 10.4).
     "OPENCLAW_GATEWAY_HOST_LIFELINE", "OPENCLAW_DOCTOR_SQLITE_NOCOW_REPAIR",
 }
 _HEAP_CAP_RE = re.compile(r"(?:^|\s)--max[-_]old[-_]space[-_]size(?:=\S*|\s+\d+)")
