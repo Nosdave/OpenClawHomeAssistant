@@ -1,0 +1,414 @@
+{
+  "gateway": {
+    "mode": "local",
+    "port": 18789,
+    "bind": "loopback",
+    "auth": {
+      "mode": "token",
+      "token": "fake-gateway-token-for-unit-tests"
+    },
+    "controlUi": {}
+  },
+  "agents": {
+    "defaults": {
+      "model": {
+        "primary": "vllm/qwen3.5-122b",
+        "fallbacks": [
+          "openai/gpt-5.5",
+          "anthropic/claude-opus-4-8",
+          "google/gemini-3.1-pro-preview"
+        ]
+      },
+      "models": {
+        "anthropic/claude-opus-4-6": {},
+        "anthropic/claude-sonnet-4-6": {},
+        "anthropic/claude-opus-4-7": {},
+        "anthropic/claude-haiku-4-5": {},
+        "openai/gpt-5.4": {
+          "agentRuntime": {
+            "id": "openclaw"
+          }
+        },
+        "openai/gpt-5.4-pro": {
+          "agentRuntime": {
+            "id": "openclaw"
+          }
+        },
+        "openai/gpt-5.3-codex": {
+          "alias": "GPT",
+          "agentRuntime": {
+            "id": "openclaw"
+          }
+        },
+        "google/gemini-3.1-pro-preview": {},
+        "google/gemini-flash-latest": {},
+        "ollama/*": {},
+        "anthropic/claude-opus-4-8": {},
+        "openai/gpt-5.5": {
+          "agentRuntime": {
+            "id": "openclaw"
+          }
+        },
+        "openai/gpt-5.5-pro": {
+          "agentRuntime": {
+            "id": "openclaw"
+          }
+        },
+        "vllm/qwen3.5-122b": {},
+        "vllm-nothink/qwen3.5-122b": {},
+        "vllm/gemma-4-26b": {},
+        "vllm-fast/qwen3.6-35b": {},
+        "anthropic/*": {},
+        "openai/*": {
+          "agentRuntime": {
+            "id": "openclaw"
+          }
+        },
+        "xai/grok-4.7": {},
+        "xai/grok-4.7-build-fast": {},
+        "xai/grok-4.3": {
+          "alias": "Grok"
+        },
+        "xai/grok-4.6": {}
+      },
+      "workspace": "/config/clawd",
+      "contextPruning": {
+        "mode": "cache-ttl",
+        "ttl": "1h"
+      },
+      "compaction": {
+        "mode": "safeguard"
+      },
+      "heartbeat": {
+        "every": "1h"
+      },
+      "thinkingDefault": "low",
+      "subagents": {
+        "archiveAfterMinutes": 60,
+        "runTimeoutSeconds": 120
+      },
+      "pdfModel": {
+        "primary": "vllm/qwen3.5-122b"
+      },
+      "modelPolicy": {
+        "allow": [
+          "anthropic/claude-opus-4-6",
+          "anthropic/claude-sonnet-4-6",
+          "anthropic/claude-opus-4-7",
+          "anthropic/claude-haiku-4-5",
+          "openai/gpt-5.4",
+          "openai/gpt-5.4-pro",
+          "openai/gpt-5.3-codex",
+          "google/gemini-3.1-pro-preview",
+          "google/gemini-flash-latest",
+          "ollama/*",
+          "anthropic/claude-opus-4-8",
+          "openai/gpt-5.5",
+          "openai/gpt-5.5-pro",
+          "vllm/qwen3.5-122b",
+          "vllm-nothink/qwen3.5-122b",
+          "vllm/gemma-4-26b",
+          "vllm-fast/qwen3.6-35b",
+          "anthropic/*",
+          "openai/*",
+          "xai/grok-4.7",
+          "xai/grok-4.7-build-fast",
+          "xai/grok-4.3",
+          "xai/grok-4.6"
+        ]
+      },
+      "mediaModels": {
+        "image": {
+          "primary": "openai/gpt-image-1"
+        }
+      },
+      "systemAgent": {
+        "agentId": "main"
+      }
+    },
+    "ownership": "explicit",
+    "entries": {
+      "main": {
+        "tools": {
+          "profile": "full",
+          "alsoAllow": [
+            "tts"
+          ]
+        },
+        "workspace": "/config/clawd"
+      },
+      "mail_reader": {
+        "workspace": "/config/clawd-mail-reader",
+        "model": "vllm/qwen3.5-122b",
+        "sandbox": {
+          "mode": "all",
+          "scope": "session",
+          "workspaceAccess": "none"
+        },
+        "tools": {
+          "profile": "minimal",
+          "allow": [
+            "session_status"
+          ],
+          "deny": [
+            "group:fs",
+            "group:runtime",
+            "group:web",
+            "browser",
+            "cron",
+            "gateway",
+            "nodes"
+          ]
+        }
+      }
+    }
+  },
+  "plugins": {
+    "entries": {
+      "google": {
+        "enabled": true,
+        "config": {
+          "webSearch": {
+            "apiKey": "DUMMY-google"
+          }
+        }
+      },
+      "brave": {
+        "enabled": true,
+        "config": {
+          "webSearch": {
+            "apiKey": "DUMMY-brave"
+          }
+        }
+      },
+      "elevenlabs": {
+        "enabled": true,
+        "config": {}
+      },
+      "microsoft": {
+        "enabled": true,
+        "config": {}
+      },
+      "anthropic": {
+        "enabled": true
+      },
+      "openai": {
+        "enabled": true
+      },
+      "memory-core": {
+        "config": {
+          "dreaming": {
+            "enabled": true
+          }
+        },
+        "enabled": true
+      },
+      "browser": {
+        "enabled": false
+      },
+      "acpx": {
+        "enabled": true,
+        "config": {
+          "permissionMode": "approve-all",
+          "nonInteractivePermissions": "deny"
+        }
+      },
+      "ollama": {
+        "enabled": true
+      },
+      "xai": {
+        "enabled": true,
+        "config": {
+          "webSearch": {
+            "inlineCitations": false
+          },
+          "codeExecution": {
+            "enabled": false
+          },
+          "xSearch": {
+            "enabled": false,
+            "inlineCitations": false
+          }
+        }
+      },
+      "vllm": {
+        "enabled": true
+      }
+    }
+  },
+  "meta": {
+    "lastTouchedVersion": "2026.9.9",
+    "migrations": {
+      "modelPolicyAllowlist": true,
+      "utilityModelSeparation": true
+    }
+  },
+  "channels": {
+    "telegram": {
+      "enabled": true,
+      "botToken": "123456:FAKE-TOKEN-FOR-UNIT-TESTS",
+      "dmPolicy": "pairing"
+    }
+  },
+  "models": {
+    "providers": {
+      "vllm": {
+        "baseUrl": "http://127.0.0.1:9/v1",
+        "api": "openai-completions",
+        "apiKey": "dummy",
+        "models": [
+          {
+            "id": "qwen3.5-122b",
+            "name": "qwen3.5-122b",
+            "contextWindow": 131072,
+            "maxTokens": 8192
+          },
+          {
+            "id": "gemma-4-26b",
+            "name": "gemma-4-26b",
+            "contextWindow": 131072,
+            "maxTokens": 8192
+          }
+        ]
+      },
+      "vllm-nothink": {
+        "baseUrl": "http://127.0.0.1:9/v1",
+        "api": "openai-completions",
+        "apiKey": "dummy",
+        "models": [
+          {
+            "id": "qwen3.5-122b",
+            "name": "qwen3.5-122b",
+            "contextWindow": 131072,
+            "maxTokens": 8192
+          }
+        ]
+      },
+      "vllm-fast": {
+        "baseUrl": "http://127.0.0.1:9/v1",
+        "api": "openai-completions",
+        "apiKey": "dummy",
+        "models": [
+          {
+            "id": "qwen3.6-35b",
+            "name": "qwen3.6-35b",
+            "contextWindow": 131072,
+            "maxTokens": 8192
+          }
+        ]
+      }
+    }
+  },
+  "bindings": [
+    {
+      "agentId": "main",
+      "match": {
+        "channel": "telegram",
+        "accountId": "default"
+      }
+    }
+  ],
+  "wizard": {
+    "lastRunAt": "2026-10-09T15:56:49.330Z",
+    "lastRunVersion": "2026.9.9",
+    "lastRunCommand": "doctor",
+    "lastRunMode": "local"
+  },
+  "skills": {
+    "entries": {
+      "1password": {
+        "enabled": false
+      },
+      "blogwatcher": {
+        "enabled": false
+      },
+      "blucli": {
+        "enabled": false
+      },
+      "camsnap": {
+        "enabled": false
+      },
+      "coding-agent": {
+        "enabled": false
+      },
+      "eightctl": {
+        "enabled": false
+      },
+      "gemini": {
+        "enabled": false
+      },
+      "gh-issues": {
+        "enabled": false
+      },
+      "gifgrep": {
+        "enabled": false
+      },
+      "github": {
+        "enabled": false
+      },
+      "gog": {
+        "enabled": false
+      },
+      "goplaces": {
+        "enabled": false
+      },
+      "himalaya": {
+        "enabled": false
+      },
+      "nano-pdf": {
+        "enabled": false
+      },
+      "obsidian": {
+        "enabled": false
+      },
+      "openai-whisper": {
+        "enabled": false
+      },
+      "openai-whisper-api": {
+        "enabled": false
+      },
+      "openhue": {
+        "enabled": false
+      },
+      "oracle": {
+        "enabled": false
+      },
+      "ordercli": {
+        "enabled": false
+      },
+      "sag": {
+        "enabled": false
+      },
+      "session-logs": {
+        "enabled": false
+      },
+      "sherpa-onnx-tts": {
+        "enabled": false
+      },
+      "songsee": {
+        "enabled": false
+      },
+      "sonoscli": {
+        "enabled": false
+      },
+      "spotify-player": {
+        "enabled": false
+      },
+      "summarize": {
+        "enabled": false
+      },
+      "tmux": {
+        "enabled": false
+      },
+      "trello": {
+        "enabled": false
+      },
+      "video-frames": {
+        "enabled": false
+      },
+      "xurl": {
+        "enabled": false
+      }
+    }
+  }
+}

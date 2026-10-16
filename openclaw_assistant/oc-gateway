@@ -31,16 +31,31 @@ find_gateway_pid() {
     return 0
   fi
 
-  # 3) /proc cmdline fallback
-  for f in /proc/[0-9]*/cmdline; do
-    [ -r "$f" ] || continue
-    if tr '\0' ' ' < "$f" 2>/dev/null | grep -qi "openclaw"; then
-      echo "${f#/proc/}" | cut -d/ -f1
-      return 0
-    fi
-  done
+  # 3) /proc cmdline fallback — only for OpenClaw lines that respawn the
+  # gateway as a detached daemon. With OPENCLAW_NO_RESPAWN=1 (set by the add-on
+  # for OpenClaw 2026.8+) restarts stay in-process, and this scan could pick an
+  # unrelated `openclaw` CLI process (e.g. `openclaw logs` in another terminal)
+  # and send it the restart signal, which would kill it.
+  if [ "${OPENCLAW_NO_RESPAWN:-}" != "1" ]; then
+    for f in /proc/[0-9]*/cmdline; do
+      [ -r "$f" ] || continue
+      if tr '\0' ' ' < "$f" 2>/dev/null | grep -qi "openclaw"; then
+        echo "${f#/proc/}" | cut -d/ -f1
+        return 0
+      fi
+    done
+  fi
 
   return 1
+}
+
+# The add-on holds OpenClaw (does not start it) while this file exists.
+HOLD_FILE="${OC_UPGRADE_DIR:-/config/.openclaw-upgrade}/hold.txt"
+
+print_hold_hint() {
+  if [ -e "$HOLD_FILE" ]; then
+    echo "HOLD: the add-on is holding OpenClaw and does not start it. Reason and next steps: oc-upgrade status"
+  fi
 }
 
 get_gateway_port() {
@@ -76,6 +91,7 @@ status_cmd() {
   fi
 
   echo "Gateway process: not detected"
+  print_hold_hint
   echo "Tip: Check add-on logs in Home Assistant for startup errors."
   exit 1
 }
@@ -87,6 +103,7 @@ restart_cmd() {
 
   if [ -z "$pid" ] || ! kill -0 "$pid" 2>/dev/null; then
     echo "No running gateway process found to restart."
+    print_hold_hint
     echo "Tip: If startup failed, inspect add-on logs."
     exit 1
   fi

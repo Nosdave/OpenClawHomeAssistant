@@ -146,3 +146,7 @@ configuration:
   config_backup_keep:
     name: Liczba przechowywanych kopii konfiguracji
     description: Ile kopii openclaw.json przechowywać w /config/.openclaw/backups. Kopia powstaje przed pierwszym zapisem konfiguracji przy każdym starcie, dzięki czemu niechciane zmiany można cofnąć poleceniem 'oc-config restore'. Ustaw 0, aby wyłączyć kopie.
+
+  glm_thinking_levels:
+    name: Poziomy myślenia GLM
+    description: "Model GLM skonfigurowany z formatem myślenia 'qwen-chat-template' ma tylko włączone lub wyłączone myślenie. Gdy WŁĄCZONE, bramka migracji przy następnym uruchomieniu (aktualizacja OpenClaw albo 'oc-upgrade retry --doctor' i restart; zwykły restart tego nie stosuje) przełącza go na reasoning_effort, aby poziomy /think i thinkingDefault docierały do modelu. 'Wyłączone' jest wtedy wysyłane jako 'none' zamiast enable_thinking: najpierw sprawdź swój serwer GLM (zobacz dokumentację). Ponowne WYŁĄCZENIE opcji nie cofa zmiany. Każda zmiana jest zapisywana w dzienniku transformacji bramki."

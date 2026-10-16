@@ -146,3 +146,7 @@ configuration:
   config_backup_keep:
     name: Aufzubewahrende Konfigurations-Snapshots
     description: Wie viele openclaw.json-Snapshots in /config/.openclaw/backups aufbewahrt werden. Vor dem ersten Konfigurationsschreibvorgang jedes Starts wird ein Snapshot erstellt, sodass unerwünschte Änderungen mit 'oc-config restore' rückgängig gemacht werden können. 0 deaktiviert Snapshots.
+
+  glm_thinking_levels:
+    name: GLM-Denkstufen
+    description: "Ein GLM-Modell mit dem Denkformat 'qwen-chat-template' bekommt nur Denken an/aus. Wenn AN, stellt das Migrations-Gate es bei seinem nächsten Lauf auf reasoning_effort um (OpenClaw-Update oder 'oc-upgrade retry --doctor' und ein Neustart; ein normaler Neustart reicht nicht), damit /think- und thinkingDefault-Stufen beim Modell ankommen. 'Aus' wird dann als 'none' statt enable_thinking gesendet: Prüfen Sie vorher Ihren GLM-Server (siehe Dokumentation). Wieder AUS schalten macht die Änderung nicht rückgängig. Jede Änderung wird im Transform-Ledger des Gates protokolliert."

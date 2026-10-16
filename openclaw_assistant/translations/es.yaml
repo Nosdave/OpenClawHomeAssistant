@@ -146,3 +146,7 @@ configuration:
   config_backup_keep:
     name: Copias de configuración a conservar
     description: Cuántas copias de openclaw.json se conservan en /config/.openclaw/backups. Se crea una copia antes de la primera escritura de configuración de cada inicio, de modo que los cambios no deseados se pueden revertir con 'oc-config restore'. Use 0 para desactivar las copias.
+
+  glm_thinking_levels:
+    name: Niveles de razonamiento GLM
+    description: "Un modelo GLM configurado con el formato de razonamiento 'qwen-chat-template' solo puede activar o desactivar el razonamiento. Si está ACTIVADO, el gate de migración lo cambia a reasoning_effort en su próxima ejecución (una actualización de OpenClaw, o 'oc-upgrade retry --doctor' y un reinicio; un reinicio normal no lo aplica), para que los niveles de /think y thinkingDefault lleguen al modelo. 'Desactivado' se envía entonces como 'none' en lugar de enable_thinking: compruebe antes su servidor GLM (véase la documentación). Volver a DESACTIVAR la opción no deshace el cambio. Cada cambio queda registrado en el registro de transformaciones del gate."

@@ -73,7 +73,7 @@ echo -e "${BOLD}What can be cleaned from inside the add-on:${RESET}"
 echo "  1) npm cache              (safe — rebuilds on demand)"
 echo "  2) pnpm store cache       (safe — rebuilds on demand)"
 echo "  3) Python __pycache__     (safe — regenerated automatically)"
-echo "  4) /tmp files             (safe — transient data)"
+echo "  4) /tmp files             (safe — transient data; keeps OpenClaw logs)"
 echo "  5) All of the above"
 echo "  6) Show Docker prune commands (must run from HA host SSH)"
 echo "  q) Quit"
@@ -101,7 +101,13 @@ cleanup_pycache() {
 
 cleanup_tmp() {
   echo -e "${CYAN}Cleaning /tmp...${RESET}"
-  rm -rf /tmp/* 2>/dev/null || true
+  # Keep OpenClaw's own files: /tmp/openclaw* holds the gateway logs
+  # (openclaw-<date>.log, needed to diagnose a HOLD) and doctor lint snapshots;
+  # /tmp/node-compile-cache is Node's compile cache. Hidden entries (e.g. the
+  # pnpm home /tmp/.pnpm-home) were never removed and still are not.
+  find /tmp -mindepth 1 -maxdepth 1 \
+    ! -name '.*' ! -name 'openclaw*' ! -name 'node-compile-cache' \
+    -exec rm -rf {} + 2>/dev/null || true
   echo "  Done."
 }
 
