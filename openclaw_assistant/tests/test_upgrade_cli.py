@@ -314,11 +314,24 @@ class Full2CliTests(CliEnv):
         self.assertTrue(adir.exists())
         self.assertTrue(caps[0].exists())
 
-    def test_cleanup_loop_with_cleanup_off_exits_at_once(self):
+    def test_cleanup_loop_with_cleanup_off_idles_until_sigterm(self):
         rid, adir, caps = self.finished_run(72)
         self.options(gate_cleanup_hours=0)
-        self.assertEqual(self.cli("cleanup", "--loop", env={"OC_GATE_FROM_RUNSH": "1"}), 0)
-        self.assertIn("gate_cleanup_hours=0: automatic deletion is off", self.stdout)
+        self.hooks(cleanup_interval_s=0.2)
+        e = dict(os.environ, PYTHONDONTWRITEBYTECODE="1", OC_GATE_FROM_RUNSH="1")
+        p = subprocess.Popen([sys.executable, "-B", str(SCRIPT), "cleanup", "--loop"], stdout=subprocess.PIPE,
+                             stderr=subprocess.STDOUT, text=True, env=e)
+        try:
+            time.sleep(1.5)
+            self.assertIsNone(p.poll(), "the cleanup loop exited although run.sh tracks it until shutdown")
+            p.send_signal(signal.SIGTERM)
+            out, _ = p.communicate(timeout=60)
+        finally:
+            if p.poll() is None:
+                p.kill()
+                p.communicate()
+        self.assertEqual(p.returncode, 143, out)
+        self.assertIn("gate_cleanup_hours=0: automatic deletion is off", out)
         self.assertTrue(adir.exists())
         self.assertTrue(caps[0].exists())
 
@@ -391,7 +404,7 @@ class Full2CliTests(CliEnv):
         self.assertFalse(adir.exists())
         self.assertFalse(caps[0].exists())
 
-    def test_cleanup_orphans_tombstones_and_plaintext_rehearsal_exports(self):
+    def test_cleanup_orphans_tombstones_and_rehearsal_exports(self):
         orphan = self.archives / "20261001T120000Z-abcdef"
         fresh = self.archives / "20261018T120000Z-123456"
         other = self.archives / "not-a-run-dir"
@@ -407,7 +420,7 @@ class Full2CliTests(CliEnv):
         for f in (plain, enc):
             f.parent.mkdir(parents=True)
             f.write_bytes(b"\x1f\x8b" + b"\0" * 64 if f is plain else b"age-encryption.org/v1\n")
-            (f.parent / "MANIFEST.txt").write_text("rehearsal\n")
+            (f.parent / "manifest.txt").write_text("rehearsal\n")
             self.age_back(f, 72)
 
         self.assertEqual(self.cli("status"), 0)
@@ -421,19 +434,20 @@ class Full2CliTests(CliEnv):
         self.assertIn("  plaintext rehearsal export 20261001-120000: due now", self.stdout)
         self.assertRegex(self.stdout, rf"  orphaned archive {fresh.name}: due \d{{4}}-")
         self.assertNotIn("not-a-run-dir", self.stdout)
-        self.assertNotIn("20261002-120000", self.stdout)  # encrypted exports are no cleanup target
-        self.assertTrue(orphan.exists() and plain.exists() and tomb.exists())
+        self.assertIn("  encrypted rehearsal export 20261002-120000: due now", self.stdout)  # deleted as well
+        self.assertTrue(orphan.exists() and plain.exists() and tomb.exists() and enc.exists())
 
         self.assertEqual(self.cli("cleanup", "--apply"), 0, self.stdout + self.stderr)
         self.assertFalse(orphan.exists())
         self.assertFalse(tomb.exists())
         self.assertFalse(plain.parent.exists())
-        for p in (fresh, other, enc):
+        self.assertFalse(enc.parent.exists())
+        for p in (fresh, other):
             self.assertTrue(p.exists(), f"{p} was deleted")
         self.assertEqual([p.name for p in self.archives.iterdir() if p.name.startswith(".oc-addon-deleting-")], [])
         self.assertEqual(self.cli("status"), 0)
         self.assertNotIn("PLAINTEXT: delete it", self.stdout)
-        self.assertIn(f"  {enc} (", self.stdout)
+        self.assertNotIn(str(enc), self.stdout)
 
     def test_cleanup_loop_deletes_what_is_due_and_stops_on_sigterm(self):
         rid, adir, caps = self.finished_run(1)  # due in 47 h; the clock offset hook makes it due now

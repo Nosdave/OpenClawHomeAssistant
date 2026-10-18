@@ -1008,16 +1008,37 @@ fi
 # Cold export for an offline upgrade rehearsal (requested via `oc-upgrade export`)
 # Runs before anything starts or writes, so the copy is consistent.
 # ------------------------------------------------------------------------------
+# write_new_file <path>: stdin to a NEW file (O_EXCL|O_NOFOLLOW, 0600). Other add-ons can write /share, so
+# nothing there is ever opened through a link they could plant (age -o and > would follow one).
+write_new_file() {
+  python3 -I -c '
+import os, sys
+fd = os.open(sys.argv[1], os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+with os.fdopen(fd, "wb") as f:
+    while True:
+        b = sys.stdin.buffer.read(1 << 20)
+        if not b:
+            break
+        f.write(b)
+    f.flush()
+    os.fsync(f.fileno())
+' "$1"
+}
+
 process_export_request() {
-  local request="${UPG_DIR}/export-request" ts dest need_kb avail_kb archive stale
+  local request="${UPG_DIR}/export-request" ts dest need_kb avail_kb archive stale reh=/share/openclaw-rehearsal
   # An interrupted export (power loss, SIGKILL) leaves a secret-bearing .tmp
   # behind; remove those on every start, whether or not a new export is due.
-  for stale in /share/openclaw-rehearsal/*/openclaw-rehearsal.tar.gz.tmp /share/openclaw-rehearsal/*/openclaw-rehearsal.tar.gz.age.tmp; do
-    [ -e "$stale" ] || continue
-    echo "WARN: Removing incomplete rehearsal export ${stale}."
-    rm -f "$stale" 2>/dev/null || echo "WARN: Could not remove ${stale}; delete it manually (it contains secrets)."
-    rmdir "$(dirname "$stale")" 2>/dev/null || true
-  done
+  # rm removes a link itself, never its target; a linked directory is not entered.
+  if [ ! -L "$reh" ]; then
+    for stale in "$reh"/*/openclaw-rehearsal.tar.gz.tmp "$reh"/*/openclaw-rehearsal.tar.gz.age.tmp; do
+      [ -e "$stale" ] || [ -L "$stale" ] || continue
+      [ -L "$(dirname "$stale")" ] && continue
+      echo "WARN: Removing incomplete rehearsal export ${stale}."
+      rm -f "$stale" 2>/dev/null || echo "WARN: Could not remove ${stale}; delete it manually (it contains secrets)."
+      rmdir "$(dirname "$stale")" 2>/dev/null || true
+    done
+  fi
   [ -f "$request" ] || return 0
   # One-shot: never retry on every boot, even after a failure.
   rm -f "$request"
@@ -1035,8 +1056,11 @@ process_export_request() {
     echo "WARN: Rehearsal export skipped: it needs gate_archive: encrypted with gate_archive_age_recipient (no plaintext copies)."
     return 0
   fi
+  if [ -L "$reh" ] || { [ -e "$reh" ] && [ ! -d "$reh" ]; }; then
+    echo "WARN: Rehearsal export skipped: ${reh} is not a plain directory."
+    return 0
+  fi
   ts="$(date -u +%Y%m%d-%H%M%S)"
-  dest="/share/openclaw-rehearsal/${ts}"
   # Estimate with the same exclusions as the archive below (uncompressed size,
   # so a safe upper bound for the compressed export).
   need_kb="$(du -skc \
@@ -1049,11 +1073,12 @@ process_export_request() {
     echo "WARN: Rehearsal export skipped: not enough free space in /share (need ~${need_kb:-?} KiB, have ${avail_kb:-?} KiB)."
     return 0
   fi
-  echo "INFO: Creating cold rehearsal export in ${dest} (gateway not started yet)..."
-  if ! (umask 077 && mkdir -p "$dest"); then
-    echo "WARN: Rehearsal export skipped: cannot create ${dest}."
+  # a fresh, unpredictable directory (mktemp -d, 0700): nothing in it can be planted in advance
+  if ! dest="$(umask 077 && mkdir -p "$reh" && mktemp -d "${reh}/${ts}-XXXXXX")"; then
+    echo "WARN: Rehearsal export skipped: cannot create a directory in ${reh}."
     return 0
   fi
+  echo "INFO: Creating cold rehearsal export in ${dest} (gateway not started yet)..."
   archive="${dest}/openclaw-rehearsal.tar.gz.age"
   local members=(.openclaw)
   [ -d /config/clawd ] && members+=(clawd)
@@ -1067,9 +1092,8 @@ process_export_request() {
       --exclude='.openclaw/tmp' \
       --exclude='clawd/node_modules' \
       --exclude='clawd/*/node_modules' \
-      -czf - "${members[@]}" | "$agebin" -r "$rec" -o "${archive}.tmp") \
-     && mv "${archive}.tmp" "$archive"; then
-    chmod 600 "$archive" 2>/dev/null || true
+      -czf - "${members[@]}" | "$agebin" -r "$rec" | write_new_file "${archive}.tmp") \
+     && mv -T -- "${archive}.tmp" "$archive"; then
     if (umask 077 && {
           echo "created_utc=${ts}"
           echo "addon_version=${ADDON_VERSION:-unknown}"
@@ -1079,7 +1103,7 @@ process_export_request() {
           echo "encrypted=age"
           echo "recipient=${rec:0:9}...${rec: -6}"
           echo "contains_secrets=yes"
-        } > "${dest}/manifest.txt") 2>/dev/null; then
+        } | write_new_file "${dest}/manifest.txt") 2>/dev/null; then
       echo "INFO: Rehearsal export ready: ${archive} ($(du -h "$archive" 2>/dev/null | cut -f1)), age-encrypted. Decrypt it only where your private key lives; delete it after the rehearsal."
     else
       rm -f "${dest}/manifest.txt" 2>/dev/null || true
@@ -1406,8 +1430,11 @@ shutdown() {
       kill -0 "${CLEANUP_PID}" 2>/dev/null || break
       sleep 1
     done
-    kill -KILL "${CLEANUP_PID}" >/dev/null 2>&1 || true
+    if kill -0 "${CLEANUP_PID}" 2>/dev/null; then
+      kill -KILL "${CLEANUP_PID}" >/dev/null 2>&1 || true
+    fi
     wait "${CLEANUP_PID}" 2>/dev/null || true
+    CLEANUP_PID=""
   fi
 
   if [ "$CLEAN_LOCKS_ON_EXIT" = "true" ] && [ "${STATE_HOLD:-false}" != "true" ]; then

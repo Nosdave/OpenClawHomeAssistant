@@ -650,7 +650,10 @@ class CleanupTests(CleanupEnv):
                 if bad == "bad-id":
                     (self.arch / bad).mkdir(parents=True)
                 kept = [t[4] for t in G.cleanup_targets(self.gp, T0 + H48, 48) if t[0] == bad]
-                self.assertEqual(kept, [[(str(self.arch / bad), "not a plain run directory")]])
+                if bad == "bad-id":
+                    self.assertEqual(kept, [[(str(self.arch / bad), "not a plain run directory")]])
+                else:  # not one safe path component: the journal is ignored altogether
+                    self.assertEqual(kept, [])
                 self.cleanup(T0 + H48)
                 self.assertTrue(os.path.lexists(self.arch / bad))
         self.assertEqual((victim / "precious.txt").read_text(), "keep me")
@@ -710,7 +713,7 @@ class CleanupTests(CleanupEnv):
         self.assertTrue(os.path.islink(self.arch / r.rid))
         self.assertEqual((victim / "precious.txt").read_text(), "keep me")
 
-    def test_plaintext_rehearsal_exports_deleted_encrypted_ones_and_young_ones_kept(self):
+    def test_rehearsal_exports_deleted_young_ones_and_links_kept(self):
         reh = self.share / "openclaw-rehearsal"
         old = T0 - timedelta(days=3)
 
@@ -738,17 +741,19 @@ class CleanupTests(CleanupEnv):
         # an encrypted gate archive of a run that is not due yet stays as well
         r = self.make_run(finished=T0, captures=0)
 
-        self.assertEqual(self.cleanup(T0 + timedelta(hours=1)), 2)
+        self.assertEqual(self.cleanup(T0 + timedelta(hours=1)), 4)  # encrypted exports go as well
         self.assertIn("[cleanup] plaintext rehearsal export 20260901-000000: deleted 1 item(s)", self.text)
         self.assertIn("[cleanup] plaintext rehearsal export 20260902-000000: deleted 1 item(s)", self.text)
-        self.assertFalse(os.path.lexists(plain) or os.path.lexists(tmp))
-        for d in (enc, enc_tmp, young, linkfile, r.adir):
+        self.assertIn("[cleanup] encrypted rehearsal export 20260903-000000: deleted 1 item(s)", self.text)
+        self.assertIn("[cleanup] encrypted rehearsal export 20260904-000000: deleted 1 item(s)", self.text)
+        for d in (plain, tmp, enc, enc_tmp):
+            self.assertFalse(os.path.lexists(d), d)
+        for d in (young, linkfile, r.adir):
             self.assertTrue(d.is_dir(), d)
         self.assertEqual((victim / "openclaw-rehearsal.tar.gz").read_bytes(), b"\x1f\x8b precious")
         self.assertTrue((linkfile / "openclaw-rehearsal.tar.gz").is_symlink())
         self.assertEqual(self.cleanup(T0 + H48), 2)  # the young export and the run's archive are due now
         self.assertFalse(os.path.lexists(young) or os.path.lexists(r.adir))
-        self.assertTrue(enc.is_dir() and enc_tmp.is_dir())
         self.assertEqual((victim / "openclaw-rehearsal.tar.gz").read_bytes(), b"\x1f\x8b precious")
 
     # ----- tombstones -------------------------------------------------------------------------------
@@ -973,15 +978,46 @@ class CleanupTests(CleanupEnv):
         self.assertEqual(waited.call_args[0][0], float(G.CLEANUP_INTERVAL_S))
         self.assertTrue(r.adir.is_dir() and r.caps[0].is_dir())
 
-    def test_loop_with_hours_zero_returns_at_once(self):
+    def test_loop_with_hours_zero_idles_and_deletes_nothing(self):
+        # it never exits early (run.sh keeps one known child) and re-reads the option at every check
         self.protect_signals()
+        self.hooks(cleanup_interval_s=0.01)
         self.options(gate_cleanup_hours=0)
         r = self.make_run(finished=C.utc_now() - timedelta(days=30))
         lines = []
-        self.assertEqual(G.cleanup_loop(emit=lines.append), 0)
+        timer = threading.Timer(0.3, G.STOP.set)
+        timer.start()
+        try:
+            self.assertEqual(G.cleanup_loop(emit=lines.append), 143)
+        finally:
+            timer.cancel()
         self.assertEqual(lines, ["[cleanup] gate_cleanup_hours=0: automatic deletion is off (oc-upgrade cleanup "
                                  "lists what to delete)"])
         self.assertTrue(r.adir.is_dir())
+
+    def test_loop_picks_up_a_changed_cleanup_option(self):
+        self.protect_signals()
+        self.hooks(cleanup_interval_s=0.01)
+        self.options(gate_cleanup_hours=0)
+        r = self.make_run(finished=C.utc_now() - timedelta(days=30))
+        real_pass, n = G.cleanup_pass, [0]
+
+        def counting_pass(**kw):
+            n[0] += 1
+            if n[0] == 3:
+                self.options(gate_cleanup_hours=48)  # the owner changes the option while the loop runs
+            try:
+                return real_pass(**kw)
+            finally:
+                if not os.path.lexists(r.adir):
+                    G.STOP.set()
+                elif n[0] > 200:
+                    G.STOP.set()
+
+        lines = []
+        with mock.patch.object(G, "cleanup_pass", side_effect=counting_pass):
+            G.cleanup_loop(emit=lines.append)
+        self.assertFalse(os.path.lexists(r.adir), "\n".join(lines))
 
     def test_loop_pauses_during_a_hold_and_resumes_after_it(self):
         self.protect_signals()

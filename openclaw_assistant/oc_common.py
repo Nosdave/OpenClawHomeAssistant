@@ -475,12 +475,17 @@ def supervisor_token(path=None):
     try:
         with open(p, encoding="utf-8") as f:
             t = f.read(4096).strip()
-        if t and not any(c.isspace() for c in t):
+        if _token_ok(t):
             return t
     except (OSError, UnicodeDecodeError):  # unreadable file: fall back to the environment
         pass
     t = (os.environ.get("SUPERVISOR_TOKEN") or "").strip()
-    return t or None
+    return t if _token_ok(t) else None
+
+
+def _token_ok(t):
+    """A usable bearer token: printable ASCII without whitespace (anything else would break the header)."""
+    return bool(t) and len(t) <= 1024 and all(33 <= ord(c) <= 126 for c in t)
 
 
 def supervisor_get(path, token, base=None, timeout=10, max_bytes=4 * MIB):
@@ -495,15 +500,29 @@ def supervisor_get(path, token, base=None, timeout=10, max_bytes=4 * MIB):
         host, port = m.group(1), int(m.group(2) or 80)
     else:
         host, port = SUPERVISOR_ADDR
+    if not _token_ok(token or ""):
+        raise SupervisorError(0, "invalid Supervisor token")
     conn = http.client.HTTPConnection(host, port, timeout=timeout)
+    deadline = time.monotonic() + 3 * timeout  # overall limit: a slow drip never keeps the precheck waiting
     try:
         conn.request("GET", path, headers={"Authorization": f"Bearer {token}", "Host": "supervisor",
                                            "Accept": "application/json"})
         resp = conn.getresponse()
-        body = resp.read(max_bytes + 1)
+        chunks, n = [], 0
+        while n <= max_bytes:
+            if time.monotonic() > deadline:
+                raise TimeoutError("response not complete in time")
+            b = resp.read(min(64 * 1024, max_bytes + 1 - n))
+            if not b:
+                break
+            chunks.append(b)
+            n += len(b)
+        body = b"".join(chunks)
         status = resp.status
     except (OSError, http.client.HTTPException) as exc:
         raise SupervisorError(0, f"{type(exc).__name__}: {redact_text(str(exc))[:120]}") from None
+    except (ValueError, UnicodeError):  # e.g. an invalid header value; the text could carry the token
+        raise SupervisorError(0, "invalid request") from None
     finally:
         conn.close()
     if status != 200:
@@ -512,7 +531,7 @@ def supervisor_get(path, token, base=None, timeout=10, max_bytes=4 * MIB):
         raise SupervisorError(0, "response too large")
     try:
         obj = json.loads(body)
-    except ValueError:
+    except (ValueError, RecursionError):
         raise SupervisorError(0, "invalid JSON response") from None
     if not isinstance(obj, dict) or obj.get("result") != "ok" or not isinstance(obj.get("data"), dict):
         raise SupervisorError(0, "unexpected response")

@@ -214,7 +214,7 @@ for e in data:  # OpenClaw's own comparison: path, sha256, size, exec bit
     except OSError:
         bad.append(e["path"])
         continue
-    if hashlib.sha256(b).hexdigest() != e["sha256"] or len(b) != e["size"] or bool(m & 0o111) != bool(e["mode"] & 0o111):
+    if hashlib.sha256(b).hexdigest() != e["sha256"] or len(b) != e["size"] or (m & 0o111) != (e["mode"] & 0o111):
         bad.append(e["path"])
 if bad:
     sys.exit("content inventory mismatch: " + ", ".join(bad[:10]))
