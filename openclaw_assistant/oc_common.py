@@ -477,7 +477,7 @@ def supervisor_token(path=None):
             t = f.read(4096).strip()
         if t and not any(c.isspace() for c in t):
             return t
-    except OSError:
+    except (OSError, UnicodeDecodeError):  # unreadable file: fall back to the environment
         pass
     t = (os.environ.get("SUPERVISOR_TOKEN") or "").strip()
     return t or None
