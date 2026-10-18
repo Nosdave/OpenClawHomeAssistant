@@ -161,7 +161,7 @@ configuration:
 
   gate_cleanup_hours:
     name: Изтриване на архива на gate след (часове)
-    description: Брой часове след завършено изпълнение на миграционния gate, след които добавката изтрива /share/openclaw-upgrade/<run>/ на това изпълнение и записите от doctor на OpenClaw (/config/.openclaw.update-captures/doctor-*). 0 = никога. Диапазон 0-720, по подразбиране 48.
+    description: Брой часове след завършено изпълнение на миграционния gate, след които добавката изтрива /share/openclaw-upgrade/<run>/ на това изпълнение и записите от doctor на OpenClaw (/config/.openclaw.update-captures/doctor-*). Експортите за проба и старите некриптирани архиви отпреди надграждането (/config/.openclaw/upgrade-backups) се изтриват след същото време от създаването им или от миграцията. 0 = никога. Диапазон 0-720, по подразбиране 48.
 
   gate_backup_max_age_hours:
     name: Изисквана давност на резервното копие (часове)

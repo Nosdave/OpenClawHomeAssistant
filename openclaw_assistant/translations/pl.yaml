@@ -161,7 +161,7 @@ configuration:
 
   gate_cleanup_hours:
     name: Usuń archiwum bramki po (godzinach)
-    description: Liczba godzin od zakończonego przebiegu bramki migracji, po której dodatek usuwa katalog /share/openclaw-upgrade/<run>/ tego przebiegu oraz zrzuty doctor OpenClaw (/config/.openclaw.update-captures/doctor-*). 0 = nigdy. Zakres 0-720, domyślnie 48.
+    description: Liczba godzin od zakończonego przebiegu bramki migracji, po której dodatek usuwa katalog /share/openclaw-upgrade/<run>/ tego przebiegu oraz zrzuty doctor OpenClaw (/config/.openclaw.update-captures/doctor-*). Eksporty próbne i stare nieszyfrowane archiwa sprzed aktualizacji (/config/.openclaw/upgrade-backups) są usuwane po tym samym czasie od ich utworzenia lub od migracji. 0 = nigdy. Zakres 0-720, domyślnie 48.
 
   gate_backup_max_age_hours:
     name: Wymagany wiek kopii zapasowej (godziny)

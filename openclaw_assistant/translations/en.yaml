@@ -161,7 +161,7 @@ configuration:
 
   gate_cleanup_hours:
     name: Delete Gate Archive After (Hours)
-    description: Hours after a finished migration gate run before the add-on deletes that run's /share/openclaw-upgrade/<run>/ and OpenClaw's doctor captures (/config/.openclaw.update-captures/doctor-*). 0 = never. Range 0-720, default 48.
+    description: Hours after a finished migration gate run before the add-on deletes that run's /share/openclaw-upgrade/<run>/ and OpenClaw's doctor captures (/config/.openclaw.update-captures/doctor-*). Rehearsal exports and the old plaintext pre-upgrade archives (/config/.openclaw/upgrade-backups) are deleted the same time after they were written or after the migration. 0 = never. Range 0-720, default 48.
 
   gate_backup_max_age_hours:
     name: Required Backup Age (Hours)

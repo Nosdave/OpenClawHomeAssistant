@@ -1008,36 +1008,16 @@ fi
 # Cold export for an offline upgrade rehearsal (requested via `oc-upgrade export`)
 # Runs before anything starts or writes, so the copy is consistent.
 # ------------------------------------------------------------------------------
-# write_new_file <path>: stdin to a NEW file (O_EXCL|O_NOFOLLOW, 0600). Other add-ons can write /share, so
-# nothing there is ever opened through a link they could plant (age -o and > would follow one).
-write_new_file() {
-  python3 -I -c '
-import os, sys
-fd = os.open(sys.argv[1], os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
-with os.fdopen(fd, "wb") as f:
-    while True:
-        b = sys.stdin.buffer.read(1 << 20)
-        if not b:
-            break
-        f.write(b)
-    f.flush()
-    os.fsync(f.fileno())
-' "$1"
-}
+# Other add-ons can write /share: every file operation of the export there runs in
+# `oc-upgrade export-write` through directory fds (O_NOFOLLOW), never by path name.
+export_write() { OC_GATE_FROM_RUNSH=1 oc-upgrade export-write "$@"; }
 
 process_export_request() {
-  local request="${UPG_DIR}/export-request" ts dest need_kb avail_kb archive stale reh=/share/openclaw-rehearsal
+  local request="${UPG_DIR}/export-request" ts need_kb avail_kb name final reh=/share/openclaw-rehearsal
   # An interrupted export (power loss, SIGKILL) leaves a secret-bearing .tmp
   # behind; remove those on every start, whether or not a new export is due.
-  # rm removes a link itself, never its target; a linked directory is not entered.
-  if [ ! -L "$reh" ]; then
-    for stale in "$reh"/*/openclaw-rehearsal.tar.gz.tmp "$reh"/*/openclaw-rehearsal.tar.gz.age.tmp; do
-      [ -e "$stale" ] || [ -L "$stale" ] || continue
-      [ -L "$(dirname "$stale")" ] && continue
-      echo "WARN: Removing incomplete rehearsal export ${stale}."
-      rm -f "$stale" 2>/dev/null || echo "WARN: Could not remove ${stale}; delete it manually (it contains secrets)."
-      rmdir "$(dirname "$stale")" 2>/dev/null || true
-    done
+  if [ -d /share ]; then
+    export_write --sweep || echo "WARN: Could not check ${reh} for incomplete exports; delete *.tmp there manually (they contain secrets)."
   fi
   [ -f "$request" ] || return 0
   # One-shot: never retry on every boot, even after a failure.
@@ -1056,10 +1036,6 @@ process_export_request() {
     echo "WARN: Rehearsal export skipped: it needs gate_archive: encrypted with gate_archive_age_recipient (no plaintext copies)."
     return 0
   fi
-  if [ -L "$reh" ] || { [ -e "$reh" ] && [ ! -d "$reh" ]; }; then
-    echo "WARN: Rehearsal export skipped: ${reh} is not a plain directory."
-    return 0
-  fi
   ts="$(date -u +%Y%m%d-%H%M%S)"
   # Estimate with the same exclusions as the archive below (uncompressed size,
   # so a safe upper bound for the compressed export).
@@ -1073,18 +1049,13 @@ process_export_request() {
     echo "WARN: Rehearsal export skipped: not enough free space in /share (need ~${need_kb:-?} KiB, have ${avail_kb:-?} KiB)."
     return 0
   fi
-  # a fresh, unpredictable directory (mktemp -d, 0700): nothing in it can be planted in advance
-  if ! dest="$(umask 077 && mkdir -p "$reh" && mktemp -d "${reh}/${ts}-XXXXXX")"; then
-    echo "WARN: Rehearsal export skipped: cannot create a directory in ${reh}."
-    return 0
-  fi
-  echo "INFO: Creating cold rehearsal export in ${dest} (gateway not started yet)..."
-  archive="${dest}/openclaw-rehearsal.tar.gz.age"
+  echo "INFO: Creating cold rehearsal export in ${reh}/${ts}-* (gateway not started yet)..."
   local members=(.openclaw)
   [ -d /config/clawd ] && members+=(clawd)
   # Plugin packages under .openclaw (npm/, extensions/) stay in the copy; only
   # dependency trees inside the workspace are left out.
-  if (umask 077 && tar -C /config \
+  name=""
+  if name="$(umask 077 && tar -C /config \
       --exclude='.openclaw/upgrade-backups' \
       --exclude='.openclaw/media' \
       --exclude='.openclaw/logs' \
@@ -1092,25 +1063,12 @@ process_export_request() {
       --exclude='.openclaw/tmp' \
       --exclude='clawd/node_modules' \
       --exclude='clawd/*/node_modules' \
-      -czf - "${members[@]}" | "$agebin" -r "$rec" | write_new_file "${archive}.tmp") \
-     && mv -T -- "${archive}.tmp" "$archive"; then
-    if (umask 077 && {
-          echo "created_utc=${ts}"
-          echo "addon_version=${ADDON_VERSION:-unknown}"
-          echo "openclaw_runtime=$(openclaw_runtime_version || true)"
-          echo "sha256=$(sha256sum "$archive" | cut -d' ' -f1)"
-          echo "size_bytes=$(stat -c %s "$archive")"
-          echo "encrypted=age"
-          echo "recipient=${rec:0:9}...${rec: -6}"
-          echo "contains_secrets=yes"
-        } | write_new_file "${dest}/manifest.txt") 2>/dev/null; then
-      echo "INFO: Rehearsal export ready: ${archive} ($(du -h "$archive" 2>/dev/null | cut -f1)), age-encrypted. Decrypt it only where your private key lives; delete it after the rehearsal."
-    else
-      rm -f "${dest}/manifest.txt" 2>/dev/null || true
-      echo "WARN: Rehearsal export written to ${archive}, but its manifest could not be written (disk full?). Startup continues."
-    fi
+      -czf - "${members[@]}" | "$agebin" -r "$rec" | export_write --begin "$ts")" \
+     && [ -n "$name" ] \
+     && final="$(export_write --finish "$name" "$ts" "${ADDON_VERSION:-unknown}" "$(openclaw_runtime_version || true)" "${rec:0:9}...${rec: -6}")"; then
+    echo "INFO: Rehearsal export ready: ${final}, age-encrypted. Decrypt it only where your private key lives; it is deleted automatically gate_cleanup_hours after it was written."
   else
-    rm -f "${archive}.tmp"
+    [ -n "${name:-}" ] && { export_write --abort "$name" >/dev/null 2>&1 || true; }
     echo "WARN: Rehearsal export failed; nothing was changed. Startup continues."
   fi
   return 0

@@ -161,7 +161,7 @@ configuration:
 
   gate_cleanup_hours:
     name: Eliminar el archivo del gate tras (horas)
-    description: Horas tras una ejecución finalizada del gate de migración antes de que el complemento elimine el /share/openclaw-upgrade/<run>/ de esa ejecución y las capturas del doctor de OpenClaw (/config/.openclaw.update-captures/doctor-*). 0 = nunca. Rango 0-720, por defecto 48.
+    description: Horas tras una ejecución finalizada del gate de migración antes de que el complemento elimine el /share/openclaw-upgrade/<run>/ de esa ejecución y las capturas del doctor de OpenClaw (/config/.openclaw.update-captures/doctor-*). Las exportaciones de ensayo y los antiguos archivos sin cifrar anteriores a la actualización (/config/.openclaw/upgrade-backups) se eliminan el mismo tiempo después de crearse o de la migración. 0 = nunca. Rango 0-720, por defecto 48.
 
   gate_backup_max_age_hours:
     name: Antigüedad requerida de la copia de seguridad (horas)

@@ -362,7 +362,7 @@ These options control what the [migration gate](#upgrading-to-openclaw-202610-05
 |---|---|---|---|
 | `gate_archive` | `encrypted` / `off` | `encrypted` | **encrypted**: the gate writes `/share/openclaw-upgrade/<run>/openclaw-state-<ts>-before-<version>.tar.gz.age`, encrypted with [age](https://github.com/FiloSottile/age) to `gate_archive_age_recipient`; no plaintext is written to disk. **off**: no archive; the encrypted Home Assistant backup is the only rollback point. `encrypted` without a public key makes the gate hold (`archive-key-missing`) before it changes anything: there is never a plaintext archive. |
 | `gate_archive_age_recipient` | string | _(empty)_ | Your age **public** key: `age1` followed by 58 characters (62 in total). Home Assistant refuses to save anything else. **Never the private key** (`AGE-SECRET-KEY-1…`). See below. |
-| `gate_cleanup_hours` | int | `48` | Hours after a finished gate run (`[gate] done`) before the add-on deletes that run's `/share/openclaw-upgrade/<run>/` and the doctor captures that run created in `/config/.openclaw.update-captures/`. `0` = never delete automatically. Range: 0-720. See [Automatic deletion](#automatic-deletion-gate_cleanup_hours) |
+| `gate_cleanup_hours` | int | `48` | Hours after a gate run (from `[gate] done`, or from when a hold after the run was cleared, whichever is later) before the add-on deletes that run's `/share/openclaw-upgrade/<run>/` and the doctor captures that run created in `/config/.openclaw.update-captures/`. Rehearsal exports and the plaintext 2026.7 archives in `/config/.openclaw/upgrade-backups/` are deleted after the same number of hours, counted from their own time. `0` = never delete. A changed value applies from the next add-on start. Range: 0-720. See [Automatic deletion](#automatic-deletion-gate_cleanup_hours) |
 | `gate_backup_max_age_hours` | int | `24` | Before it changes the state, the gate requires an encrypted Home Assistant backup that contains this add-on and is at most this many hours old (for an OpenClaw update: taken before the update). Otherwise it holds (`ha-backup-missing`, acceptable). There is no value that switches the check off; to go ahead without a backup, accept the HOLD for that run. Range: 1-168 |
 
 **Creating the age key pair — on your own computer, not on Home Assistant:**
@@ -392,6 +392,15 @@ If you paste the private key into the option by mistake, Home Assistant refuses 
 save it, but its error message can show the value: treat that key pair as exposed,
 delete it and create a new one. If a private key reaches the options any other way,
 the gate holds with `archive-key-invalid` and never prints it.
+
+**Supervisor API access (accepted risk).** For the backup check the add-on has
+`hassio_api: true` with the `default` role. The Supervisor token is readable by every
+process in the add-on container, including the OpenClaw agent and its shell tools.
+With it they can read every `…/info` endpoint of the Supervisor: the backup list and
+backup details, host, network, OS, Supervisor, Core and hardware information, and other
+add-ons' info. Current Supervisor versions leave other add-ons' options out (`{}`);
+older ones returned them. The role adds no write access: no creating, restoring or
+deleting backups. Details: [SECURITY.md](SECURITY.md), section 9.
 
 ### Performance
 
@@ -1001,7 +1010,7 @@ oc-upgrade status           # hold reason, gate run, archives, HA backup checked
 oc-upgrade gate --dry-run   # read-only preview of what the migration gate would do
 oc-upgrade retry            # continue after fixing a HOLD (then restart the add-on)
 oc-upgrade log              # tail of the last gate run's doctor log (redacted)
-oc-upgrade cleanup          # when gate archives and doctor captures are deleted (--apply: delete what is due now)
+oc-upgrade cleanup          # what the add-on deletes when: gate archives, doctor captures, exports (--apply: what is due now)
 oc-upgrade export           # request an encrypted cold copy of the state for an upgrade rehearsal
 ```
 
@@ -1010,7 +1019,8 @@ shortened to `age1xxxxx…xxxxxx`, never a full key; cleanup hours; backup age),
 backup the last gate run checked, the archives in `/share/openclaw-upgrade/`
 (`encrypted`, or `PLAINTEXT` for those from 0.5.94-full1), the doctor captures, and
 labels other unencrypted copies (`PLAINTEXT`): rehearsal exports from earlier versions
-and the 2026.7 pre-upgrade archives in `/config/.openclaw/upgrade-backups/`.
+and the 2026.7 pre-upgrade archives in `/config/.openclaw/upgrade-backups/`. The add-on
+deletes all of these by itself (see [Automatic deletion](#automatic-deletion-gate_cleanup_hours)).
 `oc-upgrade gate --dry-run` (and the readiness section of `oc-upgrade check` when a
 migration is pending) shows the archive setting and runs the backup check, read-only.
 
@@ -1024,16 +1034,22 @@ ships.
 
 `oc-upgrade export` writes a cold copy on the **next** add-on start, before the
 gateway starts (Telegram is offline for a few minutes), to
-`/share/openclaw-rehearsal/<timestamp>/openclaw-rehearsal.tar.gz.age`, encrypted with
+`/share/openclaw-rehearsal/<timestamp>-<random>/openclaw-rehearsal.tar.gz.age` (a new
+directory with a random six-character suffix for every export), encrypted with
 age to `gate_archive_age_recipient` (streamed; no plaintext is written to disk). It
 contains `/config/.openclaw` (including installed plugins) and the `/config/clawd`
 workspace; logs, media, caches, earlier archives and `node_modules` folders inside
 the workspace are left out. The command is refused unless `gate_archive` is
-`encrypted` and a valid public key is set: there are no plaintext copies. The content
-holds secrets (tokens, OAuth logins): decrypt it only on the machine that holds your
-private key, never keep a decrypted copy of the archive, and delete the export after
-the rehearsal (the add-on does not delete encrypted exports; unencrypted exports from
-earlier versions are deleted `gate_cleanup_hours` after they were written). An
+`encrypted` and a valid public key is set: there are no plaintext copies. No export
+is written (the log shows a `WARN`) when `/share/openclaw-rehearsal` is a symbolic link
+or not a directory. The content holds secrets (tokens, OAuth logins): decrypt it only
+on the machine that holds your private key and never keep a decrypted copy of the
+archive.
+The add-on deletes the export `gate_cleanup_hours` after it was written (default 48 h;
+unencrypted exports from earlier versions too), so fetch it to your rehearsal machine
+before then, or raise `gate_cleanup_hours` and restart the add-on. Only the
+export's own files (`openclaw-rehearsal.tar.gz.age`, `manifest.txt`, an unfinished
+`.tmp`) are deleted; the directory goes only if nothing else is left in it. An
 interrupted export is removed on the next start. `oc-upgrade export --cancel`
 withdraws the request.
 
@@ -1100,9 +1116,15 @@ note after the steps)
    lines say when the add-on deletes this run's archive and doctor captures
    (`[gate] info: the archive and the doctor captures of this run are deleted after …`);
    the add-on then does it by itself (see [Automatic deletion](#automatic-deletion-gate_cleanup_hours)).
+   If the add-on holds after the run (gateway exit 78 or a crash loop), that time
+   counts from when you clear the hold with `oc-upgrade retry`; `oc-upgrade cleanup`
+   shows the current time. The plaintext 2026.7 archives in
+   `/config/.openclaw/upgrade-backups/` are deleted `gate_cleanup_hours` after the
+   migration completed.
    After that, the encrypted Home Assistant backup is the only rollback point; keep it
    until you are sure. To keep the archive longer, raise `gate_cleanup_hours` (or set
-   `0`) before that time.
+   `0`) and restart the add-on before that time: Home Assistant passes a changed option
+   to the add-on only when it starts.
 
 **Coming from `0.5.94-full1`.** The OpenClaw version does not change (2026.10.4), so
 no gate runs on this update: nothing is checked or archived now. Create the encrypted
@@ -1111,12 +1133,17 @@ restore), and set `gate_archive_age_recipient` (or `gate_archive: off`) after th
 update, otherwise the next gate run (the next OpenClaw update, or
 `oc-upgrade retry --doctor`) holds with `archive-key-missing`. On the first start the
 add-on deletes full1's **plaintext** gate archive in `/share/openclaw-upgrade/<run>/`
-and that run's doctor captures, `gate_cleanup_hours` after that gate run, so at once
-if it finished longer ago. A return to OpenClaw 2026.7.35 is then only possible with
-the Home Assistant backup of `0.5.93-full2`. If you downloaded a backup for the full1
-update, delete that copy, and delete unencrypted backups of this add-on in
-**Settings → System → Backups** (the gate names each one it sees in a `WARN` at its
-next run).
+and that run's doctor captures, `gate_cleanup_hours` after that gate run ended (or
+after a hold that followed it was cleared), so at once if that was longer ago. The
+plaintext 2026.7 archives in `/config/.openclaw/upgrade-backups/` go
+`gate_cleanup_hours` after the full1 migration completed, so usually at the first
+check after this update as well, and rehearsal exports `gate_cleanup_hours` after they
+were written. To keep any of these longer, raise `gate_cleanup_hours` (or set `0`)
+after the update and before the first start. A return to OpenClaw 2026.7.35 is then
+only possible with the Home Assistant backup of `0.5.93-full2`. If you downloaded a
+backup for the full1 update, delete that copy, and delete unencrypted backups of this
+add-on in **Settings → System → Backups** (the gate names each one it sees in a `WARN`
+at its next run).
 
 **What the gate does**
 
@@ -1178,7 +1205,7 @@ Like every HOLD they stay until `oc-upgrade retry` and a restart.
 | `archive-key-invalid` | hard | The option is not exactly one age public key, `age` rejects it, or `gate_archive` is neither `encrypted` nor `off`. A private key (`AGE-SECRET-KEY-…`) in the option lands here too; it is never printed. | Put exactly one `age1…` public key there (or set `gate_archive: off`). If the private key was pasted anywhere, create a new key pair. Then `oc-upgrade retry` and restart. |
 | `archive-age-missing` | hard | The image's `age` tool does not run. | Reinstall or rebuild the add-on. |
 | `ha-backup-missing` | acceptable | No encrypted full or partial backup with this add-on from the last `gate_backup_max_age_hours`, or, for an OpenClaw update, the recent ones hold the new add-on version (taken after the update: restoring them would not bring back the previous OpenClaw). The message lists what the gate found. | See below. |
-| `ha-backup-unverified` | acceptable | The backup list could not be read: no Supervisor token, an HTTP error (401/403: the add-on lacks Supervisor API access), no answer from the Supervisor, or the add-on version inside a backup could not be read. | If the cause was temporary, `oc-upgrade retry` and restart check again. Otherwise check in **Settings → System → Backups** that an encrypted backup with this add-on (for an update: with the previous add-on version) exists, then `oc-upgrade retry --accept ha-backup-unverified` and restart. |
+| `ha-backup-unverified` | acceptable | The backup list could not be read: no usable Supervisor token, an HTTP error (401/403: the add-on lacks Supervisor API access), no answer (or no complete answer in time) from the Supervisor, an answer that is not the expected JSON, or the add-on version inside a backup could not be read. | If the cause was temporary, `oc-upgrade retry` and restart check again. Otherwise check in **Settings → System → Backups** that an encrypted backup with this add-on (for an update: with the previous add-on version) exists, then `oc-upgrade retry --accept ha-backup-unverified` and restart. |
 
 **`ha-backup-missing`: what to do.** For an OpenClaw update the backup must hold
 the add-on version you update from, so a backup made now, after the update, does not
@@ -1206,28 +1233,53 @@ Every gate run (the 2026.10 migration, later OpenClaw updates,
 `oc-upgrade retry --doctor`) writes a new archive, and OpenClaw 2026.10 doctor leaves
 a copy of the databases in `/config/.openclaw.update-captures/doctor-<uuid>/` on every
 pass (it removes old ones only during a later doctor run, and every add-on backup
-includes them). `gate_cleanup_hours` after a gate run has finished (`[gate] done`;
-default 48 h) the add-on deletes:
+includes them). `gate_cleanup_hours` (default 48 h) after a gate run has finished
+(`[gate] done`) the add-on deletes:
 
 - that run's `/share/openclaw-upgrade/<run>/` (archive, `manifest.json`, `SHA256SUMS`);
 - the doctor captures that run created: the add-on finds them in the run's doctor
   logs and deletes only `doctor-<uuid>` directories inside
-  `/config/.openclaw.update-captures/`.
+  `/config/.openclaw.update-captures/`. That includes captures OpenClaw marked with an
+  `outcome.json`, which OpenClaw itself would keep: the rule against plaintext copies of
+  secrets takes precedence over OpenClaw's own retention.
 
-By modification time (`gate_cleanup_hours` after they were written) it also deletes
-archive directories in `/share/openclaw-upgrade/` that no finished run refers to (for
-example after a Home Assistant restore of the add-on, which does not touch `/share`,
-or after an abandoned run) and unencrypted rehearsal exports from earlier versions.
-It leaves alone the archive of a run that can still continue, encrypted rehearsal
-exports and doctor captures that no gate run created.
+If the add-on held after the run (gateway exit 78 or a crash loop), the time counts
+from when that hold was cleared with `oc-upgrade retry`, since that is later: the
+archive outlives the last moment the migrated state was shown not to work.
+
+The add-on also deletes, each `gate_cleanup_hours` after its own time:
+
+- archive directories in `/share/openclaw-upgrade/` that no finished run refers to
+  (for example after a Home Assistant restore of the add-on, which does not touch
+  `/share`, or after an abandoned run): after their last modification;
+- rehearsal exports in `/share/openclaw-rehearsal/<timestamp>[-<random>]/`, encrypted
+  ones and unencrypted ones from earlier versions alike: after they were written.
+  Only the export's own files (`openclaw-rehearsal.tar.gz[.age]`, an unfinished
+  `.tmp`, `manifest.txt`) are deleted; the directory goes only if nothing else is left
+  in it;
+- the plaintext 2026.7 pre-upgrade archives from 0.5.93,
+  `/config/.openclaw/upgrade-backups/openclaw-state-*.tar.gz` (and leftover `.tmp`
+  files): after the later of their modification time and the completion of a 2026.8+
+  migration (the gate's migrated marker). Nothing is deleted there before such a
+  migration. On an install that already migrated with 0.5.94-full1 they go at the
+  first check after the update to 0.5.94-full2, if that migration is older than
+  `gate_cleanup_hours`.
+
+It leaves alone the archive of a run that can still continue and doctor captures
+that no gate run created.
 
 The deletion runs next to the gateway: once at start, then hourly. It pauses while a
 HOLD is active, a gate run is running, interrupted or held, or a retry is pending
 (`[cleanup] paused: …`). Each run is announced once
 (`[cleanup] run <id>: … will be deleted at <time>`) and logged when it is deleted
-(`[cleanup] run <id>: deleted …`). A directory is first renamed to
+(`[cleanup] run <id>: deleted …`). An archive or capture directory is first renamed to
 `.oc-addon-deleting-<name>` and then removed, so an interrupted deletion never leaves
-a partial archive under its real name (the next pass finishes it). Progress is kept in
+a partial archive under its real name (the next pass finishes it). Other add-ons can
+write to `/share`, so every delete there goes through directory handles that never
+follow a symbolic link: a planted link is removed as a link or the delete is refused,
+and its target is never touched. If one item cannot be deleted, the log shows
+`WARN [cleanup] …` and the pass goes on with the others (the next check tries again).
+Progress is kept in
 `/config/.openclaw-upgrade/gate/runs/<run>/cleanup.json`; `oc-upgrade status` shows
 `auto-delete due …` or `deleted …` for the current run.
 
@@ -1236,11 +1288,15 @@ oc-upgrade cleanup           # list what is deleted when (read-only)
 oc-upgrade cleanup --apply   # delete what is due now instead of waiting for the hourly check
 ```
 
-With `gate_cleanup_hours: 0` nothing is deleted automatically and
-`oc-upgrade cleanup --apply` deletes nothing either; `oc-upgrade cleanup` still lists
-the paths, and you delete them yourself. No command deletes before the due time:
-lower `gate_cleanup_hours` (the next hourly check or `oc-upgrade cleanup --apply` uses
-the new value), or delete the listed paths by hand.
+With `gate_cleanup_hours: 0` nothing is deleted: not by the hourly check and not by
+`oc-upgrade cleanup --apply`. `oc-upgrade cleanup` still lists every item, marked
+`kept (gate_cleanup_hours=0)`, and you delete them yourself. The hourly check keeps
+running and reads the option at every check, but Home Assistant writes a changed option
+into the add-on only when the add-on starts: after changing `gate_cleanup_hours`
+(from or to `0`, or any other value), restart the add-on. The check at start then uses
+the new value and deletes at once what is already due under it. No command deletes
+before the due time: lower `gate_cleanup_hours` and restart, or delete the listed
+paths by hand.
 
 #### GLM thinking levels (option `glm_thinking_levels`)
 
@@ -1342,7 +1398,8 @@ multiplied by 0.5^(age in days / 30). In 2026.10.4 the minimum score
 (`memory.search.query.minScore`, default 0.35) is applied **after** that decay. A
 dated note therefore fell below 0.35 after about 45 days even on a perfect match
 (1.0 × 0.5^(45/30) ≈ 0.35), and a good match of 0.7 after 30 days, so memory search
-no longer returned it (only OpenClaw's keyword-only fallback could still surface it).
+no longer returned it (OpenClaw's keyword fallback could still return it in some
+cases, for example when no other result passed `minScore`).
 OpenClaw 2026.10.10-beta.1 applies `minScore` before the decay
 (openclaw/openclaw#168692).
 
@@ -1356,6 +1413,11 @@ for any OpenClaw version other than 2026.10.4. There is no option for it.
 half of it after one year; a perfect match stays above 0.35 for about 553 days. Among
 equally relevant results, newer ones still rank first. Older dated notes and session
 transcripts come back in the results and rank noticeably higher than before.
+
+Measured in the add-on's rehearsal (keyword-only memory search on OpenClaw 2026.10.4,
+two identical notes dated 80 days and 1 day ago): without the patch the older note
+scored 0.161 of the newer one's score (0.154, below the default `minScore` 0.35, so it
+was not returned); with the patch 0.861 (0.858, returned).
 
 What decays: dated files `memory/YYYY-MM-DD.md` (also
 `memory/<folder>/YYYY-MM-DD-<name>.md`) by the date in the name, session transcripts
@@ -1397,7 +1459,7 @@ The add-on tells the Supervisor to skip regenerable caches and tooling, so backu
 | `__pycache__/` | Python bytecode — regenerated automatically |
 | `*.jsonl.lock` | stale session locks — never useful to restore |
 
-Everything else is backed up: `openclaw.json`, config snapshots, skills, agent sessions, the `clawd` workspace, keys, secrets and TLS certificates. That includes OpenClaw 2026.10's doctor captures in `/config/.openclaw.update-captures/` (database copies from each doctor pass) until the add-on deletes them, `gate_cleanup_hours` after their gate run (see [Automatic deletion](#automatic-deletion-gate_cleanup_hours)).
+Everything else is backed up: `openclaw.json`, config snapshots, skills, agent sessions, the `clawd` workspace, keys, secrets and TLS certificates. That includes OpenClaw 2026.10's doctor captures in `/config/.openclaw.update-captures/` (database copies from each doctor pass) until the add-on deletes them, `gate_cleanup_hours` after their gate run, and the plaintext 2026.7 archives in `/config/.openclaw/upgrade-backups/` until they are deleted after the 2026.10 migration (see [Automatic deletion](#automatic-deletion-gate_cleanup_hours)).
 
 > **Important**: restoring a backup replaces `/config` wholesale, so excluded directories are **removed** by a restore rather than left in place. After restoring, reinstall any brew or global npm tools you depend on. Caches rebuild themselves.
 
@@ -1765,8 +1827,9 @@ There are two rollback points for the 2026.10 update:
 2. **The gate archive**
    `/share/openclaw-upgrade/<run>/openclaw-state-<ts>-before-2026.10.4.tar.gz.age`:
    only with `gate_archive: encrypted`, and only until the add-on deletes it,
-   `gate_cleanup_hours` after the gate run (default 48 h; `oc-upgrade cleanup` shows
-   the time; set `gate_cleanup_hours: 0` before then to keep it). It holds the state
+   `gate_cleanup_hours` after the gate run, or after a hold that followed the run was
+   cleared (default 48 h; `oc-upgrade cleanup` shows the time; to keep it, set
+   `gate_cleanup_hours: 0` and restart the add-on before then). It holds the state
    from right before the migration, so it can be newer than your backup. A Home
    Assistant restore of the add-on does not touch `/share`. You need your private key
    on your own computer and SSH access to Home Assistant through the
@@ -1806,9 +1869,10 @@ Home Assistant backup remains.
 Before 2026.8 runtimes start for the first time, the add-on also keeps a compressed
 archive under `/config/.openclaw/upgrade-backups/` (the three newest are kept); for
 the 2026.10 update the gate's `/share` archive replaces it. Those 2026.7 archives are
-**not encrypted** (`oc-upgrade status` marks them `PLAINTEXT`) and the add-on does not
-delete them: remove them once you no longer need a rollback to 2026.7
-(`rm /config/.openclaw/upgrade-backups/openclaw-state-*.tar.gz`). Work created after
+**not encrypted** (`oc-upgrade status` marks them `PLAINTEXT`). The add-on deletes them
+`gate_cleanup_hours` after the 2026.10 migration completed (on an install migrated with
+0.5.94-full1, at the first check after the update to 0.5.94-full2 if that is longer
+ago); see [Automatic deletion](#automatic-deletion-gate_cleanup_hours). Work created after
 the archive is not present after a rollback, and Telegram messages that 2026.10
 already processed are not delivered again. Files the gate moved to quarantine are
 in the gate archive too (it is written before the cleanup).

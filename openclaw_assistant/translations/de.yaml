@@ -161,7 +161,7 @@ configuration:
 
   gate_cleanup_hours:
     name: Gate-Archiv löschen nach (Stunden)
-    description: Stunden nach einem abgeschlossenen Lauf des Migrations-Gates, bis das Add-on das /share/openclaw-upgrade/<run>/ dieses Laufs und die Doctor-Aufzeichnungen von OpenClaw (/config/.openclaw.update-captures/doctor-*) löscht. 0 = nie. Bereich 0-720, Standard 48.
+    description: Stunden nach einem abgeschlossenen Lauf des Migrations-Gates, bis das Add-on das /share/openclaw-upgrade/<run>/ dieses Laufs und die Doctor-Aufzeichnungen von OpenClaw (/config/.openclaw.update-captures/doctor-*) löscht. Probe-Exporte und die alten Klartext-Archive vor dem Upgrade (/config/.openclaw/upgrade-backups) werden dieselbe Zeit nach ihrem Erstellen bzw. nach der Migration gelöscht. 0 = nie. Bereich 0-720, Standard 48.
 
   gate_backup_max_age_hours:
     name: Erforderliches Backup-Alter (Stunden)

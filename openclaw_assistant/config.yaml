@@ -14,8 +14,14 @@ boot: auto
 init: false
 # Supervisor API: used only by the migration gate's read-only check for an
 # encrypted Home Assistant backup (GET /addons/self/info, /backups/info,
-# /backups/<slug>/info). The "default" role allows only these */info reads;
-# "backup" would also allow creating, deleting, restoring and downloading backups.
+# /backups/<slug>/info). The "default" role adds GET of */info endpoints, no
+# writes; "backup" would also allow creating, deleting, restoring and downloading
+# backups. Accepted risk (SECURITY.md, section 9): the token is readable by every
+# process in this container, the OpenClaw agent and its shell tools included
+# (/run/s6/container_environment/SUPERVISOR_TOKEN), so they can read every */info
+# endpoint too: backup list and backup info, host/network/OS/Supervisor/Core/
+# hardware info, other add-ons' info (current Supervisor versions return their
+# options empty, older ones did not).
 hassio_api: true
 hassio_role: default
 homeassistant_api: false
@@ -227,9 +233,13 @@ options:
   # Your age PUBLIC key (age1..., 62 characters, from `age-keygen` on a trusted
   # device). Never the private key (AGE-SECRET-KEY-...): keep that off this host.
   gate_archive_age_recipient: ""
-  # Hours after a finished gate run ([gate] done) before the add-on deletes that
-  # run's /share/openclaw-upgrade/<run>/ and OpenClaw's doctor captures
-  # (/config/.openclaw.update-captures/doctor-*). 0 = never delete.
+  # Hours after a finished gate run ([gate] done, or when a hold after it was
+  # cleared, if later) before the add-on deletes that run's
+  # /share/openclaw-upgrade/<run>/ and OpenClaw's doctor captures
+  # (/config/.openclaw.update-captures/doctor-*). Rehearsal exports
+  # (/share/openclaw-rehearsal/) and the plaintext 2026.7 archives
+  # (/config/.openclaw/upgrade-backups/) go after the same hours, counted from
+  # their own time. 0 = never delete. A change applies from the next add-on start.
   gate_cleanup_hours: 48
   # Before it changes the state, the gate requires an encrypted Home Assistant
   # backup that contains this add-on (taken before the update) and is at most

@@ -583,12 +583,13 @@ def cmd_export(args):
     state_size = du_bytes(p["STATE"])
     print("Export requested. Restart the add-on to create it:")
     print("  - it runs on the next start, BEFORE the gateway starts (Telegram is offline for a few minutes);")
-    print("  - the copy goes to /share/openclaw-rehearsal/<timestamp>/ (state incl. installed plugins + workspace,")
+    print("  - the copy goes to /share/openclaw-rehearsal/<timestamp>-<random>/ (state incl. installed plugins + workspace,")
     print("    without logs, media, caches, earlier archives and workspace node_modules);")
     if state_size is not None:
         print(f"  - current state size: {human(state_size)} before compression;")
     print(f"  - it is encrypted with age to {short_recipient(ao['recipient'])}; the content holds secrets (tokens,")
-    print("    OAuth logins): decrypt it only where your private key lives and never store a decrypted copy.")
+    print("    OAuth logins): decrypt it only where your private key lives and never store a decrypted copy;")
+    print(f"  - the add-on deletes it {gate_options()['cleanup_hours']} h after it was written (gate_cleanup_hours, 0 = keep).")
     print("    Withdraw with: oc-upgrade export --cancel")
     return RC_OK
 
@@ -685,6 +686,11 @@ def cmd_cleanup(args):
     return _gate().cleanup_cmd(args)
 
 
+def cmd_export_write(args):
+    """Internal (run.sh's rehearsal export): the /share side through directory fds."""
+    return _gate().export_write(args)
+
+
 COMMANDS = {
     "check": cmd_check,
     "status": cmd_status,
@@ -694,6 +700,7 @@ COMMANDS = {
     "retry": cmd_retry,
     "log": cmd_log,
     "cleanup": cmd_cleanup,
+    "export-write": cmd_export_write,
 }
 
 

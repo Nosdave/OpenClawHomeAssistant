@@ -24,6 +24,7 @@ import os
 import re
 import shutil
 import signal
+import socket
 import sqlite3
 import stat
 import subprocess
@@ -504,7 +505,23 @@ def supervisor_get(path, token, base=None, timeout=10, max_bytes=4 * MIB):
         raise SupervisorError(0, "invalid Supervisor token")
     conn = http.client.HTTPConnection(host, port, timeout=timeout)
     deadline = time.monotonic() + 3 * timeout  # overall limit: a slow drip never keeps the precheck waiting
+
+    held = {}
+
+    def cut_off():  # a read blocked on a dripping socket returns once the socket is shut down
+        sock = held.get("sock")  # kept here: http.client drops conn.sock after a "Connection: close" reply
+        if sock is not None:
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+    timer = threading.Timer(3 * timeout, cut_off)
+    timer.daemon = True
+    timer.start()
     try:
+        if hasattr(conn, "connect"):
+            conn.connect()
+        held["sock"] = getattr(conn, "sock", None)
         conn.request("GET", path, headers={"Authorization": f"Bearer {token}", "Host": "supervisor",
                                            "Accept": "application/json"})
         resp = conn.getresponse()
@@ -524,7 +541,10 @@ def supervisor_get(path, token, base=None, timeout=10, max_bytes=4 * MIB):
     except (ValueError, UnicodeError):  # e.g. an invalid header value; the text could carry the token
         raise SupervisorError(0, "invalid request") from None
     finally:
+        timer.cancel()
         conn.close()
+    if time.monotonic() > deadline:
+        raise SupervisorError(0, "TimeoutError: response not complete in time")
     if status != 200:
         raise SupervisorError(status, f"HTTP {status}")
     if len(body) > max_bytes:

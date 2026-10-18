@@ -1061,7 +1061,7 @@ class StatusTests(CleanupEnv):
         a = self.line("archive: ")
         want = f"  archive: encrypted (age, {short}) {j['archive']['dir']}/{j['archive']['file']}"
         self.assertTrue(a.startswith(want), a)
-        self.assertIn(f"sha256 {j['archive']['sha256'][:12]}…", a)
+        self.assertIn(f"sha256 {j['archive']['sha256']})", a)  # in full: the trusted record (journal in /config)
         self.assertNotIn("auto-delete", a)
         self.assertEqual(self.line("Gate options: "),
                          f"Gate options: gate_archive encrypted to {short}; delete archives/doctor captures 48 h after "
