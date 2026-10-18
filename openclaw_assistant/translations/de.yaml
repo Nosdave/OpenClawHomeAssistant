@@ -150,3 +150,19 @@ configuration:
   glm_thinking_levels:
     name: GLM-Denkstufen
     description: "Ein GLM-Modell mit dem Denkformat 'qwen-chat-template' bekommt nur Denken an/aus. Wenn AN, stellt das Migrations-Gate es bei seinem nächsten Lauf auf reasoning_effort um (OpenClaw-Update oder 'oc-upgrade retry --doctor' und ein Neustart; ein normaler Neustart reicht nicht), damit /think- und thinkingDefault-Stufen beim Modell ankommen. 'Aus' wird dann als 'none' statt enable_thinking gesendet: Prüfen Sie vorher Ihren GLM-Server (siehe Dokumentation). Wieder AUS schalten macht die Änderung nicht rückgängig. Jede Änderung wird im Transform-Ledger des Gates protokolliert."
+
+  gate_archive:
+    name: Gate-Archiv
+    description: "Was das Migrations-Gate nach /share/openclaw-upgrade schreibt, bevor es den OpenClaw-Zustand ändert (ein OpenClaw-Update oder 'oc-upgrade retry --doctor'). 'encrypted' (Standard): ein mit age an den unten angegebenen öffentlichen Schlüssel verschlüsseltes Archiv; es wird nie Klartext auf die Festplatte geschrieben. 'off': kein Archiv; ein Rollback ist dann nur über Ihr verschlüsseltes Home-Assistant-Backup möglich. 'encrypted' ohne Schlüssel hält das Gate an, bevor irgendetwas geändert wird."
+
+  gate_archive_age_recipient:
+    name: Öffentlicher age-Schlüssel für das Gate-Archiv
+    description: "Ihr ÖFFENTLICHER age-Schlüssel (age1..., 62 Zeichen), erstellt mit 'age-keygen' auf einem vertrauenswürdigen Gerät. Fügen Sie niemals den privaten Schlüssel (AGE-SECRET-KEY-...) ein; halten Sie ihn von diesem Host fern. Den privaten Schlüssel brauchen Sie nur, um das Archiv für ein Rollback zu entschlüsseln."
+
+  gate_cleanup_hours:
+    name: Gate-Archiv löschen nach (Stunden)
+    description: Stunden nach einem abgeschlossenen Lauf des Migrations-Gates, bis das Add-on das /share/openclaw-upgrade/<run>/ dieses Laufs und die Doctor-Aufzeichnungen von OpenClaw (/config/.openclaw.update-captures/doctor-*) löscht. 0 = nie. Bereich 0-720, Standard 48.
+
+  gate_backup_max_age_hours:
+    name: Erforderliches Backup-Alter (Stunden)
+    description: "Bevor es den OpenClaw-Zustand ändert, verlangt das Migrations-Gate ein verschlüsseltes Home-Assistant-Backup, das dieses Add-on enthält, vor dem Update erstellt wurde und höchstens so viele Stunden alt ist; andernfalls hält es an (akzeptierbar mit 'oc-upgrade retry --accept ha-backup-missing'). Bereich 1-168, Standard 24."

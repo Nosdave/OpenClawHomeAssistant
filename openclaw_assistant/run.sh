@@ -393,6 +393,10 @@ is_reserved_gateway_env_var() {
     OPENCLAW_*|OC_GATE_*|OC_ADDON_*|OC_UPGRADE_*|OC_CONFIG_ROOT)
       return 0
       ;;
+    # Supervisor credentials: never injectable (the migration gate reads the real token from s6).
+    SUPERVISOR_TOKEN|SUPERVISOR_API|HASSIO_TOKEN)
+      return 0
+      ;;
     *)
       return 1
       ;;
@@ -598,8 +602,8 @@ trap early_stop INT TERM
 # OpenClaw 2026.8+ migrates the persistent databases one-way (2026.10.4: state
 # schema 20, agent schema 24); older OpenClaw builds cannot open them. For those
 # runtimes the migration gate (`oc-upgrade gate`, below) owns the pre-migration
-# archive: it writes a verified archive to /share/openclaw-upgrade/<run>/ and
-# only then runs `openclaw doctor --fix`. The local archive below is kept for
+# archive: it writes an age-encrypted, verified archive to /share/openclaw-upgrade/<run>/
+# (none with gate_archive: off) and only then runs `openclaw doctor --fix`. The local archive below is kept for
 # 2026.7.x runtimes, which perform no schema migration: before the gateway
 # starts a version we have not started before, archive the state while the old
 # gateway is down. It excludes regenerable/bulky content (skills, media, npm,
@@ -1008,7 +1012,7 @@ process_export_request() {
   local request="${UPG_DIR}/export-request" ts dest need_kb avail_kb archive stale
   # An interrupted export (power loss, SIGKILL) leaves a secret-bearing .tmp
   # behind; remove those on every start, whether or not a new export is due.
-  for stale in /share/openclaw-rehearsal/*/openclaw-rehearsal.tar.gz.tmp; do
+  for stale in /share/openclaw-rehearsal/*/openclaw-rehearsal.tar.gz.tmp /share/openclaw-rehearsal/*/openclaw-rehearsal.tar.gz.age.tmp; do
     [ -e "$stale" ] || continue
     echo "WARN: Removing incomplete rehearsal export ${stale}."
     rm -f "$stale" 2>/dev/null || echo "WARN: Could not remove ${stale}; delete it manually (it contains secrets)."
@@ -1019,6 +1023,16 @@ process_export_request() {
   rm -f "$request"
   if [ ! -d /share ]; then
     echo "WARN: Rehearsal export skipped: /share is not available."
+    return 0
+  fi
+  # Owner rule: no plaintext secrets in archives. The copy is age-encrypted to the gate archive key.
+  local rec mode agebin
+  mode="$(jq -r '.gate_archive // "encrypted"' /data/options.json 2>/dev/null || echo encrypted)"
+  rec="$(jq -r '.gate_archive_age_recipient // ""' /data/options.json 2>/dev/null | tr -d '[:space:]' || true)"
+  agebin="$(head -n 1 /usr/local/libexec/oc-addon/age-bin 2>/dev/null || true)"
+  [ -x "${agebin:-}" ] || agebin="$(command -v age 2>/dev/null || true)"
+  if [ "$mode" != "encrypted" ] || [[ ! "$rec" =~ ^age1[02-9ac-hj-np-z]{58}$ ]] || [ -z "$agebin" ]; then
+    echo "WARN: Rehearsal export skipped: it needs gate_archive: encrypted with gate_archive_age_recipient (no plaintext copies)."
     return 0
   fi
   ts="$(date -u +%Y%m%d-%H%M%S)"
@@ -1040,7 +1054,7 @@ process_export_request() {
     echo "WARN: Rehearsal export skipped: cannot create ${dest}."
     return 0
   fi
-  archive="${dest}/openclaw-rehearsal.tar.gz"
+  archive="${dest}/openclaw-rehearsal.tar.gz.age"
   local members=(.openclaw)
   [ -d /config/clawd ] && members+=(clawd)
   # Plugin packages under .openclaw (npm/, extensions/) stay in the copy; only
@@ -1053,7 +1067,7 @@ process_export_request() {
       --exclude='.openclaw/tmp' \
       --exclude='clawd/node_modules' \
       --exclude='clawd/*/node_modules' \
-      -czf "${archive}.tmp" "${members[@]}") \
+      -czf - "${members[@]}" | "$agebin" -r "$rec" -o "${archive}.tmp") \
      && mv "${archive}.tmp" "$archive"; then
     chmod 600 "$archive" 2>/dev/null || true
     if (umask 077 && {
@@ -1062,9 +1076,11 @@ process_export_request() {
           echo "openclaw_runtime=$(openclaw_runtime_version || true)"
           echo "sha256=$(sha256sum "$archive" | cut -d' ' -f1)"
           echo "size_bytes=$(stat -c %s "$archive")"
+          echo "encrypted=age"
+          echo "recipient=${rec:0:9}...${rec: -6}"
           echo "contains_secrets=yes"
         } > "${dest}/manifest.txt") 2>/dev/null; then
-      echo "INFO: Rehearsal export ready: ${archive} ($(du -h "$archive" 2>/dev/null | cut -f1)). It contains secrets — delete it after the rehearsal."
+      echo "INFO: Rehearsal export ready: ${archive} ($(du -h "$archive" 2>/dev/null | cut -f1)), age-encrypted. Decrypt it only where your private key lives; delete it after the rehearsal."
     else
       rm -f "${dest}/manifest.txt" 2>/dev/null || true
       echo "WARN: Rehearsal export written to ${archive}, but its manifest could not be written (disk full?). Startup continues."
@@ -1217,7 +1233,8 @@ ensure_brave_plugin() {
 
 # ------------------------------------------------------------------------------
 # Migration gate (OpenClaw 2026.8+, when `gate --plan` asked for it above).
-# `oc-upgrade gate` archives the state to /share, cleans up, pre-migrates the
+# `oc-upgrade gate` archives the state to /share (age-encrypted, or none with
+# gate_archive: off), checks for an encrypted Home Assistant backup, cleans up, pre-migrates the
 # config, runs `openclaw doctor --fix --non-interactive` twice and checks the
 # result; any failure leaves a HOLD with hold.txt (exit 20, or 1 for an internal
 # error). It runs in the background so the early stop trap can forward SIGTERM
@@ -1311,12 +1328,18 @@ GW_RELAY_PID=""
 NGINX_PID=""
 TTYD_PID=""
 HEALTH_PID=""
+CLEANUP_PID=""
 # Keep a stop request that arrived before this point (early_stop trap).
 SHUTTING_DOWN="${SHUTTING_DOWN:-false}"
 
 shutdown() {
   SHUTTING_DOWN="true"
   echo "Shutdown requested; stopping services..."
+
+  # The archive cleanup stops at its next check; it is reaped after the gateway (no wait here).
+  if [ -n "${CLEANUP_PID:-}" ] && kill -0 "${CLEANUP_PID}" >/dev/null 2>&1; then
+    kill -TERM "${CLEANUP_PID}" >/dev/null 2>&1 || true
+  fi
 
   if [ -n "${HEALTH_PID}" ] && kill -0 "${HEALTH_PID}" >/dev/null 2>&1; then
     kill -TERM "${HEALTH_PID}" >/dev/null 2>&1 || true
@@ -1377,6 +1400,15 @@ shutdown() {
   fi
 
   stop_gw_relay
+
+  if [ -n "${CLEANUP_PID:-}" ]; then
+    for _i in 1 2 3 4 5 6 7 8 9 10; do
+      kill -0 "${CLEANUP_PID}" 2>/dev/null || break
+      sleep 1
+    done
+    kill -KILL "${CLEANUP_PID}" >/dev/null 2>&1 || true
+    wait "${CLEANUP_PID}" 2>/dev/null || true
+  fi
 
   if [ "$CLEAN_LOCKS_ON_EXIT" = "true" ] && [ "${STATE_HOLD:-false}" != "true" ]; then
     cleanup_session_locks || true
@@ -1881,7 +1913,7 @@ find_gateway_daemon_pid() {
   # gateway PID stays our child, and the scan could adopt an unrelated
   # `openclaw` CLI process (hiding exit codes, or signalling it on shutdown).
   if [ "${OPENCLAW_NO_RESPAWN:-}" != "1" ]; then
-    local known=" ${NGINX_PID:-0} ${TTYD_PID:-0} ${GW_RELAY_PID:-0} ${GW_PID:-0} $$ "
+    local known=" ${NGINX_PID:-0} ${TTYD_PID:-0} ${GW_RELAY_PID:-0} ${GW_PID:-0} ${CLEANUP_PID:-0} $$ "
     local f cand
     for f in /proc/[0-9]*/cmdline; do
       [ -r "$f" ] || continue
@@ -2148,6 +2180,13 @@ if [ "$STATE_HOLD" = "true" ]; then
   exit 0
 fi
 
+# Deletes the archives and OpenClaw doctor captures of finished migration-gate runs
+# gate_cleanup_hours after the run (owner rule: no long-lived plaintext copies). Never during a gate run or HOLD.
+if command -v oc-upgrade >/dev/null 2>&1; then
+  OC_GATE_FROM_RUNSH=1 PYTHONUNBUFFERED=1 oc-upgrade cleanup --loop &
+  CLEANUP_PID=$!
+fi
+
 while true; do
   GW_START_SECONDS=$SECONDS
   if [ "$GW_IS_CHILD" = "true" ]; then
@@ -2306,7 +2345,7 @@ ${hold_out}" "$hold_keep"
     if runtime_at_least 2026.8.0; then
       echo "ERROR:   openclaw doctor --lint   (read-only)"
       echo "ERROR: Do not run 'openclaw doctor --fix' by hand (blocked). Use 'oc-upgrade retry --doctor',"
-      echo "ERROR: which archives the state first; then restart the add-on."
+      echo "ERROR: which archives the state first (age-encrypted, or none with gate_archive: off); then restart the add-on."
     else
       echo "ERROR: Take a Home Assistant backup of the add-on before running 'openclaw doctor --fix':"
       echo "ERROR: it migrates configuration and state and cannot be undone without that backup."

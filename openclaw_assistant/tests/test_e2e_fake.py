@@ -22,12 +22,15 @@ on a legacy-only config (F1b after each pass, pass 3, doctor-not-idempotent, ret
 9.x -> 9.y bump (no pre-migrate or pins; canonical refs and the user's codex pin untouched).
 """
 
+import hashlib
+import io
 import json
 import os
 import shutil
 import sqlite3
 import subprocess
 import sys
+import tarfile
 import tempfile
 import unittest
 from pathlib import Path
@@ -51,6 +54,23 @@ def _node_has_sqlite():
 
 
 HAVE_NODE = _node_has_sqlite()
+
+
+def _age_key():
+    """A throwaway age key pair (no files): (identity, recipient) or (None, None) when age is missing."""
+    if not (shutil.which("age") and shutil.which("age-keygen")):
+        return None, None
+    try:
+        ident = subprocess.run(["age-keygen"], capture_output=True, text=True, check=True).stdout
+        ident = next(x for x in ident.splitlines() if x.startswith("AGE-SECRET-KEY-"))
+        pub = subprocess.run(["age-keygen", "-y"], input=ident + "\n", capture_output=True, text=True,
+                             check=True).stdout.strip()
+        return ident, pub
+    except (OSError, subprocess.CalledProcessError, StopIteration):
+        return None, None
+
+
+AGE_IDENTITY, AGE_PUB = _age_key()
 
 FAKE_NODE_SQLITE = r"""
 export async function detectCurrentSqliteCapabilities() { return { version: "3.50.4" }; }
@@ -264,6 +284,7 @@ def uv(path):
 
 
 @unittest.skipUnless(HAVE_NODE, "node with node:sqlite is required for the fake OpenClaw entry")
+@unittest.skipUnless(AGE_PUB, "age is required for the encrypted gate archive")
 class FakeRuntimeE2E(unittest.TestCase):
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp(prefix="oc-gate-e2e-"))
@@ -287,14 +308,18 @@ class FakeRuntimeE2E(unittest.TestCase):
         self.pylib.mkdir()
         (self.upg / "gate").mkdir()
         (self.upg / "gate" / "test-hooks.json").write_text(json.dumps(
-            {"skip_network_check": True, "skip_space_check": True}))
+            {"skip_network_check": True, "skip_space_check": True, "skip_backup_check": True}))
+        self.options = self.tmp / "options.json"
+        self.options.write_text(json.dumps(
+            {"gate_archive": "encrypted", "gate_archive_age_recipient": AGE_PUB}))
         drop = ("OPENCLAW_", "OC_GATE_", "OC_UPGRADE_", "OC_ADDON_", "OC_CONFIG_ROOT", "SQLITE_TMPDIR")
         self.env = {k: v for k, v in os.environ.items() if not k.startswith(drop)}
         self.env.update({
             "OPENCLAW_STATE_DIR": str(self.state), "OPENCLAW_CONFIG_PATH": str(self.state / "openclaw.json"),
             "OC_UPGRADE_DIR": str(self.upg), "OC_UPGRADE_SHARE_DIR": str(self.share),
             "OC_CONFIG_ROOT": str(self.root), "OC_ADDON_ENTRY_FILE": str(self.entry_file),
-            "OC_ADDON_PYLIB": str(self.pylib), "OC_GATE_TEST_HOOKS": "1", "TMPDIR": str(self.tmp),
+            "OC_ADDON_PYLIB": str(self.pylib), "OC_ADDON_OPTIONS_FILE": str(self.options),
+            "OC_GATE_TEST_HOOKS": "1", "TMPDIR": str(self.tmp),
             "ADDON_VERSION": "0.5.94-e2e", "PYTHONDONTWRITEBYTECODE": "1", "NODE_NO_WARNINGS": "1",
             "OPENCLAW_RUNTIME_VERSION": RUNTIME,
         })
@@ -371,11 +396,28 @@ class FakeRuntimeE2E(unittest.TestCase):
         j = json.loads((self.upg / "gate" / "journal.json").read_text())
         self.assertEqual(j["status"], "done")
         self.assertEqual([d["pass"] for d in j["doctor"]], [1, 2])
-        # archive in /share, verified, with manifest and checksums
-        adir = Path(j["archive"]["dir"])
+        # archive in /share: age-encrypted, verified, with manifest and checksums; no plaintext anywhere
+        a = j["archive"]
+        self.assertEqual((a["mode"], a["recipient"], a["verified"]), ("encrypted", AGE_PUB, True))
+        adir = Path(a["dir"])
         self.assertTrue(str(adir).startswith(str(self.share / "openclaw-upgrade")))
-        self.assertTrue((adir / j["archive"]["file"]).is_file())
-        self.assertTrue((adir / "manifest.json").is_file() and (adir / "SHA256SUMS").is_file())
+        self.assertTrue(a["file"].endswith(".tar.gz.age"), a["file"])
+        cipher = (adir / a["file"]).read_bytes()
+        self.assertTrue(cipher.startswith(b"age-encryption.org/v1\n"))
+        self.assertEqual(hashlib.sha256(cipher).hexdigest(), a["sha256"])
+        self.assertIn(a["sha256"], (adir / "SHA256SUMS").read_text())
+        self.assertEqual(sorted(p.name for p in adir.iterdir()), sorted([a["file"], "manifest.json", "SHA256SUMS"]))
+        self.assertEqual(list(self.share.rglob("*.tar.gz")), [])
+        man = json.loads((adir / "manifest.json").read_text())
+        self.assertTrue(man["encrypted"])
+        plain = subprocess.run(["age", "-d", "-i", "-", str(adir / a["file"])],
+                               input=(AGE_IDENTITY + "\n").encode(), capture_output=True, check=True).stdout
+        self.assertEqual(hashlib.sha256(plain).hexdigest(), a["plaintext_sha256"])
+        with tarfile.open(fileobj=io.BytesIO(plain), mode="r:gz") as tf:
+            names = tf.getnames()
+        self.assertTrue(any(n.endswith("state/openclaw.sqlite") for n in names), names)
+        for s in SECRETS:
+            self.assertNotIn(s.encode(), cipher)
         # quarantine: the transient sidecar moved, the broken-empty leftover stays
         agent_dir = self.state / "agents" / "main" / "agent"
         self.assertFalse((agent_dir / "openclaw-agent.sqlite.reindex-lock.sqlite").exists())

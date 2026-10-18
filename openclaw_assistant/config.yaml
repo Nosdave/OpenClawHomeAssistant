@@ -1,5 +1,5 @@
 name: OpenClaw Assistant
-version: "0.5.94-full1"
+version: "0.5.94-full2"
 slug: openclaw_assistant
 description: Run OpenClaw Assistant (OpenClaw-compatible) as a Home Assistant add-on.
 url: https://github.com/Nosdave/OpenClawHomeAssistant
@@ -12,7 +12,12 @@ arch:
 startup: services
 boot: auto
 init: false
-hassio_api: false
+# Supervisor API: used only by the migration gate's read-only check for an
+# encrypted Home Assistant backup (GET /addons/self/info, /backups/info,
+# /backups/<slug>/info). The "default" role allows only these */info reads;
+# "backup" would also allow creating, deleting, restoring and downloading backups.
+hassio_api: true
+hassio_role: default
 homeassistant_api: false
 host_network: true
 
@@ -211,6 +216,25 @@ options:
   # server must treat that as no thinking. Set false before the update to keep
   # on/off only; switching it off later does not undo the change (see DOCS).
   glm_thinking_levels: true
+  # Migration gate archive, written to /share/openclaw-upgrade/<run>/ before the
+  # gate changes the OpenClaw state (an OpenClaw update, or oc-upgrade retry --doctor).
+  #   encrypted: a tar.gz encrypted with age to gate_archive_age_recipient; no
+  #              plaintext byte is written to disk.
+  #   off:       no archive; the rollback is only the encrypted Home Assistant backup.
+  # "encrypted" without a recipient makes the gate hold (archive-key-missing)
+  # before anything is changed: there is never a plaintext archive.
+  gate_archive: encrypted
+  # Your age PUBLIC key (age1..., 62 characters, from `age-keygen` on a trusted
+  # device). Never the private key (AGE-SECRET-KEY-...): keep that off this host.
+  gate_archive_age_recipient: ""
+  # Hours after a finished gate run ([gate] done) before the add-on deletes that
+  # run's /share/openclaw-upgrade/<run>/ and OpenClaw's doctor captures
+  # (/config/.openclaw.update-captures/doctor-*). 0 = never delete.
+  gate_cleanup_hours: 48
+  # Before it changes the state, the gate requires an encrypted Home Assistant
+  # backup that contains this add-on (taken before the update) and is at most
+  # this many hours old; otherwise it holds (acceptable: ha-backup-missing).
+  gate_backup_max_age_hours: 24
 
 
 schema:
@@ -251,3 +275,7 @@ schema:
   ha_base_url: str?
   config_backup_keep: int(0,100)?
   glm_thinking_levels: bool?
+  gate_archive: list(encrypted|off)?
+  gate_archive_age_recipient: "match(^(age1[02-9ac-hj-np-z]{58})?$)?"
+  gate_cleanup_hours: int(0,720)?
+  gate_backup_max_age_hours: int(1,168)?

@@ -1,7 +1,7 @@
 """
 Migration gate for the bundled OpenClaw runtime (2026.7.x -> 2026.9+/2026.10.x, later bumps).
 
-Phases (spec §7): 1 precheck, 2 archive (/share), 3 cleanup/quarantine, 4 pre-migrate
+Phases (spec §7): 1 precheck, 2 archive (/share, age-encrypted or off), 3 cleanup/quarantine, 4 pre-migrate
 (R1-R5, from-7x), 5 doctor pass 1, 6 fixups (F1-F4, from-7x), 7 doctor pass 2 (+3),
 8 postconditions, 9 pins (from-7x), finalize (marker).
 
@@ -10,22 +10,25 @@ Entry points used by oc-upgrade:
   run_gate()                   `OC_GATE_FROM_RUNSH=1 oc-upgrade gate`  rc 0 / 20 / 130 / 143 / 1
   dry_run(network=False)       `oc-upgrade gate --dry-run`   rc 0 / 20 / 1
   hold_after_start(code, rc)   `oc-upgrade gate --hold-exit78|--hold-crash-loop <rc>`  rc 0
-  retry_cmd(args), log_cmd(args), status_lines(), readiness_lines()
+  retry_cmd(args), log_cmd(args), cleanup_cmd(args), status_lines(), readiness_lines()
 
 Every line printed starts with "[gate]" (warnings: "WARN [gate]"); doctor output is mirrored
 as "[doctor] ..." (redacted). Secrets are never printed.
 """
 
+import errno
 import gzip
 import hashlib
 import json
 import math
 import os
 import re
+import select
 import shutil
 import signal
 import sqlite3
 import stat
+import subprocess
 import sys
 import tarfile
 import tempfile
@@ -33,6 +36,7 @@ import threading
 import time
 import traceback
 import uuid
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import oc_common as C
@@ -72,11 +76,14 @@ ACCEPTABLE = frozenset({
     "cron-json-unimported", "oauth-sidecar-referenced", "plugin-index-unimported", "plugins-installs-unindexed",
     "device-pair-subscribers", "voice-call-log", "telegram-spool-invalid", "dreaming-json-unmigrated",
     "doctor-held-back",  # acceptable only on rc 0 (2026.10 reports held stores without failing doctor)
+    # no recent encrypted Home Assistant backup with this add-on / the backup list could not be read
+    "ha-backup-missing", "ha-backup-unverified",
 })
 NO_RETRY = frozenset({"newer-state", "runtime-integrity"})
 POST_RUN_HOLDS = frozenset({"exit78", "crash-loop"})
 HOOK_KEYS = ("raise_in_phase", "doctor_cmd", "skip_network_check", "accept", "skip_cleanup_kinds",
-             "doctor_timeout_s", "skip_space_check")
+             "doctor_timeout_s", "skip_space_check", "skip_backup_check", "supervisor_url",
+             "supervisor_token_file", "cleanup_interval_s", "cleanup_clock_offset_s")
 
 STATE_EXCLUDES = ("upgrade-backups", "logs", "tmp", "cache", ".cache")
 WORKSPACE_FULL_LIMIT = 2 * C.GIB
@@ -85,6 +92,14 @@ HEARTBEAT_S = 60
 DOCTOR_KILL_AFTER = 600
 DOCTOR_STOP_GRACE = 240
 ARCHIVE_TIMEOUT = 6 * 3600
+AGE_MAGIC = b"age-encryption.org/v1\n"
+AGE_CHUNK = 64 * 1024
+BACKUP_SKEW_S = 600
+CLEANUP_INTERVAL_S = 3600
+RUN_ID_RE = re.compile(r"^\d{8}T\d{6}Z-[0-9a-f]{6}$")
+# OpenClaw 2026.10 doctor: "Pre-repair state retained for manual recovery at <dir>/manifest.json."
+CAPTURE_RE = re.compile(r"Pre-repair state retained for manual recovery at (\S+)/manifest\.json")
+CAPTURE_NAME_RE = re.compile(r"^doctor-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
 QUICK_CHECK_COPY_LIMIT = 512 * C.MIB
 CHECKPOINT_735 = "2026.7.35"
 ATTESTATION_HEADER = b"openclaw-workspace-attestation:v1\n"
@@ -109,7 +124,21 @@ ADVICE = {
     "state-symlink": "replace the symlink by the real directory (or bind-mount it), then oc-upgrade retry",
     "newer-state": "restore the Home Assistant backup that matches this add-on version",
     "not-pre-journal": "restore the 0.5.93 backup (the state is not a clean 2026.7.x state)",
-    "archive-missing": "put the archive back (same path, unchanged) and oc-upgrade retry, or restore the Home Assistant backup and start over",
+    "archive-missing": "put the archive back (same path, unchanged; sha256sum -c SHA256SUMS in its directory must pass) "
+                       "and oc-upgrade retry, or restore the encrypted Home Assistant backup and start over",
+    "archive-key-missing": "set gate_archive_age_recipient in the add-on Configuration to your age public key (age1..., "
+                           "from age-keygen on a trusted device; keep the private key off this host), or set "
+                           "gate_archive: off (no archive; rollback only through the encrypted Home Assistant backup), "
+                           "then oc-upgrade retry",
+    "archive-key-invalid": "put exactly one age public key (age1..., 62 characters) into gate_archive_age_recipient, never "
+                           "the AGE-SECRET-KEY private key (if it was pasted anywhere, create a new key pair), or set "
+                           "gate_archive: off, then oc-upgrade retry",
+    "archive-age-missing": "the add-on image has no working age tool: reinstall or rebuild the add-on",
+    "ha-backup-missing": "create an encrypted Home Assistant backup that includes this add-on before updating (Settings > "
+                         "System > Backups, add-on stopped, stored locally or on a network mount: cloud-only copies are "
+                         "not visible to the add-on), then oc-upgrade retry",
+    "ha-backup-unverified": "the Supervisor backup list could not be read (see the reason): make sure an encrypted backup "
+                            "with this add-on exists (Settings > System > Backups), then oc-upgrade retry",
     "legacy-state-dir": "move /config/.clawdbot out of /config (or merge it manually), then oc-upgrade retry",
     "custom-session-store": "remove session.store from openclaw.json (custom session stores are not migrated), then oc-upgrade retry",
     "sessions-unreadable": "repair or move the unreadable sessions.json files, then oc-upgrade retry",
@@ -124,8 +153,8 @@ ADVICE = {
     "low-disk-share": "free space on /share, then oc-upgrade retry",
     "low-disk-tmp": "free space for SQLite temporary files (/tmp, /var/tmp), then oc-upgrade retry",
     "sqlite-corrupt": "restore the database from a backup (quick_check failed), then oc-upgrade retry",
-    "archive-failed": "check free space and permissions on /share, then oc-upgrade retry",
-    "archive-verify-failed": "check the /share disk, then oc-upgrade retry (a new archive is written)",
+    "archive-failed": "check free space and permissions on /share (the reason names tar or age), then oc-upgrade retry",
+    "archive-verify-failed": "check the /share disk, then oc-upgrade retry (nothing was changed; a new archive is written)",
     "archive-timeout": "check /share performance, then oc-upgrade retry",
     "cleanup-failed": "check permissions under /config/.openclaw-upgrade, then oc-upgrade retry",
     "premigrate-failed": "check free space and permissions, then oc-upgrade retry",
@@ -139,7 +168,8 @@ ADVICE = {
                        "OpenClaw 2026.10)",
     "telegram-spool-unsupported": "rename or move the listed telegram/ingress-spool-* entries, then oc-upgrade retry",
     "doctor-retired-format": "doctor refused pre-July-2026 settings or files (see the reason): remove or move them "
-                             "(they are in the gate archive), then oc-upgrade retry; a plain retry repeats the refusal",
+                             "(they are in your encrypted Home Assistant backup, and in the gate archive unless gate_archive is off), "
+                             "then oc-upgrade retry; a plain retry repeats the refusal",
     "doctor-held-back": "doctor held back agent databases: re-register the agent (OC_ADDON_UNSAFE=1 openclaw agents add <id> --workspace <ws> --agent-dir <dir> --non-interactive) or restore the backup, then oc-upgrade retry",
     "doctor-migration-refused": "fix the item doctor reported (oc-upgrade log), then oc-upgrade retry",
     "doctor-maintenance-refused": "oc-upgrade retry (doctor resumes from its last committed step); if the reason mentions "
@@ -900,12 +930,12 @@ def apply_bookkeeping(d):
             C.atomic_write_json(gp["JOURNAL"], j)
 
 
-def write_marker(*, mode, run_id, binding, runtime, archive, accepted, orphans):
+def write_marker(*, mode, run_id, binding, runtime, archive, accepted, orphans, archive_mode=None):
     gp = gpaths()
     ensure_dirs(gp)
     C.atomic_write_json(gp["MARKER"], {
         "schema": 1, "runtime": runtime, "mode": mode, "run_id": run_id, "completed_at": C.utc_iso(),
-        "binding": binding, "archive": archive, "accepted": sorted(set(accepted or [])),
+        "binding": binding, "archive": archive, "archive_mode": archive_mode, "accepted": sorted(set(accepted or [])),
         "orphans": orphans or [], "addon_version": addon_version()})
 
 
@@ -1073,6 +1103,78 @@ def space_check(needs, disk_usage=shutil.disk_usage, fsinfo=fs_identity):
 
 
 # --- process scan ----------------------------------------------------------------------------
+
+
+def _parse_backup_date(v):
+    if not isinstance(v, str) or not v:
+        return None
+    try:
+        dt = datetime.fromisoformat(v.strip().replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return dt.astimezone(timezone.utc) if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+
+def backup_protected(b):
+    """A Supervisor backup counts as encrypted only if every stored copy is protected. location_attributes
+    (per location) wins; an empty or malformed one is unverifiable; without it the top-level flag decides."""
+    la = b.get("location_attributes")
+    if la is None:
+        return b.get("protected") is True
+    if not isinstance(la, dict) or not la:
+        return False
+    return all(isinstance(v, dict) and v.get("protected") is True for v in la.values())
+
+
+def backup_locations(b):
+    la = b.get("location_attributes")
+    if isinstance(la, dict) and la:
+        return ",".join(str(k or ".local") for k in la)
+    locs = b.get("locations") or [b.get("location")]
+    return ",".join(str(x or ".local") for x in locs if x is not None or len(locs) == 1) or ".local"
+
+
+def evaluate_ha_backups(backups, self_slug, now, max_age_s, skew_s=BACKUP_SKEW_S):
+    """Pure: the newest encrypted full/partial Home Assistant backup that contains this add-on and is at most
+    max_age_s old (a few minutes in the future are tolerated). Unencrypted ones are reported separately."""
+    out = {"candidates": [], "total": 0, "with_slug": 0, "unprotected": [], "bad_dates": 0, "newest_with_slug": None}
+    for b in backups if isinstance(backups, list) else []:
+        if not isinstance(b, dict):
+            continue
+        out["total"] += 1
+        content = b.get("content") if isinstance(b.get("content"), dict) else {}
+        slugs = content.get("addons") or content.get("apps") or []
+        if self_slug not in slugs:
+            continue
+        out["with_slug"] += 1
+        dt = _parse_backup_date(b.get("date"))
+        if dt is None:
+            out["bad_dates"] += 1
+            continue
+        prot = backup_protected(b)
+        entry = {"slug": b.get("slug"), "name": C.redact_text(str(b.get("name") or ""))[:80], "date": C.utc_iso(dt),
+                 "dt": dt, "type": b.get("type"), "protected": prot, "locations": backup_locations(b)}
+        if out["newest_with_slug"] is None or dt > out["newest_with_slug"]["dt"]:
+            out["newest_with_slug"] = entry
+        if not prot:
+            out["unprotected"].append(entry)
+            continue
+        if b.get("type") not in ("full", "partial"):
+            continue
+        age = (now - dt).total_seconds()
+        if -skew_s <= age <= max_age_s:
+            out["candidates"].append(entry)
+    out["candidates"].sort(key=lambda e: e["dt"], reverse=True)
+    return out
+
+
+def backup_addon_version(info, self_slug):
+    """The add-on version recorded in a backup (GET /backups/<slug>/info: addons|apps [{slug, version}])."""
+    for key in ("addons", "apps"):
+        for a in info.get(key) or []:
+            if isinstance(a, dict) and a.get("slug") == self_slug:
+                return a.get("version")
+    return None
 
 def find_openclaw_processes(entry, proc_dir="/proc", self_pid=None):
     self_pid = os.getpid() if self_pid is None else self_pid
@@ -1385,6 +1487,211 @@ def verify_archive(path, expected, stop=None):
     missing = [n for n in expected if n not in found]
     return {"members": members, "matched": matched, "mismatched": mismatched, "missing": missing,
             "sha256": hr.h.hexdigest(), "size": hr.n}
+
+
+def compare_members(expected, found, links, members):
+    for name, target in links.items():
+        if target in found:
+            found[name] = found[target]
+    return {"members": members, "matched": [n for n, h in expected.items() if found.get(n) == h],
+            "mismatched": [n for n, h in expected.items() if n in found and found[n] != h],
+            "missing": [n for n in expected if n not in found]}
+
+
+def age_header(path):
+    """Parse an age v1 header (text lines up to '--- <mac>'). Returns {len, stanzas: [type, ...]}."""
+    with open(path, "rb") as f:
+        head = f.read(4096)
+    if not head.startswith(AGE_MAGIC):
+        raise ValueError("not an age v1 file")
+    pos, stanzas = len(AGE_MAGIC), []
+    while True:
+        nl = head.find(b"\n", pos)
+        if nl < 0:
+            raise ValueError("age header truncated")
+        line = head[pos:nl]
+        pos = nl + 1
+        if line.startswith(b"--- "):
+            return {"len": pos, "stanzas": stanzas}
+        if not line.startswith(b"-> "):
+            raise ValueError("unexpected age header line")
+        stanzas.append(line[3:].split(b" ", 1)[0].decode("ascii", "replace"))
+        while True:  # body: base64 lines of 64 characters, the last one shorter
+            nl = head.find(b"\n", pos)
+            if nl < 0:
+                raise ValueError("age header truncated")
+            body, pos = head[pos:nl], nl + 1
+            if len(body) < 64:
+                break
+
+
+def age_cipher_size(header_len, plain_size):
+    """age STREAM: 16-byte nonce, then 64 KiB chunks with a 16-byte tag each (at least one chunk)."""
+    chunks = max(1, -(-plain_size // AGE_CHUNK))
+    return header_len + 16 + plain_size + 16 * chunks
+
+
+class _ArchiveTimeout(Exception):
+    pass
+
+
+class _CountingSink:
+    """File-like sink for the gzip stream: hashes and counts the bytes and forwards them to age's stdin."""
+
+    def __init__(self, out):
+        self.out, self.h, self.n = out, hashlib.sha256(), 0
+
+    def write(self, b):
+        self.out.write(b)
+        self.h.update(b)
+        self.n += len(b)
+        return len(b)
+
+    def flush(self):
+        self.out.flush()
+
+
+class _TeeReader:
+    """Reads tar's stdout for tarfile (stream mode) and copies every byte into the gzip writer, so the archive
+    is exactly tar's output. Polls STOP, the deadline and the heartbeat while waiting for data."""
+
+    def __init__(self, fd, gz, deadline, stop, on_tick, started):
+        self.fd, self.gz, self.deadline, self.stop, self.on_tick, self.started = fd, gz, deadline, stop, on_tick, started
+
+    def read(self, n=-1):
+        n = C.MIB if n is None or n < 0 else n
+        while True:
+            if self.stop.is_set():
+                raise GateStopped()
+            now = time.monotonic()
+            if now > self.deadline:
+                raise _ArchiveTimeout()
+            if self.on_tick:
+                self.on_tick(now - self.started)
+            r, _w, _x = select.select([self.fd], [], [], 1.0)
+            if r:
+                break
+        b = os.read(self.fd, n)
+        if b:
+            self.gz.write(b)
+        return b
+
+
+def stream_encrypted_archive(tar_argv, age_argv, tmp, expected, *, cwd, timeout, tar_log, age_log, on_tick=None):
+    """tar (uncompressed, to a pipe) -> this process (tarfile parse: sha256 of every expected member; gzip -1)
+    -> age stdin; age stdout -> a pump thread -> tmp. No plaintext byte is written to disk. Returns a dict with
+    the member comparison, plain/cipher sha256 and sizes, the exit codes and the failure kind (if any)."""
+    res = {"tar_rc": None, "age_rc": None, "failure": None, "detail": "", "members": 0}
+    fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    cipher = {"h": hashlib.sha256(), "n": 0, "err": None}
+    env = dict(os.environ, LC_ALL="C")
+    procs = []
+    for lg in (tar_log, age_log):
+        Path(lg).parent.mkdir(parents=True, exist_ok=True)
+    tlog = open(tar_log, "ab")
+    alog = open(age_log, "ab")
+    try:
+        agep = subprocess.Popen(age_argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=alog,
+                                start_new_session=True, env=env)
+        procs.append(agep)
+        tarp = subprocess.Popen(tar_argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=tlog, cwd=cwd,
+                                start_new_session=True, env=env)
+        procs.append(tarp)
+
+        def pump():
+            try:
+                while True:
+                    b = agep.stdout.read(C.MIB)
+                    if not b:
+                        break
+                    cipher["h"].update(b)
+                    view = memoryview(b)
+                    while view:
+                        k = os.write(fd, view)
+                        view = view[k:]
+                    cipher["n"] += len(b)
+            except OSError as exc:
+                cipher["err"] = exc
+                C._killpg(agep.pid, signal.SIGTERM)
+
+        th = threading.Thread(target=pump, daemon=True)
+        th.start()
+        sink = _CountingSink(agep.stdin)
+        gz = gzip.GzipFile(fileobj=sink, mode="wb", compresslevel=1, mtime=0, filename="")
+        started = time.monotonic()
+        tee = _TeeReader(tarp.stdout.fileno(), gz, started + timeout, STOP,
+                         (lambda el: on_tick(el, sink.n, cipher["n"])) if on_tick else None, started)
+        found, links = {}, {}
+        try:
+            with tarfile.open(fileobj=tee, mode="r|") as tf:
+                for m in tf:
+                    res["members"] += 1
+                    name = m.name[2:] if m.name.startswith("./") else m.name
+                    if name in expected:
+                        if m.isreg():
+                            h = hashlib.sha256()
+                            fobj = tf.extractfile(m)
+                            while True:
+                                b = fobj.read(C.MIB)
+                                if not b:
+                                    break
+                                h.update(b)
+                            found[name] = h.hexdigest()
+                        elif m.islnk():
+                            links[name] = m.linkname[2:] if m.linkname.startswith("./") else m.linkname
+            while tee.read(C.MIB):  # tar's trailing blocks: the archive must be all of tar's output
+                pass
+        except tarfile.TarError as exc:
+            res["failure"], res["detail"] = "parse", f"{type(exc).__name__}: {exc}"
+            while tee.read(C.MIB):
+                pass
+        gz.close()
+        agep.stdin.close()
+        res["tar_rc"] = tarp.wait(60)
+        res["age_rc"] = agep.wait(60)
+        th.join(60)
+        if cipher["err"] is not None:
+            res["failure"], res["detail"] = "write", os.strerror(cipher["err"].errno or 0) or str(cipher["err"])
+        os.fsync(fd)
+        res.update(compare_members(expected, found, links, res["members"]))
+        res.update({"plain_sha256": sink.h.hexdigest(), "plain_size": sink.n,
+                    "cipher_sha256": cipher["h"].hexdigest(), "cipher_size": cipher["n"]})
+        return res
+    except Exception as exc:  # noqa: BLE001 (every path must reap tar and age)
+        for pr in procs:
+            C._killpg(pr.pid, signal.SIGTERM)
+        deadline = time.monotonic() + 5
+        for pr in procs:
+            try:
+                pr.wait(max(0.1, deadline - time.monotonic()))
+            except subprocess.TimeoutExpired:
+                C._killpg(pr.pid, signal.SIGKILL)
+                pr.wait()
+        if not isinstance(exc, (_ArchiveTimeout, OSError, subprocess.TimeoutExpired)):
+            raise  # GateStopped and anything unexpected (internal-error HOLD)
+        res["tar_rc"] = procs[1].returncode if len(procs) > 1 else None
+        res["age_rc"] = procs[0].returncode if procs else None
+        if isinstance(exc, _ArchiveTimeout):
+            res["failure"] = "timeout"
+        elif cipher["err"] is not None:
+            res["failure"], res["detail"] = "write", os.strerror(cipher["err"].errno or 0) or str(cipher["err"])
+        else:
+            res["failure"], res["detail"] = "pipe", f"{type(exc).__name__}: {exc}"
+        return res
+    finally:
+        for pr in procs:
+            for stream in (pr.stdin, pr.stdout):
+                try:
+                    if stream:
+                        stream.close()
+                except OSError:
+                    pass
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        tlog.close()
+        alog.close()
 
 
 # --- the gate run ----------------------------------------------------------------------------------
@@ -1810,13 +2117,17 @@ class Gate:
             F.append(finding("state-symlink", "hard", "symlinked director(ies) would be archived as bare links, "
                              "without the data they point to: " + ", ".join(links[:6]), "precheck"))
         sizes = self.measure(ap)
+        # 7a archive setting (gate_archive / gate_archive_age_recipient); never a plaintext archive
+        opt = C.gate_options()
+        need_new_archive = self.archive_setting(F, parts, opt)
         # 8 space
         if self.hooks.get("skip_space_check"):
             parts.append("space check skipped (test hook)")
         else:
             archive_done = bool(self.j and "archive" in self.j.get("phases_done", []) and
                                 (self.j.get("archive") or {}).get("verified"))
-            need_share = 0 if archive_done else sizes["archive_input"] + C.GIB
+            no_archive = need_new_archive and opt["archive"]["mode"] == "off"
+            need_share = 0 if archive_done or no_archive or not need_new_archive else sizes["archive_input"] + C.GIB
             needs = [("/config", p["CONFIG_ROOT"],
                       2 * sizes["sqlite_total"] + 2 * sizes["transcripts_total"] + 2 * C.GIB, "low-disk-config"),
                      ("/share", p["SHARE"], need_share, "low-disk-share"),
@@ -1832,6 +2143,8 @@ class Gate:
             parts.append("network not checked")
         else:
             parts.append(self.network_check(F))
+        # 10b encrypted Home Assistant backup with this add-on (the primary rollback point)
+        parts.append(self.ha_backup_check(F, opt))
         # 11 info
         self.info_items(mode, generic_only)
         b = self.budget()
@@ -1843,6 +2156,164 @@ class Gate:
         if NODE_FALLBACKS:
             self.warn(f"node:sqlite fallback used for {len(set(NODE_FALLBACKS))} database(s)")
         return F, parts
+
+    def archive_setting(self, F, parts, opt):
+        """Precheck 7a. Records the validated archive option for this run (journal archive_opt, before the first
+        write) so phase 2 never re-reads options.json. Returns True when this run still needs a new archive."""
+        a_opt = opt["archive"]
+        for prob in opt["problems"]:
+            self.warn(f"add-on option {prob}")
+        first_write = bool((self.j or {}).get("first_write_at"))
+        if first_write:
+            rec = (self.j.get("archive") or {})
+            mode = rec.get("mode") or ("legacy" if rec else "none")
+            parts.append(f"archive {mode} (recorded for this run)")
+            if a_opt["mode"] and a_opt["mode"] != (rec.get("mode") or "encrypted"):
+                self.warn(f"gate_archive is now {a_opt['mode']}, but run {self.j['run_id']} started with {mode}; "
+                          "the run keeps its archive setting")
+            elif (mode == "encrypted" and a_opt["mode"] == "encrypted" and a_opt["recipient"] and rec.get("recipient")
+                  and a_opt["recipient"] != rec["recipient"]):
+                self.warn(f"gate_archive_age_recipient is now {C.short_recipient(a_opt['recipient'])}, but run "
+                          f"{self.j['run_id']} archived to {C.short_recipient(rec['recipient'])}; the run keeps its "
+                          "archive setting: keep the OLD private key until that archive is deleted")
+            return False
+        snap = {"mode": a_opt["mode"], "recipient": a_opt["recipient"]}
+        if a_opt["problem"] == "missing":
+            F.append(finding("archive-key-missing", "hard",
+                             "gate_archive is 'encrypted' but gate_archive_age_recipient is empty: the gate writes no "
+                             "plaintext archive", "precheck"))
+        elif a_opt["problem"] == "private-key":
+            F.append(finding("archive-key-invalid", "hard",
+                             "gate_archive_age_recipient holds an age PRIVATE key (AGE-SECRET-KEY-...): remove it from "
+                             "the add-on options now and create a new key pair; only the public key (age1...) belongs "
+                             "there", "precheck"))
+        elif a_opt["problem"] == "malformed":
+            F.append(finding("archive-key-invalid", "hard", "gate_archive_age_recipient is not one age public key "
+                             "(age1... with 58 more characters)", "precheck"))
+        elif a_opt["problem"] == "invalid-mode":
+            F.append(finding("archive-key-invalid", "hard", "gate_archive must be 'encrypted' or 'off'", "precheck"))
+        elif a_opt["mode"] == "encrypted":
+            age = C.age_bin()
+            try:
+                v = subprocess.run([age, "--version"], capture_output=True, text=True, timeout=10,
+                                   stdin=subprocess.DEVNULL)
+                ver = (v.stdout or v.stderr).strip().splitlines()[0] if v.returncode == 0 else None
+            except (OSError, subprocess.TimeoutExpired, IndexError):
+                ver = None
+            if not ver:
+                F.append(finding("archive-age-missing", "hard", f"the age tool ({age}) does not run", "precheck"))
+            else:
+                try:
+                    probe = subprocess.run([age, "-r", a_opt["recipient"], "-o", os.devnull],
+                                           stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=10)
+                    err = "" if probe.returncode == 0 else (probe.stderr.strip().splitlines() or ["age failed"])[0]
+                except (OSError, subprocess.TimeoutExpired) as exc:
+                    err = type(exc).__name__
+                if err:
+                    F.append(finding("archive-key-invalid", "hard",
+                                     "age rejects gate_archive_age_recipient: " + C.redact_text(err)[:160], "precheck"))
+                snap["age_version"] = ver
+        if self.j is not None:
+            self.j["archive_opt"] = snap
+        self.facts["archive_opt"] = snap
+        need_new = not self.archive_reusable()
+        if a_opt["problem"]:
+            parts.append("archive NOT CONFIGURED" if a_opt["problem"] == "missing" else "archive option INVALID")
+        elif a_opt["mode"] == "off":
+            parts.append("archive off")
+            if need_new:
+                F.append(finding("archive-off", "warn", "gate_archive is off: no /share archive; rollback only through "
+                                 "the encrypted Home Assistant backup", "precheck"))
+        else:
+            parts.append(f"archive encrypted ({snap.get('age_version') or 'age'}, "
+                         f"{C.short_recipient(a_opt['recipient'])})" + ("" if need_new else ", reusing this run's"))
+        legacy = sorted(self.gp["ARCHIVES"].glob("*/openclaw-state-*.tar.gz")) if self.gp["ARCHIVES"].is_dir() else []
+        if legacy:
+            self.warn(f"{len(legacy)} plaintext gate archive(s) from 0.5.94-full1 in {self.gp['ARCHIVES']} hold "
+                      "unencrypted secrets; the add-on deletes them gate_cleanup_hours after their run (oc-upgrade "
+                      "cleanup lists them)")
+        return need_new
+
+    def ha_backup_check(self, F, opt):
+        """Precheck 10b (read-only): an encrypted full/partial Home Assistant backup that contains this add-on, is
+        at most gate_backup_max_age_hours old and, for from-7x/bump runs, holds the add-on version installed
+        before this one (restoring a backup of the new version would not bring the old OpenClaw back)."""
+        if self.hooks.get("skip_backup_check"):
+            return "HA backup not checked (test hook)"
+        if (self.j or {}).get("first_write_at"):
+            return "HA backup not re-checked (resume after the first write)"
+        mode_off = opt["archive"]["mode"] == "off"
+        tail = "; gate_archive is off, so there is no other rollback point" if mode_off else ""
+        token = C.supervisor_token(self.hooks.get("supervisor_token_file"))
+        if not token:
+            F.append(finding("ha-backup-unverified", "acceptable", "no Supervisor token (neither "
+                             f"{C.S6_TOKEN_FILE} nor SUPERVISOR_TOKEN is set){tail}", "precheck"))
+            return "HA backup UNVERIFIED"
+        base = self.hooks.get("supervisor_url")
+        try:
+            me = C.supervisor_get("/addons/self/info", token, base=base)
+            data = C.supervisor_get("/backups/info", token, base=base)
+        except C.SupervisorError as exc:
+            why = exc.message
+            if exc.status in (401, 403):
+                why += " (the add-on needs hassio_api with a role that allows /backups/info)"
+            F.append(finding("ha-backup-unverified", "acceptable",
+                             f"the Supervisor backup list could not be read: {why}{tail}", "precheck"))
+            return "HA backup UNVERIFIED"
+        slug, version = me.get("slug"), me.get("version")
+        hours = opt["backup_max_age_hours"]
+        ev = evaluate_ha_backups(data.get("backups"), slug, C.utc_now(), hours * 3600)
+        for e in ev["unprotected"][:3]:
+            self.warn(f"Home Assistant backup '{e['name']}' ({e['slug']}, {e['date']}) contains this add-on "
+                      f"UNENCRYPTED in {e['locations']}: it holds the add-on's secrets in plaintext; delete it and keep "
+                      "only encrypted backups")
+        need_older = (self.j or {}).get("mode", "from-7x") in ("from-7x", "bump")
+        best, same_version, unreadable = None, [], []
+        for e in ev["candidates"][:5]:
+            bver, why = None, ""
+            try:
+                bver = backup_addon_version(C.supervisor_get(f"/backups/{e['slug']}/info", token, base=base), slug)
+            except C.SupervisorError as exc:
+                why = exc.message
+            e["addon_version"] = bver
+            if need_older:
+                # unknown is not "older": a backup taken after the update would not bring the old OpenClaw back
+                if not (isinstance(bver, str) and bver and isinstance(version, str) and version):
+                    unreadable.append((e, why or ("the running add-on version is unknown" if bver else
+                                                  "the backup lists no version for this add-on")))
+                    continue
+                if bver == version:
+                    same_version.append(e)
+                    continue
+            best = e
+            break
+        if best:
+            if self.j is not None:
+                self.j["ha_backup"] = {"checked_at": C.utc_iso(), "slug": best["slug"], "name": best["name"],
+                                       "date": best["date"], "type": best["type"], "locations": best["locations"],
+                                       "addon_version": best.get("addon_version")}
+            age = (C.utc_now() - best["dt"]).total_seconds()
+            ver = f", add-on {best['addon_version']}" if best.get("addon_version") else ""
+            return f"HA backup ok ('{best['name']}', {C.fmt_duration(age)} old, encrypted{ver})"
+        if unreadable:
+            e, why = unreadable[0]
+            F.append(finding("ha-backup-unverified", "acceptable",
+                             f"the add-on version inside backup '{e['name']}' ({e['slug']}) could not be read "
+                             f"({C.redact_text(why)[:120]}), so it is not known to hold the version before this "
+                             f"update{tail}", "precheck"))
+            return "HA backup UNVERIFIED"
+        if same_version:
+            msg = (f"the encrypted Home Assistant backup(s) of the last {hours} h hold this add-on version ({version}): "
+                   "restoring them does not bring back the previous OpenClaw; keep or restore the backup taken before "
+                   "the update")
+        else:
+            nw = ev["newest_with_slug"]
+            newest = "none" if not nw else (f"'{nw['name']}' {C.fmt_duration((C.utc_now() - nw['dt']).total_seconds())} "
+                                            f"old, {'encrypted' if nw['protected'] else 'NOT encrypted in ' + nw['locations']}")
+            msg = (f"no encrypted Home Assistant backup containing this add-on ({slug}) from the last {hours} h "
+                   f"({ev['total']} listed, {ev['with_slug']} with this add-on; newest with it: {newest})")
+        F.append(finding("ha-backup-missing", "acceptable", msg + tail, "precheck"))
+        return "HA backup MISSING"
 
     def node_capability(self, F):
         node = self.pkg.get("node")
@@ -1963,8 +2434,17 @@ class Gate:
 
     # ----- phase 2: archive -----
     def archive_reusable(self):
-        a = (self.j or {}).get("archive") or {}
+        """Phase 2 may be skipped: before the first write only when the recorded archive matches the validated
+        option of this start (a changed option, or a 0.5.94-full1 plaintext archive, makes a new one)."""
+        j = self.j or {}
+        a = j.get("archive") or {}
+        first_write = bool(j.get("first_write_at"))
+        want = j.get("archive_opt") or self.facts.get("archive_opt") or {}
+        if a.get("mode") == "off":
+            return first_write or want.get("mode") == "off"
         if not a.get("verified"):
+            return False
+        if not first_write and (a.get("mode") != want.get("mode") or a.get("recipient") != want.get("recipient")):
             return False
         f = Path(a.get("dir", "")) / a.get("file", "")
         try:
@@ -1973,28 +2453,60 @@ class Gate:
             return False
 
     def archive_intact(self):
-        """Resume after the first write: the archive must still exist with the recorded size and sha256."""
+        """Resume after the first write: the archive must still exist with the recorded size and sha256 (for an
+        encrypted archive: the ciphertext, plus its age header). Off: there is none, by the owner's choice."""
+        a = self.j.get("archive") or {}
+        if a.get("mode") == "off":
+            self.say("2/9 archive: none for this run (gate_archive was off); rollback only through the encrypted "
+                     "Home Assistant backup")
+            return True
         if not self.archive_reusable():
             return False
-        a = self.j.get("archive") or {}
         if not a.get("sha256"):
             return True
         self.say("2/9 archive: re-checking the recorded archive before continuing (sha256)")
-        return _sha_or_none(Path(a.get("dir", "")) / a.get("file", "")) == a.get("sha256")
+        path = Path(a.get("dir", "")) / a.get("file", "")
+        if _sha_or_none(path) != a.get("sha256"):
+            return False
+        if a.get("mode") == "encrypted":
+            try:
+                hdr = age_header(path)
+            except (OSError, ValueError):
+                return False
+            size = path.stat().st_size
+            return "X25519" in hdr["stanzas"] and size == age_cipher_size(hdr["len"], a.get("plaintext_size", -1))
+        return True
 
     def phase_archive(self):
         p = self.gp
+        want = self.j.get("archive_opt") or {}
+        adir = p["ARCHIVES"] / self.j["run_id"]
+        if want.get("mode") == "off":
+            if os.path.isdir(adir) and not os.path.islink(adir):
+                shutil.rmtree(adir, ignore_errors=True)  # an earlier attempt of this run, before any write
+                self.say(f"2/9 archive: removed {adir}/ of an earlier attempt (gate_archive is now off)")
+            self.j["archive"] = {"mode": "off", "verified": False, "created_at": C.utc_iso()}
+            self.save()
+            self.say("2/9 archive: off (gate_archive: off): no archive written; rollback only through the encrypted "
+                     "Home Assistant backup")
+            return
+        if want.get("mode") != "encrypted" or not want.get("recipient"):
+            raise HoldError([finding("archive-key-missing", "hard", "no validated archive setting for this run "
+                                     "(gate_archive_age_recipient)", "archive")], "archive")
+        rec = want["recipient"]
         ap = self.archive_plan()
         for w in ap["warnings"]:
             self.warn(w)
-        adir = p["ARCHIVES"] / self.j["run_id"]
         old = os.umask(0o077)
         try:
             adir.mkdir(parents=True, exist_ok=True)
             os.chmod(adir, 0o700)
-            for stale in adir.glob("*.tmp"):
-                stale.unlink()
-            name = f"openclaw-state-{C.utc_now().strftime('%Y%m%d-%H%M%S')}-before-{self.pkg['version']}.tar.gz"
+            for stale in list(adir.glob("*.tmp")) + list(adir.glob("openclaw-state-*.tar.gz")) + \
+                    list(adir.glob("openclaw-state-*.tar.gz.age")):
+                stale.unlink()  # an earlier attempt of this run (before any write), plaintext 0.5.94-full1 included
+                if stale.name.endswith(".tar.gz"):
+                    self.say(f"2/9 archive: removed the 0.5.94-full1 plaintext archive {stale} of this run")
+            name = f"openclaw-state-{C.utc_now().strftime('%Y%m%d-%H%M%S')}-before-{self.pkg['version']}.tar.gz.age"
             final, tmp = adir / name, adir / (name + ".tmp")
             expected, sqlite_meta = {}, []
             for pth, member, st in self.iter_archive_inputs(ap):
@@ -2019,87 +2531,107 @@ class Gate:
                 raise HoldError([finding("archive-verify-failed", "hard",
                                          f"database(s) the migration needs would not be in the archive ({why}): "
                                          + ", ".join(absent[:5]), "archive")], "archive")
-            argv = ["tar", "--create", f"--file={tmp}", "--use-compress-program=gzip -1",
-                    f"--directory={p['CONFIG_ROOT']}", "--anchored", "--wildcards"]
-            argv += [f"--exclude={e}" for e in ap["excludes"]]
-            argv += ["--", *ap["roots"]]
-            log = self.run_dir() / "archive-tar.log"
+            tar_argv = ["tar", "--create", "--file=-", f"--directory={p['CONFIG_ROOT']}", "--anchored", "--wildcards"]
+            tar_argv += [f"--exclude={e}" for e in ap["excludes"]]
+            tar_argv += ["--", *ap["roots"]]
+            age_argv = [C.age_bin(), "--encrypt", "-r", rec]
+            log, alog = self.run_dir() / "archive-tar.log", self.run_dir() / "archive-age.log"
             off = log.stat().st_size if log.exists() else 0
+            aoff = alog.stat().st_size if alog.exists() else 0
             last = [0.0]
 
-            def tick(elapsed):
+            def tick(elapsed, plain, written):
                 if elapsed - last[0] >= HEARTBEAT_S:
                     last[0] = elapsed
-                    try:
-                        written = tmp.stat().st_size
-                    except OSError:
-                        written = 0
-                    self.say(f"2/9 archive running {C.fmt_duration(elapsed)} ({C.human(written)} written)")
-            res = C.run_process(argv, timeout=ARCHIVE_TIMEOUT, log_path=log, stop_event=STOP, kill_grace=30,
-                                on_tick=tick, env=dict(os.environ, LC_ALL="C"))
+                    self.say(f"2/9 archive running {C.fmt_duration(elapsed)} ({C.human(plain)} compressed, "
+                             f"{C.human(written)} encrypted written)")
+            try:
+                r = stream_encrypted_archive(tar_argv, age_argv, tmp, expected, cwd=str(p["CONFIG_ROOT"]),
+                                             timeout=ARCHIVE_TIMEOUT, tar_log=log, age_log=alog, on_tick=tick)
+            except GateStopped:
+                _unlink(tmp)
+                raise
         finally:
             os.umask(old)
-        if res.stopped or STOP.is_set():
+
+        def fail(code, msg):
             _unlink(tmp)
-            raise GateStopped()
-        if res.timed_out:
-            _unlink(tmp)
-            raise HoldError([finding("archive-timeout", "hard", f"tar did not finish within {ARCHIVE_TIMEOUT // 3600} h",
-                                     "archive")], "archive")
-        errlines = []
-        if log.exists():
-            with open(log, "rb") as f:
-                f.seek(off)
-                errlines = [x for x in f.read().decode("utf-8", "replace").splitlines() if x.strip()]
+            raise HoldError([finding(code, "hard", msg, "archive")], "archive")
+
+        def tail(path, offset):
+            if not path.exists():
+                return []
+            with open(path, "rb") as f:
+                f.seek(offset)
+                return [x for x in f.read().decode("utf-8", "replace").splitlines() if x.strip()]
+        if r["failure"] == "timeout":
+            fail("archive-timeout", f"tar/age did not finish within {ARCHIVE_TIMEOUT // 3600} h")
+        errlines = tail(log, off)
         sockets = [x for x in errlines if x.rstrip().endswith("socket ignored")]
-        if res.rc != 0 and not (res.rc == 1 and errlines and len(sockets) == len(errlines)):
-            _unlink(tmp)
-            raise HoldError([finding("archive-failed", "hard", f"tar rc {res.rc}: " +
-                                     C.redact_text(" | ".join(errlines[-3:]))[:400], "archive")], "archive")
+        if r["tar_rc"] not in (0, None) and not (r["tar_rc"] == 1 and errlines and len(sockets) == len(errlines)):
+            fail("archive-failed", f"tar rc {r['tar_rc']}: " + C.redact_text(" | ".join(errlines[-3:]))[:400])
+        if r["failure"] == "write":
+            fail("archive-failed", f"writing the encrypted archive failed: {r['detail']}")
+        if r["age_rc"] not in (0, None) or r["failure"] == "pipe":
+            age_err = tail(alog, aoff)
+            fail("archive-failed", f"age rc {r['age_rc']}: " + C.redact_text(" | ".join(age_err[-2:]) or r["detail"])[:300])
+        if r["tar_rc"] is None or r["age_rc"] is None:
+            fail("archive-failed", "tar or age did not exit")
         if sockets:
             self.say(f"2/9 archive: {len(sockets)} socket(s) skipped (not archivable, recreated at runtime)")
         others = [x for x in errlines if x not in sockets]
         if others:
             self.warn(f"tar printed {len(others)} warning line(s); see {log}")
+        if r["failure"] == "parse":
+            fail("archive-verify-failed", f"the archive stream could not be parsed: {r['detail']}")
+        unmatched = [m for m in known if m not in r["matched"]]
+        if r["mismatched"] or r["missing"] or r["members"] == 0 or unmatched:
+            bad = list(dict.fromkeys(r["mismatched"] + r["missing"] + unmatched))[:5]
+            fail("archive-verify-failed", f"{len(r['matched'])}/{len(expected)} sqlite files match; differing or "
+                 "missing: " + ", ".join(bad))
         try:
-            v = verify_archive(tmp, expected, STOP)
-        except GateStopped:
-            _unlink(tmp)
-            raise
-        except (OSError, EOFError, tarfile.TarError, gzip.BadGzipFile, ValueError) as exc:
-            _unlink(tmp)
-            raise HoldError([finding("archive-verify-failed", "hard",
-                                     f"archive cannot be read back: {type(exc).__name__}: {exc}", "archive")], "archive")
-        unmatched = [m for m in known if m not in v["matched"]]
-        if v["mismatched"] or v["missing"] or v["members"] == 0 or unmatched:
-            _unlink(tmp)
-            bad = list(dict.fromkeys(v["mismatched"] + v["missing"] + unmatched))[:5]
-            raise HoldError([finding("archive-verify-failed", "hard",
-                                     f"{len(v['matched'])}/{len(expected)} sqlite files match; differing or missing: "
-                                     + ", ".join(bad), "archive")], "archive")
+            hdr = age_header(tmp)
+            size = tmp.stat().st_size
+        except (OSError, ValueError) as exc:
+            fail("archive-verify-failed", f"encrypted archive header unreadable: {exc}")
+        if "X25519" not in hdr["stanzas"]:
+            fail("archive-verify-failed", "encrypted archive has no X25519 recipient stanza")
+        expect = age_cipher_size(hdr["len"], r["plain_size"])
+        if size != r["cipher_size"] or size != expect:
+            fail("archive-verify-failed", f"encrypted archive is {size} bytes, expected {expect} (truncated?)")
+        if _sha_or_none(tmp) != r["cipher_sha256"]:
+            fail("archive-verify-failed", "read-back sha256 of the encrypted archive differs from the bytes written")
         os.replace(tmp, final)
         os.chmod(final, 0o600)
-        manifest = {"schema": 1, "kind": "openclaw-addon-pre-migration-archive", "run_id": self.j["run_id"],
-                    "created_utc": C.utc_iso(), "addon_version": addon_version(),
+        _fsync_dir(adir)
+        manifest = {"schema": 2, "kind": "openclaw-addon-pre-migration-archive", "format": "tar.gz+age",
+                    "run_id": self.j["run_id"], "created_utc": C.utc_iso(), "addon_version": addon_version(),
                     "runtime_from": (self.j.get("source") or {}).get("config_last_touched"),
                     "runtime_to": self.pkg["version"], "mode": self.j["mode"],
-                    "archive": {"file": final.name, "size_bytes": v["size"], "sha256": v["sha256"],
-                                "members": v["members"]},
+                    "archive": {"file": final.name, "size_bytes": size, "sha256": r["cipher_sha256"],
+                                "plaintext_sha256": r["plain_sha256"], "plaintext_size": r["plain_size"],
+                                "members": r["members"]},
+                    "encryption": {"tool": "age", "version": want.get("age_version"), "recipients": [rec],
+                                   "stanzas": hdr["stanzas"], "header_len": hdr["len"]},
+                    "verification": {"sqlite_in_stream": f"{len(r['matched'])}/{len(expected)}",
+                                     "size_formula": True, "readback_equals_stream": True},
                     "roots": ap["roots"], "excludes": ap["excludes"],
                     "workspace_mode": ",".join(sorted({w["mode"] for w in ap["workspaces"]})) or "none",
                     "workspaces": ap["workspaces"], "sqlite": sqlite_meta,
-                    "auth_profiles": [{k: x.get(k) for k in ("agent", "id", "provider", "type", "expires_utc")}
+                    "auth_profiles": [{k: x.get(k) for k in ("agent", "provider", "type", "expires_utc")}
                                       for x in self.j.get("auth_profiles") or []],
-                    "contains_secrets": True}
+                    "contains_secrets": True, "encrypted": True}
         C.atomic_write_json(adir / "manifest.json", manifest)
-        C.atomic_write_text(adir / "SHA256SUMS", f"{v['sha256']}  {final.name}\n")
+        C.atomic_write_text(adir / "SHA256SUMS", f"{r['cipher_sha256']}  {final.name}\n")
         for f in (adir / "manifest.json", adir / "SHA256SUMS"):
             os.chmod(f, 0o600)
-        self.j["archive"] = {"dir": str(adir), "file": final.name, "sha256": v["sha256"], "size": v["size"],
-                             "members": v["members"], "verified": True}
+        self.j["archive"] = {"mode": "encrypted", "format": "tar.gz+age", "dir": str(adir), "file": final.name,
+                             "sha256": r["cipher_sha256"], "size": size, "plaintext_sha256": r["plain_sha256"],
+                             "plaintext_size": r["plain_size"], "members": r["members"], "recipient": rec,
+                             "verified": True, "created_at": C.utc_iso()}
         self.save()
-        self.say(f"2/9 archive verified: {v['members']} members, {len(v['matched'])}/{len(expected)} sqlite match, "
-                 f"sha256 {v['sha256'][:12]}… -> {adir}/")
+        self.say(f"2/9 archive verified: encrypted (age, {C.short_recipient(rec)}), {r['members']} members, "
+                 f"{len(r['matched'])}/{len(expected)} sqlite match, sha256 {r['cipher_sha256'][:12]}… -> {adir}/")
 
     # ----- phase 3: cleanup -----
     def retired_state(self, mode, cfg=None):
@@ -2803,7 +3335,8 @@ class Gate:
         cls = classify(p["STATE"], cfg, self.pkg["schema_state"], self.pkg["schema_agent"], self.pkg["version"])
         a = self.j.get("archive") or {}
         write_marker(mode=self.j["mode"], run_id=self.j["run_id"], binding=current_binding(p["STATE"], cls),
-                     runtime=self.pkg["version"], archive=str(Path(a.get("dir", "")) / a.get("file", "")) if a else None,
+                     runtime=self.pkg["version"], archive=str(Path(a["dir"]) / a["file"]) if a.get("file") else None,
+                     archive_mode=a.get("mode") or ("legacy" if a else None),
                      accepted=sorted(self.accepted), orphans=self.j.get("orphans") or [])
         self.j["status"] = "done"
         self.j["hold"] = None
@@ -2822,6 +3355,13 @@ class Gate:
         total = _elapsed_since(self.j.get("started_at"))
         self.say(f"done: MIGRATED {self.pkg['version']} (run {self.j['run_id']}, mode {self.j['mode']}, "
                  f"total {C.fmt_duration(total)})")
+        hours = C.gate_options()["cleanup_hours"]
+        what = "the archive and the doctor captures" if a.get("file") else "the doctor captures"
+        if hours:
+            due = C.utc_iso(C.utc_now() + timedelta(hours=hours))
+            self.say(f"info: {what} of this run are deleted after {due} (gate_cleanup_hours={hours})")
+        else:
+            self.say(f"info: {what} of this run are kept (gate_cleanup_hours=0): delete them yourself")
 
     # ----- holds -----
     def write_hold(self, findings, phase, resume_after=False, post_run=False, sub=None, next_line=None):
@@ -2918,6 +3458,10 @@ class Gate:
             if phase != "precheck" and phase in done:
                 if phase == "archive" and not self.j.get("first_write_at") and not self.archive_reusable():
                     done.remove("archive")
+                elif phase == "archive" and not self.j.get("first_write_at") and not self.archive_intact():
+                    # nothing written yet: a damaged archive of an earlier attempt is simply written again
+                    self.say("2/9 archive: the archive of an earlier attempt failed its re-check; writing a new one")
+                    done.remove("archive")
                 elif phase == "archive" and not self.archive_intact():
                     # State was already changed: never continue the one-way migration without its rollback copy.
                     a = self.j.get("archive") or {}
@@ -2928,7 +3472,14 @@ class Gate:
                 else:
                     if phase == "archive":
                         a = self.j.get("archive") or {}
-                        self.say(f"2/9 archive: reusing verified archive {a.get('dir')}/{a.get('file')}")
+                        if a.get("mode") == "off":
+                            self.say("2/9 archive: off for this run")
+                        elif a.get("mode") == "encrypted":
+                            self.say(f"2/9 archive: reusing verified archive {a.get('dir')}/{a.get('file')} "
+                                     f"(encrypted, {C.short_recipient(a.get('recipient'))})")
+                        else:
+                            self.say(f"2/9 archive: reusing verified archive {a.get('dir')}/{a.get('file')} "
+                                     "(PLAINTEXT 0.5.94-full1 archive; deleted by the cleanup after the run)")
                     continue
             self.run_phase(phase)
         return 0
@@ -2953,6 +3504,19 @@ class Gate:
 
 
 # --- helpers used by phases --------------------------------------------------------------------
+
+def _fsync_dir(d):
+    try:
+        fd = os.open(str(d), os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
+
 
 def _unlink(p):
     try:
@@ -3529,6 +4093,16 @@ def readiness(g, mode):
     for f in F:
         lines.append(f"[gate]   {f['cls']:<10} {f['code']}: {f['message']}")
     lines.append("[gate]   precheck: " + "; ".join(parts))
+    ao = g.facts.get("archive_opt") or {}
+    if ao.get("mode") == "encrypted" and ao.get("recipient"):
+        rt = (g.pkg or {}).get("version", "?")
+        lines.append(f"[gate]   archive: encrypted to {C.short_recipient(ao['recipient'])} -> {g.gp['ARCHIVES']}/<run>/"
+                     f"openclaw-state-<ts>-before-{rt}.tar.gz.age (no plaintext on disk)")
+    elif ao.get("mode") == "off":
+        lines.append("[gate]   archive: off (rollback only through the encrypted Home Assistant backup)")
+    elif ao:
+        lines.append("[gate]   archive: NOT CONFIGURED (the gate would HOLD; set gate_archive_age_recipient or "
+                     "gate_archive: off)")
     M = mig()
     plan_entries = g.facts.get("cleanup_plan")
     if plan_entries is None:
@@ -3731,6 +4305,298 @@ def log_cmd(args, emit=out):
     return 0
 
 
+# --- automatic deletion of gate archives and doctor captures (gate_cleanup_hours) ----------------
+
+def captures_root(gp):
+    """OpenClaw's doctor capture directory: <state dir>.update-captures (update-capture-paths in 2026.10)."""
+    return Path(os.path.realpath(str(gp["STATE"])) + ".update-captures")
+
+
+def _run_journals(gp):
+    """Every recorded gate run: runs/<id>/journal.json (copied when a new run starts) plus the current journal."""
+    runs = {}
+    for jp in sorted(gp["RUNS"].glob("*/journal.json")):
+        j = C.load_json_or_none(jp)
+        if isinstance(j, dict) and j.get("run_id"):
+            runs[j["run_id"]] = j
+    try:
+        cur = load_journal()
+    except (OSError, ValueError):
+        cur = None
+    if isinstance(cur, dict) and cur.get("run_id"):
+        runs[cur["run_id"]] = cur
+    return runs, cur
+
+
+def cleanup_blocked(gp, cur):
+    """Never delete while a gate run is active, held or about to be retried (its archive is the rollback copy)."""
+    if gp["HOLD"].exists():
+        return "hold"
+    if isinstance(cur, dict) and cur.get("status") in ("running", "interrupted", "hold"):
+        return f"gate run {cur.get('run_id')} is {cur.get('status')}"
+    if gp["RETRY"].exists():
+        return "a retry request is pending"
+    fd = _try_lock(gp)
+    if fd is None:
+        return "the gate is running"
+    os.close(fd)
+    return None
+
+
+def run_captures(gp, j):
+    """The doctor capture directories a gate run created: parsed from its doctor logs and validated (inside
+    <state>.update-captures, OpenClaw's doctor-<uuid> name, a real directory)."""
+    root = captures_root(gp)
+    found = set()
+    for log in sorted((gp["RUNS"] / str(j.get("run_id"))).glob("doctor-pass*.log")):
+        try:
+            text = log.read_bytes().decode("utf-8", "replace")
+        except OSError:
+            continue
+        for line in text.splitlines():
+            m = CAPTURE_RE.search(ANSI_RE.sub("", line))
+            if m:
+                found.add(m.group(1).rstrip("."))
+    keep, refused = [], []
+    for c in sorted(found):
+        pth = Path(c)
+        if os.path.islink(str(root)) or os.path.realpath(str(pth.parent)) != str(root):
+            refused.append((c, "not inside " + str(root)))
+        elif not CAPTURE_NAME_RE.match(pth.name):
+            refused.append((c, "unexpected name"))
+        elif os.path.islink(c):
+            refused.append((c, "symlink"))
+        elif os.path.isdir(c):
+            keep.append(pth)
+    return keep, refused
+
+
+def _dir_bytes(d):
+    total = 0
+    for _p, st in C.walk_lstat(d):
+        if stat.S_ISREG(st.st_mode):
+            total += st.st_size
+    return total
+
+
+TOMB_PREFIX = ".oc-addon-deleting-"
+
+
+def _delete_tree(d):
+    """Rename to a tombstone first (an interrupted delete never leaves a half archive under its real name); a
+    leftover tombstone is removed where it is. A symlink is never followed: only the link itself goes. Raises
+    OSError when something is left, so a pass never claims a deletion that did not happen."""
+    if os.path.islink(str(d)):
+        os.unlink(d)
+        return 0
+    size = _dir_bytes(d)
+    tomb = d if d.name.startswith(TOMB_PREFIX) else d.parent / f"{TOMB_PREFIX}{d.name}"
+    if tomb != d:
+        os.replace(d, tomb)
+    shutil.rmtree(tomb, ignore_errors=True)
+    if os.path.lexists(str(tomb)):
+        raise OSError(errno.ENOTEMPTY, "not completely removed", str(tomb))
+    return size
+
+
+def _archive_dir_ok(gp, d):
+    arch = gp["ARCHIVES"]
+    return (not os.path.islink(str(arch)) and d.parent == arch and RUN_ID_RE.match(d.name)
+            and d.is_dir() and not os.path.islink(str(d)))
+
+
+def cleanup_targets(gp, now, hours):
+    """[(run_id or None, label, due_utc, [paths], kept)] for every finished run plus orphaned archives and
+    plaintext rehearsal exports (journal-independent, by modification time)."""
+    runs, cur = _run_journals(gp)
+    out_ = []
+    referenced = set()
+    for rid, j in sorted(runs.items()):
+        adir = gp["ARCHIVES"] / rid
+        referenced.add(rid)
+        fin = _parse_backup_date(j.get("finished_at"))
+        if fin is None:
+            continue  # not finished by this gate (held, abandoned): an archive of it is handled as an orphan
+        due = fin + timedelta(hours=hours)
+        paths, kept = [], []
+        if os.path.lexists(str(adir)):
+            if _archive_dir_ok(gp, adir):
+                paths.append(adir)
+            else:
+                kept.append((str(adir), "not a plain run directory"))
+        caps, refused = run_captures(gp, j)
+        paths += caps
+        kept += refused
+        out_.append((rid, f"run {rid}", due, paths, kept))
+    unfinished = {rid for rid, j in runs.items() if not j.get("finished_at")}
+    # the current run's archive is its rollback copy while that run can still continue (closed runs: abandoned,
+    # or done through bookkeeping without finished_at, are handled like orphans)
+    active = (cur.get("run_id") if isinstance(cur, dict) and cur.get("status") not in ("done", "abandoned")
+              else None)
+    if gp["ARCHIVES"].is_dir() and not os.path.islink(str(gp["ARCHIVES"])):
+        for d in sorted(gp["ARCHIVES"].iterdir()):
+            if d.name in referenced and d.name not in unfinished:
+                continue
+            if d.name.startswith(TOMB_PREFIX):
+                out_.append((None, f"leftover {d.name}", now, [d], []))
+                continue
+            if not _archive_dir_ok(gp, d) or d.name == active:
+                continue
+            try:
+                due = datetime.fromtimestamp(d.stat().st_mtime, timezone.utc) + timedelta(hours=hours)
+            except OSError:
+                continue
+            out_.append((None, f"orphaned archive {d.name}", due, [d], []))
+    caps = captures_root(gp)
+    if caps.is_dir() and not os.path.islink(str(caps)):
+        for d in sorted(caps.iterdir()):  # a capture delete interrupted after its rename
+            if (d.name.startswith(TOMB_PREFIX) and CAPTURE_NAME_RE.match(d.name[len(TOMB_PREFIX):])
+                    and not os.path.islink(str(d)) and d.is_dir()):
+                out_.append((None, f"leftover {d.name}", now, [d], []))
+    reh = gp["SHARE"] / "openclaw-rehearsal"
+    if reh.is_dir() and not os.path.islink(str(reh)):
+        for f in sorted(list(reh.glob("*/openclaw-rehearsal.tar.gz")) + list(reh.glob("*/openclaw-rehearsal.tar.gz.tmp"))):
+            if os.path.islink(str(f)) or os.path.islink(str(f.parent)) or not f.is_file():
+                continue
+            due = datetime.fromtimestamp(f.stat().st_mtime, timezone.utc) + timedelta(hours=hours)
+            out_.append((None, f"plaintext rehearsal export {f.parent.name}", due, [f.parent], []))
+    return out_
+
+
+def cleanup_pass(now=None, hours=None, emit=out, state=None):
+    """One deletion pass: everything whose due time has passed. Logs once per run (announcement, deletion)."""
+    gp = gpaths()
+    hours = C.gate_options()["cleanup_hours"] if hours is None else hours
+    state = state if state is not None else {}
+    if not hours:
+        return 0
+    now = now or C.utc_now()
+    import fcntl
+    ensure_dirs(gp)
+    lk = os.open(str(gp["GATE"] / ".cleanup.lock"), os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        try:
+            fcntl.flock(lk, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            return 0
+        _runs, cur = _run_journals(gp)
+        why = cleanup_blocked(gp, cur)
+        if why:
+            if state.get("paused") != why:
+                emit(f"[cleanup] paused: {why}")
+            state["paused"] = why
+            return 0
+        state.pop("paused", None)
+        deleted = 0
+        for rid, label, due, paths, kept in cleanup_targets(gp, now, hours):
+            if STOP.is_set():
+                break
+            rec_path = gp["RUNS"] / rid / "cleanup.json" if rid else None
+            rec = (C.load_json_or_none(rec_path) if rec_path else None) or {"schema": 1}
+            dirty = False
+            for path, reason in kept:
+                key = f"kept:{path}"
+                if not rec.get(key):
+                    emit(f"WARN [cleanup] {label}: kept {path}: {reason}")
+                    rec[key] = dirty = True
+            live = [p_ for p_ in paths if os.path.lexists(str(p_))]
+            if not live:
+                if rec.get("deleted_at") is None and rec.get("due_at"):
+                    rec["deleted_at"] = C.utc_iso(now)
+                    dirty = True
+                if dirty and rec_path and rec_path.parent.is_dir():
+                    C.atomic_write_json(rec_path, rec)
+                continue
+            if now < due:
+                if rec_path and not rec.get("announced_at"):
+                    rec.update({"due_at": C.utc_iso(due), "announced_at": C.utc_iso(now)})
+                    emit(f"[cleanup] {label}: {len(live)} item(s) (archive / doctor captures) will be deleted at "
+                         f"{C.utc_iso(due)}")
+                    if rec_path.parent.is_dir():
+                        C.atomic_write_json(rec_path, rec)
+                continue
+            gone = []
+            for p_ in live:
+                if STOP.is_set():
+                    break
+                try:
+                    size = _delete_tree(p_) if p_.is_dir() else (p_.stat().st_size, p_.unlink())[0]
+                    gone.append({"path": str(p_), "bytes": size})
+                except OSError as exc:
+                    emit(f"WARN [cleanup] {label}: could not delete {p_}: {exc.strerror or exc}")
+            if gone:
+                deleted += len(gone)
+                emit(f"[cleanup] {label}: deleted {len(gone)} item(s), {C.human(sum(g['bytes'] for g in gone))}: "
+                     + ", ".join(g["path"] for g in gone[:4]) + (" ..." if len(gone) > 4 else ""))
+                if rec_path and rec_path.parent.is_dir():
+                    rec.update({"due_at": rec.get("due_at") or C.utc_iso(due), "deleted_at": C.utc_iso(now)})
+                    rec.setdefault("deleted", []).extend(gone)
+                    C.atomic_write_json(rec_path, rec)
+        return deleted
+    finally:
+        os.close(lk)
+
+
+def cleanup_loop(emit=out):
+    """Started by run.sh next to the gateway (never during a gate run or HOLD): a pass now, then hourly."""
+    install_signal_handlers()
+    STOP.clear()
+    hours = C.gate_options()["cleanup_hours"]
+    if not hours:
+        emit("[cleanup] gate_cleanup_hours=0: automatic deletion is off (oc-upgrade cleanup lists what to delete)")
+        return 0
+    emit(f"[cleanup] gate archives and doctor captures are deleted {hours} h after their gate run (checked hourly)")
+    state = {}
+    while not STOP.is_set():
+        hooks = load_hooks()
+        now = C.utc_now() + timedelta(seconds=float(hooks.get("cleanup_clock_offset_s") or 0))
+        try:
+            cleanup_pass(now=now, hours=C.gate_options()["cleanup_hours"], emit=emit, state=state)
+        except Exception as exc:  # noqa: BLE001 (the loop must survive one bad pass)
+            emit(f"WARN [cleanup] pass failed: {type(exc).__name__}: {C.redact_text(str(exc))[:200]}")
+        STOP.wait(float(hooks.get("cleanup_interval_s") or CLEANUP_INTERVAL_S))
+    return stop_rc()
+
+
+def cleanup_cmd(args, emit=out):
+    """oc-upgrade cleanup            list what is deleted when (read-only)
+       oc-upgrade cleanup --apply    delete everything that is due now
+       (run.sh runs `cleanup --loop` next to the gateway)"""
+    gp = gpaths()
+    if args == ["--loop"]:
+        if os.environ.get("OC_GATE_FROM_RUNSH") != "1":
+            emit("oc-upgrade cleanup --loop is started by the add-on itself")
+            return 2
+        return cleanup_loop(emit)
+    if args not in ([], ["--apply"]):
+        emit("usage: oc-upgrade cleanup [--apply]")
+        return 2
+    hours = C.gate_options()["cleanup_hours"]
+    now = C.utc_now()
+    _runs, cur = _run_journals(gp)
+    why = cleanup_blocked(gp, cur)
+    emit(f"gate_cleanup_hours={hours}" + (" (automatic deletion off)" if not hours else "")
+         + (f"; paused: {why}" if why else ""))
+    for rid, label, due, paths, kept in cleanup_targets(gp, now, hours or 0):
+        live = [p_ for p_ in paths if os.path.lexists(str(p_))]
+        verdict = "nothing left" if not live else ("due now" if now >= due else f"due {C.utc_iso(due)}")
+        emit(f"  {label}: {verdict}")
+        for p_ in live:
+            emit(f"    {p_} ({C.human(_dir_bytes(p_) if p_.is_dir() else p_.stat().st_size)})")
+        for path, reason in kept:
+            emit(f"    kept {path}: {reason}")
+    if args == ["--apply"]:
+        if not hours:
+            emit("gate_cleanup_hours=0: nothing is deleted automatically; delete the listed paths yourself")
+            return 0
+        if why:
+            emit(f"not deleting now: {why}")
+            return 1
+        n = cleanup_pass(now=now, hours=hours, emit=emit)
+        emit(f"deleted {n} item(s)")
+    return 0
+
+
 def status_lines():
     gp = gpaths()
     L = []
@@ -3757,8 +4623,21 @@ def status_lines():
         if j.get("accepted"):
             L.append(f"  accepted codes: {', '.join(j['accepted'])}")
         a = j.get("archive") or {}
-        if a:
-            L.append(f"  archive: {a.get('dir')}/{a.get('file')} ({C.human(a.get('size'))}, sha256 {str(a.get('sha256'))[:12]}…)")
+        cl = C.load_json_or_none(gp["RUNS"] / str(j.get("run_id")) / "cleanup.json") or {}
+        when = f"; deleted {cl['deleted_at']}" if cl.get("deleted_at") else \
+            (f"; auto-delete due {cl['due_at']}" if cl.get("due_at") else "")
+        if a.get("mode") == "off":
+            L.append(f"  archive: off for this run (gate_archive: off){when}")
+        elif a.get("mode") == "encrypted":
+            L.append(f"  archive: encrypted (age, {C.short_recipient(a.get('recipient'))}) {a.get('dir')}/{a.get('file')} "
+                     f"({C.human(a.get('size'))}, sha256 {str(a.get('sha256'))[:12]}…){when}")
+        elif a:
+            L.append(f"  archive: {a.get('dir')}/{a.get('file')} PLAINTEXT (0.5.94-full1) ({C.human(a.get('size'))}, "
+                     f"sha256 {str(a.get('sha256'))[:12]}…){when}")
+        hb = j.get("ha_backup")
+        if isinstance(hb, dict):
+            L.append(f"  HA backup checked: '{hb.get('name')}' ({hb.get('slug')}, {hb.get('date')}, "
+                     f"add-on {hb.get('addon_version') or '?'})")
         g1 = j.get("glm_thinking")
         if isinstance(g1, dict):
             refs = ", ".join(g1.get("refs") or []) or "-"
@@ -3777,7 +4656,14 @@ def status_lines():
     if r:
         L.append(f"Pending retry request: doctor={r.get('doctor')} accept={','.join(r.get('accept') or []) or '-'} "
                  "(runs on the next add-on start)")
-    archives = sorted(gp["ARCHIVES"].glob("*/*.tar.gz"))
+    o = C.gate_options()
+    ao = o["archive"]
+    L.append(f"Gate options: gate_archive {ao['mode'] or '?'}"
+             + (f" to {C.short_recipient(ao['recipient'])}" if ao.get("recipient") else "")
+             + (f" (problem: {ao['problem']})" if ao.get("problem") else "")
+             + f"; delete archives/doctor captures {o['cleanup_hours']} h after a run (0 = never); "
+             f"backup max age {o['backup_max_age_hours']} h")
+    archives = sorted(gp["ARCHIVES"].glob("*/*.tar.gz")) + sorted(gp["ARCHIVES"].glob("*/*.tar.gz.age"))
     L.append("Gate archives in /share:" if archives else "Gate archives in /share: none")
     for a in archives:
         sums = (a.parent / "SHA256SUMS")
@@ -3786,7 +4672,12 @@ def status_lines():
             size = a.stat().st_size
         except OSError:
             size = None
-        L.append(f"  {a} ({C.human(size)}, sha256 {sha}…)")
+        kind = "encrypted" if a.name.endswith(".age") else "PLAINTEXT from 0.5.94-full1: unencrypted secrets"
+        L.append(f"  {a} ({C.human(size)}, sha256 {sha}…, {kind})")
+    caps = captures_root(gp)
+    if caps.is_dir():
+        n = sum(1 for x in caps.iterdir() if CAPTURE_NAME_RE.match(x.name.removeprefix(TOMB_PREFIX)))
+        L.append(f"Doctor captures: {n} in {caps} (pre-repair database copies; deleted with their gate run)")
     qd = gp["QUAR"]
     if qd.exists():
         n = sum(1 for _p, st in C.walk_lstat(qd) if not stat.S_ISDIR(st.st_mode) and _p.name != "MANIFEST.json")
