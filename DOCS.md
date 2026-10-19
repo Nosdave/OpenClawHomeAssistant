@@ -1015,7 +1015,7 @@ lines start with `[gate]` and are numbered `1/8` … `8/8`.
 backups stay inside the Home Assistant backup system and are encrypted. The add-on's
 data holds tokens, OAuth logins and API keys, so the only backup step below is an
 encrypted Home Assistant backup, and restoring it is the only rollback: the gate
-writes no archive of its own, and the add-on writes no copy of the state outside the
+writes no archive of its own, and the add-on keeps no copy of the state outside the
 Home Assistant backup system.
 
 **Runbook** (from `0.5.93-full2` to `0.5.94-full3`; coming from `0.5.94-full1` or
@@ -1076,10 +1076,13 @@ run's doctor captures after the run ended (or after a hold that followed it was
 cleared), rehearsal exports in `/share/openclaw-rehearsal/` after they were written,
 and the plaintext 2026.7 archives in `/config/.openclaw/upgrade-backups/` after the
 2026.10 migration completed. A return to OpenClaw 2026.7.35 is only possible with the
-Home Assistant backup of `0.5.93-full2`. The age key pair created for full2 is no
-longer needed. If you downloaded a backup for the full1 update, delete that copy, and
-delete unencrypted backups of this add-on in **Settings → System → Backups** (the gate
-names each one it sees in a `WARN` at its next run).
+Home Assistant backup of `0.5.93-full2`. If a full2 gate wrote an encrypted archive and
+you have no encrypted Home Assistant backup from before that migration, keep the full2
+private key until that archive is deleted (`oc-upgrade cleanup` shows when; never with
+`gate_cleanup_hours: 0`); otherwise the key pair is no longer needed. If you downloaded
+a backup for the full1 update, delete that copy, and delete unencrypted backups of this
+add-on in **Settings → System → Backups** (the gate names up to three in a `WARN` at
+its next run and counts the rest).
 
 **What the gate does**
 
@@ -1136,6 +1139,7 @@ Like every HOLD they stay until `oc-upgrade retry` and a restart.
 | Code | Class | Cause | What to do |
 |---|---|---|---|
 | `ha-backup-missing` | acceptable | No encrypted full or partial backup with this add-on from the last `gate_backup_max_age_hours`, or, for an OpenClaw update, the recent ones hold the new add-on version (taken after the update: restoring them would not bring back the previous OpenClaw). The message lists what the gate found. | See below. |
+| `agent-db-outside-config` | acceptable | An agent database lies outside `/config` (registered with an absolute path, for example under `/share` or `/media`). Doctor migrates it one-way, but a backup of the add-on alone does not contain it. | Move the agent below `/config` (re-register it), or make sure the encrypted backup holds that folder (a full backup includes `/share` and `/media`), then `oc-upgrade retry --accept agent-db-outside-config` and restart. |
 | `ha-backup-unverified` | acceptable | The backup list could not be read: no usable Supervisor token, an HTTP error (401/403: the add-on lacks Supervisor API access), no answer (or no complete answer in time) from the Supervisor, an answer that is not the expected JSON, or the add-on version inside a backup could not be read. | If the cause was temporary, `oc-upgrade retry` and restart check again. Otherwise check in **Settings → System → Backups** that an encrypted backup with this add-on (for an update: with the previous add-on version) exists, then `oc-upgrade retry --accept ha-backup-unverified` and restart. |
 
 **`ha-backup-missing`: what to do.** For an OpenClaw update the backup must hold
@@ -1153,7 +1157,8 @@ this add-on counts: create one now (OpenClaw is not running during a HOLD), then
 `oc-upgrade retry` and restart.
 
 Unencrypted backups that contain this add-on are named in a `WARN` during the
-precheck (they hold its secrets in plaintext): delete them.
+precheck (up to three, the rest counted; they hold its secrets in plaintext): delete
+them.
 
 #### Automatic deletion (`gate_cleanup_hours`)
 
@@ -1194,9 +1199,10 @@ The deletion runs next to the gateway: once at start, then hourly. It pauses whi
 HOLD is active, a gate run is running, interrupted or held, or a retry is pending
 (`[cleanup] paused: …`). Each run is announced once
 (`[cleanup] run <id>: … will be deleted at <time>`) and logged when it is deleted
-(`[cleanup] run <id>: deleted …`). A directory is first renamed to
+(`[cleanup] run <id>: deleted …`). An archive or capture directory is first renamed to
 `.oc-addon-deleting-<name>` and then removed, so an interrupted deletion never leaves
-a partial copy under its real name (the next pass finishes it). Other add-ons can
+a partial copy under its real name (the next pass finishes it); a rehearsal export's
+files are unlinked one by one and its directory is removed once empty. Other add-ons can
 write to `/share`, so every delete there goes through directory handles that never
 follow a symbolic link: a planted link is removed as a link or the delete is refused,
 and its target is never touched. If one item cannot be deleted, the log shows
@@ -1367,7 +1373,7 @@ logins and API keys, so:
 Before it changes the OpenClaw state, the migration gate checks for a recent encrypted
 backup that contains this add-on and warns about unencrypted ones (see the
 [runbook](#upgrading-to-openclaw-202610-0594-full1--the-migration-gate)). That backup
-is the only rollback point: the add-on writes no copy of its state outside the Home
+is the only rollback point: the add-on keeps no copy of its state outside the Home
 Assistant backup system.
 
 ### What is excluded from backups (v0.5.90+)
@@ -1697,7 +1703,8 @@ acceptable and you understand the consequence, `oc-upgrade retry --accept <code>
 The codes of the backup check (`ha-backup-missing`, `ha-backup-unverified`) are
 explained in [Backup HOLD codes](#backup-hold-codes).
 If the HOLD happened after doctor started (`State: partially migrated`), either
-retry forward or roll back with the backup (next section). Do not run
+retry forward or roll back with the backup
+([Safe rollback](#safe-rollback-after-an-openclaw-database-upgrade)). Do not run
 `openclaw doctor --fix` by hand — the wrapper refuses it; `oc-upgrade retry --doctor`
 does the same with a backup check first.
 

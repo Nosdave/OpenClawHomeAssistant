@@ -707,8 +707,9 @@ backup_state_before_upgrade() {
 # Fork: only refuse to start when the runtime that is about to run can actually
 # migrate state (the 2026.8+ lines). The 2026.7.x runtime performs no schema
 # migration, so a failed archive there must not take the add-on page and
-# terminal down with it. run.sh calls this only for runtimes below 2026.8 (the
-# migration gate owns the archive from 2026.8 on); the HOLD branch is a
+# terminal down with it. run.sh calls this only for runtimes below 2026.8 (from
+# 2026.8 on the migration gate requires an encrypted Home Assistant backup instead
+# and writes no archive); the HOLD branch is a
 # fail-closed fallback for an undeterminable runtime version.
 require_upgrade_backup() {
   local bundled_version
@@ -750,6 +751,11 @@ get_openclaw_version() {
   printf '%s\n' "$raw" | grep -oE '[0-9]{4}\.[0-9]+\.[0-9]+(-[0-9]+)?' | head -n 1 || true
 }
 OPENCLAW_RUNTIME_VERSION="$(get_openclaw_version)"
+# A failed probe must not look like a pre-2026.8 runtime (that would skip the migration
+# gate and write the plaintext 2026.7 archive): fall back to the version the image pinned.
+if [ -z "$OPENCLAW_RUNTIME_VERSION" ]; then
+  OPENCLAW_RUNTIME_VERSION="$(head -n 1 /usr/local/libexec/oc-addon/openclaw-pinned-version 2>/dev/null | grep -oE '^[0-9]{4}\.[0-9]+\.[0-9]+(-[0-9]+)?$' || true)"
+fi
 export OPENCLAW_RUNTIME_VERSION
 
 # True when the bundled runtime is at least $1 (x.y.z; a -N patch suffix of the
@@ -999,7 +1005,7 @@ if [ "$STATE_HOLD" != "true" ]; then
   # A HOLD from an earlier boot no longer applies. Before a gate run the gate
   # (and run_migration_gate) delete it themselves.
   if [ "$GATE_NEEDED" != "true" ]; then rm -f "${UPG_DIR}/hold.txt"; fi
-  # From 2026.8 on the migration gate owns the pre-migration archive. Not
+  # From 2026.8 on there is no local archive (the gate requires an encrypted HA backup). Not
   # started when a stop request arrived meanwhile (the Supervisor would kill it).
   if ! runtime_at_least 2026.8.0 && [ "$SHUTTING_DOWN" != "true" ]; then require_upgrade_backup; fi
 fi

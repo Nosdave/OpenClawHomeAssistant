@@ -73,8 +73,14 @@ ACCEPTABLE = frozenset({
     "doctor-held-back",  # acceptable only on rc 0 (2026.10 reports held stores without failing doctor)
     # no recent encrypted Home Assistant backup with this add-on / the backup list could not be read
     "ha-backup-missing", "ha-backup-unverified",
+    "agent-db-outside-config",  # acceptable once the encrypted backup also holds that folder (a full backup)
 })
 NO_RETRY = frozenset({"newer-state", "runtime-integrity"})
+# HOLD codes of the gate archive of 0.5.94-full1/full2 (removed in full3): a journal may still hold one
+REMOVED_HOLDS = frozenset({"archive-key-missing", "archive-key-invalid", "archive-age-missing", "archive-failed",
+                           "archive-verify-failed", "archive-timeout", "archive-missing", "low-disk-share"})
+REMOVED_HOLD_ADVICE = ("this check was removed in 0.5.94-full3 (the encrypted Home Assistant backup is the only "
+                       "rollback point): oc-upgrade retry, then restart the add-on")
 POST_RUN_HOLDS = frozenset({"exit78", "crash-loop"})
 HOOK_KEYS = ("raise_in_phase", "doctor_cmd", "skip_network_check", "accept", "skip_cleanup_kinds",
              "doctor_timeout_s", "skip_space_check", "skip_backup_check", "supervisor_url",
@@ -110,7 +116,8 @@ ADVICE = {
     "node-runtime": "the bundled Node.js cannot run this OpenClaw: reinstall or rebuild the add-on",
     "openclaw-running": "another OpenClaw process is running: stop it (restart the add-on), then oc-upgrade retry",
     "gate-busy": "another migration gate is running: wait for it, or restart the add-on",
-    "config-missing": "restore openclaw.json from the Home Assistant backup, then oc-upgrade retry",
+    "config-missing": "restore openclaw.json with oc-config restore (oc-config list shows the snapshots), or restore the "
+                      "add-on from the encrypted Home Assistant backup, then oc-upgrade retry",
     "config-unreadable": "fix openclaw.json (strict JSON required; JSON5 comments are unsupported), then oc-upgrade retry",
     "config-includes": "inline the $include files into openclaw.json, then oc-upgrade retry",
     "state-symlink": "replace the symlink by the real directory (or bind-mount it), then oc-upgrade retry",
@@ -119,7 +126,10 @@ ADVICE = {
     "ha-backup-missing": "create an encrypted Home Assistant backup that includes this add-on before updating (Settings > "
                          "System > Backups, add-on stopped, stored locally or on a network mount: cloud-only copies are "
                          "not visible to the add-on), then oc-upgrade retry",
-    "ha-backup-unverified": "the Supervisor backup list could not be read (see the reason): make sure an encrypted backup "
+    "agent-db-outside-config": "move the agent below /config (re-register it), or make sure the encrypted Home "
+                               "Assistant backup also holds that folder (a full backup includes /share and /media), "
+                               "then oc-upgrade retry --accept agent-db-outside-config",
+    "ha-backup-unverified":"the Supervisor backup list could not be read (see the reason): make sure an encrypted backup "
                             "with this add-on exists (Settings > System > Backups), then oc-upgrade retry",
     "legacy-state-dir": "move /config/.clawdbot out of /config (or merge it manually), then oc-upgrade retry",
     "custom-session-store": "remove session.store from openclaw.json (custom session stores are not migrated), then oc-upgrade retry",
@@ -133,7 +143,8 @@ ADVICE = {
     "models-wildcard-pinned": "remove the agentRuntime pin from the openai-codex/* wildcard entry, then oc-upgrade retry",
     "low-disk-config": "free space on the /config disk, then oc-upgrade retry",
     "low-disk-tmp": "free space for SQLite temporary files (/tmp, /var/tmp), then oc-upgrade retry",
-    "sqlite-corrupt": "restore the database from a backup (quick_check failed), then oc-upgrade retry",
+    "sqlite-corrupt": "restore the add-on from the encrypted Home Assistant backup (quick_check failed; Settings > "
+                      "System > Backups), then oc-upgrade retry",
     "cleanup-failed": "check permissions under /config/.openclaw-upgrade, then oc-upgrade retry",
     "premigrate-failed": "check free space and permissions, then oc-upgrade retry",
     "config-retired-keys": "remove the listed settings from openclaw.json on 0.5.93 (OpenClaw 2026.7.35 does not use "
@@ -692,6 +703,13 @@ def decide(ctx):
         bk["journal_status"] = "done"
         warnings.append(f"previous HOLD {(j.get('hold') or {}).get('code')} no longer applies; closing it")
         status = "done"
+    if (status == "hold" and not has_retry and removed_hold(j.get("hold")) and j.get("first_write_at") is None
+            and j.get("mode") != "maintenance" and gate_needed):
+        # nothing was written: the run simply starts again from the precheck (the HA backup check included)
+        code = (j.get("hold") or {}).get("code")
+        warnings.append(f"previous HOLD {code} no longer applies (0.5.94-full3 writes no gate archive)")
+        return R(10, "resume", f"run {run_id}: HOLD {code} no longer applies, re-running from precheck",
+                 mode=mode_new, resume_phase="precheck")
     if status == "hold":
         hold = j.get("hold") or {}
         code = hold.get("code") or "unknown"
@@ -919,6 +937,13 @@ def write_marker(*, mode, run_id, binding, runtime, accepted, orphans):
 
 # --- hold.txt ---------------------------------------------------------------------------------
 
+def removed_hold(h):
+    """True for a HOLD whose every code belongs to the gate archive of 0.5.94-full1/full2 (no such check now)."""
+    h = h or {}
+    codes = set(h.get("codes") or [h.get("code")]) - {None}
+    return bool(codes) and codes <= REMOVED_HOLDS
+
+
 def advice_for(codes, findings=None):
     codes = list(codes)
     acc = [c for c in codes if c in ACCEPTABLE or any(f.get("code") == c and f.get("cls") == "acceptable"
@@ -965,6 +990,7 @@ def write_sticky_hold_txt(d, pkg):
                                                   jh.get("message", ""))]
         text = hold_text(pkg["version"], j.get("run_id"), jh.get("phase") or j.get("phase"), findings,
                          jh.get("state_line") or state_line_for(j, jh.get("code") in POST_RUN_HOLDS),
+                         REMOVED_HOLD_ADVICE if removed_hold(jh) else
                          jh.get("next") or advice_for([f["code"] for f in findings], findings))
     else:
         findings = [finding(h["code"], "hard", h.get("message", ""))]
@@ -1755,10 +1781,21 @@ class Gate:
         if links:
             F.append(finding("state-symlink", "hard", "symlinked director(ies) would be backed up as bare links, "
                              "without the data they point to: " + ", ".join(links[:6]), "precheck"))
+        root = os.path.realpath(p["CONFIG_ROOT"])
+        outside = [a for a in sorted(set((self.cls.get("agent_paths") or {}).values()))
+                   if not (os.path.realpath(p["STATE"] / a) + "/").startswith(root + "/")]
+        if outside:
+            F.append(finding("agent-db-outside-config", "acceptable",
+                             "agent database(s) outside /config are migrated one-way, but a backup of the add-on "
+                             "alone does not contain them: " + ", ".join(outside[:4]), "precheck"))
         sizes = self.measure()
         opt = C.gate_options()
         for prob in opt["problems"]:
             self.warn(f"add-on option {prob}")
+        plain = C.safe_files_below(p["ARCHIVES"], lambda n: n.endswith(".tar.gz"))
+        if plain:
+            self.warn(f"{len(plain)} plaintext gate archive(s) of 0.5.94-full1 in {p['ARCHIVES']} hold unencrypted "
+                      f"secrets ({leftover_note(opt['cleanup_hours'])})")
         # 8 space
         if self.hooks.get("skip_space_check"):
             parts.append("space check skipped (test hook)")
@@ -1777,7 +1814,7 @@ class Gate:
             parts.append("network not checked")
         else:
             parts.append(self.network_check(F))
-        # 10b encrypted Home Assistant backup with this add-on (the primary rollback point)
+        # 10b encrypted Home Assistant backup with this add-on (the only rollback point)
         parts.append(self.ha_backup_check(F, opt))
         # 11 info
         self.info_items(mode, generic_only)
@@ -1823,6 +1860,9 @@ class Gate:
             self.warn(f"Home Assistant backup '{e['name']}' ({e['slug']}, {e['date']}) contains this add-on "
                       f"UNENCRYPTED in {e['locations']}: it holds the add-on's secrets in plaintext; delete it and keep "
                       "only encrypted backups")
+        if len(ev["unprotected"]) > 3:
+            self.warn(f"... and {len(ev['unprotected']) - 3} more Home Assistant backup(s) that contain this add-on "
+                      "UNENCRYPTED (Settings > System > Backups)")
         need_older = (self.j or {}).get("mode", "from-7x") in ("from-7x", "bump")
         best, same_version, unreadable = None, [], []
         for e in ev["candidates"][:BACKUP_VERSION_LOOKUPS]:  # newest first, until one holds the previous version
@@ -2080,7 +2120,7 @@ class Gate:
         detail = ", ".join(f"{v} {k}" for k, v in sorted(counts.items())) or "nothing to move"
         self.say(f"2/8 cleanup: quarantined {total} files ({detail}) -> {qdir}/")
 
-    # ----- phase 4: pre-migrate -----
+    # ----- phase 3: pre-migrate -----
     def phase_premigrate(self):
         if self.j.get("doctor_started"):
             self.say("3/8 pre-migrate: skipped (doctor already started)")
@@ -2471,7 +2511,7 @@ class Gate:
             return ["(unreadable)"]
         return sorted(k for k in set(a) | set(b) if a.get(k) != b.get(k))
 
-    # ----- phase 8: postconditions -----
+    # ----- phase 7: postconditions -----
     def phase_postconditions(self):
         M = mig()
         p = self.gp
@@ -2632,7 +2672,7 @@ class Gate:
             self.resolve(policy, "postconditions")
         self.say("7/8 postconditions OK: " + ", ".join(summary))
 
-    # ----- phase 9: pins -----
+    # ----- phase 8: pins -----
     def phase_pins(self):
         if "pins-invalid" in self.accepted:
             self.warn("accepted pins-invalid: behaviour pins skipped")
@@ -2709,11 +2749,14 @@ class Gate:
         self.say(f"done: MIGRATED {self.pkg['version']} (run {self.j['run_id']}, mode {self.j['mode']}, "
                  f"total {C.fmt_duration(total)})")
         hours = C.gate_options()["cleanup_hours"]
+        a = self.j.get("archive") or {}  # a run resumed from 0.5.94-full1/full2 may have one
+        what = (f"the doctor captures and the archive {printable(a.get('dir'))}/{printable(a.get('file'))}"
+                if a.get("file") else "the doctor captures")
         if hours:
             due = C.utc_iso(C.utc_now() + timedelta(hours=hours))
-            self.say(f"info: the doctor captures of this run are deleted after {due} (gate_cleanup_hours={hours})")
+            self.say(f"info: {what} of this run are deleted after {due} (gate_cleanup_hours={hours})")
         else:
-            self.say("info: the doctor captures of this run are kept (gate_cleanup_hours=0): delete them yourself")
+            self.say(f"info: {what} of this run are kept (gate_cleanup_hours=0): delete them yourself")
 
     # ----- holds -----
     def write_hold(self, findings, phase, resume_after=False, post_run=False, sub=None, next_line=None):
@@ -4174,6 +4217,12 @@ def cleanup_cmd(args, emit=out):
     return 0
 
 
+def leftover_note(hours):
+    """What happens to the copies earlier versions left, for status listings."""
+    return ("deleted automatically, see oc-upgrade cleanup" if hours else
+            "kept: gate_cleanup_hours=0, delete them yourself")
+
+
 def status_lines():
     gp = gpaths()
     L = []
@@ -4193,7 +4242,8 @@ def status_lines():
         h = j.get("hold")
         if h:
             L.append(f"  HOLD {', '.join(h.get('codes') or [h.get('code')])} in {h.get('phase')}: {h.get('message')}")
-            L.append(f"  acceptable: {'yes' if h.get('acceptable') else 'no'}; next: {h.get('next') or 'oc-upgrade retry'}")
+            nxt = REMOVED_HOLD_ADVICE if removed_hold(h) else h.get("next") or "oc-upgrade retry"
+            L.append(f"  acceptable: {'yes' if h.get('acceptable') else 'no'}; next: {nxt}")
             acc = [f["code"] for f in h.get("findings") or [] if f.get("cls") == "acceptable"]
             if acc:
                 L.append(f"  accept: oc-upgrade retry --accept {','.join(dict.fromkeys(acc))}")
@@ -4234,7 +4284,7 @@ def status_lines():
              f"backup max age {o['backup_max_age_hours']} h")
     archives = C.safe_files_below(gp["ARCHIVES"], lambda n: n.endswith((".tar.gz", ".tar.gz.age")))
     if archives:
-        L.append("Gate archives in /share from earlier add-on versions (deleted automatically, see oc-upgrade cleanup):")
+        L.append(f"Gate archives in /share from earlier add-on versions ({leftover_note(o['cleanup_hours'])}):")
     for a, st in archives:
         kind = "encrypted" if a.name.endswith(".age") else "PLAINTEXT: unencrypted secrets"
         L.append(f"  {printable(a)} ({C.human(st.st_size)}, {kind})")

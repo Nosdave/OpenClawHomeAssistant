@@ -537,10 +537,12 @@ def cmd_status(_args):
         print("No hold.")
     archives = [(a, st) for a, st in C.safe_children(p["STATE"] / "upgrade-backups")
                 if stat.S_ISREG(st.st_mode) and a.name.startswith("openclaw-state-") and a.name.endswith(".tar.gz")]
+    hours = gate_options()["cleanup_hours"]
     print("Pre-upgrade archives (local, Stage A, 7.x only):")
     for a, st in archives:
-        print(f"  {_gate().printable(a)} ({human(st.st_size)}, PLAINTEXT; deleted automatically after the 2026.8+ migration, "
-              "see oc-upgrade cleanup)")
+        when = "deleted automatically after the 2026.8+ migration, see oc-upgrade cleanup" if hours else \
+            _gate().leftover_note(hours)
+        print(f"  {_gate().printable(a)} ({human(st.st_size)}, PLAINTEXT; {when})")
     if not archives:
         print("  none")
     rehearsal = C.safe_files_below(p["SHARE"] / "openclaw-rehearsal",
@@ -548,7 +550,7 @@ def cmd_status(_args):
     print("Rehearsal exports (earlier add-on versions):")
     for a, st in rehearsal:
         kind = "encrypted" if a.name.endswith(".age") else "PLAINTEXT"
-        print(f"  {_gate().printable(a)} ({human(st.st_size)}, {kind}; deleted automatically, see oc-upgrade cleanup)")
+        print(f"  {_gate().printable(a)} ({human(st.st_size)}, {kind}; {_gate().leftover_note(hours)})")
     if not rehearsal:
         print("  none")
     print("Migration gate:")

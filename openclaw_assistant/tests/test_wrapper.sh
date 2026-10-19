@@ -695,6 +695,27 @@ else
   check "startup: a directory named export-request stopped run.sh (set -e): $got" [ "$got" = "RESULT ok" ]
 fi
 
+# A failed `openclaw --version` probe falls back to the image's pinned version, so it can never
+# look like a pre-2026.8 runtime (which would skip the gate and write the plaintext 2026.7 archive).
+{
+  echo 'set -euo pipefail'
+  sed -n '/^get_openclaw_version() {/,/^export OPENCLAW_RUNTIME_VERSION$/p' "$RUN_SH" |
+    sed "s#/usr/local/libexec/oc-addon/openclaw-pinned-version#\$PINNED#"
+  echo 'echo "RESULT ${OPENCLAW_RUNTIME_VERSION:-<empty>}"'
+} > "$T/runtime-version.sh"
+mkdir -p "$T/rv-bin"
+printf '#!/bin/sh\nexit 1\n' > "$T/rv-bin/openclaw"; chmod +x "$T/rv-bin/openclaw"
+printf '2026.10.4\n' > "$T/rv-pinned"
+got="$(PATH="$T/rv-bin:$PATH" PINNED="$T/rv-pinned" bash "$T/runtime-version.sh" 2>&1)"
+check "startup: a failed version probe did not fall back to the pinned version: $got" [ "$got" = "RESULT 2026.10.4" ]
+printf 'garbage\n' > "$T/rv-pinned"
+got="$(PATH="$T/rv-bin:$PATH" PINNED="$T/rv-pinned" bash "$T/runtime-version.sh" 2>&1)"
+check "startup: a garbage pinned version was used or stopped run.sh: $got" [ "$got" = "RESULT <empty>" ]
+printf '#!/bin/sh\necho "OpenClaw 2026.10.4 (383c124)"\n' > "$T/rv-bin/openclaw"
+printf '2026.9.9\n' > "$T/rv-pinned"
+got="$(PATH="$T/rv-bin:$PATH" PINNED="$T/rv-pinned" bash "$T/runtime-version.sh" 2>&1)"
+check "startup: a working version probe was overridden by the pinned version: $got" [ "$got" = "RESULT 2026.10.4" ]
+
 # known_bug DESCRIPTION COMMAND...: asserts the correct behaviour, but the
 # current run.sh is known to fail it. A failure is a KNOWN-BUG skip (not counted
 # as FAIL); a pass means the bug was fixed and the marker can be removed.

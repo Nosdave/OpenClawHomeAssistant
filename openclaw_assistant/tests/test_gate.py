@@ -2464,5 +2464,107 @@ class ModelsStatusRegressionOnlyTests(unittest.TestCase):
         self.assertEqual(G.primary_model_refs(cfg), {"vllm/qwen3.5-122b", "openai/gpt-5.5"})
 
 
+class Full3ReviewTests(GateEnv):
+    """Review of 0.5.94-full3: HOLDs left by full2, agent DBs outside /config, leftovers with cleanup off."""
+
+    FULL2_NEXT = ("set gate_archive_age_recipient in the add-on Configuration to your age public key (age1...), or "
+                  "set gate_archive: off, then oc-upgrade retry")
+
+    def full2_hold(self, code="archive-key-missing", first_write_at=None, codes=None):
+        return {"schema": 1, "run_id": "20261018T101010Z-abcdef", "mode": "from-7x", "status": "hold",
+                "phase": "precheck", "phases_done": [], "first_write_at": first_write_at, "doctor": [],
+                "hold": {"code": code, "codes": codes or [code], "phase": "precheck", "acceptable": False,
+                         "message": "gate_archive is 'encrypted' but gate_archive_age_recipient is empty",
+                         "next": self.FULL2_NEXT}}
+
+    def test_removed_archive_hold_before_the_first_write_resumes_by_itself(self):
+        cfg7 = {"meta": {"lastTouchedVersion": "2026.7.35"}}
+        d = G.decide(ctx(journal=self.full2_hold(), cls=cls_of("gate", state_uv=1), cfg=cfg7))
+        self.assertEqual((d["rc"], d["action"], d["resume_phase"]), (10, "resume", "precheck"))
+        self.assertTrue(any("archive-key-missing no longer applies" in w for w in d["warnings"]), d["warnings"])
+        # a HOLD with a current code next to the removed one, or after the first write, stays until retry
+        for j in (self.full2_hold(codes=["archive-key-missing", "no-network"]),
+                  self.full2_hold("archive-missing", first_write_at="2026-10-18T10:20:00Z")):
+            self.assertEqual(G.decide(ctx(journal=j, cls=cls_of("gate", state_uv=1), cfg=cfg7))["rc"], 11)
+
+    def test_full2_hold_resumes_and_migrates_on_full3(self):
+        self.build_735()
+        self.hooks()
+        C.atomic_write_json(self.upg / "gate" / "journal.json", self.full2_hold())
+        self.assertEqual(self.run_gate(), 0, self.out)
+        self.assertIn("previous HOLD archive-key-missing no longer applies", self.out)
+        j = self.journal()
+        self.assertEqual(j["status"], "done")
+        self.assertEqual(j["previous_holds"][-1]["code"], "archive-key-missing")
+
+    def test_removed_hold_after_the_first_write_names_no_removed_option(self):
+        self.build_735()
+        self.hooks()
+        C.atomic_write_json(self.upg / "gate" / "journal.json",
+                            self.full2_hold("archive-missing", first_write_at="2026-10-18T10:20:00Z"))
+        self.assertEqual(self.run_gate(), 20, self.out)
+        hold = (self.upg / "hold.txt").read_text()
+        self.assertIn(G.REMOVED_HOLD_ADVICE, hold)
+        self.assertNotIn("gate_archive", hold.split("Reason")[0] + hold.split("Next")[-1])
+        status = "\n".join(G.status_lines())
+        self.assertIn("HOLD archive-missing in precheck", status)
+        self.assertIn(f"next: {G.REMOVED_HOLD_ADVICE}", status)
+        self.assertNotIn(self.FULL2_NEXT, status)
+
+    def test_agent_db_outside_config_holds_acceptably_before_any_write(self):
+        self.build_735()
+        self.hooks()
+        src = self.state / "agents" / "main" / "agent" / "openclaw-agent.sqlite"
+        ext = self.tmp / "media" / "agents" / "main" / "agent"
+        ext.mkdir(parents=True)
+        shutil.copy2(src, ext / src.name)
+        c = sqlite3.connect(self.state / "state" / "openclaw.sqlite")
+        c.execute("UPDATE agent_databases SET path=? WHERE agent_id='main'", (str(ext / src.name),))
+        c.commit()
+        c.close()
+        self.assertEqual(self.run_gate(), 20, self.out)
+        j = self.journal()
+        self.assertEqual((j["hold"]["code"], j["hold"]["acceptable"], j["first_write_at"]),
+                         ("agent-db-outside-config", True, None))
+        self.assertIn(str(ext / src.name), j["hold"]["message"])
+        self.assertIn("oc-upgrade retry --accept agent-db-outside-config", (self.upg / "hold.txt").read_text())
+
+    def test_leftovers_with_cleanup_off_are_reported_as_kept(self):
+        self.build_735()
+        old = self.share / "openclaw-upgrade" / "20261001T090000Z-123456"
+        old.mkdir(parents=True)
+        (old / "openclaw-state-20261001-090000-before-2026.9.9.tar.gz").write_bytes(b"plaintext")
+        self.options(gate_cleanup_hours=0)
+        status = "\n".join(G.status_lines())
+        self.assertIn("from earlier add-on versions (kept: gate_cleanup_hours=0, delete them yourself):", status)
+        self.assertNotIn("deleted automatically", status)
+        self.options()
+        self.assertIn("(deleted automatically, see oc-upgrade cleanup):", "\n".join(G.status_lines()))
+        # the precheck names the plaintext leftover in a WARN
+        lines = []
+        self.quiet(G.dry_run, emit=lines.append)
+        text = "\n".join(lines) + "\n" + self.out + self.err
+        self.assertIn("1 plaintext gate archive(s) of 0.5.94-full1", text)
+        self.assertIn("(deleted automatically, see oc-upgrade cleanup)", text)
+
+
+class UnencryptedBackupCountTests(unittest.TestCase):
+    def test_more_than_three_unencrypted_backups_are_counted(self):
+        g = G.Gate(emit=lambda s: None)
+        warned = []
+        g.warn = warned.append
+        g.hooks = {"supervisor_url": "http://127.0.0.1:9"}
+        now = C.utc_now()
+        backups = [{"slug": f"u{i}", "name": f"plain {i}", "date": now.isoformat(), "type": "partial",
+                    "protected": False, "location_attributes": {".local": {"protected": False}},
+                    "content": {"addons": ["self_slug"]}} for i in range(5)]
+        with mock.patch.object(C, "supervisor_token", return_value="t" * 40), \
+                mock.patch.object(C, "supervisor_get", side_effect=[
+                    {"slug": "self_slug", "version": "0.5.94-full3"}, {"backups": backups}]):
+            g.ha_backup_check([], {"backup_max_age_hours": 24})
+        self.assertEqual(sum("UNENCRYPTED in" in w for w in warned), 3)
+        self.assertTrue(any("... and 2 more Home Assistant backup(s)" in w for w in warned), warned)
+
+
 if __name__ == "__main__":
     unittest.main()
