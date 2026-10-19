@@ -96,6 +96,7 @@ AGE_MAGIC = b"age-encryption.org/v1\n"
 AGE_CHUNK = 64 * 1024
 BACKUP_SKEW_S = 600
 CLEANUP_INTERVAL_S = 3600
+BACKUP_VERSION_LOOKUPS = 50  # recent encrypted backups with this add-on whose add-on version the precheck reads
 RUN_ID_RE = re.compile(r"^\d{8}T\d{6}Z-[0-9a-f]{6}\Z")
 SAFE_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,79}")  # one path component, never ".."
 # OpenClaw 2026.10 doctor: "Pre-repair state retained for manual recovery at <dir>/manifest.json."
@@ -2323,7 +2324,7 @@ class Gate:
                       "only encrypted backups")
         need_older = (self.j or {}).get("mode", "from-7x") in ("from-7x", "bump")
         best, same_version, unreadable = None, [], []
-        for e in ev["candidates"][:5]:
+        for e in ev["candidates"][:BACKUP_VERSION_LOOKUPS]:  # newest first, until one holds the previous version
             bver, why = None, ""
             try:
                 bver = backup_addon_version(C.supervisor_get(f"/backups/{e['slug']}/info", token, base=base), slug)

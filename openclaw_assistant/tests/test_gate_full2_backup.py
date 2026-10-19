@@ -732,6 +732,18 @@ class BackupCheckGateTests(T.GateEnv):
         self.assertEqual(self.fake.paths(), ["/addons/self/info", "/backups/info", "/backups/same/info",
                                              "/backups/prev/info"])
 
+    def test_previous_version_backup_behind_many_newer_same_version_backups_is_found(self):
+        """Scheduled backups taken while the gate holds (new add-on version) must not hide the pre-update backup."""
+        self.build_735()
+        newer = [self.backup(f"same{i}", f"Auto {i}", 0.5 + i * 0.25) for i in range(6)]
+        self.set_backups(newer + [self.backup("prev", "Before update", 5)],
+                         versions={**{f"same{i}": RUNNING_VER for i in range(6)}, "prev": PREV_VER})
+        self.assertEqual(self.run_gate(), 0, self.out)
+        self.assertIn("HA backup ok ('Before update', ", self.out)
+        self.assertEqual(self.journal()["ha_backup"]["slug"], "prev")
+        self.assertEqual([p for p in self.fake.paths() if p.endswith("/info") and p.startswith("/backups/")
+                          and p != "/backups/info"], [f"/backups/same{i}/info" for i in range(6)] + ["/backups/prev/info"])
+
     def test_backup_info_with_apps_key_is_read(self):
         self.build_735()
         b = self.backup("v2", "V2 names", 1)

@@ -1484,14 +1484,14 @@ class GateRunTests(GateEnv):
         j = self.journal()
         self.assertEqual((j["hold"]["code"], j["phase"]), ("doctor-migration-refused", "doctor1"))
         self.assertIn("partially migrated (doctor started)", (self.upg / "hold.txt").read_text())
-        archive_file = j["archive"]["file"]
+        archive_file = j["archive"].get("file")  # None with gate_archive off (no age on this host)
         self.hooks()
         G.retry_cmd([], emit=lambda s: None)
         rc = self.run_gate()
         self.assertEqual(rc, 0, self.out)
         j = self.journal()
-        self.assertEqual(j["archive"]["file"], archive_file)  # never retaken after the first write
-        self.assertEqual(len(list((self.share / "openclaw-upgrade").glob("*/*.tar.gz.age"))), 1)
+        self.assertEqual(j["archive"].get("file"), archive_file)  # never retaken after the first write
+        self.assertEqual(len(list((self.share / "openclaw-upgrade").glob("*/*.tar.gz.age"))), 1 if HAVE_AGE else 0)
 
     def test_interrupt_resume_once_then_interrupted_twice(self):
         self.build_735()
@@ -1534,6 +1534,7 @@ class GateRunTests(GateEnv):
         self.assertEqual(self.journal()["doctor"][-1]["pass"], 2)  # pass 1 not repeated
         self.assertEqual(sum(1 for d in self.journal()["doctor"] if d["pass"] == 1), 1)
 
+    @unittest.skipUnless(HAVE_AGE, "age not installed (the scenario needs an archive file)")
     def test_resume_after_first_write_refuses_a_missing_archive(self):
         """Codex review: never continue a partially migrated state without its verified archive."""
         self.build_735()
@@ -1734,7 +1735,7 @@ class GateRunMoreTests(GateEnv):
         self.assertEqual(j["mode"], "maintenance")
         self.assertNotIn("pins", j["phases_done"])
         self.assertTrue((self.upg / "gate" / "runs" / first / "journal.json").exists())
-        self.assertEqual(len(list((self.share / "openclaw-upgrade").glob("*/*.tar.gz.age"))), 2)
+        self.assertEqual(len(list((self.share / "openclaw-upgrade").glob("*/*.tar.gz.age"))), 2 if HAVE_AGE else 0)
 
     def test_B19_new_from7x_run_resets_pins_ledger(self):
         self.build_735()
@@ -2020,7 +2021,7 @@ class ReviewFixTests(GateEnv):
         g.pkg = C.runtime_package()
         g.cfg = json.loads(json.dumps(CFG_735))
         g.j = {"run_id": run_id, "mode": "from-7x", "history": [], "source": {}, "auth_profiles": [],
-               "archive_opt": {"mode": "encrypted", "recipient": AGE_PUB}}
+               "archive_opt": {"mode": "encrypted", "recipient": AGE_PUB or "age1" + "q" * 58}}
         return g
 
     def test_F1_archive_invariant_every_known_db_is_archived(self):
