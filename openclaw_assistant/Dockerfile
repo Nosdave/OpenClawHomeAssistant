@@ -31,7 +31,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     bat \
     less \
     openssl \
-    age \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
@@ -301,17 +300,6 @@ RUN set -eu; \
     printf '%s\n' "$pkg/openclaw.mjs" > /usr/local/libexec/oc-addon/openclaw-entry; \
     jq -r .version "$pkg/package.json" > /usr/local/libexec/oc-addon/openclaw-pinned-version; \
     printf '%s\n' "${BRAVE_PLUGIN_VERSION}" > /usr/local/libexec/oc-addon/brave-plugin-version; \
-    age_bin="$(command -v age)"; \
-    case "$age_bin" in *linuxbrew*|"") echo "unexpected age: '$age_bin'" >&2; exit 1 ;; esac; \
-    printf '%s\n' "$age_bin" > /usr/local/libexec/oc-addon/age-bin; \
-    "$age_bin" --version; \
-    k="$(mktemp -d)"; age-keygen -o "$k/key" 2>/dev/null; pub="$(age-keygen -y "$k/key")"; \
-    test "$(printf ok | "$age_bin" -r "$pub" | "$age_bin" -d -i "$k/key")" = ok; \
-    for n in 0 1 65537; do \
-      head -c "$n" /dev/zero | "$age_bin" -r "$pub" -o "$k/t.age"; \
-      python3 -c 'import sys; d = open(sys.argv[1], "rb").read(); i = d.index(b"\n--- ") + 1; hl = d.index(b"\n", i) + 1; n = int(sys.argv[2]); assert d.startswith(b"age-encryption.org/v1\n") and b"\n-> X25519 " in d[:hl], "age header"; assert len(d) == hl + 16 + n + 16 * max(1, -(-n // 65536)), "age size formula"' "$k/t.age" "$n"; \
-    done; \
-    rm -rf "$k"; \
     for bin in $(IFS=:; for d in $PATH; do [ -e "$d/openclaw" ] && echo "$d/openclaw"; done | sort -u); do \
       if [ "$(readlink -f "$bin")" != "$(readlink -f "$W")" ]; then ln -sf "$W" "$bin"; fi; \
     done; \

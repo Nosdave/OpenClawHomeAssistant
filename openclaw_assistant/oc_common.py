@@ -15,7 +15,6 @@ whole module at a temporary tree:
   OC_ADDON_ENTRY_FILE    default /usr/local/libexec/oc-addon/openclaw-entry
                          (the image's Node binary is recorded next to it in openclaw-node)
   OC_ADDON_OPTIONS_FILE  default /data/options.json (add-on options)
-  OC_ADDON_AGE           default: the age binary recorded at build time (/usr/local/libexec/oc-addon/age-bin)
 """
 
 import hashlib
@@ -388,35 +387,17 @@ def glm_thinking_option():
     return addon_options().get("glm_thinking_levels", True) is True
 
 
-# --- gate archive / backup / cleanup options ----------------------------------------------
+# --- gate backup / cleanup options ---------------------------------------------------------
 
-AGE_RECIPIENT_RE = re.compile(r"age1[02-9ac-hj-np-z]{58}")
-AGE_BIN_RECORD = "/usr/local/libexec/oc-addon/age-bin"
-GATE_OPTION_DEFAULTS = {"gate_archive": "encrypted", "gate_archive_age_recipient": "",
-                        "gate_cleanup_hours": 48, "gate_backup_max_age_hours": 24}
+GATE_OPTION_DEFAULTS = {"gate_cleanup_hours": 48, "gate_backup_max_age_hours": 24}
 _GATE_INT_RANGES = {"gate_cleanup_hours": (0, 720), "gate_backup_max_age_hours": (1, 168)}
 
 
 def gate_options():
-    """The migration gate's archive/backup/cleanup options from /data/options.json (no environment needed,
-    so this works under s6's cleared environment). A missing file means the config.yaml defaults: encrypted
-    without a recipient, which the precheck refuses (fail-closed, never plaintext). Values are never echoed
-    in `problems` (a pasted private key must not reach a log)."""
+    """The migration gate's backup/cleanup options from /data/options.json (no environment needed, so this
+    works under s6's cleared environment). A missing file means the config.yaml defaults."""
     o = addon_options()
     problems = []
-    mode = o.get("gate_archive", GATE_OPTION_DEFAULTS["gate_archive"])
-    rec = o.get("gate_archive_age_recipient", "")
-    rec = rec.strip() if isinstance(rec, str) else ""
-    problem = None
-    if mode not in ("encrypted", "off"):
-        problem, mode = "invalid-mode", None
-    elif mode == "encrypted":
-        if not rec:
-            problem = "missing"
-        elif "AGE-SECRET-KEY-" in rec.upper():  # also a whole pasted key file
-            problem, rec = "private-key", ""
-        elif not AGE_RECIPIENT_RE.fullmatch(rec):
-            problem, rec = "malformed", ""
     ints = {}
     for key, (lo, hi) in _GATE_INT_RANGES.items():
         default = GATE_OPTION_DEFAULTS[key]
@@ -425,9 +406,7 @@ def gate_options():
             problems.append(f"{key} is not an integer in {lo}..{hi}; using {default}")
             v = default
         ints[key] = v
-    return {"archive": {"mode": mode, "recipient": rec if mode == "encrypted" and not problem else None,
-                        "problem": problem},
-            "cleanup_hours": ints["gate_cleanup_hours"],
+    return {"cleanup_hours": ints["gate_cleanup_hours"],
             "backup_max_age_hours": ints["gate_backup_max_age_hours"],
             "problems": problems}
 
@@ -455,26 +434,6 @@ def safe_files_below(root, name_pred):
     return [(f, fst) for d, dst in safe_children(root) if stat.S_ISDIR(dst.st_mode)
             for f, fst in safe_children(d) if stat.S_ISREG(fst.st_mode) and name_pred(f.name)]
 
-
-def short_recipient(rec):
-    """age1abcd…uvwxyz: a full 62-character recipient would be mangled to *** by the 40-character redaction."""
-    return f"{rec[:9]}…{rec[-6:]}" if rec and len(rec) > 16 else (rec or "")
-
-
-def age_bin():
-    """The image's age binary: env OC_ADDON_AGE (tests), then the build-time record (a Homebrew age earlier on
-    PATH must never win), then PATH."""
-    env = os.environ.get("OC_ADDON_AGE")
-    if env:
-        return env
-    try:
-        with open(AGE_BIN_RECORD, encoding="utf-8") as f:
-            rec = f.readline().strip()
-        if rec and os.access(rec, os.X_OK):
-            return rec
-    except OSError:
-        pass
-    return shutil.which("age") or "age"
 
 
 # --- Supervisor API (read-only backup check) -------------------------------------------------

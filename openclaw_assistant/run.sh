@@ -601,9 +601,9 @@ trap early_stop INT TERM
 #
 # OpenClaw 2026.8+ migrates the persistent databases one-way (2026.10.4: state
 # schema 20, agent schema 24); older OpenClaw builds cannot open them. For those
-# runtimes the migration gate (`oc-upgrade gate`, below) owns the pre-migration
-# archive: it writes an age-encrypted, verified archive to /share/openclaw-upgrade/<run>/
-# (none with gate_archive: off) and only then runs `openclaw doctor --fix`. The local archive below is kept for
+# runtimes the migration gate (`oc-upgrade gate`, below) requires a recent
+# encrypted Home Assistant backup with this add-on (the only rollback point; the
+# gate writes no archive) before it runs `openclaw doctor --fix`. The local archive below is kept for
 # 2026.7.x runtimes, which perform no schema migration: before the gateway
 # starts a version we have not started before, archive the state while the old
 # gateway is down. It excludes regenerable/bulky content (skills, media, npm,
@@ -1004,85 +1004,10 @@ if [ "$STATE_HOLD" != "true" ]; then
   if ! runtime_at_least 2026.8.0 && [ "$SHUTTING_DOWN" != "true" ]; then require_upgrade_backup; fi
 fi
 
-# ------------------------------------------------------------------------------
-# Cold export for an offline upgrade rehearsal (requested via `oc-upgrade export`)
-# Runs before anything starts or writes, so the copy is consistent.
-# ------------------------------------------------------------------------------
-# Other add-ons can write /share: every file operation of the export there runs in
-# `oc-upgrade export-write` through directory fds (O_NOFOLLOW), never by path name.
-export_write() { OC_GATE_FROM_RUNSH=1 oc-upgrade export-write "$@"; }
-
-process_export_request() {
-  local request="${UPG_DIR}/export-request" ts need_kb avail_kb begun name sha size final reh=/share/openclaw-rehearsal
-  # An interrupted export (power loss, SIGKILL) leaves a secret-bearing .tmp
-  # behind; remove those on every start, whether or not a new export is due.
-  if [ -d /share ]; then
-    export_write --sweep || echo "WARN: Could not check ${reh} for incomplete exports; delete *.tmp there manually (they contain secrets)."
-  fi
-  [ -f "$request" ] || return 0
-  # One-shot: never retry on every boot, even after a failure.
-  rm -f "$request"
-  if [ ! -d /share ]; then
-    echo "WARN: Rehearsal export skipped: /share is not available."
-    return 0
-  fi
-  # Owner rule: no plaintext secrets in archives. The copy is age-encrypted to the gate archive key.
-  local rec mode agebin
-  mode="$(jq -r '.gate_archive // "encrypted"' /data/options.json 2>/dev/null || echo encrypted)"
-  rec="$(jq -r '.gate_archive_age_recipient // ""' /data/options.json 2>/dev/null | tr -d '[:space:]' || true)"
-  agebin="$(head -n 1 /usr/local/libexec/oc-addon/age-bin 2>/dev/null || true)"
-  [ -x "${agebin:-}" ] || agebin="$(command -v age 2>/dev/null || true)"
-  if [ "$mode" != "encrypted" ] || [[ ! "$rec" =~ ^age1[02-9ac-hj-np-z]{58}$ ]] || [ -z "$agebin" ]; then
-    echo "WARN: Rehearsal export skipped: it needs gate_archive: encrypted with gate_archive_age_recipient (no plaintext copies)."
-    return 0
-  fi
-  ts="$(date -u +%Y%m%d-%H%M%S)"
-  # Estimate with the same exclusions as the archive below (uncompressed size,
-  # so a safe upper bound for the compressed export).
-  need_kb="$(du -skc \
-      --exclude='.openclaw/upgrade-backups' --exclude='.openclaw/media' \
-      --exclude='.openclaw/logs' --exclude='.openclaw/.cache' --exclude='.openclaw/tmp' \
-      --exclude='clawd/node_modules' --exclude='clawd/*/node_modules' \
-      "$OPENCLAW_CONFIG_DIR" /config/clawd 2>/dev/null | tail -n 1 | cut -f1)" || need_kb=""
-  avail_kb="$(df -Pk /share 2>/dev/null | awk 'NR==2 {print $4}')" || avail_kb=""
-  if [ -z "$need_kb" ] || [ -z "$avail_kb" ] || [ "$avail_kb" -lt "$need_kb" ]; then
-    echo "WARN: Rehearsal export skipped: not enough free space in /share (need ~${need_kb:-?} KiB, have ${avail_kb:-?} KiB)."
-    return 0
-  fi
-  echo "INFO: Creating cold rehearsal export in ${reh}/${ts}-* (gateway not started yet)..."
-  local members=(.openclaw)
-  [ -d /config/clawd ] && members+=(clawd)
-  # Plugin packages under .openclaw (npm/, extensions/) stay in the copy; only
-  # dependency trees inside the workspace are left out.
-  begun="" name=""
-  if begun="$(umask 077 && tar -C /config \
-      --exclude='.openclaw/upgrade-backups' \
-      --exclude='.openclaw/media' \
-      --exclude='.openclaw/logs' \
-      --exclude='.openclaw/.cache' \
-      --exclude='.openclaw/tmp' \
-      --exclude='clawd/node_modules' \
-      --exclude='clawd/*/node_modules' \
-      -czf - "${members[@]}" | "$agebin" -r "$rec" | export_write --begin "$ts")" \
-     && read -r name sha size <<<"$begun" && [ -n "$name" ] && [ -n "$size" ] \
-     && final="$(export_write --finish "$name" "$sha" "$size" "$ts" "${ADDON_VERSION:-unknown}" "$(openclaw_runtime_version || true)" "${rec:0:9}...${rec: -6}")"; then
-    local keep_h
-    keep_h="$(jq -r '.gate_cleanup_hours // 48' /data/options.json 2>/dev/null || echo 48)"
-    if [ "$keep_h" = "0" ]; then keep_h="it is kept (gate_cleanup_hours=0): delete it yourself after the rehearsal"
-    else keep_h="it is deleted automatically ${keep_h} h after it was written (gate_cleanup_hours)"; fi
-    echo "INFO: Rehearsal export ready: ${final} (sha256 ${sha}, ${size} bytes), age-encrypted. Compare the sha256 of any copy with this line before you decrypt it, only where your private key lives; ${keep_h}."
-  else
-    [ -n "${name:-}" ] || name="${begun%% *}"
-    [ -n "${name:-}" ] && { export_write --abort "$name" >/dev/null 2>&1 || true; }
-    echo "WARN: Rehearsal export failed; nothing was changed. Startup continues."
-  fi
-  return 0
-}
-# A stop request that arrived during the state guard or `gate --plan` must not
-# start a multi-GB export the Supervisor kills (its one-shot request would be lost).
-if [ "$SHUTTING_DOWN" != "true" ]; then
-  process_export_request
-fi
+# A rehearsal export request of an earlier add-on version is void (no copies of the
+# state outside the encrypted Home Assistant backup); leftover exports in /share are
+# deleted by the cleanup loop below.
+rm -f "${UPG_DIR}/export-request"
 
 # ------------------------------------------------------------------------------
 # Session lock cleanup helpers
@@ -1220,9 +1145,8 @@ ensure_brave_plugin() {
 
 # ------------------------------------------------------------------------------
 # Migration gate (OpenClaw 2026.8+, when `gate --plan` asked for it above).
-# `oc-upgrade gate` archives the state to /share (age-encrypted, or none with
-# gate_archive: off), checks for an encrypted Home Assistant backup, cleans up, pre-migrates the
-# config, runs `openclaw doctor --fix --non-interactive` twice and checks the
+# `oc-upgrade gate` checks for an encrypted Home Assistant backup (the rollback
+# point), cleans up, pre-migrates the config, runs `openclaw doctor --fix --non-interactive` twice and checks the
 # result; any failure leaves a HOLD with hold.txt (exit 20, or 1 for an internal
 # error). It runs in the background so the early stop trap can forward SIGTERM
 # (exit 130/143, the next start resumes once).
@@ -1323,7 +1247,7 @@ shutdown() {
   SHUTTING_DOWN="true"
   echo "Shutdown requested; stopping services..."
 
-  # The archive cleanup stops at its next check; it is reaped after the gateway (no wait here).
+  # The cleanup loop stops at its next check; it is reaped after the gateway (no wait here).
   if [ -n "${CLEANUP_PID:-}" ] && kill -0 "${CLEANUP_PID}" >/dev/null 2>&1; then
     kill -TERM "${CLEANUP_PID}" >/dev/null 2>&1 || true
   fi
@@ -2158,7 +2082,7 @@ GW_FAIL_STREAK=0
 # `openclaw doctor --fix --non-interactive --yes`. On this deployment that would
 # run OpenClaw's config/state migrations (e.g. the openai-codex -> openai route
 # migration) unattended and without a pre-migration backup. Doctor runs only in
-# the migration gate at startup (archive first, checks after), also when
+# the migration gate at startup (backup check first, checks after), also when
 # requested with `oc-upgrade retry --doctor`. A crash loop backs off and
 # reports; on OpenClaw 2026.8+ it ends in a HOLD.
 GW_CRASH_LOOP_HOLD_AFTER=10
@@ -2170,8 +2094,9 @@ if [ "$STATE_HOLD" = "true" ]; then
   exit 0
 fi
 
-# Deletes the archives and OpenClaw doctor captures of finished migration-gate runs
-# gate_cleanup_hours after the run (owner rule: no long-lived plaintext copies). Never during a gate run or HOLD.
+# Deletes OpenClaw's doctor captures of finished migration-gate runs (and the archives and
+# exports earlier add-on versions left) gate_cleanup_hours after the run (owner rule: no
+# long-lived plaintext copies). Never during a gate run or HOLD.
 if command -v oc-upgrade >/dev/null 2>&1; then
   OC_GATE_FROM_RUNSH=1 PYTHONUNBUFFERED=1 oc-upgrade cleanup --loop &
   CLEANUP_PID=$!
@@ -2335,7 +2260,7 @@ ${hold_out}" "$hold_keep"
     if runtime_at_least 2026.8.0; then
       echo "ERROR:   openclaw doctor --lint   (read-only)"
       echo "ERROR: Do not run 'openclaw doctor --fix' by hand (blocked). Use 'oc-upgrade retry --doctor',"
-      echo "ERROR: which archives the state first (age-encrypted, or none with gate_archive: off); then restart the add-on."
+      echo "ERROR: which first checks for an encrypted Home Assistant backup of the add-on; then restart the add-on."
     else
       echo "ERROR: Take a Home Assistant backup of the add-on before running 'openclaw doctor --fix':"
       echo "ERROR: it migrates configuration and state and cannot be undone without that backup."
