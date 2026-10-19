@@ -544,7 +544,7 @@ class ArchiveModeTests(T.GateEnv):
         with self.assertRaises(subprocess.CalledProcessError):
             T.age_decrypt(arch)  # the old key no longer opens the rollback copy
         man = json.loads((arch.parent / "manifest.json").read_text())
-        self.assertEqual(man["encryption"]["recipients"], [pub2])
+        self.assertEqual(man["encryption"]["recipients"], [C.short_recipient(pub2)])
 
     @NEEDS_AGE
     def test_option_change_after_first_write_keeps_the_recorded_archive(self):
@@ -791,7 +791,9 @@ class ArchiveModeTests(T.GateEnv):
         self.assertEqual(man["archive"]["file"], arch.name)
         self.assertEqual((man["archive"]["sha256"], man["archive"]["plaintext_sha256"]),
                          (a["sha256"], a["plaintext_sha256"]))
-        self.assertEqual(man["encryption"]["recipients"], [T.AGE_PUB])
+        self.assertEqual(man["encryption"]["recipients"], [C.short_recipient(T.AGE_PUB)])
+        self.assertNotIn(T.AGE_PUB, man_text)  # the full recipient is in the journal only
+        self.assertEqual(j["archive"]["recipient"], T.AGE_PUB)
         self.assertIn("X25519", man["encryption"]["stanzas"])
         sq = {s["path"]: s for s in man["sqlite"]}
         self.assertEqual(sq[".openclaw/state/openclaw.sqlite"]["sha256"], hashlib.sha256(db).hexdigest())

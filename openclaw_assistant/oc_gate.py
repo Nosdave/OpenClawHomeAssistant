@@ -96,11 +96,11 @@ AGE_MAGIC = b"age-encryption.org/v1\n"
 AGE_CHUNK = 64 * 1024
 BACKUP_SKEW_S = 600
 CLEANUP_INTERVAL_S = 3600
-RUN_ID_RE = re.compile(r"^\d{8}T\d{6}Z-[0-9a-f]{6}$")
+RUN_ID_RE = re.compile(r"^\d{8}T\d{6}Z-[0-9a-f]{6}\Z")
 SAFE_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,79}")  # one path component, never ".."
 # OpenClaw 2026.10 doctor: "Pre-repair state retained for manual recovery at <dir>/manifest.json."
 CAPTURE_RE = re.compile(r"Pre-repair state retained for manual recovery at (\S+)/manifest\.json")
-CAPTURE_NAME_RE = re.compile(r"^doctor-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+CAPTURE_NAME_RE = re.compile(r"^doctor-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\Z")
 QUICK_CHECK_COPY_LIMIT = 512 * C.MIB
 CHECKPOINT_735 = "2026.7.35"
 ATTESTATION_HEADER = b"openclaw-workspace-attestation:v1\n"
@@ -2281,7 +2281,7 @@ class Gate:
         else:
             parts.append(f"archive encrypted ({snap.get('age_version') or 'age'}, "
                          f"{C.short_recipient(a_opt['recipient'])})" + ("" if need_new else ", reusing this run's"))
-        legacy = sorted(self.gp["ARCHIVES"].glob("*/openclaw-state-*.tar.gz")) if self.gp["ARCHIVES"].is_dir() else []
+        legacy = C.safe_files_below(self.gp["ARCHIVES"], lambda n: n.startswith("openclaw-state-") and n.endswith(".tar.gz"))
         if legacy:
             self.warn(f"{len(legacy)} plaintext gate archive(s) from 0.5.94-full1 in {self.gp['ARCHIVES']} hold "
                       "unencrypted secrets; the add-on deletes them gate_cleanup_hours after their run (oc-upgrade "
@@ -2528,12 +2528,12 @@ class Gate:
             else:
                 name = str(adir / a.get("file", ""))
             with open_regular_at(dfd, name) as f:
-                if sha256_fileobj(f) != a.get("sha256"):
+                size = os.fstat(f.fileno()).st_size
+                if size != a.get("size") or sha256_fileobj(f, size) != a.get("sha256"):
                     return False
                 if a.get("mode") != "encrypted":
                     return True
                 hdr = age_header(f)
-                size = os.fstat(f.fileno()).st_size
         except (OSError, ValueError):
             return False
         finally:
@@ -2706,9 +2706,10 @@ class Gate:
                  "missing: " + ", ".join(bad))
         try:
             with open_regular_at(rfd, tmpname) as f:
-                hdr = age_header(f)
                 size = os.fstat(f.fileno()).st_size
-                readback = sha256_fileobj(f)
+                hdr = age_header(f)
+                # never hash more than was written (a swapped-in sparse file would keep the gate reading)
+                readback = sha256_fileobj(f, r["cipher_size"]) if size == r["cipher_size"] else None
         except (OSError, ValueError) as exc:
             fail("archive-verify-failed", f"encrypted archive unreadable: {exc}")
         if "X25519" not in hdr["stanzas"]:
@@ -2727,7 +2728,8 @@ class Gate:
                     "archive": {"file": final.name, "size_bytes": size, "sha256": r["cipher_sha256"],
                                 "plaintext_sha256": r["plain_sha256"], "plaintext_size": r["plain_size"],
                                 "members": r["members"]},
-                    "encryption": {"tool": "age", "version": want.get("age_version"), "recipients": [rec],
+                    "encryption": {"tool": "age", "version": want.get("age_version"),
+                                   "recipients": [C.short_recipient(rec)],
                                    "stanzas": hdr["stanzas"], "header_len": hdr["len"]},
                     "verification": {"sqlite_in_stream": f"{len(r['matched'])}/{len(expected)}",
                                      "size_formula": True, "readback_equals_stream": True},
@@ -3703,17 +3705,26 @@ def open_regular_at(dfd, name):
         raise
 
 
-def sha256_fileobj(f):
-    """sha256 of an open file from its start; a stop request interrupts it (GateStopped)."""
+def sha256_fileobj(f, limit=None):
+    """sha256 of an open file from its start (at most `limit` bytes); a stop request interrupts it."""
     f.seek(0)
     h = hashlib.sha256()
-    while True:
+    left = limit
+    while left is None or left > 0:
         if STOP.is_set():
             raise GateStopped()
-        b = f.read(C.MIB)
+        b = f.read(C.MIB if left is None else min(C.MIB, left))
         if not b:
-            return h.hexdigest()
+            break
         h.update(b)
+        if left is not None:
+            left -= len(b)
+    return h.hexdigest()
+
+
+def printable(s):
+    """Names from /share or /config listings in a log line: control characters escaped (no forged lines)."""
+    return "".join(c if c.isprintable() else f"\\x{ord(c):02x}" for c in str(s))
 
 
 def _write_new_at(dfd, name, data, mode=0o600):
@@ -4607,8 +4618,8 @@ def _dir_bytes(d):
 TOMB_PREFIX = ".oc-addon-deleting-"
 REHEARSAL_FILES = ("openclaw-rehearsal.tar.gz", "openclaw-rehearsal.tar.gz.tmp", "openclaw-rehearsal.tar.gz.age",
                    "openclaw-rehearsal.tar.gz.age.tmp", "manifest.txt")
-REHEARSAL_DIR_RE = re.compile(r"^\d{8}-\d{6}(?:-[A-Za-z0-9]{6})?$")
-STAGE_A_RE = re.compile(r"^openclaw-state-[0-9]{8}-[0-9]{6}-before-[0-9][0-9A-Za-z.+-]*\.tar\.gz(?:\.tmp)?$")
+REHEARSAL_DIR_RE = re.compile(r"^\d{8}-\d{6}(?:-[A-Za-z0-9]{6})?\Z")
+STAGE_A_RE = re.compile(r"^openclaw-state-[0-9]{8}-[0-9]{6}-before-[0-9][0-9A-Za-z.+-]*\.tar\.gz(?:\.tmp)?\Z")
 
 
 def _open_parent(base):
@@ -4703,9 +4714,13 @@ def _delete_tree(d):
 
 
 def _archive_dir_ok(gp, d):
+    """A real run directory directly in ARCHIVES (lstat only: a planted link is never followed or stat'ed)."""
     arch = gp["ARCHIVES"]
-    return (not os.path.islink(str(arch)) and d.parent == arch and RUN_ID_RE.match(d.name)
-            and d.is_dir() and not os.path.islink(str(d)))
+    try:
+        return (d.parent == arch and bool(RUN_ID_RE.match(d.name)) and stat.S_ISDIR(os.lstat(arch).st_mode)
+                and stat.S_ISDIR(os.lstat(d).st_mode))
+    except OSError:
+        return False
 
 
 def _mtime_utc(p):
@@ -4745,17 +4760,25 @@ def cleanup_targets(gp, now, hours):
             if fin is None:
                 continue  # not finished by this gate (held, abandoned): an archive of it is handled as an orphan
             due = fin + timedelta(hours=hours)
-            paths, kept = [], []
+        except (ValueError, TypeError, OverflowError, AttributeError) as exc:
+            out_.append((rid, f"run {rid}", now, None, [(str(adir), f"journal unusable: {type(exc).__name__}")]))
+            continue
+        paths, kept = [], []
+        try:
             if os.path.lexists(str(adir)):
                 if _archive_dir_ok(gp, adir):
                     paths.append(adir)
                 else:
                     kept.append((str(adir), "not a plain run directory"))
+        except OSError as exc:
+            kept.append((str(adir), f"not checked: {type(exc).__name__}"))
+        try:
             caps, refused = run_captures(gp, j)
             paths += caps
             kept += refused
-        except (OSError, ValueError, TypeError, OverflowError, AttributeError) as exc:
-            out_.append((rid, f"run {rid}", now, [], [(str(adir), f"journal unusable: {type(exc).__name__}")]))
+        except OSError as exc:  # like an unusable journal: warn once per loop, record nothing
+            out_.append((rid, f"run {rid}", now, None,
+                         kept + [(str(captures_root(gp)), f"doctor captures not listed: {type(exc).__name__}")]))
             continue
         out_.append((rid, f"run {rid}", due, paths, kept))
     unfinished = {rid for rid, j in runs.items() if not j.get("finished_at")}
@@ -4775,46 +4798,42 @@ def _scan_archives(gp, now, hours, runs, cur, referenced, unfinished):
     # or done through bookkeeping without finished_at, are handled like orphans)
     active = (cur.get("run_id") if isinstance(cur, dict) and cur.get("status") not in ("done", "abandoned")
               else None)
-    if gp["ARCHIVES"].is_dir() and not os.path.islink(str(gp["ARCHIVES"])):
-        for d in sorted(gp["ARCHIVES"].iterdir()):
-            if d.name in referenced and d.name not in unfinished:
-                continue
-            if d.name.startswith(TOMB_PREFIX):
+    for d, _st in C.safe_children(gp["ARCHIVES"]):
+        if d.name in referenced and d.name not in unfinished:
+            continue
+        if d.name.startswith(TOMB_PREFIX):
+            if RUN_ID_RE.match(d.name[len(TOMB_PREFIX):]):
                 out_.append((None, f"leftover {d.name}", now, [d], []))
-                continue
-            if not _archive_dir_ok(gp, d) or d.name == active:
-                continue
-            mt = _mtime_utc(d)
-            if mt is not None:
-                out_.append((None, f"orphaned archive {d.name}", mt + timedelta(hours=hours), [d], []))
+            continue
+        if not _archive_dir_ok(gp, d) or d.name == active:
+            continue
+        mt = _mtime_utc(d)
+        if mt is not None:
+            out_.append((None, f"orphaned archive {d.name}", mt + timedelta(hours=hours), [d], []))
     return out_
 
 
 def _scan_captures(gp, now, hours, runs, cur, referenced, unfinished):
     out_ = []
-    caps = captures_root(gp)
-    if caps.is_dir() and not os.path.islink(str(caps)):
-        for d in sorted(caps.iterdir()):  # a capture delete interrupted after its rename
-            if (d.name.startswith(TOMB_PREFIX) and CAPTURE_NAME_RE.match(d.name[len(TOMB_PREFIX):])
-                    and not os.path.islink(str(d)) and d.is_dir()):
-                out_.append((None, f"leftover {d.name}", now, [d], []))
+    for d, st in C.safe_children(captures_root(gp)):  # a capture delete interrupted after its rename
+        if (d.name.startswith(TOMB_PREFIX) and CAPTURE_NAME_RE.match(d.name[len(TOMB_PREFIX):])
+                and stat.S_ISDIR(st.st_mode)):
+            out_.append((None, f"leftover {d.name}", now, [d], []))
     return out_
 
 
 def _scan_rehearsal(gp, now, hours, runs, cur, referenced, unfinished):
     out_ = []
-    reh = rehearsal_root(gp)
-    if reh.is_dir() and not os.path.islink(str(reh)):
-        for d in sorted(reh.iterdir()):
-            if not REHEARSAL_DIR_RE.match(d.name) or os.path.islink(str(d)) or not d.is_dir():
-                continue
-            files = [d / f for f in REHEARSAL_FILES[:4] if os.path.isfile(d / f) and not os.path.islink(d / f)]
-            stamps = [t for t in (_mtime_utc(f) for f in files) if t is not None]
-            if stamps:
-                kind = "plaintext" if any(f.name.startswith("openclaw-rehearsal.tar.gz") and
-                                          not f.name.endswith((".age", ".age.tmp")) for f in files) else "encrypted"
-                out_.append((None, f"{kind} rehearsal export {d.name}", max(stamps) + timedelta(hours=hours),
-                             [d], []))
+    for d, st in C.safe_children(rehearsal_root(gp)):
+        if not REHEARSAL_DIR_RE.match(d.name) or not stat.S_ISDIR(st.st_mode):
+            continue
+        files = [f for f, fst in C.safe_children(d) if f.name in REHEARSAL_FILES[:4] and stat.S_ISREG(fst.st_mode)]
+        stamps = [t for t in (_mtime_utc(f) for f in files) if t is not None]
+        if stamps:
+            kind = "plaintext" if any(f.name.startswith("openclaw-rehearsal.tar.gz") and
+                                      not f.name.endswith((".age", ".age.tmp")) for f in files) else "encrypted"
+            out_.append((None, f"{kind} rehearsal export {d.name}", max(stamps) + timedelta(hours=hours),
+                         [d], []))
     return out_
 
 
@@ -4822,15 +4841,14 @@ def _scan_stage_a(gp, now, hours, runs, cur, referenced, unfinished):
     out_ = []
     marker = C.load_json_or_none(gp["MARKER"])
     sa = stage_a_root(gp)
-    if (isinstance(marker, dict) and (C.version_tuple(str(marker.get("runtime") or "")) or (0,)) >= (2026, 8, 0)
-            and sa.is_dir() and not os.path.islink(str(sa))):
+    if isinstance(marker, dict) and (C.version_tuple(str(marker.get("runtime") or "")) or (0,)) >= (2026, 8, 0):
         done_at = _parse_backup_date(marker.get("completed_at"))
         mj = runs.get(str(marker.get("run_id")))
         cleared = run_due_base(mj) if mj else None
         if cleared and (done_at is None or cleared > done_at):
             done_at = cleared
-        for f in sorted(sa.iterdir()):
-            if not STAGE_A_RE.match(f.name) or os.path.islink(str(f)) or not f.is_file():
+        for f, st in C.safe_children(sa):
+            if not STAGE_A_RE.match(f.name) or not stat.S_ISREG(st.st_mode):
                 continue
             mt = _mtime_utc(f)
             if mt is None:
@@ -4848,10 +4866,11 @@ def export_write(args, emit=out):
     """Filesystem side of run.sh's rehearsal export, all through directory fds (other add-ons can write /share,
     so no path is opened by name after a check):
       export-write --sweep                 remove incomplete exports (*.tmp) left by an interrupted export
-      export-write --begin <ts>            stdin -> <share>/openclaw-rehearsal/<ts>-XXXXXX/<EXPORT_TMP>; prints the
-                                           new directory's name
-      export-write --finish <dir> <created> <addon> <runtime> <recipient>
-                                           rename to the final name, write manifest.txt; prints the final path
+      export-write --begin <ts>            stdin -> <share>/openclaw-rehearsal/<ts>-XXXXXX/<EXPORT_TMP>; prints
+                                           "<dir> <sha256> <size>" of the bytes it wrote (the trusted record)
+      export-write --finish <dir> <sha256> <size> <created> <addon> <runtime> <recipient>
+                                           check size and sha256 against --begin's, rename to the final name,
+                                           write manifest.txt; prints the final path
       export-write --abort <dir>           remove the incomplete export of <dir>"""
     if os.environ.get("OC_GATE_FROM_RUNSH") != "1":
         emit("oc-upgrade export-write is used by the add-on itself (oc-upgrade export requests an export)")
@@ -4863,7 +4882,8 @@ def export_write(args, emit=out):
             return _export_sweep(gp, reh, emit)
         if len(args) == 2 and args[0] == "--begin" and re.fullmatch(r"\d{8}-\d{6}", args[1]):
             return _export_begin(gp, reh, args[1], emit)
-        if len(args) == 6 and args[0] == "--finish" and REHEARSAL_DIR_RE.fullmatch(args[1]):
+        if (len(args) == 8 and args[0] == "--finish" and REHEARSAL_DIR_RE.fullmatch(args[1])
+                and re.fullmatch(r"[0-9a-f]{64}", args[2]) and re.fullmatch(r"\d{1,15}", args[3])):
             return _export_finish(gp, reh, args[1:], emit)
         if len(args) == 2 and args[0] == "--abort" and REHEARSAL_DIR_RE.fullmatch(args[1]):
             _export_abort(gp, reh, args[1])
@@ -4882,6 +4902,8 @@ def _export_sweep(gp, reh, emit):
         return 0
     try:
         for name in sorted(os.listdir(rfd)):
+            if not REHEARSAL_DIR_RE.match(name):
+                continue  # only directories the export creates (<ts> or <ts>-XXXXXX)
             try:
                 dfd = os.open(name, _DIR_NOFOLLOW, dir_fd=rfd)
             except OSError:
@@ -4930,16 +4952,19 @@ def _export_begin(gp, reh, ts, emit):
         os.fchmod(dfd, 0o700)
         fd = os.open(EXPORT_TMP, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600,
                      dir_fd=dfd)
+        h, n = hashlib.sha256(), 0
         with os.fdopen(fd, "wb") as f:
             while True:
                 b = sys.stdin.buffer.read(C.MIB)
                 if not b:
                     break
                 f.write(b)
+                h.update(b)
+                n += len(b)
             f.flush()
             os.fsync(f.fileno())
         os.fsync(dfd)
-        sys.stdout.write(name + "\n")
+        sys.stdout.write(f"{name} {h.hexdigest()} {n}\n")
         return 0
     except BaseException:
         if dfd is not None:
@@ -4957,7 +4982,8 @@ def _export_begin(gp, reh, ts, emit):
 
 
 def _export_finish(gp, reh, a, emit):
-    name, created, addon, runtime, recipient = a
+    name, sha, size, created, addon, runtime, recipient = a
+    size = int(size)
     dfd = open_dir_nofollow(gp["SHARE"], reh.name, name)
     try:
         st = os.stat(EXPORT_TMP, dir_fd=dfd, follow_symlinks=False)
@@ -4966,16 +4992,13 @@ def _export_finish(gp, reh, a, emit):
         os.replace(EXPORT_TMP, EXPORT_FILE, src_dir_fd=dfd, dst_dir_fd=dfd)
         try:
             with open_regular_at(dfd, EXPORT_FILE) as f:
-                h, n = hashlib.sha256(), 0
-                while True:
-                    b = f.read(C.MIB)
-                    if not b:
-                        break
-                    h.update(b)
-                    n += len(b)
+                # the file must still be what --begin wrote (another add-on can write /share): size first, so a
+                # swapped-in sparse file is never read to its end
+                if os.fstat(f.fileno()).st_size != size or sha256_fileobj(f, size) != sha:
+                    raise OSError(errno.EINVAL, "the export changed after it was written")
             manifest = "".join(f"{k}={v}\n" for k, v in (
                 ("created_utc", created), ("addon_version", addon), ("openclaw_runtime", runtime),
-                ("sha256", h.hexdigest()), ("size_bytes", n), ("encrypted", "age"), ("recipient", recipient),
+                ("sha256", sha), ("size_bytes", size), ("encrypted", "age"), ("recipient", recipient),
                 ("contains_secrets", "yes")))
             _write_new_at(dfd, "manifest.txt", manifest.encode("utf-8"))
             os.fsync(dfd)
@@ -5050,7 +5073,8 @@ def cleanup_pass(now=None, hours=None, emit=out, state=None):
                 errors.discard(label)
             except Exception as exc:  # noqa: BLE001 (report, then go on with the next target)
                 if label not in errors:
-                    emit(f"WARN [cleanup] {label}: {type(exc).__name__}: {C.redact_text(str(exc))[:200]}")
+                    emit(f"WARN [cleanup] {printable(label)}: {type(exc).__name__}: "
+                         f"{printable(C.redact_text(str(exc))[:200])}")
                     errors.add(label)
         return deleted
     finally:
@@ -5063,14 +5087,21 @@ def _cleanup_target(gp, now, rid, label, due, paths, kept, emit, errors=None):
     rec = rec if isinstance(rec, dict) else {"schema": 1}
     errors = errors if errors is not None else set()
     dirty = False
+    label = printable(label)
+    if paths is None:  # the target could not be built: warn once per loop, never record anything
+        for path, reason in kept:
+            if f"{label}\0err:{path}" not in errors:
+                emit(f"WARN [cleanup] {label}: kept {printable(path)}: {printable(reason)}")
+                errors.add(f"{label}\0err:{path}")
+        return 0
     for path, reason in kept:
         key = f"kept:{path}"
         if rid is None:  # no record file: once per loop
             if f"{label}\0{key}" not in errors:
-                emit(f"WARN [cleanup] {label}: kept {path}: {reason}")
+                emit(f"WARN [cleanup] {label}: kept {printable(path)}: {printable(reason)}")
                 errors.add(f"{label}\0{key}")
         elif not rec.get(key):
-            emit(f"WARN [cleanup] {label}: kept {path}: {reason}")
+            emit(f"WARN [cleanup] {label}: kept {printable(path)}: {printable(reason)}")
             rec[key] = dirty = True
     live = [p_ for p_ in paths if os.path.lexists(str(p_))]
     if not live:
@@ -5088,7 +5119,7 @@ def _cleanup_target(gp, now, rid, label, due, paths, kept, emit, errors=None):
             dirty = True
         elif rec_path and rec.get("due_at") != C.utc_iso(due):
             rec["due_at"] = C.utc_iso(due)  # moved: a hold after the run was cleared later
-            emit(f"[cleanup] {label}: deletion moved to {C.utc_iso(due)} (a hold after the run was cleared)")
+            emit(f"[cleanup] {label}: deletion moved to {C.utc_iso(due)}")
             dirty = True
         if dirty and rec_path and rec_path.parent.is_dir():
             C.atomic_write_json(rec_path, rec)
@@ -5103,11 +5134,11 @@ def _cleanup_target(gp, now, rid, label, due, paths, kept, emit, errors=None):
             errors.discard(key)
         except OSError as exc:
             if key not in errors:  # once per path, not at every hourly pass
-                emit(f"WARN [cleanup] {label}: could not delete {p_}: {exc.strerror or exc}")
+                emit(f"WARN [cleanup] {label}: could not delete {printable(p_)}: {printable(exc.strerror or exc)}")
                 errors.add(key)
     if gone:
         emit(f"[cleanup] {label}: deleted {len(gone)} item(s), {C.human(sum(g['bytes'] for g in gone))}: "
-             + ", ".join(g["path"] for g in gone[:4]) + (" ..." if len(gone) > 4 else ""))
+             + ", ".join(printable(g["path"]) for g in gone[:4]) + (" ..." if len(gone) > 4 else ""))
         if rec_path and rec_path.parent.is_dir():
             rec.update({"due_at": C.utc_iso(due), "deleted_at": C.utc_iso(now)})
             rec.setdefault("deleted", []).extend(gone)
@@ -5124,7 +5155,8 @@ def cleanup_loop(emit=out):
     STOP.clear()
     hours = C.gate_options()["cleanup_hours"]
     if hours:
-        emit(f"[cleanup] gate archives and doctor captures are deleted {hours} h after their gate run (checked hourly)")
+        emit(f"[cleanup] gate archives and doctor captures are deleted {hours} h after their gate run, rehearsal "
+             "exports and 2026.7 plaintext archives the same time after they were written or migrated (checked hourly)")
     else:
         emit("[cleanup] gate_cleanup_hours=0: automatic deletion is off (oc-upgrade cleanup lists what to delete)")
     state = {}
@@ -5159,22 +5191,23 @@ def cleanup_cmd(args, emit=out):
     emit(f"gate_cleanup_hours={hours}" + (" (automatic deletion off)" if not hours else "")
          + (f"; paused: {why}" if why else ""))
     for rid, label, due, paths, kept in cleanup_targets(gp, now, hours or 0):
-        live = [p_ for p_ in paths if os.path.lexists(str(p_))]
+        live = [p_ for p_ in paths or [] if os.path.lexists(str(p_))]
         if not live:
             verdict = "nothing left"
         elif not hours:
             verdict = "kept (gate_cleanup_hours=0)"
         else:
             verdict = "due now" if now >= due else f"due {C.utc_iso(due)}"
-        emit(f"  {label}: {verdict}")
+        emit(f"  {printable(label)}: {verdict}")
         for p_ in live:
             try:
-                size = _dir_bytes(p_) if p_.is_dir() and not p_.is_symlink() else os.lstat(p_).st_size
+                st = os.lstat(p_)
+                size = _dir_bytes(p_) if stat.S_ISDIR(st.st_mode) else st.st_size
             except OSError:
                 size = None
-            emit(f"    {p_} ({C.human(size)})")
+            emit(f"    {printable(p_)} ({C.human(size)})")
         for path, reason in kept:
-            emit(f"    kept {path}: {reason}")
+            emit(f"    kept {printable(path)}: {printable(reason)}")
     if args == ["--apply"]:
         if not hours:
             emit("gate_cleanup_hours=0: nothing is deleted automatically; delete the listed paths yourself")
@@ -5253,17 +5286,21 @@ def status_lines():
              + (f" (problem: {ao['problem']})" if ao.get("problem") else "")
              + f"; delete archives/doctor captures {o['cleanup_hours']} h after a run (0 = never); "
              f"backup max age {o['backup_max_age_hours']} h")
-    archives = sorted(gp["ARCHIVES"].glob("*/*.tar.gz")) + sorted(gp["ARCHIVES"].glob("*/*.tar.gz.age"))
+    archives = [f for f, _st in C.safe_files_below(gp["ARCHIVES"], lambda n: n.endswith((".tar.gz", ".tar.gz.age")))]
     L.append("Gate archives in /share:" if archives else "Gate archives in /share: none")
     for a in archives:
-        sums = (a.parent / "SHA256SUMS")
-        sha = sums.read_text(encoding="utf-8", errors="replace").split()[0][:12] if sums.exists() else "?"
+        try:  # informational only; never through a link, never a FIFO (other add-ons can write /share)
+            with open_regular_at(None, str(a.parent / "SHA256SUMS")) as f:
+                words = f.read(4096).decode("utf-8", "replace").split()
+            sha = printable(words[0][:12]) if words else "?"
+        except (OSError, ValueError):
+            sha = "?"
         try:
-            size = a.stat().st_size
+            size = os.lstat(a).st_size
         except OSError:
             size = None
         kind = "encrypted" if a.name.endswith(".age") else "PLAINTEXT from 0.5.94-full1: unencrypted secrets"
-        L.append(f"  {a} ({C.human(size)}, sha256 {sha}…, {kind})")
+        L.append(f"  {printable(a)} ({C.human(size)}, sha256 {sha}…, {kind})")
     caps = captures_root(gp)
     if caps.is_dir():
         n = sum(1 for x in caps.iterdir() if CAPTURE_NAME_RE.match(x.name.removeprefix(TOMB_PREFIX)))

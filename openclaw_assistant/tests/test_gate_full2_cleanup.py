@@ -893,7 +893,8 @@ class CleanupTests(CleanupEnv):
         self.assertLess(time.monotonic() - t, 10)
         self.assertEqual(rc, 143)
         self.assertEqual(lines[0], "[cleanup] gate archives and doctor captures are deleted 48 h after their gate "
-                                   "run (checked hourly)")
+                                   "run, rehearsal exports and 2026.7 plaintext archives the same time after they "
+                                   "were written or migrated (checked hourly)")
         self.assertFalse(os.path.lexists(r.adir))  # the first pass runs at once
 
     def test_loop_exits_143_on_sigterm(self):

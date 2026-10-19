@@ -1042,7 +1042,9 @@ workspace; logs, media, caches, earlier archives and `node_modules` folders insi
 the workspace are left out. The command is refused unless `gate_archive` is
 `encrypted` and a valid public key is set: there are no plaintext copies. No export
 is written (the log shows a `WARN`) when `/share/openclaw-rehearsal` is a symbolic link
-or not a directory. The content holds secrets (tokens, OAuth logins): decrypt it only
+or not a directory. The log line `Rehearsal export ready: … (sha256 …, … bytes)` is the
+trusted record: other add-ons can write `/share`, so compare the `sha256sum` of the copy
+you fetch with that line before you decrypt it. The content holds secrets (tokens, OAuth logins): decrypt it only
 on the machine that holds your private key and never keep a decrypted copy of the
 archive.
 The add-on deletes the export `gate_cleanup_hours` after it was written (default 48 h;
@@ -1111,6 +1113,10 @@ note after the steps)
    `[gate] done: MIGRATED 2026.10.4 …`, then the gateway starts.
    Pair each browser once (`openclaw devices list`, `openclaw devices approve <id>`),
    then test Telegram, your models, MCP and cron jobs.
+   Copy the line `[gate] info: archive sha256 … (encrypted file), plaintext sha256 …`
+   to your own computer (or note the archive's full `sha256` from `oc-upgrade status`):
+   it is the only trustworthy reference if you ever need the archive, because other
+   add-ons can replace files in `/share` (see step 0 of the archive rollback).
 7. Decide about a rollback within `gate_cleanup_hours` (default 48 h; see
    [Safe rollback](#safe-rollback-after-an-openclaw-database-upgrade)). The gate's last
    lines say when the add-on deletes this run's archive and doctor captures
@@ -1837,12 +1843,22 @@ There are two rollback points for the 2026.10 update:
    configuration directory as `/addon_configs/<…>_openclaw_assistant/` (this add-on's
    `/config`). The decrypted archive is never written to a file: it only passes
    through a pipe on your computer.
+   0. **Before step 1, note the archive's two sha256 values from a trusted source.**
+      Other add-ons can write `/share`, so they can replace the archive together with
+      its `manifest.json` and `SHA256SUMS` (both are informational only). The trusted
+      values are in the gate journal in this add-on's `/config`, which the restore in
+      step 1 replaces: run `oc-upgrade status` in the add-on terminal now and note the
+      full `sha256` of the archive line, and `jq -r .archive.plaintext_sha256
+      /config/.openclaw-upgrade/gate/journal.json` (or take both from the
+      `[gate] info: archive sha256 …` line logged at the end of the gate run).
    1. Install `0.5.93-full2` again. That is only possible by restoring a Home
       Assistant backup of the add-on that has this version (older data is fine: the
       archive replaces it). Stop the add-on if it started.
    2. In the SSH add-on, move the current state and workspace aside:
       `cd /addon_configs/<…>_openclaw_assistant && mv .openclaw .openclaw.rollback-old && mv clawd clawd.rollback-old`.
-   3. Check the archive: `cd /share/openclaw-upgrade/<run> && sha256sum -c SHA256SUMS`.
+   3. Check the archive against the noted value (not against `SHA256SUMS`):
+      `sha256sum /share/openclaw-upgrade/<run>/openclaw-state-<ts>-before-2026.10.4.tar.gz.age`
+      must print the archive sha256 you noted in step 0. Stop if it differs.
    4. On your computer, decrypt it on the way and extract it into the add-on's
       configuration directory:
       ```sh
@@ -1850,10 +1866,9 @@ There are two rollback points for the 2026.10 update:
         | age -d -i openclaw-gate-key.txt \
         | ssh <user>@<ha-host> 'tar -xzf - -C /addon_configs/<…>_openclaw_assistant'
       ```
-      Optionally check first that the key fits and the content is complete: the
+      Check first that the key fits and the content is the one the gate wrote: the
       same command with `| sha256sum` instead of the second `ssh …` must print the
-      value that `jq -r .archive.plaintext_sha256 /share/openclaw-upgrade/<run>/manifest.json`
-      shows in the SSH add-on.
+      plaintext sha256 you noted in step 0 (not the value in `manifest.json`).
    5. Start the add-on. The log must show `OpenClaw runtime version: 2026.7.35`.
 
    **Never extract over the migrated directory**: leftover 2026.10

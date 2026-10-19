@@ -432,6 +432,30 @@ def gate_options():
             "problems": problems}
 
 
+def safe_children(root):
+    """[(path, lstat)] of a directory's entries, sorted, never following a link (root included) and never raising:
+    other add-ons can write /share, and one odd entry (a link with an over-long target) must not break a listing."""
+    try:
+        if not stat.S_ISDIR(os.lstat(root).st_mode):
+            return []
+        out = []
+        with os.scandir(root) as it:
+            for e in it:
+                try:
+                    out.append((Path(e.path), e.stat(follow_symlinks=False)))
+                except OSError:
+                    continue
+        return sorted(out, key=lambda x: str(x[0]))
+    except OSError:
+        return []
+
+
+def safe_files_below(root, name_pred):
+    """Regular files <root>/<dir>/<file> with name_pred(file name), through real directories only."""
+    return [(f, fst) for d, dst in safe_children(root) if stat.S_ISDIR(dst.st_mode)
+            for f, fst in safe_children(d) if stat.S_ISREG(fst.st_mode) and name_pred(f.name)]
+
+
 def short_recipient(rec):
     """age1abcd…uvwxyz: a full 62-character recipient would be mangled to *** by the 40-character redaction."""
     return f"{rec[:9]}…{rec[-6:]}" if rec and len(rec) > 16 else (rec or "")

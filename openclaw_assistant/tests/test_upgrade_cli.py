@@ -424,9 +424,8 @@ class Full2CliTests(CliEnv):
             self.age_back(f, 72)
 
         self.assertEqual(self.cli("status"), 0)
-        self.assertIn(f"  {plain} (", self.stdout)
-        self.assertIn("PLAINTEXT: delete it", self.stdout)
-        self.assertIn(f"  {enc} (", self.stdout)
+        self.assertIn(f"  {plain} (66 B, PLAINTEXT; deleted automatically, see oc-upgrade cleanup)\n", self.stdout)
+        self.assertIn(f"  {enc} (22 B, encrypted; deleted automatically, see oc-upgrade cleanup)\n", self.stdout)
 
         self.assertEqual(self.cli("cleanup"), 0, self.stdout + self.stderr)
         self.assertIn(f"  orphaned archive {orphan.name}: due now", self.stdout)
@@ -446,8 +445,43 @@ class Full2CliTests(CliEnv):
             self.assertTrue(p.exists(), f"{p} was deleted")
         self.assertEqual([p.name for p in self.archives.iterdir() if p.name.startswith(".oc-addon-deleting-")], [])
         self.assertEqual(self.cli("status"), 0)
-        self.assertNotIn("PLAINTEXT: delete it", self.stdout)
+        self.assertIn("Rehearsal exports:\n  none\n", self.stdout)
+        self.assertNotIn(str(plain), self.stdout)
         self.assertNotIn(str(enc), self.stdout)
+
+    # Regression: listings use lstat only. A link another add-on planted in /share whose target cannot even be
+    # resolved (stat: ENAMETOOLONG) neither breaks `oc-upgrade status` / `cleanup` nor hides the real entries.
+    def test_status_and_cleanup_survive_links_with_over_long_targets(self):
+        long_target = "x" * 300
+        rid, adir, caps = self.finished_run(1)
+        reh = self.share / "openclaw-rehearsal"
+        exp = reh / "20261001-120000-AbC123" / "openclaw-rehearsal.tar.gz.age"
+        exp.parent.mkdir(parents=True)
+        exp.write_bytes(b"age-encryption.org/v1\n")
+        stage_a = self.state / "upgrade-backups"
+        stage_a.mkdir()
+        links = [self.archives / "20260901T000000Z-0bad0f", self.archives / "long-link",
+                 adir / "openclaw-state-20260901-000000-before-2026.9.9.tar.gz",
+                 reh / "20260901-000000-LnkLnk", reh / "long-link", exp.parent / "openclaw-rehearsal.tar.gz.age.tmp",
+                 stage_a / "openclaw-state-20260101-120000-before-2026.7.35.tar.gz"]
+        for link in links:
+            os.symlink(long_target, link)
+        self.assertEqual(self.cli("status"), 0, self.stdout + self.stderr)
+        self.assertEqual(self.stderr, "")
+        self.assertNotIn("n/a (", self.stdout)  # the gate section (status_lines) did not fail either
+        self.assertIn("Pre-upgrade archives (local, Stage A, 7.x only):\n  none\n", self.stdout)
+        self.assertIn(f"Rehearsal exports:\n  {exp} (22 B, encrypted; deleted automatically, see oc-upgrade "
+                      "cleanup)\nMigration gate:", self.stdout)
+        self.assertRegex(self.stdout, rf"\n    {adir}/openclaw-state-[^ ]+\.tar\.gz\.age \(2\.\d KiB, sha256 0{{12}}…, "
+                                      r"encrypted\)\n")
+        for name in ("0bad0f", "long-link", "LnkLnk", ".age.tmp", "2026.7.35", "20260901-000000-before"):
+            self.assertNotIn(name, self.stdout)
+        self.assertEqual(self.cli("cleanup"), 0, self.stdout + self.stderr)
+        self.assertIn(f"  run {rid}: due ", self.stdout)
+        self.assertIn("  encrypted rehearsal export 20261001-120000-AbC123: ", self.stdout)
+        self.assertNotIn("scan", self.stdout)
+        for link in links:
+            self.assertTrue(os.path.islink(link), link)
 
     def test_cleanup_loop_deletes_what_is_due_and_stops_on_sigterm(self):
         rid, adir, caps = self.finished_run(1)  # due in 47 h; the clock offset hook makes it due now
@@ -516,6 +550,9 @@ class Full2CliTests(CliEnv):
         self.assertEqual(self.cli("export"), 0, self.stdout + self.stderr)
         self.assertIn("Export requested.", self.stdout)
         self.assertIn(f"encrypted with age to {C.short_recipient(FAKE_RECIPIENT)}", self.stdout)
+        self.assertIn("\n  - the add-on deletes it 48 h after it was written (gate_cleanup_hours).\n"
+                      "Withdraw with: oc-upgrade export --cancel\n", self.stdout)
+        self.assertNotIn(FAKE_RECIPIENT, self.stdout)
         self.assertTrue((self.upg / "export-request").exists())
         self.assertEqual(self.share_files(), [])  # the copy is made by run.sh on the next start
         self.assertEqual(self.cli("status"), 0)
@@ -527,6 +564,25 @@ class Full2CliTests(CliEnv):
         self.assertFalse((self.upg / "export-request").exists())
         self.assertEqual(self.cli("export", "--cancel"), 0)
         self.assertIn("No export request pending.", self.stdout)
+
+    def test_export_says_how_long_the_copy_is_kept(self):
+        for hours, line in ((12, "  - the add-on deletes it 12 h after it was written (gate_cleanup_hours).\n"),
+                            (0, "  - it is kept (gate_cleanup_hours=0): delete it yourself after the rehearsal.\n")):
+            with self.subTest(hours=hours):
+                self.set_options({"gate_archive": "encrypted", "gate_archive_age_recipient": FAKE_RECIPIENT,
+                                  "gate_cleanup_hours": hours})
+                self.assertEqual(self.cli("export"), 0, self.stdout + self.stderr)
+                self.assertIn(line + "Withdraw with: oc-upgrade export --cancel\n", self.stdout)
+                self.assertEqual(self.cli("export", "--cancel"), 0)
+
+    def test_status_labels_stage_a_archives_as_deleted_after_the_migration(self):
+        stage_a = self.state / "upgrade-backups"
+        stage_a.mkdir()
+        f = stage_a / "openclaw-state-20260101-120000-before-2026.7.35.tar.gz"
+        f.write_bytes(b"\x1f\x8b" + b"\0" * 30)
+        self.assertEqual(self.cli("status"), 0, self.stderr)
+        self.assertIn(f"Pre-upgrade archives (local, Stage A, 7.x only):\n  {f} (32 B, PLAINTEXT; deleted "
+                      "automatically after the 2026.8+ migration, see oc-upgrade cleanup)\n", self.stdout)
 
     # status
     def gate_options_line(self):

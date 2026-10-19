@@ -17,6 +17,11 @@ Covers:
 - cleanup robustness, Stage A plaintext archives, retention after a cleared post-run hold.
 - Supervisor client hardening: token validation, deep JSON, content.addons type, overall deadline, redacted
   internal-error HOLDs.
+- Bounded read-backs: --finish of the rehearsal export, phase_archive and archive_intact compare the size before
+  hashing (a swapped-in 1 TiB sparse file is refused at once, a FIFO without blocking); the gate manifest names
+  only the short recipient.
+- lstat-only listings: links with unresolvable (over-long) targets in /share; names from /share listings never
+  reach a log line raw, and only directories named like the add-on's are swept or cleaned up.
 
 Python tests must run inside `unshare --pid --fork --mount-proc` on hosts with rehearsal containers (their
 OpenClaw processes would make the openclaw-running precheck HOLD); find_openclaw_processes is additionally
@@ -29,6 +34,7 @@ import io
 import json
 import os
 import re
+import shutil
 import socket
 import stat
 import subprocess
@@ -61,6 +67,9 @@ H48 = timedelta(hours=48)
 SEC = timedelta(seconds=1)
 MIB = 1024 * 1024
 SLUG = "a0d7b954_openclaw_assistant"
+TIB = 2 ** 40  # a sparse file this size is created at once; reading it to its end would take many minutes
+# One 300-character path component as a symlink target: lstat works, stat (any follow) fails with ENAMETOOLONG.
+LONG_TARGET = "x" * 300
 
 # Like OpenClaw 2026.10's doctor: copies the pre-repair state into <realpath(state)>.update-captures/doctor-<uuid>/
 # and logs the line naming its manifest, then runs the fake doctor of test_gate.
@@ -205,6 +214,52 @@ class SecEnv(T.GateEnv):
         if keep_as is not None:
             os.rename(path, keep_as)
         os.symlink(str(target), str(path))
+
+    def long_link(self, path):
+        """A symlink another /share writer plants whose target cannot be resolved (ENAMETOOLONG on any stat that
+        follows it): only lstat-based listings survive it."""
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        os.symlink(LONG_TARGET, str(path))
+        with self.assertRaises(OSError) as cm:
+            os.stat(path)
+        self.assertEqual(cm.exception.errno, errno.ENAMETOOLONG)
+        return Path(path)
+
+    @staticmethod
+    def sparse_swap(path, size=TIB, head=b""):
+        """Replace path (a new inode, renamed over it) with a sparse file of `size` bytes that starts with head."""
+        q = Path(path).with_name(Path(path).name + ".swap")
+        with open(q, "wb") as f:
+            f.write(head)
+            f.truncate(size)
+        os.replace(q, path)
+
+    def watchdog(self, fifo=None, after=10.0):
+        """Started before a call that must return at once. If it is still running after `after` s, STOP is set (the
+        hashing loops check it) and a writer opens `fifo` once (a blocking reader returns): a regression fails
+        instead of hanging the suite. Returns a function giving (elapsed s, whether the watchdog had to act)."""
+        fired = []
+
+        def fire():
+            fired.append(1)
+            G.STOP.set()
+            if fifo is not None:
+                try:
+                    os.close(os.open(str(fifo), os.O_WRONLY | os.O_NONBLOCK))
+                except OSError:
+                    pass
+        t = threading.Timer(after, fire)
+        t.daemon = True
+        t0 = time.monotonic()
+        t.start()
+        self.addCleanup(t.cancel)
+
+        def done():
+            t.cancel()
+            elapsed = time.monotonic() - t0
+            G.STOP.clear()
+            return elapsed, bool(fired)
+        return done
 
 
 # --- /share symlink swaps during the cleanup ---------------------------------------------------------------
@@ -527,6 +582,149 @@ class ArchiveDirTests(ArchiveEnv):
         self.assertEqual((rdir / "SHA256SUMS").read_text().split(), [a["sha256"], a["file"]])
 
 
+# --- read-back of the archive: bounded by what was written, never a FIFO -------------------------------------
+
+class ReadBackTests(ArchiveEnv):
+    """phase_archive re-reads the .tmp it streamed, and archive_intact the recorded archive, through directory fds.
+    Another /share writer that swaps the file (a sparse file of another size, a FIFO) makes them fail at once:
+    the size is compared before anything is hashed, and a FIFO is refused without a blocking open."""
+
+    def tmp_of_run(self):
+        tmps = [n for n in os.listdir(self.arch / self.RID) if n.endswith(".tmp")]
+        self.assertEqual(len(tmps), 1, tmps)
+        return self.arch / self.RID / tmps[0]
+
+    def archive_with_swap_after_stream(self, swap, fifo=False):
+        """phase_archive with swap(tmp) right after the stream returned; returns (HoldError finding, elapsed s
+        from the swap to the hold)."""
+        real = G.stream_encrypted_archive
+        box = {}
+
+        def racing(*a, **kw):
+            r = real(*a, **kw)
+            tmp = self.tmp_of_run()
+            box["cipher"] = tmp.read_bytes()
+            swap(tmp)
+            box["done"] = self.watchdog(fifo=tmp if fifo else None)
+            return r
+        g = self.gate()
+        try:
+            with mock.patch.object(G, "stream_encrypted_archive", side_effect=racing), \
+                    self.assertRaises(G.HoldError) as cm:
+                g.phase_archive()
+        finally:  # STOP is cleared even when the watchdog had to stop a regression (GateStopped)
+            elapsed, fired = box["done"]() if "done" in box else (0.0, False)
+        self.assertFalse(fired, "the read-back kept reading (or blocked on) the swapped-in file")
+        self.assertLess(elapsed, 1.0)
+        self.assertEqual([n for n in os.listdir(self.arch / self.RID)], [])  # no .tmp, no archive, no manifest
+        self.assertNotIn("archive", g.j)
+        return cm.exception.findings[0], box["cipher"]
+
+    @NEEDS_AGE
+    def test_phase_archive_refuses_a_sparse_file_of_another_size_without_reading_it(self):
+        cases = [("sparse 1 TiB with the age header", lambda t: self.sparse_swap(t, TIB, t.read_bytes()[:4096]),
+                  f"encrypted archive is {TIB} bytes, expected "),
+                 ("sparse 1 TiB of zeros", lambda t: self.sparse_swap(t, TIB),
+                  "encrypted archive unreadable: not an age v1 file"),
+                 ("one byte longer, same header", lambda t: self.sparse_swap(t, t.stat().st_size + 1,
+                                                                            t.read_bytes()),
+                  "encrypted archive is ")]
+        for label, swap, needle in cases:
+            with self.subTest(label):
+                self.lines = []
+                f, _cipher = self.archive_with_swap_after_stream(swap)
+                self.assertEqual(f["code"], "archive-verify-failed", f)
+                self.assertTrue(f["message"].startswith(needle), f["message"])
+
+    @NEEDS_AGE
+    def test_phase_archive_refuses_same_size_other_bytes(self):
+        def flip(t):
+            raw = bytearray(t.read_bytes())
+            raw[-3] ^= 0x01
+            q = t.with_name("swap")
+            q.write_bytes(bytes(raw))
+            os.replace(q, t)
+        f, _cipher = self.archive_with_swap_after_stream(flip)
+        self.assertEqual((f["code"], f["message"]), ("archive-verify-failed", "read-back sha256 of the encrypted "
+                                                                               "archive differs from the bytes written"))
+
+    @NEEDS_AGE
+    def test_phase_archive_refuses_a_fifo_without_hanging(self):
+        def fifo(t):
+            os.unlink(t)
+            os.mkfifo(t, 0o600)
+        f, _cipher = self.archive_with_swap_after_stream(fifo, fifo=True)
+        self.assertEqual(f["code"], "archive-verify-failed", f)
+        self.assertIn("not a regular file", f["message"])
+
+    @NEEDS_AGE
+    def test_archive_intact_on_a_swapped_file_is_false_at_once(self):
+        g = self.gate()
+        g.phase_archive()
+        g.j["first_write_at"] = "2026-10-18T00:00:00Z"
+        a = g.j["archive"]
+        arch = Path(a["dir"]) / a["file"]
+        good = arch.read_bytes()
+        self.assertTrue(g.archive_intact())
+        real = G.Gate.archive_reusable
+
+        def restore():
+            if os.path.lexists(arch):
+                os.unlink(arch)
+            arch.write_bytes(good)
+            os.chmod(arch, 0o600)
+
+        def larger(t):
+            self.sparse_swap(t, len(good) + 1, good)
+
+        def fifo(t):
+            os.unlink(t)
+            os.mkfifo(t, 0o600)
+        cases = [("sparse 1 TiB with the age header", lambda t: self.sparse_swap(t, TIB, good[:4096]), False),
+                 ("one byte longer", larger, False), ("FIFO", fifo, True)]
+        for label, swap, is_fifo in cases:
+            for race in (False, True):
+                with self.subTest(label, race=race):
+                    restore()
+                    self.assertTrue(g.archive_intact())
+                    swapped = []
+
+                    def racing(gate):  # the swap lands between archive_reusable's check and the open
+                        ok = real(gate)
+                        swap(arch)
+                        swapped.append(ok)
+                        return ok
+                    if not race:
+                        swap(arch)
+                    done = self.watchdog(fifo=arch if is_fifo else None)
+                    try:
+                        with mock.patch.object(G.Gate, "archive_reusable", racing if race else real):
+                            intact = g.archive_intact()
+                    finally:
+                        elapsed, fired = done()
+                    self.assertFalse(intact)
+                    self.assertFalse(fired, "archive_intact kept reading (or blocked on) the swapped-in file")
+                    self.assertLess(elapsed, 1.0)
+                    if race:
+                        self.assertEqual(swapped, [True])  # the check itself passed: the open must refuse
+        restore()
+        self.assertTrue(g.archive_intact())
+
+    @NEEDS_AGE
+    def test_gate_manifest_names_only_the_short_recipient_and_the_journal_the_full_one(self):
+        g = self.gate()
+        g.phase_archive()
+        rdir = self.arch / self.RID
+        text = (rdir / "manifest.json").read_text()
+        man = json.loads(text)
+        self.assertEqual(man["encryption"]["recipients"], [C.short_recipient(PUB)])
+        self.assertRegex(man["encryption"]["recipients"][0], r"^age1[0-9a-z]{5}…[0-9a-z]{6}$")
+        self.assertNotIn(PUB, text)
+        self.assertNotIn(PUB, (rdir / "SHA256SUMS").read_text())
+        self.assertEqual(g.j["archive"]["recipient"], PUB)
+        self.assertEqual(json.loads(self.gp["JOURNAL"].read_text())["archive"]["recipient"], PUB)
+
+
 # --- stream_encrypted_archive: watchdog, write failures, clean shutdown ------------------------------------
 
 class StreamEnv(ArchiveEnv):
@@ -771,6 +969,165 @@ class CleanupRobustnessTests(SecEnv):
                 self.assertEqual(self.lines, [], f"pass {k}: {self.text}")
 
 
+# --- links with over-long targets and failing listings in /share -------------------------------------------
+
+class UnresolvableLinkTests(SecEnv):
+    """Other add-ons can write /share: a link there whose target cannot even be resolved (ENAMETOOLONG on every
+    stat that follows it) must not stop the cleanup, the gate precheck or the status. Listings use lstat only."""
+
+    def plant(self):
+        return [self.long_link(self.arch / "20260901T000000Z-0bad0f"),  # named like a run directory
+                self.long_link(self.arch / "long-link"),
+                self.long_link(self.reh / "20260901-000000-LnkLnk"),  # named like an export directory
+                self.long_link(self.reh / "long-link")]
+
+    def assert_links_left(self, links):
+        for link in links:
+            self.assertTrue(os.path.islink(link), link)
+            self.assertEqual(os.readlink(link), LONG_TARGET)
+
+    def test_cleanup_still_deletes_due_runs_orphans_exports_and_captures(self):
+        links = self.plant()
+        tomb = self.long_link(self.arch / (G.TOMB_PREFIX + "20260901T000000Z-0bad0f"))  # a leftover: unlinked
+        r = self.make_run(finished=T0, captures=2)
+        self.long_link(r.adir / "SHA256SUMS.link")  # inside a run directory: removed with it
+        orphan = self.arch / "20260902T000000Z-0abcde"
+        orphan.mkdir()
+        (orphan / "openclaw-state-x.tar.gz.age").write_bytes(G.AGE_MAGIC)
+        self.age_old(orphan, T0)
+        exp = self.make_export("20260903-000000-AbC123", files=(G.EXPORT_FILE, "manifest.txt"), when=T0)
+        self.long_link(exp / "openclaw-rehearsal.tar.gz.age.tmp")  # an export file name: unlinked as a link
+        listing = []
+        self.assertEqual(G.cleanup_cmd([], emit=listing.append), 0)
+        self.assertTrue(any(x.startswith(f"  run {r.rid}: due") for x in listing), listing)
+        self.assertNotIn("scan", "\n".join(listing))
+        state = {}
+        self.assertEqual(self.cleanup(T0 + H48, state=state), 6, self.text)  # run 3, orphan, export, tombstone
+        self.assertNotIn("WARN", self.text)
+        for gone in (r.adir, *r.caps, orphan, exp, tomb):
+            self.assertFalse(os.path.lexists(gone), gone)
+        self.assert_links_left(links)
+        rec = json.loads((r.rd / "cleanup.json").read_text())
+        self.assertEqual(sorted(x["path"] for x in rec["deleted"]), sorted(str(x) for x in (r.adir, *r.caps)))
+        self.assertEqual(self.cleanup(T0 + H48 + SEC, state=state), 0)
+        self.assertEqual(self.lines, [])
+
+    def test_a_run_directory_replaced_by_such_a_link_still_loses_its_doctor_captures(self):
+        r = self.make_run(finished=T0, captures=2)
+        shutil.rmtree(r.adir)
+        self.long_link(r.adir)
+        state = {}
+        self.assertEqual(self.cleanup(T0 + H48, state=state), 2, self.text)
+        for c in r.caps:
+            self.assertFalse(os.path.lexists(c), c)
+        self.assertTrue(os.path.islink(r.adir))  # not a plain run directory: kept, never followed
+        warns = [x for x in self.lines if x.startswith("WARN ")]
+        self.assertEqual(warns, [f"WARN [cleanup] run {r.rid}: kept {r.adir}: not a plain run directory"])
+        rec = json.loads((r.rd / "cleanup.json").read_text())
+        self.assertEqual(sorted(x["path"] for x in rec["deleted"]), sorted(str(c) for c in r.caps))
+        self.assertEqual(self.cleanup(T0 + H48 + SEC, state=state), 0)
+        self.assertEqual(self.lines, [])
+
+    def test_gate_precheck_and_status_lines_survive_such_links(self):
+        self.build_735()
+        self.hooks()
+        links = self.plant()
+        legacy = self.arch / "20260901T000000Z-abcdef" / f"openclaw-state-20260901-000000-before-{T.RUNTIME}.tar.gz"
+        legacy.parent.mkdir(parents=True)
+        legacy.write_bytes(b"\x1f\x8b legacy plaintext")
+        self.long_link(legacy.parent / "openclaw-state-20260901-000001-before-2026.9.9.tar.gz")  # not counted
+        rc = self.run_gate()
+        self.assertNotIn("internal-error", self.out + self.err)
+        self.assertNotIn("Traceback", self.err)
+        self.assertEqual(rc, 0, self.out + self.err)
+        self.assertEqual(self.journal()["status"], "done")
+        self.assertIn(f"WARN [gate] 1 plaintext gate archive(s) from 0.5.94-full1 in {self.arch} hold unencrypted "
+                      "secrets", self.out)
+        self.assert_links_left(links)
+        st = G.status_lines()
+        self.assertIn(f"  {legacy} (", "\n".join(st))
+        self.assertNotIn("long-link", "\n".join(st))
+
+    # Regression: a run whose doctor captures cannot be listed is an error target: warned once per loop,
+    # nothing recorded in cleanup.json (no deleted_at), deleted on a later pass.
+    def test_a_failing_capture_listing_records_no_deletion_and_warns_once_per_loop(self):
+        for with_archive in (False, True):
+            with self.subTest(with_archive=with_archive):
+                r = self.make_run(finished=T0, captures=1)
+                if not with_archive:
+                    shutil.rmtree(r.adir)  # gate_archive off, or the archive already gone
+                self.assertEqual(self.cleanup(T0 + timedelta(hours=1)), 0)  # announced: due_at recorded
+                rec_path = r.rd / "cleanup.json"
+                self.assertEqual(json.loads(rec_path.read_text())["due_at"], iso(T0 + H48))
+                real = G.run_captures
+
+                def failing(gp, j, rid=r.rid):  # this run's doctor-log listing fails (EIO), the others' do not
+                    if j.get("run_id") == rid:
+                        raise OSError(errno.EIO, "Input/output error")
+                    return real(gp, j)
+                warn = (f"WARN [cleanup] run {r.rid}: kept {self.caps}: doctor captures not listed: OSError")
+                loop1, loop2 = {}, {}
+                with mock.patch.object(G, "run_captures", side_effect=failing):
+                    self.cleanup(T0 + H48, state=loop1)
+                    self.assertEqual([x for x in self.lines if x.startswith("WARN")], [warn])
+                    rec = json.loads(rec_path.read_text())
+                    self.assertNotIn("deleted_at", rec)
+                    self.assertEqual([k for k in rec if k.startswith("kept:")], [])
+                    self.cleanup(T0 + H48 + SEC, state=loop1)
+                    self.assertEqual([x for x in self.lines if x.startswith("WARN")], [])  # same loop: once
+                    self.cleanup(T0 + H48 + 2 * SEC, state=loop2)  # a new loop (add-on restart): again
+                    self.assertEqual([x for x in self.lines if x.startswith("WARN")], [warn])
+                    self.assertNotIn("deleted_at", json.loads(rec_path.read_text()))
+                self.assertTrue(os.path.isdir(r.caps[0]))
+                self.cleanup(T0 + H48 + 3 * SEC, state=loop2)  # listed again: everything goes, now recorded
+                self.assertFalse(os.path.lexists(r.caps[0]))
+                self.assertFalse(os.path.lexists(r.adir))
+                rec = json.loads(rec_path.read_text())
+                self.assertTrue(rec.get("deleted_at"), rec)
+                self.assertIn(str(r.caps[0]), [x["path"] for x in rec["deleted"]])
+
+    def test_an_unusable_journal_warns_once_per_loop_and_records_nothing(self):
+        r = self.make_run(finished=T0)
+        (r.rd / "journal.json").write_text(json.dumps(dict(r.j, finished_at="9999-12-31T23:00:00Z")))
+        loop1, loop2 = {}, {}
+        self.assertEqual(self.cleanup(T0 + H48, state=loop1), 0)
+        warns = [x for x in self.lines if x.startswith("WARN")]
+        self.assertEqual(len(warns), 1, self.lines)
+        self.assertIn(f"run {r.rid}: kept {r.adir}: journal unusable: OverflowError", warns[0])
+        self.assertFalse((r.rd / "cleanup.json").exists())
+        self.assertEqual(self.cleanup(T0 + H48 + SEC, state=loop1), 0)
+        self.assertEqual(self.lines, [])
+        self.assertEqual(self.cleanup(T0 + H48 + SEC, state=loop2), 0)
+        self.assertEqual(len([x for x in self.lines if x.startswith("WARN")]), 1, self.lines)
+        self.assertFalse((r.rd / "cleanup.json").exists())
+        self.assertTrue(r.adir.is_dir())
+
+    # Regression: `oc-upgrade status` reads SHA256SUMS only as a regular file (an unresolvable link, a FIFO
+    # or an empty file never breaks or blocks the gate section).
+    def test_status_lines_survive_an_odd_sha256sums(self):
+        r = self.make_run(finished=T0)
+        sums = r.adir / "SHA256SUMS"
+        for label in ("unresolvable link", "FIFO", "empty file"):
+            with self.subTest(label):
+                os.unlink(sums)
+                if label == "FIFO":
+                    os.mkfifo(sums, 0o600)
+                elif label == "empty file":
+                    sums.write_bytes(b"")
+                else:
+                    self.long_link(sums)
+                done = self.watchdog(fifo=sums if label == "FIFO" else None, after=3)
+                try:
+                    st = "\n".join(G.status_lines())
+                except Exception as exc:  # noqa: BLE001 (oc-upgrade status would print only "n/a (...)")
+                    st = f"raised {type(exc).__name__}: {exc}"
+                finally:
+                    elapsed, fired = done()
+                self.assertFalse(fired, "status_lines blocked on the FIFO")
+                self.assertIn(f"  {r.file} (", st)
+                self.assertIn("sha256 ?…", st)
+
+
 # --- Stage A plaintext archives (/config/.openclaw/upgrade-backups) -----------------------------------------
 
 class StageATests(SecEnv):
@@ -953,8 +1310,7 @@ class RetentionBaseTests(SecEnv):
         (r.rd / "journal.json").write_text(json.dumps(j))
         state = {}
         self.assertEqual(self.cleanup(T0 + timedelta(hours=61), state=state), 0)
-        self.assertEqual(self.lines, [f"[cleanup] run {r.rid}: deletion moved to {iso(cleared + H48)} "
-                                      "(a hold after the run was cleared)"])
+        self.assertEqual(self.lines, [f"[cleanup] run {r.rid}: deletion moved to {iso(cleared + H48)}"])
         self.assertEqual(json.loads(rec.read_text())["due_at"], iso(cleared + H48))
         self.assertEqual(self.cleanup(T0 + timedelta(hours=62), state=state), 0)
         self.assertEqual(self.lines, [])
@@ -1238,11 +1594,14 @@ class ExportWriteTests(SecEnv):
     TS = "20261018-120000"
     FIELDS = (TS, "0.5.94-test", "2026.10.4", "age1qpzry...a7lqpz")  # <created> <addon> <runtime> <recipient>
     NAME_RE = r"^20261018-120000-[A-Za-z0-9]{6}$"
+    # --begin prints "<dir> <sha256> <size>" of the bytes it wrote: run.sh hands them to --finish
+    BEGUN_RE = re.compile(r"(20261018-120000-[A-Za-z0-9]{6}) ([0-9a-f]{64}) ([0-9]+)\n")
 
     def setUp(self):
         super().setUp()
         old = os.umask(0)  # the modes must not depend on the caller's umask
         self.addCleanup(os.umask, old)
+        self.begun = {}
 
     def ew(self, *args, data=b"", runsh=True, stdin=None):
         """export_write as run.sh calls it (stdin: data); sets self.out / self.err and returns the exit status."""
@@ -1256,9 +1615,20 @@ class ExportWriteTests(SecEnv):
         return rc
 
     def begin(self, data=b"ciphertext"):
+        """--begin as run.sh calls it; returns the new directory's name and keeps the sha256 and size it printed
+        (which must be those of the bytes it was given) for finish()."""
         self.assertEqual(self.ew("--begin", self.TS, data=data), 0, self.out + self.err)
-        self.assertRegex(self.out, self.NAME_RE)
-        return self.out.strip()
+        m = self.BEGUN_RE.fullmatch(self.out)
+        self.assertIsNotNone(m, self.out)
+        name, sha, size = m.groups()
+        self.assertEqual((sha, int(size)), (hashlib.sha256(data).hexdigest(), len(data)))
+        self.begun[name] = (sha, size)
+        return name
+
+    def finish(self, name, *fields, record=None):
+        """--finish as run.sh calls it: <dir> <sha256> <size> (as --begin printed them) <created> <addon> <runtime>
+        <recipient>."""
+        return self.ew("--finish", name, *(record or self.begun[name]), *(fields or self.FIELDS))
 
     @staticmethod
     def mode(p):
@@ -1276,7 +1646,7 @@ class ExportWriteTests(SecEnv):
         self.assertEqual(os.listdir(self.share), [])
         name = self.begin()
         before = tree(self.share)
-        for args in (["--finish", name, *self.FIELDS], ["--abort", name], ["--sweep"]):
+        for args in (["--finish", name, *self.begun[name], *self.FIELDS], ["--abort", name], ["--sweep"]):
             self.assertEqual(self.ew(*args, runsh=False), 2, args)
             self.assertIn("used by the add-on itself", self.out)
         self.assertEqual(tree(self.share), before)
@@ -1284,7 +1654,7 @@ class ExportWriteTests(SecEnv):
     def test_begin_streams_stdin_into_a_fresh_0700_directory_as_a_0600_tmp_and_prints_its_name(self):
         data = os.urandom(3 * MIB) + b"\0tail\n"  # several 1 MiB chunks
         name = self.begin(data)
-        self.assertEqual(self.out, name + "\n")
+        self.assertEqual(self.out, f"{name} {hashlib.sha256(data).hexdigest()} {len(data)}\n")
         d = self.reh / name
         self.assertEqual(self.mode(self.reh), 0o700)  # the root, created by --begin
         self.assertTrue(stat.S_ISDIR(os.lstat(d).st_mode))
@@ -1294,6 +1664,7 @@ class ExportWriteTests(SecEnv):
         self.assertEqual((d / G.EXPORT_TMP).read_bytes(), data)
         # the same second again: another fresh directory, the first one untouched; empty stdin: an empty .tmp
         name2 = self.begin(b"")
+        self.assertEqual(self.out, f"{name2} {hashlib.sha256(b'').hexdigest()} 0\n")
         self.assertNotEqual(name2, name)
         self.assertEqual((self.reh / name2 / G.EXPORT_TMP).read_bytes(), b"")
         self.assertEqual((d / G.EXPORT_TMP).read_bytes(), data)
@@ -1317,7 +1688,7 @@ class ExportWriteTests(SecEnv):
         data = os.urandom(MIB + 123)
         name = self.begin(data)
         d = self.reh / name
-        self.assertEqual(self.ew("--finish", name, *self.FIELDS), 0, self.out + self.err)
+        self.assertEqual(self.finish(name), 0, self.out + self.err)
         self.assertEqual(self.out, f"{d / G.EXPORT_FILE}\n")
         self.assertEqual(sorted(os.listdir(d)), ["manifest.txt", G.EXPORT_FILE])
         self.assert_plain_file(d / G.EXPORT_FILE)
@@ -1329,13 +1700,18 @@ class ExportWriteTests(SecEnv):
             "recipient=age1qpzry...a7lqpz", "contains_secrets=yes"])
         before = tree(self.reh)
         # finished: a second --finish has no .tmp and changes nothing
-        self.assertEqual(self.ew("--finish", name, *self.FIELDS), 1)
+        self.assertEqual(self.finish(name), 1)
         self.assertEqual(self.out, "")
         self.assertEqual(tree(self.reh), before)
-        # run.sh passes an empty runtime when openclaw_runtime_version fails: still the six-argument shape
+        # run.sh passes an empty runtime when openclaw_runtime_version fails: still the eight-argument shape
         name2 = self.begin(b"x")
-        self.assertEqual(self.ew("--finish", name2, self.TS, "0.5.94-test", "", "r"), 0, self.err)
+        self.assertEqual(self.finish(name2, self.TS, "0.5.94-test", "", "r"), 0, self.err)
         self.assertIn("openclaw_runtime=\n", (self.reh / name2 / "manifest.txt").read_text())
+        # an empty export (age wrote nothing): size 0 and the sha256 of no bytes
+        name3 = self.begin(b"")
+        self.assertEqual(self.finish(name3), 0, self.err)
+        self.assertIn(f"sha256={hashlib.sha256(b'').hexdigest()}\nsize_bytes=0\n",
+                      (self.reh / name3 / "manifest.txt").read_text())
 
     def test_abort_removes_the_tmp_and_the_directory(self):
         name = self.begin(b"partial")
@@ -1461,14 +1837,15 @@ class ExportWriteTests(SecEnv):
                             test.replace_with_link(test.reh / d, v, keep_as=moved)
                     rc = self.ew("--begin", self.TS, stdin=SwappingStdin(swap, fail))
                     self.assertEqual(tree(v), before)
-                    real = moved / self.out.strip() if what == "root" else moved
+                    real = moved / self.out.split(" ")[0] if what == "root" else moved
                     if fail:
                         self.assertEqual((rc, self.out), (1, ""))
                         # the cleanup removed the real .tmp (and, through the root's fd, the real directory)
                         self.assertEqual(tree(moved), {})
                     else:
                         self.assertEqual(rc, 0, self.err)
-                        self.assertRegex(self.out, self.NAME_RE)
+                        self.assertRegex(self.out, self.BEGUN_RE)
+                        self.assertEqual(self.out.split()[1:], [hashlib.sha256(b"ciphertext").hexdigest(), "10"])
                         self.assertEqual((real / G.EXPORT_TMP).read_bytes(), b"ciphertext")
 
     def test_finish_and_abort_with_a_directory_swapped_to_a_symlink_touch_nothing_outside(self):
@@ -1477,7 +1854,7 @@ class ExportWriteTests(SecEnv):
         v = self.victim("victim", {G.EXPORT_TMP: b"DECOY", "openclaw.json": b"{}"})
         before = tree(v)
         self.replace_with_link(d, v, keep_as=self.reh / f"{name}.moved")
-        self.assertEqual(self.ew("--finish", name, *self.FIELDS), 1)
+        self.assertEqual(self.finish(name), 1)
         self.assertEqual(self.out, "")
         self.assertIn("WARN: rehearsal export:", self.err)
         self.assertEqual(tree(v), before)
@@ -1491,7 +1868,7 @@ class ExportWriteTests(SecEnv):
         v = self.victim("victim", {f"{name}/{G.EXPORT_TMP}": b"DECOY", "openclaw.json": b"{}"})
         before = tree(v)
         self.replace_with_link(self.reh, v, keep_as=self.share / "moved")
-        self.assertEqual(self.ew("--finish", name, *self.FIELDS), 1)
+        self.assertEqual(self.finish(name), 1)
         self.assertEqual(self.out, "")
         self.assertEqual(tree(v), before)
         self.assertIn(self.ew("--abort", name), (0, 1))  # run.sh ignores its status
@@ -1506,7 +1883,7 @@ class ExportWriteTests(SecEnv):
         d = self.reh / name
         os.symlink(vdir, d / G.EXPORT_FILE)  # the final name: replaced, never moved into
         os.symlink(victim, d / "manifest.txt")  # replaced, never written through
-        self.assertEqual(self.ew("--finish", name, *self.FIELDS), 0, self.err)
+        self.assertEqual(self.finish(name), 0, self.err)
         self.assert_plain_file(d / G.EXPORT_FILE)
         self.assert_plain_file(d / "manifest.txt")
         self.assertEqual((d / G.EXPORT_FILE).read_bytes(), b"ciphertext")
@@ -1519,7 +1896,7 @@ class ExportWriteTests(SecEnv):
         d = self.reh / name
         os.unlink(d / G.EXPORT_TMP)
         os.symlink(victim, d / G.EXPORT_TMP)
-        self.assertEqual(self.ew("--finish", name, *self.FIELDS), 1)
+        self.assertEqual(self.finish(name), 1)
         self.assertEqual(os.listdir(d), [G.EXPORT_TMP])
         self.assertEqual(self.ew("--abort", name), 0)
         self.assertFalse(os.path.lexists(d))
@@ -1527,11 +1904,21 @@ class ExportWriteTests(SecEnv):
 
     def test_bad_argument_shapes_are_rc_2_and_create_nothing(self):
         n = "20261018-120000-abcdef"
+        sha = hashlib.sha256(b"ciphertext").hexdigest()
         for args in ([], ["--bogus"], ["--sweep", "extra"], ["--begin"], ["--begin", "2026-10-18"],
                      ["--begin", "../20261018-120000"], ["--begin", n], ["--begin", self.TS, "extra"],
-                     ["--finish", n], ["--finish", n, "a", "b", "c"], ["--finish", n, *self.FIELDS, "extra"],
-                     ["--finish", "../../config", *self.FIELDS], ["--finish", f"{n}/..", *self.FIELDS],
-                     ["--abort"], ["--abort", "../share"], ["--abort", "."], ["--abort", ""], ["--abort", n, "x"]):
+                     ["--finish", n], ["--finish", n, "a", "b", "c"], ["--finish", n, sha, "10", *self.FIELDS, "x"],
+                     ["--finish", n, *self.FIELDS],  # the former six-argument shape: no sha256 / size
+                     ["--finish", n, sha, *self.FIELDS], ["--finish", n, "10", sha, *self.FIELDS],
+                     ["--finish", n, sha.upper(), "10", *self.FIELDS], ["--finish", n, sha[:63], "10", *self.FIELDS],
+                     ["--finish", n, sha + "0", "10", *self.FIELDS], ["--finish", n, "g" * 64, "10", *self.FIELDS],
+                     ["--finish", n, sha, "-1", *self.FIELDS], ["--finish", n, sha, "1e3", *self.FIELDS],
+                     ["--finish", n, sha, "", *self.FIELDS], ["--finish", n, sha, "1" * 16, *self.FIELDS],
+                     ["--finish", n, sha, "10\n", *self.FIELDS], ["--finish", n, sha + "\n", "10", *self.FIELDS],
+                     ["--finish", "../../config", sha, "10", *self.FIELDS],
+                     ["--finish", f"{n}/..", sha, "10", *self.FIELDS], ["--finish", f"{n}\n", sha, "10", *self.FIELDS],
+                     ["--abort"], ["--abort", "../share"], ["--abort", "."], ["--abort", ""], ["--abort", n, "x"],
+                     ["--abort", f"{n}\n"], ["--abort", f"{n}.moved"]):
             with self.subTest(args=args):
                 self.assertEqual(self.ew(*args, data=b"ciphertext"), 2)
                 self.assertIn("usage: oc-upgrade export-write", self.out)
@@ -1541,10 +1928,134 @@ class ExportWriteTests(SecEnv):
     def test_finish_failing_after_the_rename_leaves_nothing_behind_after_abort(self):
         name = self.begin(b"ciphertext")
         with mock.patch.object(G, "_write_new_at", side_effect=OSError(errno.ENOSPC, "No space left on device")):
-            self.assertEqual(self.ew("--finish", name, *self.FIELDS), 1)
+            self.assertEqual(self.finish(name), 1)
         self.assertIn("No space left on device", self.err)
         self.assertEqual(self.ew("--abort", name), 0)
         self.assertFalse(os.path.lexists(self.reh / name), tree(self.reh))
+
+    # Regression: --finish trusts only the sha256 and size --begin printed (the bytes it wrote itself). Another /share
+    # writer replacing the .tmp between the two calls is refused before anything is finalized, and a swapped-in
+    # sparse file is refused by its size, never read to its end.
+    def test_finish_refuses_a_tmp_replaced_after_begin(self):
+        data = os.urandom(64 * 1024 + 7)
+
+        def in_place_same_size(t):
+            with open(t, "r+b") as f:
+                f.seek(1000)
+                f.write(bytes(b ^ 0xFF for b in data[1000:1010]))
+
+        def new_file_same_size(t):
+            q = t.with_name("swap")
+            q.write_bytes(os.urandom(len(data)))
+            os.replace(q, t)
+
+        def larger(t):
+            q = t.with_name("swap")
+            q.write_bytes(data + b"appended")
+            os.replace(q, t)
+
+        def appended_in_place(t):
+            with open(t, "ab") as f:
+                f.write(b"x")
+
+        def shorter(t):
+            os.truncate(t, len(data) - 1)
+
+        cases = [("same size, changed in place", in_place_same_size), ("same size, new file", new_file_same_size),
+                 ("larger file", larger), ("appended in place", appended_in_place), ("shorter", shorter),
+                 ("sparse 1 TiB", lambda t: self.sparse_swap(t, TIB, data[:4096])),
+                 ("sparse 1 TiB of zeros", lambda t: self.sparse_swap(t, TIB))]
+        for label, swap in cases:
+            with self.subTest(label):
+                name = self.begin(data)
+                d = self.reh / name
+                swap(d / G.EXPORT_TMP)
+                left = os.lstat(d / G.EXPORT_TMP)
+                done = self.watchdog()
+                try:
+                    rc = self.finish(name)
+                finally:
+                    elapsed, fired = done()
+                self.assertFalse(fired, "--finish kept reading the swapped-in file")
+                self.assertLess(elapsed, 1.0)
+                self.assertEqual((rc, self.out), (1, ""), self.err)
+                self.assertIn("the export changed after it was written", self.err)
+                # nothing finalized: no archive under its final name, no manifest; the .tmp is back under its name
+                self.assertEqual(os.listdir(d), [G.EXPORT_TMP])
+                st = os.lstat(d / G.EXPORT_TMP)
+                self.assertEqual((st.st_ino, st.st_size), (left.st_ino, left.st_size))
+                self.assertEqual(self.ew("--abort", name), 0, self.err)
+                self.assertFalse(os.path.lexists(d), tree(self.reh))
+        self.assertEqual(os.listdir(self.reh), [])
+
+    def test_finish_refuses_a_record_that_is_not_begins(self):
+        data = b"ciphertext"
+        name = self.begin(data)
+        sha, size = self.begun[name]
+        other = hashlib.sha256(b"other").hexdigest()
+        for record in ((other, size), (sha, str(len(data) + 1)), (sha, "0"), (sha, str(TIB))):
+            with self.subTest(record=record):
+                self.assertEqual(self.finish(name, record=record), 1)
+                self.assertEqual(self.out, "")
+                self.assertEqual(os.listdir(self.reh / name), [G.EXPORT_TMP])
+                self.assertEqual((self.reh / name / G.EXPORT_TMP).read_bytes(), data)
+        self.assertEqual(self.finish(name), 0, self.err)  # the record --begin printed still finishes it
+        self.assertIn(f"sha256={sha}\nsize_bytes={size}\n", (self.reh / name / "manifest.txt").read_text())
+
+    # Regression: names from a /share listing never reach a log line raw, and the sweep only touches directories
+    # named like the export creates them (<ts> or <ts>-XXXXXX): a renamed or foreign directory is left alone, its
+    # .tmp included (it is encrypted, and not the add-on's any more), and an empty directory of its owner survives.
+    def test_foreign_names_in_share_are_never_handled_or_logged(self):
+        fake = "[gate] info: archive sha256 " + "f" * 64 + "…"
+        self.arch.mkdir(parents=True)
+        odd_arch = [G.TOMB_PREFIX + "x\n" + fake,  # a tombstone name whose suffix is no run id
+                    G.TOMB_PREFIX + "20260901T000000Z-abcdef\n",  # `$` accepted the trailing newline
+                    "20260901T000000Z-abcdef\n" + fake, "20260901T000000Z-abcdef\n", "20260901T000000Z-ABCDEF"]
+        for n in odd_arch:
+            (self.arch / n).mkdir()
+            (self.arch / n / "openclaw-state-x.tar.gz.age").write_bytes(G.AGE_MAGIC)
+            self.age_old(self.arch / n, T0 - timedelta(days=30))
+        odd_reh = ["evil\nINFO: fake", "20260901-000000\nINFO: fake", "20260901-000000\n",
+                   "20260901-000000-AbC123.moved", "20260901-000000-AbC12", "x20260901-000000"]
+        for n in odd_reh:
+            d = self.reh / n
+            d.mkdir(parents=True)
+            for f in (G.EXPORT_TMP, "openclaw-rehearsal.tar.gz.tmp", G.EXPORT_FILE):
+                (d / f).write_bytes(b"ENCRYPTED")
+                self.age_old(d / f, T0 - timedelta(days=30))
+        (self.reh / "owner-dir").mkdir()  # empty: a sweep that removes every empty directory would take it
+        (self.reh / "20260901-000001-Empty1.moved").mkdir()
+        before = tree(self.share)
+
+        self.assertEqual(self.ew("--sweep"), 0, self.err)
+        self.assertEqual((self.out, self.err), ("", ""))
+        lines = []
+        self.assertEqual(G.cleanup_pass(now=T0 + timedelta(days=365), hours=48, emit=lines.append), 0)
+        self.assertEqual(G.cleanup_cmd([], emit=lines.append), 0)
+        self.assertEqual(tree(self.share), before)  # nothing touched, moved or removed
+        text = "\n".join(lines)
+        for line in text.splitlines():
+            self.assertFalse(line.startswith(("[gate]", "INFO:")), line)
+        for needle in ("evil", "fake", "abcdef", "ABCDEF", "moved", "owner-dir", "AbC12", "x20260901"):
+            self.assertNotIn(needle, text)
+
+    def test_names_that_are_logged_have_control_characters_escaped(self):
+        self.assertEqual(G.printable("a\nb\rc\x1b[31md\x7f\u2028e…/x y"),
+                         "a\\x0ab\\x0dc\\x1b[31md\\x7f\\x2028e…/x y")
+        # a run whose doctor log names a capture outside the capture root with a control character in its path:
+        # the "kept" WARN shows it escaped, on one line
+        r = SimpleNamespace(rid="20261001T120000Z-0000ff")
+        rd = self.gp["RUNS"] / r.rid
+        rd.mkdir(parents=True)
+        (rd / "journal.json").write_text(json.dumps({"run_id": r.rid, "status": "done", "finished_at": iso(T0)}))
+        bad = f"/tmp/\x08\x08\x08\x1b]0;x\x07doctor-{uuid.uuid4()}"  # backspaces, an OSC title sequence
+        (rd / "doctor-pass1.log").write_text(f"Pre-repair state retained for manual recovery at {bad}/manifest.json.\n")
+        lines = []
+        G.cleanup_pass(now=T0 + H48, hours=48, emit=lines.append)
+        kept = [x for x in lines if "kept" in x]
+        self.assertEqual(len(kept), 1, lines)
+        self.assertIn("/tmp/\\x08\\x08\\x08\\x1b]0;x\\x07doctor-", kept[0])
+        self.assertTrue(all(c.isprintable() for c in kept[0]), kept[0])
 
 
 

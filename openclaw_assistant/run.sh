@@ -1013,7 +1013,7 @@ fi
 export_write() { OC_GATE_FROM_RUNSH=1 oc-upgrade export-write "$@"; }
 
 process_export_request() {
-  local request="${UPG_DIR}/export-request" ts need_kb avail_kb name final reh=/share/openclaw-rehearsal
+  local request="${UPG_DIR}/export-request" ts need_kb avail_kb begun name sha size final reh=/share/openclaw-rehearsal
   # An interrupted export (power loss, SIGKILL) leaves a secret-bearing .tmp
   # behind; remove those on every start, whether or not a new export is due.
   if [ -d /share ]; then
@@ -1054,8 +1054,8 @@ process_export_request() {
   [ -d /config/clawd ] && members+=(clawd)
   # Plugin packages under .openclaw (npm/, extensions/) stay in the copy; only
   # dependency trees inside the workspace are left out.
-  name=""
-  if name="$(umask 077 && tar -C /config \
+  begun="" name=""
+  if begun="$(umask 077 && tar -C /config \
       --exclude='.openclaw/upgrade-backups' \
       --exclude='.openclaw/media' \
       --exclude='.openclaw/logs' \
@@ -1064,10 +1064,15 @@ process_export_request() {
       --exclude='clawd/node_modules' \
       --exclude='clawd/*/node_modules' \
       -czf - "${members[@]}" | "$agebin" -r "$rec" | export_write --begin "$ts")" \
-     && [ -n "$name" ] \
-     && final="$(export_write --finish "$name" "$ts" "${ADDON_VERSION:-unknown}" "$(openclaw_runtime_version || true)" "${rec:0:9}...${rec: -6}")"; then
-    echo "INFO: Rehearsal export ready: ${final}, age-encrypted. Decrypt it only where your private key lives; it is deleted automatically gate_cleanup_hours after it was written."
+     && read -r name sha size <<<"$begun" && [ -n "$name" ] && [ -n "$size" ] \
+     && final="$(export_write --finish "$name" "$sha" "$size" "$ts" "${ADDON_VERSION:-unknown}" "$(openclaw_runtime_version || true)" "${rec:0:9}...${rec: -6}")"; then
+    local keep_h
+    keep_h="$(jq -r '.gate_cleanup_hours // 48' /data/options.json 2>/dev/null || echo 48)"
+    if [ "$keep_h" = "0" ]; then keep_h="it is kept (gate_cleanup_hours=0): delete it yourself after the rehearsal"
+    else keep_h="it is deleted automatically ${keep_h} h after it was written (gate_cleanup_hours)"; fi
+    echo "INFO: Rehearsal export ready: ${final} (sha256 ${sha}, ${size} bytes), age-encrypted. Compare the sha256 of any copy with this line before you decrypt it, only where your private key lives; ${keep_h}."
   else
+    [ -n "${name:-}" ] || name="${begun%% *}"
     [ -n "${name:-}" ] && { export_write --abort "$name" >/dev/null 2>&1 || true; }
     echo "WARN: Rehearsal export failed; nothing was changed. Startup continues."
   fi

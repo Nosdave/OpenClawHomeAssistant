@@ -24,16 +24,19 @@ Commands:
                  Tail of the current gate run's doctor log (redacted).
   cleanup [--apply]
                  List when the gate archives and OpenClaw's doctor captures of
-                 finished gate runs are deleted (gate_cleanup_hours after the
-                 run; the add-on does it by itself), or delete what is due now.
+                 finished gate runs, rehearsal exports and the 2026.7 plaintext
+                 pre-upgrade archives are deleted (gate_cleanup_hours after the
+                 run, the export or the migration; the add-on does it by
+                 itself), or delete what is due now.
   gate --dry-run [--network]
                  Read-only preview of what the migration gate would do.
   export         Request a cold copy of the state for an offline upgrade
                  rehearsal. The copy is written on the NEXT add-on start, before
-                 the gateway starts, to /share/openclaw-rehearsal/<timestamp>/,
-                 encrypted with age to gate_archive_age_recipient (refused
-                 without one: no plaintext copies). `export --cancel` withdraws
-                 the request.
+                 the gateway starts, to /share/openclaw-rehearsal/<timestamp>-
+                 <random>/, encrypted with age to gate_archive_age_recipient
+                 (refused without one: no plaintext copies), and deleted
+                 gate_cleanup_hours after it was written. `export --cancel`
+                 withdraws the request.
   state-guard    Used by run.sh at startup. Exit 3 (with reasons on stdout) when
                  the persistent state was written by a newer OpenClaw than the
                  bundled runtime, 0 otherwise.
@@ -45,6 +48,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 from datetime import datetime, timezone
@@ -539,17 +543,20 @@ def cmd_status(_args):
     else:
         print("No hold.")
     print(f"Export requested: {'yes (runs on next add-on start)' if (upg / 'export-request').exists() else 'no'}")
-    archives = sorted((p["STATE"] / "upgrade-backups").glob("openclaw-state-*.tar.gz"))
+    archives = [(a, st) for a, st in C.safe_children(p["STATE"] / "upgrade-backups")
+                if stat.S_ISREG(st.st_mode) and a.name.startswith("openclaw-state-") and a.name.endswith(".tar.gz")]
     print("Pre-upgrade archives (local, Stage A, 7.x only):")
-    for a in archives or []:
-        print(f"  {a} ({human(a.stat().st_size)}, PLAINTEXT: delete after the rollback window)")
+    for a, st in archives:
+        print(f"  {_gate().printable(a)} ({human(st.st_size)}, PLAINTEXT; deleted automatically after the 2026.8+ migration, "
+              "see oc-upgrade cleanup)")
     if not archives:
         print("  none")
-    rehearsal = sorted((p["SHARE"] / "openclaw-rehearsal").glob("*/openclaw-rehearsal.tar.gz*"))
+    rehearsal = C.safe_files_below(p["SHARE"] / "openclaw-rehearsal",
+                                   lambda n: n.startswith("openclaw-rehearsal.tar.gz"))
     print("Rehearsal exports:")
-    for a in rehearsal or []:
-        kind = "encrypted" if a.name.endswith(".age") else "PLAINTEXT: delete it"
-        print(f"  {a} ({human(a.stat().st_size)}, {kind})")
+    for a, st in rehearsal:
+        kind = "encrypted" if a.name.endswith(".age") else "PLAINTEXT"
+        print(f"  {_gate().printable(a)} ({human(st.st_size)}, {kind}; deleted automatically, see oc-upgrade cleanup)")
     if not rehearsal:
         print("  none")
     print("Migration gate:")
@@ -589,8 +596,10 @@ def cmd_export(args):
         print(f"  - current state size: {human(state_size)} before compression;")
     print(f"  - it is encrypted with age to {short_recipient(ao['recipient'])}; the content holds secrets (tokens,")
     print("    OAuth logins): decrypt it only where your private key lives and never store a decrypted copy;")
-    print(f"  - the add-on deletes it {gate_options()['cleanup_hours']} h after it was written (gate_cleanup_hours, 0 = keep).")
-    print("    Withdraw with: oc-upgrade export --cancel")
+    hours = gate_options()["cleanup_hours"]
+    print(f"  - the add-on deletes it {hours} h after it was written (gate_cleanup_hours)." if hours else
+          "  - it is kept (gate_cleanup_hours=0): delete it yourself after the rehearsal.")
+    print("Withdraw with: oc-upgrade export --cancel")
     return RC_OK
 
 

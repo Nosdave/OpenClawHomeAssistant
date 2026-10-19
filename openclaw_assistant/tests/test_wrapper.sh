@@ -753,6 +753,17 @@ ew_bad --begin 20261018-120000 extra
 ew_bad --finish 20261018-120000-abcdef
 ew_bad --finish ../../config a b c d
 ew_bad --finish 20261018-120000-abcdef a b c d e
+# --finish <dir> <sha256 of --begin> <size of --begin> <created> <addon> <runtime> <recipient>
+EW_SHA="$(printf 'PAYLOAD' | sha256sum | cut -d' ' -f1)"
+ew_bad --finish 20261018-120000-abcdef 20261018-120000 0.5.94-test 2026.10.4 r   # the former shape
+ew_bad --finish 20261018-120000-abcdef "$EW_SHA" 7 20261018-120000 0.5.94-test 2026.10.4
+ew_bad --finish 20261018-120000-abcdef "$EW_SHA" 7 20261018-120000 0.5.94-test 2026.10.4 r extra
+ew_bad --finish 20261018-120000-abcdef "${EW_SHA:0:63}" 7 20261018-120000 0.5.94-test 2026.10.4 r
+ew_bad --finish 20261018-120000-abcdef "${EW_SHA^^}" 7 20261018-120000 0.5.94-test 2026.10.4 r
+ew_bad --finish 20261018-120000-abcdef "$EW_SHA" -7 20261018-120000 0.5.94-test 2026.10.4 r
+ew_bad --finish 20261018-120000-abcdef "$EW_SHA" 7B 20261018-120000 0.5.94-test 2026.10.4 r
+ew_bad --finish 20261018-120000-abcdef 7 "$EW_SHA" 20261018-120000 0.5.94-test 2026.10.4 r
+ew_bad --finish 20261018-120000-abcdef.moved "$EW_SHA" 7 20261018-120000 0.5.94-test 2026.10.4 r
 ew_bad --abort
 ew_bad --abort ../share
 ew_bad --abort 20261018-120000-abcdef/..
@@ -804,11 +815,13 @@ EOF
   echo 'echo "RESULT ok"'
 } > "$XPD/runner.sh"
 
-# tar: records its argv, writes a fixed stream.
+# tar: records its argv, writes a fixed stream; FAKE_TAR_FAIL=1 then exits 2 (a file
+# changed while it was read): the pipeline fails although age and --begin succeeded.
 cat > "$XPD/bin/tar" <<'EOF'
 #!/usr/bin/env bash
 printf '%s\n' "$*" > "${XP_ROOT}/tar.args"
 printf 'FAKE-TAR-STREAM\n'
+if [ "${FAKE_TAR_FAIL:-0}" = "1" ]; then echo "tar: .openclaw/x: file changed as we read it" >&2; exit 2; fi
 EOF
 # age (found through the age-bin record): records its argv, "encrypts" stdin to stdout.
 # It runs while `export_write --begin` streams; with SWAP_AT=age it first waits
@@ -868,17 +881,18 @@ cat > "$XPD/bin/df" <<'EOF'
 printf 'Filesystem 1024-blocks Used Available Capacity Mounted on\n'
 printf 'fake 10000000 1 %s 1%% /share\n' "${FAKE_AVAIL_KB:-9999999}"
 EOF
-# jq: only the `.key // "default"` filters run.sh uses, read from the fake options file.
+# jq: only the `.key // "default"` and `.key // 48` filters run.sh uses, read from the fake options file.
 cat > "$XPD/bin/jq" <<'EOF'
 #!/usr/bin/env python3
 import json, re, sys
 args = [a for a in sys.argv[1:] if a != "-r"]
-m = re.fullmatch(r'\.(\w+) // "(.*)"', args[0])
+m = re.fullmatch(r'\.(\w+) // (?:"(.*)"|(-?[0-9]+))', args[0])
 if not m:
     sys.exit(5)
 with open(args[1]) as f:
     value = json.load(f).get(m.group(1))
-print(m.group(2) if value is None or value is False else value)
+default = m.group(2) if m.group(2) is not None else m.group(3)
+print(default if value is None or value is False else value)
 EOF
 # oc-upgrade: records each call, then runs the real one (section 7). Right before
 # `export-write --finish <dir>` (the fresh directory exists, its .tmp is complete)
@@ -889,6 +903,9 @@ EOF
 #   SWAP_AT=finish with SWAP_ROOT_TO=<dir>  moves the root away, links it to <dir> and
 #                            prepares <dir>/<dir name>/ with a decoy .tmp
 #   SWAP_AT=finish with SWAP_DEST_TO=<dir>  moves the fresh directory away and links it to <dir>
+#   SWAP_TMP_BYTES=1         replaces the .tmp with other bytes of the same size (a new file)
+#   GROW_TMP=<bytes>         appends <bytes> to the .tmp in place
+#   PLANT_MANIFEST_DIR=1     plants a directory at manifest.txt (--finish then fails writing it)
 {
   echo '#!/usr/bin/env bash'
   cat <<'EOF'
@@ -900,6 +917,11 @@ if [ "${1:-}" = export-write ] && [ "${2:-}" = --finish ] && [ -n "${3:-}" ]; th
   if [ -n "${PLANT_TMP:-}" ]; then rm -f "$d/$t" && ln -s "$PLANT_TMP" "$d/$t" && log "planted tmp"; fi
   if [ -n "${PLANT_FINAL:-}" ]; then ln -s "$PLANT_FINAL" "$d/openclaw-rehearsal.tar.gz.age" && log "planted final"; fi
   if [ -n "${PLANT_MANIFEST:-}" ]; then ln -s "$PLANT_MANIFEST" "$d/manifest.txt" && log "planted manifest"; fi
+  if [ "${SWAP_TMP_BYTES:-}" = 1 ]; then
+    tr 'A-Za-z' 'a-zA-Z' < "$d/$t" > "$d/swap" && mv -f -- "$d/swap" "$d/$t" && log "swapped tmp bytes"
+  fi
+  if [ -n "${GROW_TMP:-}" ]; then printf '%s' "$GROW_TMP" >> "$d/$t" && log "grew tmp"; fi
+  if [ "${PLANT_MANIFEST_DIR:-}" = 1 ]; then mkdir "$d/manifest.txt" && log "planted manifest dir"; fi
   if [ "${SWAP_AT:-}" = finish ] && [ -n "${SWAP_ROOT_TO:-}" ]; then
     mkdir -p "$SWAP_ROOT_TO/$3" && printf 'DECOY' > "$SWAP_ROOT_TO/$3/$t"
     mv -T -- "$reh" "$reh.moved" && ln -s "$SWAP_ROOT_TO" "$reh" && log "swapped root"
@@ -958,6 +980,15 @@ xp_ready() {  # $1 = case label: reported ready; log dumped otherwise
   if xp_log_has "INFO: Rehearsal export ready: "; then pass; else fail "export[$1]: not reported ready:"; xp_dump; fi
 }
 xp_tree() { (cd "$1" 2>/dev/null && find . -mindepth 1 | sed 's#^\./##' | LC_ALL=C sort | tr '\n' ' '); }
+xp_ready_line() { grep -m1 '^INFO: Rehearsal export ready: ' "$XP_LOG" || true; }
+# xp_ready_names FILE: the ready line names FILE with FILE's sha256 and size
+xp_ready_names() {
+  local f="$1" line
+  line="$(xp_ready_line)"
+  [[ "$line" == "INFO: Rehearsal export ready: $f (sha256 $(sha256sum "$f" | cut -d' ' -f1), $(stat -c %s "$f") bytes), age-encrypted. "* ]]
+}
+# xp_abort_name: the directory of the `export-write --abort <dir>` call (empty when there was none)
+xp_abort_name() { sed -n 's/^export-write --abort \([0-9]\{8\}-[0-9]\{6\}-[A-Za-z0-9]\{6\}\)$/\1/p' "$XP/oc-upgrade.calls" 2>/dev/null; }
 
 # --- a normal export -----------------------------------------------------------
 xp_setup ok
@@ -976,8 +1007,15 @@ for f in openclaw-rehearsal.tar.gz.age manifest.txt; do
   check "export[ok]: $f mode $(mode_of "$XD/$f") is not 600" [ "$(mode_of "$XD/$f")" = 600 ]
 done
 check "export[ok]: archive is not the age output of the tar stream" cmp -s "$XPD/expected-archive" "$XD/openclaw-rehearsal.tar.gz.age"
-check "export[ok]: the ready line does not name the archive" \
-  xp_log_has "INFO: Rehearsal export ready: $XD/openclaw-rehearsal.tar.gz.age, age-encrypted."
+XSHA="$(sha256sum "$XPD/expected-archive" | cut -d' ' -f1)"
+XSIZE="$(stat -c %s "$XPD/expected-archive")"
+check "export[ok]: the ready line does not name the archive with the sha256 and size of what was written: $(xp_ready_line)" \
+  xp_log_has "INFO: Rehearsal export ready: $XD/openclaw-rehearsal.tar.gz.age (sha256 $XSHA, $XSIZE bytes), age-encrypted. "
+check "export[ok]: the ready line's sha256 and size are not the final archive's: $(xp_ready_line)" \
+  xp_ready_names "$XD/openclaw-rehearsal.tar.gz.age"
+check "export[ok]: the ready line does not say when the export is deleted (gate_cleanup_hours default 48): $(xp_ready_line)" \
+  bash -c '[[ "$1" == *"; it is deleted automatically 48 h after it was written (gate_cleanup_hours)." ]]' _ "$(xp_ready_line)"
+check "export[ok]: not exactly one ready line" [ "$(grep -c '^INFO: Rehearsal export ready: ' "$XP_LOG")" -eq 1 ]
 check "export[ok]: age not run as 'age -r <recipient>' writing to stdout: $(cat "$XP/age.args" 2>/dev/null)" \
   [ "$(cat "$XP/age.args" 2>/dev/null)" = "-r $XP_REC" ]
 check "export[ok]: tar did not archive .openclaw and clawd from the config dir: $(cat "$XP/tar.args" 2>/dev/null)" \
@@ -986,7 +1024,7 @@ XTS="$(basename "$XD" | cut -c1-15)"
 check "export[ok]: oc-upgrade calls are not sweep, begin, finish: $(tr '\n' ',' < "$XP/oc-upgrade.calls" 2>/dev/null)" \
   [ "$(cat "$XP/oc-upgrade.calls" 2>/dev/null)" = "export-write --sweep
 export-write --begin $XTS
-export-write --finish $(basename "$XD") $XTS 0.5.94-test 2026.10.4 ${XP_MASKED#recipient=}" ]
+export-write --finish $(basename "$XD") $XSHA $XSIZE $XTS 0.5.94-test 2026.10.4 ${XP_MASKED#recipient=}" ]
 XM="$XD/manifest.txt"
 check "export[ok]: manifest created_utc is not the directory's timestamp" grep -qxF "created_utc=$XTS" "$XM"
 check "export[ok]: manifest addon_version" grep -qxF "addon_version=0.5.94-test" "$XM"
@@ -1167,6 +1205,61 @@ check "export[age-fails]: --abort not called for the directory --begin made: $(t
   grep -qE -- "^export-write --abort [0-9]{8}-[0-9]{6}-[A-Za-z0-9]{6}$" "$XP/oc-upgrade.calls"
 check "export[age-fails]: something was left in the rehearsal root: $(xp_tree "$XR")" [ -z "$(xp_tree "$XR")" ]
 
+# --- tar fails after --begin succeeded (pipefail): --abort with the name --begin printed
+xp_setup tar-fails
+xp_run FAKE_TAR_FAIL=1
+check "export[tar-fails]: runner did not finish" grep -qx "RESULT ok" "$XP_LOG"
+xp_failed tar-fails
+check "export[tar-fails]: --begin was not run (the case would not test the pipefail branch): $(tr '\n' ',' < "$XP/oc-upgrade.calls" 2>/dev/null)" \
+  grep -qE '^export-write --begin [0-9]{8}-[0-9]{6}$' "$XP/oc-upgrade.calls"
+check "export[tar-fails]: --abort not called with the directory --begin printed: $(tr '\n' ',' < "$XP/oc-upgrade.calls" 2>/dev/null)" \
+  [ -n "$(xp_abort_name)" ]
+check "export[tar-fails]: --finish ran although tar failed" bash -c '! grep -q -- "--finish" "$1"' _ "$XP/oc-upgrade.calls"
+check "export[tar-fails]: something was left in the rehearsal root: $(xp_tree "$XR")" [ -z "$(xp_tree "$XR")" ]
+
+# --- the .tmp changed between --begin and --finish: --finish refuses, --abort removes it
+for how in swap grow; do
+  xp_setup "tmp-$how"
+  if [ "$how" = swap ]; then xp_run SWAP_TMP_BYTES=1; else xp_run GROW_TMP=APPENDED; fi
+  check "export[tmp-$how]: the attacker did nothing: $(cat "$XP/attacker.log" 2>/dev/null)" \
+    grep -qE "^finish: (swapped tmp bytes|grew tmp)$" "$XP/attacker.log"
+  xp_failed "tmp-$how"
+  check "export[tmp-$how]: --finish did not say why it refused" xp_log_has "WARN: rehearsal export: the export changed after it was written"
+  check "export[tmp-$how]: --abort not called: $(tr '\n' ',' < "$XP/oc-upgrade.calls" 2>/dev/null)" [ -n "$(xp_abort_name)" ]
+  check "export[tmp-$how]: something was left in the rehearsal root: $(xp_tree "$XR")" [ -z "$(xp_tree "$XR")" ]
+done
+
+# --- --finish fails writing the manifest (a directory planted at manifest.txt)
+xp_setup finish-fails
+xp_run PLANT_MANIFEST_DIR=1
+check "export[finish-fails]: the attacker planted nothing" grep -qx "finish: planted manifest dir" "$XP/attacker.log"
+check "export[finish-fails]: runner did not finish" grep -qx "RESULT ok" "$XP_LOG"
+xp_failed finish-fails
+check "export[finish-fails]: --finish's WARN missing" xp_log_has "WARN: rehearsal export: "
+XN="$(xp_abort_name)"
+check "export[finish-fails]: --abort not called: $(tr '\n' ',' < "$XP/oc-upgrade.calls" 2>/dev/null)" [ -n "$XN" ]
+check "export[finish-fails]: more than the planted directory was left: $(xp_tree "$XR")" \
+  [ "$(xp_tree "$XR")" = "${XN:-?} ${XN:-?}/manifest.txt " ]
+check "export[finish-fails]: the planted directory is not a directory any more" [ -d "$XR/${XN:-?}/manifest.txt" ]
+
+# --- how long the export is kept: gate_cleanup_hours from the options
+for hours in 0 12; do
+  xp_setup "keep-$hours"
+  printf '{"gate_archive":"encrypted","gate_archive_age_recipient":"%s","gate_cleanup_hours":%s}\n' "$XP_REC" "$hours" > "$XP/options.json"
+  xp_run
+  xp_ready "keep-$hours"
+  if [ "$hours" = 0 ]; then
+    want="; it is kept (gate_cleanup_hours=0): delete it yourself after the rehearsal."
+  else
+    want="; it is deleted automatically 12 h after it was written (gate_cleanup_hours)."
+  fi
+  check "export[keep-$hours]: the ready line does not end with '$want': $(xp_ready_line)" \
+    bash -c '[[ "$1" == *"$2" ]]' _ "$(xp_ready_line)" "$want"
+  XD="$(xp_dirs "$XR" | head -n 1)"
+  check "export[keep-$hours]: the ready line does not name the archive with its sha256 and size: $(xp_ready_line)" \
+    xp_ready_names "${XD:-$XR/missing}/openclaw-rehearsal.tar.gz.age"
+done
+
 # --- the stale .tmp sweep (no request): links removed, linked dirs never entered --
 xp_setup sweep
 rm -f "$XP/upg/export-request"
@@ -1183,7 +1276,17 @@ printf 'OUTSIDE' > "$XP/outside/openclaw-rehearsal.tar.gz.tmp"
 ln -s "$XP/outside" "$XR/20260101-000004-DDDDDD"
 printf 'DONE' > "$XR/20260101-000005-EEEEEE/openclaw-rehearsal.tar.gz.age"
 printf 'M' > "$XR/20260101-000005-EEEEEE/manifest.txt"
+# not named like the export's directories: never entered, emptied or removed, never logged
+XEVIL="$XR/evil"$'\n'"INFO: fake"
+mkdir -p "$XR/20260101-000006-FFFFFF.moved" "$XR/owner-notes" "$XEVIL"
+printf 'ENCRYPTED' > "$XR/20260101-000006-FFFFFF.moved/openclaw-rehearsal.tar.gz.age.tmp"
+printf 'ENCRYPTED' > "$XEVIL/openclaw-rehearsal.tar.gz.age.tmp"
 xp_run
+check "sweep: a .tmp in a directory not named like the export's was removed" bash -c \
+  '[ "$(cat "$1/openclaw-rehearsal.tar.gz.age.tmp")" = ENCRYPTED ] && [ "$(cat "$2/openclaw-rehearsal.tar.gz.age.tmp")" = ENCRYPTED ]' \
+  _ "$XR/20260101-000006-FFFFFF.moved" "$XEVIL"
+check "sweep: an empty directory of another owner was removed" [ -d "$XR/owner-notes" ]
+check "sweep: a name from the listing forged a log line" bash -c '! grep -q "^INFO: fake" "$1" && ! grep -q "FFFFFF.moved" "$1"' _ "$XP_LOG"
 check "sweep: runner did not finish" grep -qx "RESULT ok" "$XP_LOG"
 check "sweep: plain .age.tmp and its empty directory not removed" \
   bash -c '[ ! -e "$1/openclaw-rehearsal.tar.gz.age.tmp" ] && [ ! -e "$1" ]' _ "$XR/20260101-000000-AAAAAA"
@@ -1204,17 +1307,31 @@ check "sweep: expected 4 removals logged" [ "$(grep -c "WARN: Removed incomplete
 check "sweep: an export ran without a request" bash -c '[ ! -e "$1/tar.args" ] && [ ! -e "$1/age.args" ]' _ "$XP"
 check "sweep: expected only the finished export as a real <ts>-XXXXXX directory, got $(xp_count "$XR")" [ "$(xp_count "$XR")" -eq 1 ]
 # the next start sweeps what the planted-link and the swap cases above left behind:
-# the links and the .tmp go, nothing behind a link is touched
+# the links and the .tmp in the export's own directories go, nothing behind a link
+# is touched, and a directory someone renamed (<dir>.moved) is not the add-on's any
+# more: left alone, its .tmp included (it is encrypted)
+# xp_own_tmps DIR: *.tmp in DIR's subdirectories named like the export's (<ts> or <ts>-XXXXXX)
+xp_own_tmps() {
+  find "$1" -mindepth 2 -maxdepth 2 -name '*.tmp' | while IFS= read -r f; do
+    [[ "$(basename "$(dirname "$f")")" =~ ^[0-9]{8}-[0-9]{6}(-[A-Za-z0-9]{6})?$ ]] && printf '%s ' "$f"
+  done
+  return 0
+}
 for c in plant-predictable swap-dest-finish; do
   XP="$XPD/case-$c"
   XR="$XP/share/openclaw-rehearsal"
   before="$(cat "$XP/victim" 2>/dev/null; stat -c %a "$XP/victim" 2>/dev/null; xp_tree "$XP/config")"
+  moved_before="$(find "$XR" -mindepth 1 -maxdepth 1 -name '*.moved' -exec sha256sum {}/openclaw-rehearsal.tar.gz.age.tmp \;)"
   xp_run
   check "sweep[$c]: something behind a link changed" \
     [ "$before" = "$(cat "$XP/victim" 2>/dev/null; stat -c %a "$XP/victim" 2>/dev/null; xp_tree "$XP/config")" ]
-  check "sweep[$c]: a .tmp is left in the rehearsal root: $(cd "$XR" && find . -name '*.tmp' | tr '\n' ' ')" \
-    [ -z "$(find "$XR" -name '*.tmp')" ]
+  check "sweep[$c]: a .tmp is left in an export directory: $(xp_own_tmps "$XR")" [ -z "$(xp_own_tmps "$XR")" ]
+  check "sweep[$c]: a renamed directory or its .tmp was touched" \
+    [ "$moved_before" = "$(find "$XR" -mindepth 1 -maxdepth 1 -name '*.moved' -exec sha256sum {}/openclaw-rehearsal.tar.gz.age.tmp \;)" ]
+  check "sweep[$c]: a renamed directory was logged" bash -c '! grep -q "\.moved" "$1"' _ "$XP_LOG"
 done
+check "sweep[swap-dest-finish]: the case left no renamed directory with a .tmp to leave alone" \
+  [ -n "$(find "$XPD/case-swap-dest-finish/share/openclaw-rehearsal" -mindepth 2 -maxdepth 2 -path '*.moved/*.tmp')" ]
 
 # ------------------------------------------------------------------------------
 # 9. run.sh shutdown(): the archive-cleanup loop gets SIGKILL only while
