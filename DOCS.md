@@ -1134,12 +1134,15 @@ again, or runs a maintenance gate (backup check, doctor) if the state needs it.
 #### Backup HOLD codes
 
 These come from the precheck, before anything is changed (`State: unchanged`).
-Like every HOLD they stay until `oc-upgrade retry` and a restart.
+When a run that was interrupted after its first write resumes, the precheck checks
+again that the backup it recorded still exists and is encrypted; if not, the same
+codes appear with `State: partially migrated`. Like every HOLD they stay until
+`oc-upgrade retry` and a restart.
 
 | Code | Class | Cause | What to do |
 |---|---|---|---|
 | `ha-backup-missing` | acceptable | No encrypted full or partial backup with this add-on from the last `gate_backup_max_age_hours`, or, for an OpenClaw update, the recent ones hold the new add-on version (taken after the update: restoring them would not bring back the previous OpenClaw). The message lists what the gate found. | See below. |
-| `agent-db-outside-config` | acceptable | An agent database lies outside `/config` (registered with an absolute path, for example under `/share` or `/media`). Doctor migrates it one-way, but a backup of the add-on alone does not contain it. | Move the agent below `/config` (re-register it), or make sure the encrypted backup holds that folder (a full backup includes `/share` and `/media`), then `oc-upgrade retry --accept agent-db-outside-config` and restart. |
+| `data-outside-config` | acceptable | An agent database or a workspace lies outside `/config` (an absolute path, for example under `/share` or `/media`). The migration changes it (doctor migrates agent databases one-way and imports workspace attestations), but a backup of the add-on alone does not contain it. | Move the agent or workspace below `/config`, or make sure the encrypted backup holds that folder (a full backup includes `/share` and `/media`), then `oc-upgrade retry --accept data-outside-config` and restart. |
 | `ha-backup-unverified` | acceptable | The backup list could not be read: no usable Supervisor token, an HTTP error (401/403: the add-on lacks Supervisor API access), no answer (or no complete answer in time) from the Supervisor, an answer that is not the expected JSON, or the add-on version inside a backup could not be read. | If the cause was temporary, `oc-upgrade retry` and restart check again. Otherwise check in **Settings → System → Backups** that an encrypted backup with this add-on (for an update: with the previous add-on version) exists, then `oc-upgrade retry --accept ha-backup-unverified` and restart. |
 
 **`ha-backup-missing`: what to do.** For an OpenClaw update the backup must hold

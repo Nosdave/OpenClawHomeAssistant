@@ -2525,9 +2525,24 @@ class Full3ReviewTests(GateEnv):
         self.assertEqual(self.run_gate(), 20, self.out)
         j = self.journal()
         self.assertEqual((j["hold"]["code"], j["hold"]["acceptable"], j["first_write_at"]),
-                         ("agent-db-outside-config", True, None))
+                         ("data-outside-config", True, None))
         self.assertIn(str(ext / src.name), j["hold"]["message"])
-        self.assertIn("oc-upgrade retry --accept agent-db-outside-config", (self.upg / "hold.txt").read_text())
+        self.assertIn("oc-upgrade retry --accept data-outside-config", (self.upg / "hold.txt").read_text())
+
+    def test_workspace_outside_config_holds_acceptably_before_any_write(self):
+        self.build_735()
+        self.hooks()
+        ext = self.tmp / "share" / "ws-helper"
+        (ext / "memory").mkdir(parents=True)
+        cfg = json.loads(json.dumps(CFG_735))
+        cfg["agents"]["list"].append({"id": "helper", "workspace": str(ext)})
+        self.write_cfg(cfg)
+        self.assertEqual(self.run_gate(), 20, self.out)
+        j = self.journal()
+        self.assertEqual((j["hold"]["code"], j["hold"]["acceptable"], j["first_write_at"]),
+                         ("data-outside-config", True, None))
+        self.assertIn(str(ext), j["hold"]["message"])
+        self.assertNotIn(str(self.ws), j["hold"]["message"])  # the workspace below /config is fine
 
     def test_leftovers_with_cleanup_off_are_reported_as_kept(self):
         self.build_735()

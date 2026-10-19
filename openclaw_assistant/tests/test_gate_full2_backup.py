@@ -880,7 +880,7 @@ class BackupCheckGateTests(T.GateEnv):
         self.assertEqual(self.run_gate(), 0, self.out)
         self.assertEqual(self.journal()["ha_backup"]["slug"], "pre1")
 
-    def test_resume_after_the_first_write_skips_the_check(self):
+    def interrupted_after_the_first_write(self):
         self.build_735()
         self.set_backups([self.backup("pre1", "Before update", 1)])
         self.sup_hooks(raise_in_phase="fixups")
@@ -889,17 +889,51 @@ class BackupCheckGateTests(T.GateEnv):
         self.assertEqual((j["hold"]["code"], j["phase"]), ("internal-error", "fixups"))
         self.assertTrue(j.get("first_write_at"))
         self.assertEqual(j["ha_backup"]["slug"], "pre1")
-        # the backup list is gone and the Supervisor refuses: the resume must not care
+
+    def test_resume_after_the_first_write_rechecks_only_the_recorded_backup(self):
+        self.interrupted_after_the_first_write()
+        # the backup list is refused and the backup is older than gate_backup_max_age_hours by now: the resume
+        # asks only for the recorded backup
         self.fake.clear()
-        self.set_backups([])
+        self.set_backups([self.backup("pre1", "Before update", 30)])
         self.fake.route("/backups/info", {"result": "error"}, status=500)
         self.sup_hooks()
         self.assertEqual(self.retry(), 0)
         self.assertEqual(self.run_gate(), 0, self.out)
-        self.assertIn("HA backup not re-checked (resume after the first write)", self.out)
-        self.assertEqual(self.fake.requests, [])
+        self.assertIn("HA backup still there ('Before update' (pre1), encrypted)", self.out)
+        self.assertEqual([r["path"] for r in self.fake.requests], ["/backups/pre1/info"])
         self.assertEqual(self.journal()["ha_backup"]["slug"], "pre1")  # the record of the first attempt stays
         self.assert_no_secrets()
+
+    def test_resume_holds_when_the_recorded_backup_is_gone(self):
+        self.interrupted_after_the_first_write()
+        self.set_backups([])  # deleted between the interruption and the retry
+        self.fake.routes.pop("/backups/pre1/info")
+        self.sup_hooks()
+        self.assertEqual(self.retry(), 0)
+        self.assertEqual(self.run_gate(), 20, self.out)
+        j = self.journal()
+        self.assertEqual((j["hold"]["code"], j["hold"]["phase"], j["hold"]["acceptable"]),
+                         ("ha-backup-missing", "precheck", True))
+        self.assertIn("'Before update' (pre1) this run relies on no longer exists", j["hold"]["message"])
+        self.assertTrue(j["hold"]["message"].endswith(ROLLBACK_TAIL))
+        self.assertIn("partially migrated", (self.upg / "hold.txt").read_text())
+        self.assertEqual(j["phases_done"].count("doctor1"), 1)  # nothing re-ran before the HOLD
+        # accepting it continues the migration
+        self.assertEqual(self.retry("--accept", "ha-backup-missing"), 0)
+        self.assertEqual(self.run_gate(), 0, self.out)
+        self.assertEqual(self.journal()["status"], "done")
+        self.assert_no_secrets()
+
+    def test_resume_holds_when_the_recorded_backup_cannot_be_rechecked(self):
+        self.interrupted_after_the_first_write()
+        self.fake.route("/backups/pre1/info", {"result": "error"}, status=500)
+        self.sup_hooks()
+        self.assertEqual(self.retry(), 0)
+        self.assertEqual(self.run_gate(), 20, self.out)
+        h = self.journal()["hold"]
+        self.assertEqual((h["code"], h["acceptable"]), ("ha-backup-unverified", True))
+        self.assertIn("could not be re-checked: HTTP 500", h["message"])
 
     def test_dry_run_previews_the_check(self):
         self.build_735()

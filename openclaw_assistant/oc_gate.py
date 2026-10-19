@@ -73,7 +73,7 @@ ACCEPTABLE = frozenset({
     "doctor-held-back",  # acceptable only on rc 0 (2026.10 reports held stores without failing doctor)
     # no recent encrypted Home Assistant backup with this add-on / the backup list could not be read
     "ha-backup-missing", "ha-backup-unverified",
-    "agent-db-outside-config",  # acceptable once the encrypted backup also holds that folder (a full backup)
+    "data-outside-config",  # acceptable once the encrypted backup also holds that folder (a full backup)
 })
 NO_RETRY = frozenset({"newer-state", "runtime-integrity"})
 # HOLD codes of the gate archive of 0.5.94-full1/full2 (removed in full3): a journal may still hold one
@@ -126,9 +126,9 @@ ADVICE = {
     "ha-backup-missing": "create an encrypted Home Assistant backup that includes this add-on before updating (Settings > "
                          "System > Backups, add-on stopped, stored locally or on a network mount: cloud-only copies are "
                          "not visible to the add-on), then oc-upgrade retry",
-    "agent-db-outside-config": "move the agent below /config (re-register it), or make sure the encrypted Home "
-                               "Assistant backup also holds that folder (a full backup includes /share and /media), "
-                               "then oc-upgrade retry --accept agent-db-outside-config",
+    "data-outside-config": "move the agent or workspace below /config, or make sure the encrypted Home Assistant "
+                           "backup also holds that folder (a full backup includes /share and /media), then "
+                           "oc-upgrade retry --accept data-outside-config",
     "ha-backup-unverified":"the Supervisor backup list could not be read (see the reason): make sure an encrypted backup "
                             "with this add-on exists (Settings > System > Backups), then oc-upgrade retry",
     "legacy-state-dir": "move /config/.clawdbot out of /config (or merge it manually), then oc-upgrade retry",
@@ -1784,10 +1784,12 @@ class Gate:
         root = os.path.realpath(p["CONFIG_ROOT"])
         outside = [a for a in sorted(set((self.cls.get("agent_paths") or {}).values()))
                    if not (os.path.realpath(p["STATE"] / a) + "/").startswith(root + "/")]
+        outside += [str(ws) for ws in workspaces(self.cfg)  # doctor writes there too (workspace attestations)
+                    if os.path.isdir(ws) and not str(ws).startswith(str(p["CONFIG_ROOT"]) + "/")]
         if outside:
-            F.append(finding("agent-db-outside-config", "acceptable",
-                             "agent database(s) outside /config are migrated one-way, but a backup of the add-on "
-                             "alone does not contain them: " + ", ".join(outside[:4]), "precheck"))
+            F.append(finding("data-outside-config", "acceptable",
+                             "agent database(s) or workspace(s) outside /config are changed by the migration, but a "
+                             "backup of the add-on alone does not contain them: " + ", ".join(outside[:4]), "precheck"))
         sizes = self.measure()
         opt = C.gate_options()
         for prob in opt["problems"]:
@@ -1835,7 +1837,7 @@ class Gate:
         if self.hooks.get("skip_backup_check"):
             return "HA backup not checked (test hook)"
         if (self.j or {}).get("first_write_at"):
-            return "HA backup not re-checked (resume after the first write)"
+            return self.recorded_backup_check(F)
         tail = "; the Home Assistant backup is the only rollback point"
         token = C.supervisor_token(self.hooks.get("supervisor_token_file"))
         if not token:
@@ -1910,6 +1912,33 @@ class Gate:
                    f"({ev['total']} listed, {ev['with_slug']} with this add-on; newest with it: {newest})")
         F.append(finding("ha-backup-missing", "acceptable", msg + tail, "precheck"))
         return "HA backup MISSING"
+
+    def recorded_backup_check(self, F):
+        """Resume after the first write: the backup this run's precheck accepted must still exist and be
+        encrypted, because it is the only rollback point for the rest of the one-way migration."""
+        hb = (self.j or {}).get("ha_backup") or {}
+        if not hb.get("slug"):
+            return "HA backup not re-checked (none was recorded for this run)"
+        tail = "; the Home Assistant backup is the only rollback point"
+        name = f"'{hb.get('name')}' ({hb['slug']})"
+        token = C.supervisor_token(self.hooks.get("supervisor_token_file"))
+        try:
+            if not token:
+                raise C.SupervisorError(0, "no Supervisor token")
+            info = C.supervisor_get(f"/backups/{hb['slug']}/info", token, base=self.hooks.get("supervisor_url"))
+        except C.SupervisorError as exc:
+            if exc.status == 404:
+                F.append(finding("ha-backup-missing", "acceptable", f"the backup {name} this run relies on no longer "
+                                 f"exists, and the state is already partially migrated{tail}", "precheck"))
+                return "HA backup MISSING"
+            F.append(finding("ha-backup-unverified", "acceptable", f"the backup {name} this run relies on could not "
+                             f"be re-checked: {exc.message}{tail}", "precheck"))
+            return "HA backup UNVERIFIED"
+        if not backup_protected(info):
+            F.append(finding("ha-backup-missing", "acceptable", f"the backup {name} this run relies on is no longer "
+                             f"encrypted in every location{tail}", "precheck"))
+            return "HA backup NOT ENCRYPTED"
+        return f"HA backup still there ({name}, encrypted)"
 
     def node_capability(self, F):
         node = self.pkg.get("node")
