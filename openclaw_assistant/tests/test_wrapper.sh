@@ -170,6 +170,13 @@ deny "$UPDATE_MSG" --dev --update
 # OpenClaw rewrites `--update` only in the root-option position; after a command
 # word it is that command's (unknown) option, not the update command.
 allow gateway --update
+# The writing-doctor refusal names what `oc-upgrade retry --doctor` does first: the
+# Home Assistant backup check (the gate writes no archive of its own any more).
+invoke doctor --fix
+check "doctor refusal: does not say the gate checks the Home Assistant backup first: err='$ERR'" \
+  grep -qxF "Run: oc-upgrade retry --doctor   and restart the add-on — it first checks for an encrypted Home Assistant backup of the add-on, then runs doctor --fix twice with checks." "$T/stderr"
+check "doctor refusal: still mentions the removed gate archive: err='$ERR'" \
+  bash -c '! grep -qiE "gate_archive|age-encrypted|archives the state" "$1"' _ "$T/stderr"
 EXTRA_ENV=(OC_ADDON_UNSAFE=1)
 allow_unsafe doctor --help
 allow_unsafe doctor --fix --non-interactive
@@ -634,24 +641,59 @@ wait "$pid" || true
 check "loop[control]: the gateway was not restarted" grep -q "^START #2 SHUTTING_DOWN=false$" "$d/log"
 
 # ------------------------------------------------------------------------------
-# 6. run.sh: a stop request during startup skips the cold export and the 7.x
-#    pre-upgrade backup (the Supervisor would kill them mid-way).
+# 6. run.sh: a stop request during startup skips the 7.x pre-upgrade backup (the
+#    Supervisor would kill it mid-way). The rehearsal export is gone: a request an
+#    earlier add-on version left (oc-upgrade export) is removed, never served.
 # ------------------------------------------------------------------------------
 backup_line="$(grep -m1 'then require_upgrade_backup; fi$' "$RUN_SH" || true)"
-export_block="$(grep -B1 -A1 '^  process_export_request$' "$RUN_SH" || true)"
-if [ -z "$backup_line" ] || [ "$(printf '%s\n' "$export_block" | wc -l)" -ne 3 ]; then
-  fail "run.sh: require_upgrade_backup / process_export_request call sites not found"
+if [ -z "$backup_line" ]; then
+  fail "run.sh: require_upgrade_backup call site not found"
 fi
 {
   echo 'runtime_at_least() { return 1; }'
   echo 'require_upgrade_backup() { echo BACKUP; }'
-  echo 'process_export_request() { echo EXPORT; }'
-  printf '%s\n' "$backup_line" "$export_block"
+  printf '%s\n' "$backup_line"
 } > "$T/startup-guards.sh"
-check "startup: export/backup ran after a stop request" \
+check "startup: backup ran after a stop request" \
   [ -z "$(bash -c "set -eu; SHUTTING_DOWN=true; . '$T/startup-guards.sh'")" ]
-check "startup: export/backup skipped without a stop request" \
-  [ "$(bash -c "set -eu; SHUTTING_DOWN=false; . '$T/startup-guards.sh'" | tr '\n' ' ')" = "BACKUP EXPORT " ]
+check "startup: backup skipped without a stop request" \
+  [ "$(bash -c "set -eu; SHUTTING_DOWN=false; . '$T/startup-guards.sh'" | tr '\n' ' ')" = "BACKUP " ]
+
+# No export code is left in run.sh: no process_export_request, no export_write
+# helper, no `oc-upgrade export-write` call, no "Rehearsal export ready" report.
+if grep -nE 'process_export_request|export_write|export-write|Rehearsal export ready' "$RUN_SH" >&2; then
+  fail "run.sh still has rehearsal export code (lines above)"
+else
+  pass
+fi
+# The one line that is left removes the request, at top level, once UPG_DIR is set
+# (set -u: PID 1 would exit on an unset UPG_DIR).
+xreq_line="$(grep -nxF 'rm -f "${UPG_DIR}/export-request" 2>/dev/null || true' "$RUN_SH" || true)"
+upg_dir_line="$(grep -nm1 '^UPG_DIR=' "$RUN_SH" | cut -d: -f1)"
+if [ "$(printf '%s' "$xreq_line" | grep -c .)" -ne 1 ]; then
+  fail "run.sh: not exactly one top-level 'rm -f \"\${UPG_DIR}/export-request\" 2>/dev/null || true': $xreq_line"
+else
+  check "run.sh: the export request is removed (line ${xreq_line%%:*}) before UPG_DIR is set (line ${upg_dir_line:-missing})" \
+    [ "${xreq_line%%:*}" -gt "${upg_dir_line:-999999}" ]
+  {
+    echo 'set -euo pipefail'
+    echo 'UPG_DIR="$1"'
+    printf '%s\n' "${xreq_line#*:}"
+    echo 'echo "RESULT ok"'
+  } > "$T/export-request.sh"
+  mkdir -p "$T/xreq"
+  : > "$T/xreq/export-request"
+  got="$(bash "$T/export-request.sh" "$T/xreq" 2>&1)"
+  check "startup: an export request of an earlier version was not removed ($got)" \
+    bash -c '[ "$1" = "RESULT ok" ] && [ ! -e "$2" ]' _ "$got" "$T/xreq/export-request"
+  got="$(bash "$T/export-request.sh" "$T/xreq" 2>&1)"
+  check "startup: no export request (the usual start) stopped run.sh: $got" [ "$got" = "RESULT ok" ]
+  got="$(bash "$T/export-request.sh" "$T/xreq-missing" 2>&1)"
+  check "startup: a missing upgrade directory stopped run.sh: $got" [ "$got" = "RESULT ok" ]
+  mkdir -p "$T/xreq-dir/export-request"
+  got="$(bash "$T/export-request.sh" "$T/xreq-dir" 2>&1)"
+  check "startup: a directory named export-request stopped run.sh (set -e): $got" [ "$got" = "RESULT ok" ]
+fi
 
 # known_bug DESCRIPTION COMMAND...: asserts the correct behaviour, but the
 # current run.sh is known to fail it. A failure is a KNOWN-BUG skip (not counted
@@ -668,679 +710,15 @@ known_bug() {
     echo "KNOWN-BUG (skipped): $desc" >&2
   fi
 }
-is_plain_file() { [ -f "$1" ] && [ ! -L "$1" ]; }
-mode_of() { stat -c %a "$1" 2>/dev/null || echo missing; }
 
 # ------------------------------------------------------------------------------
-# 7. run.sh export_write: every file operation of the export on /share runs in
-#    `oc-upgrade export-write` (Python, directory fds, O_NOFOLLOW). The helper
-#    only marks the call as run.sh's and passes argv, stdin, stdout and the exit
-#    status through; the real subcommand refuses other callers and other shapes.
-# ------------------------------------------------------------------------------
-if [ -z "$(extract_function process_export_request)" ]; then
-  fail "run.sh has no top-level function process_export_request()"
-fi
-# export_write is a one-line function (extract_function handles multi-line ones only).
-extract_oneliner() { grep -m1 -E "^$1\\(\\) \\{ .*\\}\$" "$RUN_SH" || true; }
-EW_DEF="$(extract_oneliner export_write)"
-if [ -z "$EW_DEF" ]; then
-  fail "run.sh has no one-line top-level function export_write()"
-fi
-W="$T/ew"
-mkdir -p "$W/bin" "$W/share"
-cat > "$W/bin/oc-upgrade" <<'EOF'
-#!/usr/bin/env bash
-# Stub: records how it was called, echoes stdin, exits with $EW_RC.
-{ printf 'FROM_RUNSH=[%s]' "${OC_GATE_FROM_RUNSH-unset}"; for a in "$@"; do printf ' [%s]' "$a"; done; printf '\n'; } > "$EW_LOG"
-cat
-exit "${EW_RC:-0}"
-EOF
-chmod +x "$W/bin/oc-upgrade"
-{
-  echo 'set -euo pipefail'
-  printf '%s\n' "$EW_DEF"
-  echo 'rc=0; export_write "$@" || rc=$?'
-  echo 'echo "AFTER FROM_RUNSH=[${OC_GATE_FROM_RUNSH-unset}] rc=$rc"'
-} > "$W/runner.sh"
-got="$(printf 'STDIN-BYTES\n' | env -u OC_GATE_FROM_RUNSH PATH="$W/bin:$PATH" EW_LOG="$W/log" EW_RC=0 \
-         bash "$W/runner.sh" --finish "a b" "" "c'd" 2>&1)"
-check "export_write: oc-upgrade not called as 'OC_GATE_FROM_RUNSH=1 oc-upgrade export-write <argv>': $(cat "$W/log" 2>/dev/null)" \
-  [ "$(cat "$W/log" 2>/dev/null)" = "FROM_RUNSH=[1] [export-write] [--finish] [a b] [] [c'd]" ]
-check "export_write: stdin/stdout not passed through, or OC_GATE_FROM_RUNSH leaked into the caller: $got" \
-  [ "$got" = "STDIN-BYTES
-AFTER FROM_RUNSH=[unset] rc=0" ]
-got="$(env -u OC_GATE_FROM_RUNSH PATH="$W/bin:$PATH" EW_LOG="$W/log" EW_RC=1 bash "$W/runner.sh" --sweep </dev/null 2>&1)"
-check "export_write: exit status not returned: $got" [ "$got" = "AFTER FROM_RUNSH=[unset] rc=1" ]
-
-# The REAL oc-upgrade (oc_upgrade.py -> oc_gate.export_write) with every path
-# oc_gate.gpaths() uses inside ${XP_ROOT}; section 8 runs the export through it.
-OCU="$T/ocu"
-mkdir -p "$OCU"
-{
-  echo '#!/usr/bin/env bash'
-  echo ': "${XP_ROOT:?}"'
-  echo 'exec env -u OC_GATE_TEST_HOOKS -u OPENCLAW_CONFIG_PATH -u OPENCLAW_WORKSPACE_DIR -u OC_ADDON_ENTRY_FILE \'
-  echo '  OC_UPGRADE_SHARE_DIR="${XP_ROOT}/share" OC_UPGRADE_DIR="${XP_ROOT}/upg" \'
-  echo '  OPENCLAW_STATE_DIR="${XP_ROOT}/config/.openclaw" OC_CONFIG_ROOT="${XP_ROOT}/config" \'
-  echo '  OC_ADDON_OPTIONS_FILE="${XP_ROOT}/options.json" OC_ADDON_PYLIB="${XP_ROOT}/no-pylib" \'
-  printf '  PYTHONDONTWRITEBYTECODE=1 python3 -B %q "$@"\n' "${ADDON_DIR}/oc_upgrade.py"
-} > "$OCU/oc-upgrade"
-chmod +x "$OCU/oc-upgrade"
-# ew_real ARGS...: the real subcommand in $W (stdin: a payload); sets RC and OUT (stdout + stderr).
-ew_real() {
-  RC=0
-  OUT="$(printf 'PAYLOAD' | env -u OC_GATE_FROM_RUNSH XP_ROOT="$W" "$OCU/oc-upgrade" export-write "$@" 2>&1)" || RC=$?
-}
-for args in "--sweep" "--begin 20261018-120000" "--abort 20261018-120000-abcdef"; do
-  # shellcheck disable=SC2086  # word splitting intended
-  ew_real $args
-  check "export-write $args: not refused without OC_GATE_FROM_RUNSH=1 (rc=$RC): $OUT" \
-    bash -c '[ "$1" -eq 2 ] && [[ "$2" == *"used by the add-on itself"* ]]' _ "$RC" "$OUT"
-done
-ew_bad() {  # the real subcommand as run.sh calls it, with an argument shape it must refuse (rc 2)
-  RC=0
-  OUT="$(printf 'PAYLOAD' | env XP_ROOT="$W" OC_GATE_FROM_RUNSH=1 "$OCU/oc-upgrade" export-write "$@" 2>&1)" || RC=$?
-  check "export-write $(printf '[%s] ' "$@"): bad argument shape not refused with rc 2 (rc=$RC): $OUT" \
-    bash -c '[ "$1" -eq 2 ] && [[ "$2" == *"usage: oc-upgrade export-write"* ]]' _ "$RC" "$OUT"
-}
-ew_bad
-ew_bad --bogus
-ew_bad --sweep extra
-ew_bad --begin
-ew_bad --begin 2026-10-18
-ew_bad --begin ../20261018-120000
-ew_bad --begin 20261018-120000 extra
-ew_bad --finish 20261018-120000-abcdef
-ew_bad --finish ../../config a b c d
-ew_bad --finish 20261018-120000-abcdef a b c d e
-# --finish <dir> <sha256 of --begin> <size of --begin> <created> <addon> <runtime> <recipient>
-EW_SHA="$(printf 'PAYLOAD' | sha256sum | cut -d' ' -f1)"
-ew_bad --finish 20261018-120000-abcdef 20261018-120000 0.5.94-test 2026.10.4 r   # the former shape
-ew_bad --finish 20261018-120000-abcdef "$EW_SHA" 7 20261018-120000 0.5.94-test 2026.10.4
-ew_bad --finish 20261018-120000-abcdef "$EW_SHA" 7 20261018-120000 0.5.94-test 2026.10.4 r extra
-ew_bad --finish 20261018-120000-abcdef "${EW_SHA:0:63}" 7 20261018-120000 0.5.94-test 2026.10.4 r
-ew_bad --finish 20261018-120000-abcdef "${EW_SHA^^}" 7 20261018-120000 0.5.94-test 2026.10.4 r
-ew_bad --finish 20261018-120000-abcdef "$EW_SHA" -7 20261018-120000 0.5.94-test 2026.10.4 r
-ew_bad --finish 20261018-120000-abcdef "$EW_SHA" 7B 20261018-120000 0.5.94-test 2026.10.4 r
-ew_bad --finish 20261018-120000-abcdef 7 "$EW_SHA" 20261018-120000 0.5.94-test 2026.10.4 r
-ew_bad --finish 20261018-120000-abcdef.moved "$EW_SHA" 7 20261018-120000 0.5.94-test 2026.10.4 r
-ew_bad --abort
-ew_bad --abort ../share
-ew_bad --abort 20261018-120000-abcdef/..
-check "export-write: a refused call created something in /share: $(cd "$W/share" && find . -mindepth 1 | tr '\n' ' ')" \
-  [ -z "$(ls -A "$W/share")" ]
-
-# ------------------------------------------------------------------------------
-# 8. run.sh process_export_request: the cold rehearsal export in a sandbox.
-#    The functions are extracted verbatim; every absolute path (/share, /config,
-#    /data/options.json, the age-bin record) is rebased onto ${XP_ROOT}.
-#    tar/age/du/df/jq and openclaw_runtime_version are stubs; oc-upgrade is the
-#    REAL oc_upgrade.py (section 7), wrapped by the attacker (another /share
-#    writer) who acts before --begin (du), while --begin streams (age) and
-#    between --begin and --finish (the wrapper).
-# ------------------------------------------------------------------------------
-XPD="$T/xp"
-mkdir -p "$XPD/bin"
-xp_text="$({ printf '%s\n' "$EW_DEF"; extract_function process_export_request; } | sed \
-  -e 's#/usr/local/libexec/oc-addon/age-bin#${XP_ROOT}/age-bin#g' \
-  -e 's#/data/options\.json#${XP_ROOT}/options.json#g' \
-  -e 's#/share#${XP_ROOT}/share#g' \
-  -e 's#/config#${XP_ROOT}/config#g')"
-# Hermetic guard: no absolute path outside the sandbox may survive the rewrite.
-XP_SANDBOXED=true
-if printf '%s\n' "$xp_text" | grep -nE '(^|[^}])/(share|config|data|usr|etc|var|root|home|opt|srv|mnt|run)([/"[:space:]]|$)' >&2; then
-  fail "export: process_export_request has an absolute path the sandbox rewrite does not cover (lines above); export cases not run"
-  XP_SANDBOXED=false
-fi
-if ! printf '%s\n' "$xp_text" | grep -q 'reh=${XP_ROOT}/share/openclaw-rehearsal'; then
-  fail "export: rehearsal root is no longer 'reh=/share/openclaw-rehearsal'; export cases not run"
-  XP_SANDBOXED=false
-fi
-# The design: bash never creates, moves or removes anything on /share itself.
-if extract_function process_export_request | grep -nwE 'mkdir|mktemp|mv|ln|rmdir|cp|touch|write_new_file' >&2; then
-  fail "export: process_export_request operates on files itself (lines above) instead of through export_write"
-fi
-{
-  cat <<'EOF'
-#!/usr/bin/env bash
-set -euo pipefail
-: "${XP_ROOT:?}"
-UPG_DIR="${XP_ROOT}/upg"
-OPENCLAW_CONFIG_DIR="${XP_ROOT}/config/.openclaw"
-ADDON_VERSION="0.5.94-test"
-openclaw_runtime_version() { echo 2026.10.4; }
-EOF
-  printf '%s\n' "$xp_text"
-  echo 'process_export_request'
-  echo 'echo "RESULT ok"'
-} > "$XPD/runner.sh"
-
-# tar: records its argv, writes a fixed stream; FAKE_TAR_FAIL=1 then exits 2 (a file
-# changed while it was read): the pipeline fails although age and --begin succeeded.
-cat > "$XPD/bin/tar" <<'EOF'
-#!/usr/bin/env bash
-printf '%s\n' "$*" > "${XP_ROOT}/tar.args"
-printf 'FAKE-TAR-STREAM\n'
-if [ "${FAKE_TAR_FAIL:-0}" = "1" ]; then echo "tar: .openclaw/x: file changed as we read it" >&2; exit 2; fi
-EOF
-# age (found through the age-bin record): records its argv, "encrypts" stdin to stdout.
-# It runs while `export_write --begin` streams; with SWAP_AT=age it first waits
-# until --begin has opened the root, the fresh directory and the .tmp, then
-#   SWAP_ROOT_TO=<dir>  moves the rehearsal root away and plants a link to <dir>
-#   SWAP_DEST_TO=<dir>  moves the fresh directory away and plants a link to <dir>
-cat > "$XPD/bin/fake-age" <<'EOF'
-#!/usr/bin/env bash
-printf '%s\n' "$*" > "${XP_ROOT}/age.args"
-if [ "${SWAP_AT:-}" = age ]; then
-  reh="${XP_ROOT}/share/openclaw-rehearsal" tmpf=""
-  for _ in $(seq 400); do
-    for f in "$reh"/*/openclaw-rehearsal.tar.gz.age.tmp; do [ -f "$f" ] && tmpf="$f"; done
-    [ -n "$tmpf" ] && break
-    sleep 0.025
-  done
-  if [ -z "$tmpf" ]; then echo "fake-age: --begin never created its .tmp" >&2; exit 1; fi
-  d="$(dirname "$tmpf")"
-  if [ -n "${SWAP_ROOT_TO:-}" ]; then
-    mv -T -- "$reh" "$reh.moved" && ln -s "$SWAP_ROOT_TO" "$reh" && echo "age: swapped root" >> "${XP_ROOT}/attacker.log"
-  fi
-  if [ -n "${SWAP_DEST_TO:-}" ]; then
-    mv -T -- "$d" "$d.moved" && ln -s "$SWAP_DEST_TO" "$d" && echo "age: swapped $(basename "$d")" >> "${XP_ROOT}/attacker.log"
-  fi
-fi
-if [ "${FAKE_AGE_FAIL:-0}" = "1" ]; then printf 'PARTIAL'; cat > /dev/null; exit 1; fi
-printf 'AGE-CIPHERTEXT\n'
-cat
-EOF
-# du: the size estimate. It runs after the stale sweep, before tar | age | --begin;
-# it doubles as the attacker:
-#   PLANT_PREDICTABLE=<victim>  plants links at the old predictable paths
-#                               <root>/<ts>/{...age.tmp,...age,manifest.txt} for ts now-1..now+3
-#   SWAP_ROOT_TO=<dir> (SWAP_AT unset or du)  puts a link to <dir> where the (missing) root belongs
-cat > "$XPD/bin/du" <<'EOF'
-#!/usr/bin/env bash
-reh="${XP_ROOT}/share/openclaw-rehearsal"
-if [ -n "${PLANT_PREDICTABLE:-}" ]; then
-  now="$(date -u +%s)"
-  for off in -1 0 1 2 3; do
-    ts="$(date -u -d "@$((now + off))" +%Y%m%d-%H%M%S)"
-    mkdir -p "$reh/$ts"
-    for f in openclaw-rehearsal.tar.gz.age.tmp openclaw-rehearsal.tar.gz.age manifest.txt; do
-      ln -sfn "$PLANT_PREDICTABLE" "$reh/$ts/$f"
-    done
-  done
-fi
-if [ -n "${SWAP_ROOT_TO:-}" ] && [ "${SWAP_AT:-du}" = du ]; then
-  rmdir "$reh" 2>/dev/null || true
-  ln -s "$SWAP_ROOT_TO" "$reh" && echo "du: swapped root" >> "${XP_ROOT}/attacker.log"
-fi
-printf '%s\t%s\n' 100 "$1"
-printf '%s\ttotal\n' 100
-EOF
-cat > "$XPD/bin/df" <<'EOF'
-#!/usr/bin/env bash
-printf 'Filesystem 1024-blocks Used Available Capacity Mounted on\n'
-printf 'fake 10000000 1 %s 1%% /share\n' "${FAKE_AVAIL_KB:-9999999}"
-EOF
-# jq: only the `.key // "default"` and `.key // 48` filters run.sh uses, read from the fake options file.
-cat > "$XPD/bin/jq" <<'EOF'
-#!/usr/bin/env python3
-import json, re, sys
-args = [a for a in sys.argv[1:] if a != "-r"]
-m = re.fullmatch(r'\.(\w+) // (?:"(.*)"|(-?[0-9]+))', args[0])
-if not m:
-    sys.exit(5)
-with open(args[1]) as f:
-    value = json.load(f).get(m.group(1))
-default = m.group(2) if m.group(2) is not None else m.group(3)
-print(default if value is None or value is False else value)
-EOF
-# oc-upgrade: records each call, then runs the real one (section 7). Right before
-# `export-write --finish <dir>` (the fresh directory exists, its .tmp is complete)
-# the attacker acts:
-#   PLANT_TMP=<target>       replaces the .tmp with a link to <target>
-#   PLANT_FINAL=<target>     plants a link to <target> at the archive's final name
-#   PLANT_MANIFEST=<target>  plants a link to <target> at manifest.txt
-#   SWAP_AT=finish with SWAP_ROOT_TO=<dir>  moves the root away, links it to <dir> and
-#                            prepares <dir>/<dir name>/ with a decoy .tmp
-#   SWAP_AT=finish with SWAP_DEST_TO=<dir>  moves the fresh directory away and links it to <dir>
-#   SWAP_TMP_BYTES=1         replaces the .tmp with other bytes of the same size (a new file)
-#   GROW_TMP=<bytes>         appends <bytes> to the .tmp in place
-#   PLANT_MANIFEST_DIR=1     plants a directory at manifest.txt (--finish then fails writing it)
-{
-  echo '#!/usr/bin/env bash'
-  cat <<'EOF'
-printf '%s\n' "$*" >> "${XP_ROOT}/oc-upgrade.calls"
-reh="${XP_ROOT}/share/openclaw-rehearsal"
-if [ "${1:-}" = export-write ] && [ "${2:-}" = --finish ] && [ -n "${3:-}" ]; then
-  d="$reh/$3" t=openclaw-rehearsal.tar.gz.age.tmp
-  log() { echo "finish: $*" >> "${XP_ROOT}/attacker.log"; }
-  if [ -n "${PLANT_TMP:-}" ]; then rm -f "$d/$t" && ln -s "$PLANT_TMP" "$d/$t" && log "planted tmp"; fi
-  if [ -n "${PLANT_FINAL:-}" ]; then ln -s "$PLANT_FINAL" "$d/openclaw-rehearsal.tar.gz.age" && log "planted final"; fi
-  if [ -n "${PLANT_MANIFEST:-}" ]; then ln -s "$PLANT_MANIFEST" "$d/manifest.txt" && log "planted manifest"; fi
-  if [ "${SWAP_TMP_BYTES:-}" = 1 ]; then
-    tr 'A-Za-z' 'a-zA-Z' < "$d/$t" > "$d/swap" && mv -f -- "$d/swap" "$d/$t" && log "swapped tmp bytes"
-  fi
-  if [ -n "${GROW_TMP:-}" ]; then printf '%s' "$GROW_TMP" >> "$d/$t" && log "grew tmp"; fi
-  if [ "${PLANT_MANIFEST_DIR:-}" = 1 ]; then mkdir "$d/manifest.txt" && log "planted manifest dir"; fi
-  if [ "${SWAP_AT:-}" = finish ] && [ -n "${SWAP_ROOT_TO:-}" ]; then
-    mkdir -p "$SWAP_ROOT_TO/$3" && printf 'DECOY' > "$SWAP_ROOT_TO/$3/$t"
-    mv -T -- "$reh" "$reh.moved" && ln -s "$SWAP_ROOT_TO" "$reh" && log "swapped root"
-  fi
-  if [ "${SWAP_AT:-}" = finish ] && [ -n "${SWAP_DEST_TO:-}" ]; then
-    mv -T -- "$d" "$d.moved" && ln -s "$SWAP_DEST_TO" "$d" && log "swapped $3"
-  fi
-fi
-EOF
-  printf 'exec %q "$@"\n' "$OCU/oc-upgrade"
-} > "$XPD/bin/oc-upgrade"
-chmod +x "$XPD/bin/tar" "$XPD/bin/fake-age" "$XPD/bin/du" "$XPD/bin/df" "$XPD/bin/jq" "$XPD/bin/oc-upgrade"
-
-# A syntactically valid (fake) age public key: age1 + 58 bech32 characters.
-XP_REC="age1$(printf '%s' qpzry9x8gf2tvdw0s3jn54khce6mua7lqpzry9x8gf2tvdw0s3jn54khce6mua7l | cut -c1-58)"
-XP_MASKED="recipient=${XP_REC:0:9}...${XP_REC: -6}"
-printf 'AGE-CIPHERTEXT\nFAKE-TAR-STREAM\n' > "$XPD/expected-archive"
-
-# xp_setup NAME: a fresh sandbox $XP with state, options, the age record and a pending request.
-xp_setup() {
-  XP="$XPD/case-$1"
-  XR="$XP/share/openclaw-rehearsal"
-  mkdir -p "$XP/share" "$XP/config/.openclaw" "$XP/config/clawd" "$XP/upg"
-  printf '{"gateway":{}}\n' > "$XP/config/.openclaw/openclaw.json"
-  printf '{"gate_archive":"encrypted","gate_archive_age_recipient":"%s"}\n' "$XP_REC" > "$XP/options.json"
-  printf '%s\n' "$XPD/bin/fake-age" > "$XP/age-bin"
-  : > "$XP/upg/export-request"
-}
-# xp_run [VAR=VALUE ...]: runs the extracted function (umask 000) in $XP; log in $XP_LOG.
-xp_run() {
-  XP_LOG="$XP/log"
-  if [ "$XP_SANDBOXED" != "true" ]; then : > "$XP_LOG"; return 0; fi
-  (umask 000; env -u OC_GATE_FROM_RUNSH PATH="$XPD/bin:$PATH" XP_ROOT="$XP" "$@" bash "$XPD/runner.sh") > "$XP_LOG" 2>&1 || true
-}
-# xp_dirs DIR: the real (not linked) <ts>-XXXXXX export directories in DIR.
-xp_dirs() {
-  local e
-  for e in "$1"/*; do
-    if [ -d "$e" ] && [ ! -L "$e" ] && [[ "$(basename "$e")" =~ ^[0-9]{8}-[0-9]{6}-[A-Za-z0-9]{6}$ ]]; then
-      printf '%s\n' "$e"
-    fi
-  done
-  return 0
-}
-xp_count() { xp_dirs "$1" | grep -c . ; }
-xp_log_has() { grep -qF -- "$1" "$XP_LOG"; }
-xp_dump() { sed 's/^/    | /' "$XP_LOG" >&2; }
-xp_failed() {  # $1 = case label: reported as failed (not ready); log dumped otherwise
-  if xp_log_has "WARN: Rehearsal export failed; nothing was changed." && ! xp_log_has "Rehearsal export ready"; then
-    pass
-  else
-    fail "export[$1]: not reported as failed (or reported ready):"; xp_dump
-  fi
-}
-xp_ready() {  # $1 = case label: reported ready; log dumped otherwise
-  if xp_log_has "INFO: Rehearsal export ready: "; then pass; else fail "export[$1]: not reported ready:"; xp_dump; fi
-}
-xp_tree() { (cd "$1" 2>/dev/null && find . -mindepth 1 | sed 's#^\./##' | LC_ALL=C sort | tr '\n' ' '); }
-xp_ready_line() { grep -m1 '^INFO: Rehearsal export ready: ' "$XP_LOG" || true; }
-# xp_ready_names FILE: the ready line names FILE with FILE's sha256 and size
-xp_ready_names() {
-  local f="$1" line
-  line="$(xp_ready_line)"
-  [[ "$line" == "INFO: Rehearsal export ready: $f (sha256 $(sha256sum "$f" | cut -d' ' -f1), $(stat -c %s "$f") bytes), age-encrypted. "* ]]
-}
-# xp_abort_name: the directory of the `export-write --abort <dir>` call (empty when there was none)
-xp_abort_name() { sed -n 's/^export-write --abort \([0-9]\{8\}-[0-9]\{6\}-[A-Za-z0-9]\{6\}\)$/\1/p' "$XP/oc-upgrade.calls" 2>/dev/null; }
-
-# --- a normal export -----------------------------------------------------------
-xp_setup ok
-xp_run
-check "export[ok]: runner did not finish" grep -qx "RESULT ok" "$XP_LOG"
-xp_ready ok
-check "export[ok]: expected one fresh <ts>-XXXXXX directory, got $(xp_count "$XR")" [ "$(xp_count "$XR")" -eq 1 ]
-XD="$(xp_dirs "$XR" | head -n 1)"
-XD="${XD:-$XR/missing}"
-check "export[ok]: rehearsal root mode $(mode_of "$XR") is not 700" [ "$(mode_of "$XR")" = 700 ]
-check "export[ok]: directory mode $(mode_of "$XD") is not 700" [ "$(mode_of "$XD")" = 700 ]
-check "export[ok]: directory holds more or less than the archive and manifest: $(LC_ALL=C ls -A "$XD" 2>/dev/null | tr '\n' ' ')" \
-  [ "$(LC_ALL=C ls -A "$XD" 2>/dev/null | tr '\n' ' ')" = "manifest.txt openclaw-rehearsal.tar.gz.age " ]
-for f in openclaw-rehearsal.tar.gz.age manifest.txt; do
-  check "export[ok]: $f is not a regular file" is_plain_file "$XD/$f"
-  check "export[ok]: $f mode $(mode_of "$XD/$f") is not 600" [ "$(mode_of "$XD/$f")" = 600 ]
-done
-check "export[ok]: archive is not the age output of the tar stream" cmp -s "$XPD/expected-archive" "$XD/openclaw-rehearsal.tar.gz.age"
-XSHA="$(sha256sum "$XPD/expected-archive" | cut -d' ' -f1)"
-XSIZE="$(stat -c %s "$XPD/expected-archive")"
-check "export[ok]: the ready line does not name the archive with the sha256 and size of what was written: $(xp_ready_line)" \
-  xp_log_has "INFO: Rehearsal export ready: $XD/openclaw-rehearsal.tar.gz.age (sha256 $XSHA, $XSIZE bytes), age-encrypted. "
-check "export[ok]: the ready line's sha256 and size are not the final archive's: $(xp_ready_line)" \
-  xp_ready_names "$XD/openclaw-rehearsal.tar.gz.age"
-check "export[ok]: the ready line does not say when the export is deleted (gate_cleanup_hours default 48): $(xp_ready_line)" \
-  bash -c '[[ "$1" == *"; it is deleted automatically 48 h after it was written (gate_cleanup_hours)." ]]' _ "$(xp_ready_line)"
-check "export[ok]: not exactly one ready line" [ "$(grep -c '^INFO: Rehearsal export ready: ' "$XP_LOG")" -eq 1 ]
-check "export[ok]: age not run as 'age -r <recipient>' writing to stdout: $(cat "$XP/age.args" 2>/dev/null)" \
-  [ "$(cat "$XP/age.args" 2>/dev/null)" = "-r $XP_REC" ]
-check "export[ok]: tar did not archive .openclaw and clawd from the config dir: $(cat "$XP/tar.args" 2>/dev/null)" \
-  grep -qE -- "^-C $XP/config .* -czf - \.openclaw clawd$" "$XP/tar.args"
-XTS="$(basename "$XD" | cut -c1-15)"
-check "export[ok]: oc-upgrade calls are not sweep, begin, finish: $(tr '\n' ',' < "$XP/oc-upgrade.calls" 2>/dev/null)" \
-  [ "$(cat "$XP/oc-upgrade.calls" 2>/dev/null)" = "export-write --sweep
-export-write --begin $XTS
-export-write --finish $(basename "$XD") $XSHA $XSIZE $XTS 0.5.94-test 2026.10.4 ${XP_MASKED#recipient=}" ]
-XM="$XD/manifest.txt"
-check "export[ok]: manifest created_utc is not the directory's timestamp" grep -qxF "created_utc=$XTS" "$XM"
-check "export[ok]: manifest addon_version" grep -qxF "addon_version=0.5.94-test" "$XM"
-check "export[ok]: manifest openclaw_runtime" grep -qxF "openclaw_runtime=2026.10.4" "$XM"
-check "export[ok]: manifest sha256 is not the archive's" \
-  grep -qxF "sha256=$(sha256sum "$XD/openclaw-rehearsal.tar.gz.age" 2>/dev/null | cut -d' ' -f1)" "$XM"
-check "export[ok]: manifest size_bytes" grep -qxF "size_bytes=$(stat -c %s "$XD/openclaw-rehearsal.tar.gz.age" 2>/dev/null)" "$XM"
-check "export[ok]: manifest encrypted/contains_secrets" bash -c 'grep -qx "encrypted=age" "$1" && grep -qx "contains_secrets=yes" "$1"' _ "$XM"
-check "export[ok]: manifest recipient not masked" grep -qxF "$XP_MASKED" "$XM"
-check "export[ok]: manifest holds the full recipient" bash -c '! grep -qF "$1" "$2"' _ "$XP_REC" "$XM"
-check "export[ok]: the request was not consumed" [ ! -e "$XP/upg/export-request" ]
-# a second export (same second or not) gets its own fresh directory
-: > "$XP/upg/export-request"
-xp_run
-check "export[ok]: second export did not get a second fresh directory ($(xp_count "$XR"))" [ "$(xp_count "$XR")" -eq 2 ]
-check "export[ok]: first export changed by the second" cmp -s "$XPD/expected-archive" "$XD/openclaw-rehearsal.tar.gz.age"
-check "export[ok]: first export's manifest changed by the second" grep -qxF "created_utc=$XTS" "$XM"
-
-# --- plaintext is never written: gate_archive off -> skipped --------------------
-xp_setup plaintext
-printf '{"gate_archive":"off","gate_archive_age_recipient":"%s"}\n' "$XP_REC" > "$XP/options.json"
-xp_run
-check "export[plaintext]: not skipped" xp_log_has "WARN: Rehearsal export skipped: it needs gate_archive: encrypted"
-check "export[plaintext]: something was written" bash -c '[ ! -e "$1/share/openclaw-rehearsal" ] && [ ! -e "$1/tar.args" ]' _ "$XP"
-check "export[plaintext]: the one-shot request was kept" [ ! -e "$XP/upg/export-request" ]
-check "export[plaintext]: export-write called for more than the sweep: $(tr '\n' ',' < "$XP/oc-upgrade.calls" 2>/dev/null)" \
-  [ "$(cat "$XP/oc-upgrade.calls" 2>/dev/null)" = "export-write --sweep" ]
-
-# --- the rehearsal root is a symlink / not a directory: nothing written outside --
-xp_setup root-link
-mkdir -p "$XP/elsewhere/20260101-000000-AAAAAA"
-printf 'PARTIAL\n' > "$XP/elsewhere/20260101-000000-AAAAAA/openclaw-rehearsal.tar.gz.age.tmp"
-ln -s "$XP/elsewhere" "$XR"
-xp_run
-check "export[root-link]: runner did not finish" grep -qx "RESULT ok" "$XP_LOG"
-check "export[root-link]: the sweep did not refuse the linked root" \
-  xp_log_has "WARN: Could not check $XR for incomplete exports"
-xp_failed root-link
-check "export[root-link]: something was written into the link target: $(xp_tree "$XP/elsewhere")" \
-  [ "$(xp_tree "$XP/elsewhere")" = "20260101-000000-AAAAAA 20260101-000000-AAAAAA/openclaw-rehearsal.tar.gz.age.tmp " ]
-check "export[root-link]: the stale sweep entered the linked root" \
-  is_plain_file "$XP/elsewhere/20260101-000000-AAAAAA/openclaw-rehearsal.tar.gz.age.tmp"
-check "export[root-link]: the link was replaced" bash -c '[ -L "$1" ] && [ "$(readlink "$1")" = "$2" ]' _ "$XR" "$XP/elsewhere"
-check "export[root-link]: --finish ran without a directory from --begin" bash -c '! grep -q -- "--finish" "$1"' _ "$XP/oc-upgrade.calls"
-check "export[root-link]: the one-shot request was kept" [ ! -e "$XP/upg/export-request" ]
-xp_setup root-dangling
-ln -s "$XP/nowhere" "$XR"
-xp_run
-xp_failed root-dangling
-check "export[root-dangling]: the link target was created" bash -c '[ ! -e "$1" ] && [ ! -L "$1" ]' _ "$XP/nowhere"
-check "export[root-dangling]: the link was replaced" bash -c '[ -L "$1" ] && [ "$(readlink "$1")" = "$2" ]' _ "$XR" "$XP/nowhere"
-xp_setup root-file
-printf 'NOT A DIR\n' > "$XR"
-xp_run
-xp_failed root-file
-check "export[root-file]: the file changed" bash -c 'is() { [ -f "$1" ] && [ ! -L "$1" ]; }; is "$1" && [ "$(cat "$1")" = "NOT A DIR" ]' _ "$XR"
-check "export[root-file]: something was created next to it: $(xp_tree "$XP/share")" [ "$(xp_tree "$XP/share")" = "openclaw-rehearsal " ]
-
-# --- links planted at the old predictable paths (between sweep and write) -------
-xp_setup plant-predictable
-printf 'VICTIM\n' > "$XP/victim"
-chmod 644 "$XP/victim"
-xp_run PLANT_PREDICTABLE="$XP/victim"
-check "export[plant-predictable]: the du stub planted nothing" [ "$(find "$XR" -mindepth 2 -maxdepth 2 -type l -name manifest.txt | wc -l)" -ge 3 ]
-check "export[plant-predictable]: victim written through a planted link" \
-  bash -c '[ "$(cat "$1")" = VICTIM ] && [ "$(stat -c %a "$1")" = 644 ]' _ "$XP/victim"
-xp_ready plant-predictable
-check "export[plant-predictable]: export not in one fresh directory" [ "$(xp_count "$XR")" -eq 1 ]
-XD="$(xp_dirs "$XR" | head -n 1)"
-check "export[plant-predictable]: archive not a regular 0600 file in the fresh directory" \
-  bash -c '[ -f "$1" ] && [ ! -L "$1" ] && [ "$(stat -c %a "$1")" = 600 ]' _ "${XD:-$XR/missing}/openclaw-rehearsal.tar.gz.age"
-
-# --- links planted inside the fresh directory -----------------------------------
-# --begin creates the directory and opens it and its .tmp (O_EXCL|O_NOFOLLOW)
-# before anyone can know its name, so the earliest an attacker can plant is after
-# --begin, right before --finish (the oc-upgrade wrapper).
-xp_setup plant-tmp
-printf 'VICTIM\n' > "$XP/victim"
-xp_run PLANT_TMP="$XP/victim"
-check "export[plant-tmp]: the attacker planted nothing" grep -qx "finish: planted tmp" "$XP/attacker.log"
-check "export[plant-tmp]: victim written or removed through the planted .tmp link" [ "$(cat "$XP/victim" 2>/dev/null)" = VICTIM ]
-xp_failed plant-tmp
-check "export[plant-tmp]: --abort did not remove the planted link and the fresh directory: $(xp_tree "$XR")" \
-  [ "$(xp_count "$XR")" -eq 0 ]
-check "export[plant-tmp]: an archive or manifest was written somewhere: $(xp_tree "$XR")" \
-  [ -z "$(find "$XP" \( -name openclaw-rehearsal.tar.gz.age -o -name manifest.txt \) -print)" ]
-
-xp_setup plant-final-dir
-mkdir -p "$XP/victim-dir"
-xp_run PLANT_FINAL="$XP/victim-dir"
-check "export[plant-final-dir]: the attacker planted nothing" grep -qx "finish: planted final" "$XP/attacker.log"
-check "export[plant-final-dir]: archive moved into the linked directory: $(ls -A "$XP/victim-dir" | tr '\n' ' ')" \
-  [ -z "$(ls -A "$XP/victim-dir")" ]
-xp_ready plant-final-dir
-XD="$(xp_dirs "$XR" | head -n 1)"
-XD="${XD:-$XR/missing}"
-check "export[plant-final-dir]: the archive is not a regular 0600 file replacing the link" \
-  bash -c '[ -f "$1" ] && [ ! -L "$1" ] && [ "$(stat -c %a "$1")" = 600 ]' _ "$XD/openclaw-rehearsal.tar.gz.age"
-check "export[plant-final-dir]: archive content" cmp -s "$XPD/expected-archive" "$XD/openclaw-rehearsal.tar.gz.age"
-
-xp_setup plant-final-file
-printf 'VICTIM\n' > "$XP/victim"
-xp_run PLANT_FINAL="$XP/victim"
-check "export[plant-final-file]: the attacker planted nothing" grep -qx "finish: planted final" "$XP/attacker.log"
-check "export[plant-final-file]: victim written through the planted archive link" [ "$(cat "$XP/victim")" = VICTIM ]
-xp_ready plant-final-file
-XD="$(xp_dirs "$XR" | head -n 1)"
-XD="${XD:-$XR/missing}"
-check "export[plant-final-file]: the archive is still a link" is_plain_file "$XD/openclaw-rehearsal.tar.gz.age"
-check "export[plant-final-file]: archive content" cmp -s "$XPD/expected-archive" "$XD/openclaw-rehearsal.tar.gz.age"
-
-xp_setup plant-manifest
-printf 'VICTIM\n' > "$XP/victim"
-xp_run PLANT_MANIFEST="$XP/victim"
-check "export[plant-manifest]: the attacker planted nothing" grep -qx "finish: planted manifest" "$XP/attacker.log"
-check "export[plant-manifest]: victim written through the planted manifest link" [ "$(cat "$XP/victim")" = VICTIM ]
-xp_ready plant-manifest
-XD="$(xp_dirs "$XR" | head -n 1)"
-XD="${XD:-$XR/missing}"
-check "export[plant-manifest]: the manifest is not a regular 0600 file replacing the link" \
-  bash -c '[ -f "$1" ] && [ ! -L "$1" ] && [ "$(stat -c %a "$1")" = 600 ]' _ "$XD/manifest.txt"
-check "export[plant-manifest]: manifest sha256 is not the archive's" \
-  grep -qxF "sha256=$(sha256sum "$XD/openclaw-rehearsal.tar.gz.age" 2>/dev/null | cut -d' ' -f1)" "$XD/manifest.txt"
-check "export[plant-manifest]: directory holds more or less than the archive and manifest: $(LC_ALL=C ls -A "$XD" 2>/dev/null | tr '\n' ' ')" \
-  [ "$(LC_ALL=C ls -A "$XD" 2>/dev/null | tr '\n' ' ')" = "manifest.txt openclaw-rehearsal.tar.gz.age " ]
-
-# --- the root or the fresh directory swapped to a link: the fds keep the export --
-# The bash implementation opened these paths again by name after its checks (the
-# former KNOWN-BUG checks export[swap-root] / export[swap-dest]). Now --begin
-# holds directory fds and --finish / --abort open every component O_NOFOLLOW: a
-# swap before --begin, while it streams, or before --finish redirects nothing.
-# The victim is the sandbox's /config/.openclaw.
-for at in du age finish; do
-  xp_setup "swap-root-$at"
-  V="$XP/config/.openclaw"
-  xp_run SWAP_AT="$at" SWAP_ROOT_TO="$V"
-  check "export[swap-root]($at): the attacker did not swap the root: $(cat "$XP/attacker.log" 2>/dev/null)" \
-    bash -c '[ -L "$1" ] && grep -qx "$2: swapped root" "$3"' _ "$XR" "$at" "$XP/attacker.log"
-  xp_failed "swap-root($at)"
-  if [ "$at" = finish ]; then
-    # the attacker prepared <victim>/<dir>/ with a decoy .tmp: a --finish or --abort following the link would use it
-    XN="$(basename "$(xp_dirs "$XR.moved" | head -n 1)")"
-    check "export[swap-root]($at): export created through a rehearsal root swapped to a link: $(xp_tree "$V")" \
-      [ "$(xp_tree "$V")" = "$XN $XN/openclaw-rehearsal.tar.gz.age.tmp openclaw.json " ]
-    check "export[swap-root]($at): the decoy behind the link was changed" [ "$(cat "$V/$XN/openclaw-rehearsal.tar.gz.age.tmp" 2>/dev/null)" = DECOY ]
-  else
-    check "export[swap-root]($at): export created through a rehearsal root swapped to a link: $(xp_tree "$V")" \
-      [ "$(xp_tree "$V")" = "openclaw.json " ]
-  fi
-  if [ "$at" != du ]; then
-    XD="$(xp_dirs "$XR.moved" | head -n 1)"
-    check "export[swap-root]($at): --begin did not keep writing into the real (moved) directory" \
-      cmp -s "$XPD/expected-archive" "${XD:-$XR.moved/missing}/openclaw-rehearsal.tar.gz.age.tmp"
-  fi
-done
-for at in age finish; do
-  xp_setup "swap-dest-$at"
-  V="$XP/config/.openclaw"
-  printf 'DECOY' > "$V/openclaw-rehearsal.tar.gz.age.tmp"  # what a --finish / --abort following the link would use
-  xp_run SWAP_AT="$at" SWAP_DEST_TO="$V"
-  XL="$(find "$XR" -mindepth 1 -maxdepth 1 -type l | head -n 1)"
-  check "export[swap-dest]($at): the attacker did not swap the fresh directory: $(cat "$XP/attacker.log" 2>/dev/null)" \
-    bash -c '[ -n "$1" ] && [ -d "$1.moved" ] && grep -qx "$2: swapped $(basename "$1")" "$3"' _ "$XL" "$at" "$XP/attacker.log"
-  xp_failed "swap-dest($at)"
-  check "export[swap-dest]($at): export written through a fresh directory swapped to a link: $(xp_tree "$V")" \
-    [ "$(xp_tree "$V")" = "openclaw-rehearsal.tar.gz.age.tmp openclaw.json " ]
-  check "export[swap-dest]($at): the decoy behind the link was changed" [ "$(cat "$V/openclaw-rehearsal.tar.gz.age.tmp")" = DECOY ]
-  check "export[swap-dest]($at): --begin did not keep writing into the real (moved) directory" \
-    cmp -s "$XPD/expected-archive" "${XL:-$XR/missing}.moved/openclaw-rehearsal.tar.gz.age.tmp"
-done
-
-# --- age fails: --abort leaves nothing (no partial .tmp, no directory) ------------
-xp_setup age-fails
-xp_run FAKE_AGE_FAIL=1
-check "export[age-fails]: runner did not finish" grep -qx "RESULT ok" "$XP_LOG"
-xp_failed age-fails
-check "export[age-fails]: --abort not called for the directory --begin made: $(tr '\n' ',' < "$XP/oc-upgrade.calls" 2>/dev/null)" \
-  grep -qE -- "^export-write --abort [0-9]{8}-[0-9]{6}-[A-Za-z0-9]{6}$" "$XP/oc-upgrade.calls"
-check "export[age-fails]: something was left in the rehearsal root: $(xp_tree "$XR")" [ -z "$(xp_tree "$XR")" ]
-
-# --- tar fails after --begin succeeded (pipefail): --abort with the name --begin printed
-xp_setup tar-fails
-xp_run FAKE_TAR_FAIL=1
-check "export[tar-fails]: runner did not finish" grep -qx "RESULT ok" "$XP_LOG"
-xp_failed tar-fails
-check "export[tar-fails]: --begin was not run (the case would not test the pipefail branch): $(tr '\n' ',' < "$XP/oc-upgrade.calls" 2>/dev/null)" \
-  grep -qE '^export-write --begin [0-9]{8}-[0-9]{6}$' "$XP/oc-upgrade.calls"
-check "export[tar-fails]: --abort not called with the directory --begin printed: $(tr '\n' ',' < "$XP/oc-upgrade.calls" 2>/dev/null)" \
-  [ -n "$(xp_abort_name)" ]
-check "export[tar-fails]: --finish ran although tar failed" bash -c '! grep -q -- "--finish" "$1"' _ "$XP/oc-upgrade.calls"
-check "export[tar-fails]: something was left in the rehearsal root: $(xp_tree "$XR")" [ -z "$(xp_tree "$XR")" ]
-
-# --- the .tmp changed between --begin and --finish: --finish refuses, --abort removes it
-for how in swap grow; do
-  xp_setup "tmp-$how"
-  if [ "$how" = swap ]; then xp_run SWAP_TMP_BYTES=1; else xp_run GROW_TMP=APPENDED; fi
-  check "export[tmp-$how]: the attacker did nothing: $(cat "$XP/attacker.log" 2>/dev/null)" \
-    grep -qE "^finish: (swapped tmp bytes|grew tmp)$" "$XP/attacker.log"
-  xp_failed "tmp-$how"
-  check "export[tmp-$how]: --finish did not say why it refused" xp_log_has "WARN: rehearsal export: the export changed after it was written"
-  check "export[tmp-$how]: --abort not called: $(tr '\n' ',' < "$XP/oc-upgrade.calls" 2>/dev/null)" [ -n "$(xp_abort_name)" ]
-  check "export[tmp-$how]: something was left in the rehearsal root: $(xp_tree "$XR")" [ -z "$(xp_tree "$XR")" ]
-done
-
-# --- --finish fails writing the manifest (a directory planted at manifest.txt)
-xp_setup finish-fails
-xp_run PLANT_MANIFEST_DIR=1
-check "export[finish-fails]: the attacker planted nothing" grep -qx "finish: planted manifest dir" "$XP/attacker.log"
-check "export[finish-fails]: runner did not finish" grep -qx "RESULT ok" "$XP_LOG"
-xp_failed finish-fails
-check "export[finish-fails]: --finish's WARN missing" xp_log_has "WARN: rehearsal export: "
-XN="$(xp_abort_name)"
-check "export[finish-fails]: --abort not called: $(tr '\n' ',' < "$XP/oc-upgrade.calls" 2>/dev/null)" [ -n "$XN" ]
-check "export[finish-fails]: more than the planted directory was left: $(xp_tree "$XR")" \
-  [ "$(xp_tree "$XR")" = "${XN:-?} ${XN:-?}/manifest.txt " ]
-check "export[finish-fails]: the planted directory is not a directory any more" [ -d "$XR/${XN:-?}/manifest.txt" ]
-
-# --- how long the export is kept: gate_cleanup_hours from the options
-for hours in 0 12; do
-  xp_setup "keep-$hours"
-  printf '{"gate_archive":"encrypted","gate_archive_age_recipient":"%s","gate_cleanup_hours":%s}\n' "$XP_REC" "$hours" > "$XP/options.json"
-  xp_run
-  xp_ready "keep-$hours"
-  if [ "$hours" = 0 ]; then
-    want="; it is kept (gate_cleanup_hours=0): delete it yourself after the rehearsal."
-  else
-    want="; it is deleted automatically 12 h after it was written (gate_cleanup_hours)."
-  fi
-  check "export[keep-$hours]: the ready line does not end with '$want': $(xp_ready_line)" \
-    bash -c '[[ "$1" == *"$2" ]]' _ "$(xp_ready_line)" "$want"
-  XD="$(xp_dirs "$XR" | head -n 1)"
-  check "export[keep-$hours]: the ready line does not name the archive with its sha256 and size: $(xp_ready_line)" \
-    xp_ready_names "${XD:-$XR/missing}/openclaw-rehearsal.tar.gz.age"
-done
-
-# --- the stale .tmp sweep (no request): links removed, linked dirs never entered --
-xp_setup sweep
-rm -f "$XP/upg/export-request"
-mkdir -p "$XR/20260101-000000-AAAAAA" "$XR/20260101-000001" "$XR/20260101-000002-BBBBBB" \
-  "$XR/20260101-000003-CCCCCC" "$XR/20260101-000005-EEEEEE" "$XP/outside"
-printf 'PARTIAL' > "$XR/20260101-000000-AAAAAA/openclaw-rehearsal.tar.gz.age.tmp"
-printf 'PARTIAL' > "$XR/20260101-000001/openclaw-rehearsal.tar.gz.tmp"
-printf 'KEEP' > "$XR/20260101-000001/notes.txt"
-printf 'VICTIM' > "$XP/victim"
-ln -s "$XP/victim" "$XR/20260101-000002-BBBBBB/openclaw-rehearsal.tar.gz.age.tmp"
-ln -s "$XP/nowhere" "$XR/20260101-000003-CCCCCC/openclaw-rehearsal.tar.gz.tmp"
-printf 'OUTSIDE' > "$XP/outside/openclaw-rehearsal.tar.gz.age.tmp"
-printf 'OUTSIDE' > "$XP/outside/openclaw-rehearsal.tar.gz.tmp"
-ln -s "$XP/outside" "$XR/20260101-000004-DDDDDD"
-printf 'DONE' > "$XR/20260101-000005-EEEEEE/openclaw-rehearsal.tar.gz.age"
-printf 'M' > "$XR/20260101-000005-EEEEEE/manifest.txt"
-# not named like the export's directories: never entered, emptied or removed, never logged
-XEVIL="$XR/evil"$'\n'"INFO: fake"
-mkdir -p "$XR/20260101-000006-FFFFFF.moved" "$XR/owner-notes" "$XEVIL"
-printf 'ENCRYPTED' > "$XR/20260101-000006-FFFFFF.moved/openclaw-rehearsal.tar.gz.age.tmp"
-printf 'ENCRYPTED' > "$XEVIL/openclaw-rehearsal.tar.gz.age.tmp"
-xp_run
-check "sweep: a .tmp in a directory not named like the export's was removed" bash -c \
-  '[ "$(cat "$1/openclaw-rehearsal.tar.gz.age.tmp")" = ENCRYPTED ] && [ "$(cat "$2/openclaw-rehearsal.tar.gz.age.tmp")" = ENCRYPTED ]' \
-  _ "$XR/20260101-000006-FFFFFF.moved" "$XEVIL"
-check "sweep: an empty directory of another owner was removed" [ -d "$XR/owner-notes" ]
-check "sweep: a name from the listing forged a log line" bash -c '! grep -q "^INFO: fake" "$1" && ! grep -q "FFFFFF.moved" "$1"' _ "$XP_LOG"
-check "sweep: runner did not finish" grep -qx "RESULT ok" "$XP_LOG"
-check "sweep: plain .age.tmp and its empty directory not removed" \
-  bash -c '[ ! -e "$1/openclaw-rehearsal.tar.gz.age.tmp" ] && [ ! -e "$1" ]' _ "$XR/20260101-000000-AAAAAA"
-check "sweep: plain .tmp not removed" [ ! -e "$XR/20260101-000001/openclaw-rehearsal.tar.gz.tmp" ]
-check "sweep: other files or a non-empty directory removed" [ "$(cat "$XR/20260101-000001/notes.txt" 2>/dev/null)" = KEEP ]
-check "sweep: .tmp link to a file not removed" \
-  bash -c '[ ! -e "$1" ] && [ ! -L "$1" ]' _ "$XR/20260101-000002-BBBBBB/openclaw-rehearsal.tar.gz.age.tmp"
-check "sweep: the link target was removed or changed" bash -c '[ -f "$1" ] && [ "$(cat "$1")" = VICTIM ]' _ "$XP/victim"
-check "sweep: dangling .tmp link not removed" [ ! -L "$XR/20260101-000003-CCCCCC/openclaw-rehearsal.tar.gz.tmp" ]
-check "sweep: dangling link target created" bash -c '[ ! -e "$1" ] && [ ! -L "$1" ]' _ "$XP/nowhere"
-check "sweep: entered a linked <ts> directory" bash -c \
-  '[ "$(cat "$1/openclaw-rehearsal.tar.gz.age.tmp")" = OUTSIDE ] && [ "$(cat "$1/openclaw-rehearsal.tar.gz.tmp")" = OUTSIDE ]' _ "$XP/outside"
-check "sweep: the linked <ts> directory was replaced" bash -c '[ -L "$1" ] && [ "$(readlink "$1")" = "$2" ]' _ "$XR/20260101-000004-DDDDDD" "$XP/outside"
-check "sweep: logged a file in a linked <ts> directory" bash -c '! grep -q "20260101-000004-DDDDDD" "$1"' _ "$XP_LOG"
-check "sweep: a finished export was touched" \
-  bash -c '[ "$(cat "$1/openclaw-rehearsal.tar.gz.age")" = DONE ] && [ "$(cat "$1/manifest.txt")" = M ]' _ "$XR/20260101-000005-EEEEEE"
-check "sweep: expected 4 removals logged" [ "$(grep -c "WARN: Removed incomplete rehearsal export" "$XP_LOG")" -eq 4 ]
-check "sweep: an export ran without a request" bash -c '[ ! -e "$1/tar.args" ] && [ ! -e "$1/age.args" ]' _ "$XP"
-check "sweep: expected only the finished export as a real <ts>-XXXXXX directory, got $(xp_count "$XR")" [ "$(xp_count "$XR")" -eq 1 ]
-# the next start sweeps what the planted-link and the swap cases above left behind:
-# the links and the .tmp in the export's own directories go, nothing behind a link
-# is touched, and a directory someone renamed (<dir>.moved) is not the add-on's any
-# more: left alone, its .tmp included (it is encrypted)
-# xp_own_tmps DIR: *.tmp in DIR's subdirectories named like the export's (<ts> or <ts>-XXXXXX)
-xp_own_tmps() {
-  find "$1" -mindepth 2 -maxdepth 2 -name '*.tmp' | while IFS= read -r f; do
-    [[ "$(basename "$(dirname "$f")")" =~ ^[0-9]{8}-[0-9]{6}(-[A-Za-z0-9]{6})?$ ]] && printf '%s ' "$f"
-  done
-  return 0
-}
-for c in plant-predictable swap-dest-finish; do
-  XP="$XPD/case-$c"
-  XR="$XP/share/openclaw-rehearsal"
-  before="$(cat "$XP/victim" 2>/dev/null; stat -c %a "$XP/victim" 2>/dev/null; xp_tree "$XP/config")"
-  moved_before="$(find "$XR" -mindepth 1 -maxdepth 1 -name '*.moved' -exec sha256sum {}/openclaw-rehearsal.tar.gz.age.tmp \;)"
-  xp_run
-  check "sweep[$c]: something behind a link changed" \
-    [ "$before" = "$(cat "$XP/victim" 2>/dev/null; stat -c %a "$XP/victim" 2>/dev/null; xp_tree "$XP/config")" ]
-  check "sweep[$c]: a .tmp is left in an export directory: $(xp_own_tmps "$XR")" [ -z "$(xp_own_tmps "$XR")" ]
-  check "sweep[$c]: a renamed directory or its .tmp was touched" \
-    [ "$moved_before" = "$(find "$XR" -mindepth 1 -maxdepth 1 -name '*.moved' -exec sha256sum {}/openclaw-rehearsal.tar.gz.age.tmp \;)" ]
-  check "sweep[$c]: a renamed directory was logged" bash -c '! grep -q "\.moved" "$1"' _ "$XP_LOG"
-done
-check "sweep[swap-dest-finish]: the case left no renamed directory with a .tmp to leave alone" \
-  [ -n "$(find "$XPD/case-swap-dest-finish/share/openclaw-rehearsal" -mindepth 2 -maxdepth 2 -path '*.moved/*.tmp')" ]
-
-# ------------------------------------------------------------------------------
-# 9. run.sh shutdown(): the archive-cleanup loop gets SIGKILL only while
+# 7. run.sh shutdown(): the cleanup loop gets SIGKILL only while
 #    `kill -0` still succeeds (a reaped PID may have been reused); kill is a stub.
 # ------------------------------------------------------------------------------
 SC="$T/stop-cleanup"
 mkdir -p "$SC"
 if ! extract_function shutdown | grep -q 'kill -KILL "${CLEANUP_PID}"'; then
-  fail "run.sh shutdown() no longer sends SIGKILL to the archive cleanup loop"
+  fail "run.sh shutdown() no longer sends SIGKILL to the cleanup loop"
 fi
 {
   cat <<'EOF'

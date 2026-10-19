@@ -6,15 +6,14 @@ passed through the OC_GATE_TEST_HOOKS doctor_cmd hook. The real oc_migrate is us
 """
 
 import copy
+import hashlib
 import io
 import json
 import os
 import shutil
-import socket
 import sqlite3
 import stat
 import sys
-import tarfile
 import tempfile
 import threading
 import time
@@ -31,31 +30,6 @@ import oc_common as C  # noqa: E402
 import oc_gate as G  # noqa: E402
 
 _REAL_WHICH = shutil.which
-
-
-def _age_key():
-    """A throwaway age key pair for the encrypted-archive tests (no files): (identity, recipient) or (None, None)."""
-    import subprocess
-    if not (_REAL_WHICH("age") and _REAL_WHICH("age-keygen")):
-        return None, None
-    try:
-        ident = subprocess.run(["age-keygen"], capture_output=True, text=True, check=True).stdout
-        ident = next(x for x in ident.splitlines() if x.startswith("AGE-SECRET-KEY-"))
-        pub = subprocess.run(["age-keygen", "-y"], input=ident + "\n", capture_output=True, text=True,
-                             check=True).stdout.strip()
-        return ident, pub
-    except (OSError, subprocess.CalledProcessError, StopIteration):
-        return None, None
-
-
-AGE_IDENTITY, AGE_PUB = _age_key()
-HAVE_AGE = AGE_PUB is not None
-
-
-def age_decrypt(path):
-    import subprocess
-    return subprocess.run(["age", "-d", "-i", "-", str(path)], input=(AGE_IDENTITY + "\n").encode(),
-                          capture_output=True, check=True).stdout
 
 
 def which_without_npm(name, *a, **kw):
@@ -257,8 +231,7 @@ class GateEnv(unittest.TestCase):
                   "SQLITE_TMPDIR", "OC_GATE_FROM_RUNSH"):
             os.environ.pop(k, None)
         os.environ["OPENCLAW_CONFIG_PATH"] = str(self.state / "openclaw.json")
-        self.base_options = ({"gate_archive": "encrypted", "gate_archive_age_recipient": AGE_PUB} if HAVE_AGE
-                             else {"gate_archive": "off"})
+        self.base_options = {}  # options every test starts from (the gate needs none since 0.5.94-full3)
         self.options()
         G.STOP.clear()
         G._STOP_SIG[0] = None
@@ -389,7 +362,7 @@ class DecideTests(unittest.TestCase):
 
     def test_retry_before_first_write_when_nothing_left_closes_run(self):
         j = {"status": "hold", "run_id": "r1", "mode": "bump", "phase": "precheck", "first_write_at": None,
-             "hold": {"code": "low-disk-share", "phase": "precheck"}}
+             "hold": {"code": "low-disk-config", "phase": "precheck"}}
         d = G.decide(ctx(journal=j, retry={}))
         self.assertEqual(d["rc"], 0)
         self.assertEqual(d["bk"]["journal_status"], "done")
@@ -404,6 +377,7 @@ class DecideTests(unittest.TestCase):
         self.assertEqual(d["bk"]["journal_status"], "done")
         d = G.decide(ctx(journal=j, retry={}, marker=marker, cls=cls_of("gate", state_uv=19)))
         self.assertEqual((d["rc"], d["mode"], d["new_run"]), (10, "maintenance", True))
+        self.assertEqual(d["reason"], "retry after exit78: maintenance gate (backup check, doctor)")
         d = G.decide(ctx(journal=j, retry={"doctor": True}, marker=marker))
         self.assertEqual((d["rc"], d["mode"]), (10, "maintenance"))
 
@@ -593,7 +567,6 @@ class ClassifyTests(GateEnv):
         self.assertEqual(G.classify(self.state, {}, 19, 24, RUNTIME)["files_verdict"], "gate")
 
     def test_B5_legacy_dir_attestation(self):
-        import hashlib
         make_99_state(self.state)
         key = hashlib.sha256(str(self.ws).encode()).hexdigest()
         d = self.root / ".clawdbot" / "workspace-attestations"
@@ -788,7 +761,7 @@ class DoctorNotesTests(unittest.TestCase):
         g.emit = lines.append
         g.resolve([G.finding("canonical-openai-refs", "info", "3 canonical openai/* refs/keys will be pinned"),
                    G.finding("x", "warn", "w")], "precheck")
-        self.assertEqual(lines, ["[gate] 1/9 info: 3 canonical openai/* refs/keys will be pinned", "WARN [gate] x: w"])
+        self.assertEqual(lines, ["[gate] 1/8 info: 3 canonical openai/* refs/keys will be pinned", "WARN [gate] x: w"])
         g.cleanup_tmp()
 
 
@@ -1041,25 +1014,24 @@ class SpaceTests(unittest.TestCase):
         return lambda p: mock.Mock(free=free[p])
 
     def needs(self):
-        return [("/config", "/c", 6 * C.GIB, "low-disk-config"), ("/share", "/s", 3 * C.GIB, "low-disk-share"),
-                ("sqlite-tmp", "/t", 2 * C.GIB, "low-disk-tmp")]
+        # the precheck's needs since 0.5.94-full3 (no /share: the gate writes no archive)
+        return [("/config", "/c", 6 * C.GIB, "low-disk-config"), ("sqlite-tmp", "/t", 2 * C.GIB, "low-disk-tmp")]
 
     def test_shared_disk_sum(self):
-        fs = {"/c": {"dev": 1, "mm": "8:1", "fstype": "ext4"}, "/s": {"dev": 1, "mm": "8:1", "fstype": "ext4"},
-              "/t": {"dev": 5, "mm": "0:50", "fstype": "overlay"}}
-        free = {"/c": 10 * C.GIB, "/s": 10 * C.GIB, "/t": 40 * C.GIB}
+        fs = {"/c": {"dev": 1, "mm": "8:1", "fstype": "ext4"}, "/t": {"dev": 5, "mm": "0:50", "fstype": "overlay"}}
+        free = {"/c": 7 * C.GIB, "/t": 40 * C.GIB}
         with mock.patch.object(G, "existing_parent", side_effect=lambda p: p):
             F, summary = G.space_check(self.needs(), disk_usage=self.du(free), fsinfo=lambda p: fs[p])
-        self.assertEqual([f["code"] for f in F], ["low-disk-config"])  # 11 GiB > 10 GiB (overlay not distinct)
-        self.assertIn("/config+/share+sqlite-tmp need 11.0 GiB have 10.0 GiB", summary)
+        self.assertEqual([f["code"] for f in F], ["low-disk-config"])  # 8 GiB > 7 GiB (overlay not distinct)
+        self.assertIn("/config+sqlite-tmp need 8.0 GiB have 7.0 GiB", summary)
 
     def test_distinct_filesystems(self):
-        fs = {"/c": {"dev": 1, "mm": "8:1", "fstype": "ext4"}, "/s": {"dev": 2, "mm": "8:2", "fstype": "ext4"},
-              "/t": {"dev": 3, "mm": "0:60", "fstype": "tmpfs"}}
-        free = {"/c": 7 * C.GIB, "/s": 4 * C.GIB, "/t": 1 * C.GIB}
+        fs = {"/c": {"dev": 1, "mm": "8:1", "fstype": "ext4"}, "/t": {"dev": 3, "mm": "0:60", "fstype": "tmpfs"}}
+        free = {"/c": 7 * C.GIB, "/t": 1 * C.GIB}
         with mock.patch.object(G, "existing_parent", side_effect=lambda p: p):
-            F, _s = G.space_check(self.needs(), disk_usage=self.du(free), fsinfo=lambda p: fs[p])
+            F, summary = G.space_check(self.needs(), disk_usage=self.du(free), fsinfo=lambda p: fs[p])
         self.assertEqual([f["code"] for f in F], ["low-disk-tmp"])
+        self.assertEqual(summary, "/config need 6.0 GiB have 7.0 GiB; sqlite-tmp need 2.0 GiB have 1.0 GiB")
 
     def test_proven_distinct(self):
         a = {"dev": 1, "mm": "8:1", "fstype": "ext4"}
@@ -1081,185 +1053,6 @@ class SpaceTests(unittest.TestCase):
             self.assertEqual(ident["mm"], "0:50")
         finally:
             os.unlink(f.name)
-
-
-# --- archive -------------------------------------------------------------------------------------
-
-class ArchiveTests(GateEnv):
-    def setUp(self):
-        super().setUp()
-        make_735_state(self.state)
-        self.write_cfg(CFG_735)
-        (self.state / "logs").mkdir()
-        (self.state / "logs" / "big.log").write_text("x" * 5000)
-        (self.state / "tailscale").mkdir()
-        self.sock = socket.socket(socket.AF_UNIX)
-        self.sock.bind(str(self.state / "tailscale" / "tailscaled.sock"))
-        os.symlink("../openclaw.json", self.state / "tailscale" / "link-to-config")
-        (self.state / "memory.sqlite-wal").write_bytes(b"wal-bytes")
-        (self.ws / "AGENTS.md").write_text("# a\n")
-        (self.ws / "node_modules").mkdir()
-        (self.ws / "node_modules" / "x.js").write_text("x")
-        Path(f"{self.ws}.attested").write_bytes(G.ATTESTATION_HEADER)
-
-    def tearDown(self):
-        self.sock.close()
-        super().tearDown()
-
-    def gate(self):
-        g = G.Gate(emit=lambda s: None)
-        g.pkg = C.runtime_package()
-        g.cfg = dict(CFG_735)
-        g.j = {"run_id": "r-arch", "mode": "from-7x", "history": [], "source": {"config_last_touched": "2026.7.35"},
-               "auth_profiles": [{"agent": "main", "id": "openai-codex:default", "provider": "openai-codex",
-                                  "type": "oauth", "expires_utc": "2100-01-01T00:00:00Z", "expires_ms": 1}],
-               "archive_opt": {"mode": "encrypted", "recipient": AGE_PUB, "age_version": "test"}}
-        return g
-
-    def fake_bin(self, name, body):
-        f = self.bin / name
-        f.write_text("#!/bin/sh\n" + body)
-        f.chmod(0o755)
-        return str(f)
-
-    @unittest.skipUnless(HAVE_AGE, "age not installed")
-    def test_archive_create_and_verify(self):
-        g = self.gate()
-        g.phase_archive()
-        a = g.j["archive"]
-        adir = Path(a["dir"])
-        self.assertEqual(adir, self.share / "openclaw-upgrade" / "r-arch")
-        self.assertEqual(stat.S_IMODE(adir.stat().st_mode), 0o700)
-        arch = adir / a["file"]
-        self.assertRegex(a["file"], r"^openclaw-state-\d{8}-\d{6}-before-2026\.9\.9\.tar\.gz\.age$")
-        self.assertEqual(stat.S_IMODE(arch.stat().st_mode), 0o600)
-        self.assertEqual(list(adir.glob("*.tmp")), [])
-        raw = arch.read_bytes()
-        self.assertTrue(raw.startswith(G.AGE_MAGIC))
-        hdr = G.age_header(arch)
-        self.assertIn("X25519", hdr["stanzas"])
-        self.assertEqual(len(raw), G.age_cipher_size(hdr["len"], a["plaintext_size"]))
-        plain = age_decrypt(arch)
-        self.assertEqual(C.sha256_file(arch), a["sha256"])
-        import hashlib
-        self.assertEqual(hashlib.sha256(plain).hexdigest(), a["plaintext_sha256"])
-        with tarfile.open(fileobj=io.BytesIO(plain), mode="r:gz") as tf:
-            names = set(tf.getnames())
-        self.assertIn(".openclaw/state/openclaw.sqlite", names)
-        self.assertIn(".openclaw/agents/main/agent/openclaw-agent.sqlite", names)
-        self.assertIn(".openclaw/tailscale/link-to-config", names)
-        self.assertNotIn(".openclaw/tailscale/tailscaled.sock", names)
-        self.assertNotIn(".openclaw/logs/big.log", names)
-        self.assertIn("clawd/AGENTS.md", names)
-        self.assertNotIn("clawd/node_modules/x.js", names)
-        self.assertIn("clawd.attested", names)
-        sums = (adir / "SHA256SUMS").read_text().split()
-        self.assertEqual(sums, [a["sha256"], a["file"]])
-        man = json.loads((adir / "manifest.json").read_text())
-        self.assertEqual(man["kind"], "openclaw-addon-pre-migration-archive")
-        self.assertEqual((man["schema"], man["format"]), (2, "tar.gz+age"))
-        self.assertEqual(man["archive"]["sha256"], a["sha256"])
-        # only the short form: the full recipient stays in the journal (a.recipient below)
-        self.assertEqual(man["encryption"]["recipients"], [C.short_recipient(AGE_PUB)])
-        self.assertNotIn(AGE_PUB, json.dumps(man))
-        self.assertTrue(man["contains_secrets"] and man["encrypted"])
-        self.assertNotIn("id", man["auth_profiles"][0])
-        self.assertIn(".openclaw/state/openclaw.sqlite", [s["path"] for s in man["sqlite"]])
-        self.assertNotIn("SECRET", json.dumps(man))
-        for f in self.share.rglob("*"):  # no plaintext gzip anywhere under /share
-            if f.is_file():
-                self.assertFalse(f.read_bytes().startswith(b"\x1f\x8b"), f)
-        self.assertTrue(a["verified"])
-        self.assertEqual((a["mode"], a["recipient"]), ("encrypted", AGE_PUB))
-
-    @unittest.skipUnless(HAVE_AGE, "age not installed")
-    def test_verify_detects_mismatch_and_corruption(self):
-        g = self.gate()
-        real = C.sha256_file
-
-        def bad_sha(path, *a, **kw):
-            return "0" * 64 if str(path).endswith("state/openclaw.sqlite") else real(path, *a, **kw)
-        with mock.patch.object(C, "sha256_file", side_effect=bad_sha):
-            with self.assertRaises(G.HoldError) as cm:
-                g.phase_archive()
-        self.assertEqual(cm.exception.findings[0]["code"], "archive-verify-failed")
-        self.assertIn("state/openclaw.sqlite", cm.exception.findings[0]["message"])
-        self.assertEqual(list((self.share / "openclaw-upgrade" / "r-arch").glob("*.age*")), [])
-        g = self.gate()
-        g.phase_archive()
-        g.j["first_write_at"] = "2026-10-18T00:00:00Z"
-        self.assertTrue(g.archive_intact())
-        arch = Path(g.j["archive"]["dir"]) / g.j["archive"]["file"]
-        data = bytearray(arch.read_bytes())
-        data[-5] ^= 0xFF
-        arch.write_bytes(bytes(data))
-        self.assertFalse(g.archive_intact())
-
-    @unittest.skipUnless(HAVE_AGE, "age not installed")
-    def test_truncating_age_is_detected(self):
-        real_age = shutil.which("age")
-        fake = self.fake_bin("trunc-age", f'"{real_age}" "$@" | head -c -1\n')
-        g = self.gate()
-        with mock.patch.dict(os.environ, {"OC_ADDON_AGE": fake}):
-            with self.assertRaises(G.HoldError) as cm:
-                g.phase_archive()
-        self.assertEqual(cm.exception.findings[0]["code"], "archive-verify-failed")
-        self.assertEqual(list((self.share / "openclaw-upgrade" / "r-arch").glob("*.age*")), [])
-
-    def test_archive_failure_is_hold(self):
-        g = self.gate()
-        g.j["archive_opt"]["recipient"] = AGE_PUB or "age1" + "q" * 58
-        self.fake_bin("tar", "echo 'tar: boom' >&2\nexit 2\n")
-        cat = self.fake_bin("cat-age", "cat >/dev/null\n")
-        with mock.patch.dict(os.environ, {"OC_ADDON_AGE": cat}):
-            with self.assertRaises(G.HoldError) as cm:
-                g.phase_archive()
-        self.assertEqual(cm.exception.findings[0]["code"], "archive-failed")
-        self.assertIn("tar rc 2", cm.exception.findings[0]["message"])
-        (self.bin / "tar").unlink()
-        failing = self.fake_bin("bad-age", "cat >/dev/null\necho 'age: no space left on device' >&2\nexit 1\n")
-        g = self.gate()
-        g.j["archive_opt"]["recipient"] = AGE_PUB or "age1" + "q" * 58
-        with mock.patch.dict(os.environ, {"OC_ADDON_AGE": failing}):
-            with self.assertRaises(G.HoldError) as cm:
-                g.phase_archive()
-        self.assertEqual(cm.exception.findings[0]["code"], "archive-failed")
-        self.assertIn("age rc 1", cm.exception.findings[0]["message"])
-        self.assertEqual(list((self.share / "openclaw-upgrade" / "r-arch").glob("*.tmp")), [])
-
-    def test_archive_timeout_kills_both(self):
-        g = self.gate()
-        g.j["archive_opt"]["recipient"] = AGE_PUB or "age1" + "q" * 58
-        self.fake_bin("tar", "sleep 30\n")
-        cat = self.fake_bin("cat-age", "cat >/dev/null\n")
-        t0 = time.monotonic()
-        with mock.patch.dict(os.environ, {"OC_ADDON_AGE": cat}), mock.patch.object(G, "ARCHIVE_TIMEOUT", 2):
-            with self.assertRaises(G.HoldError) as cm:
-                g.phase_archive()
-        self.assertEqual(cm.exception.findings[0]["code"], "archive-timeout")
-        self.assertLess(time.monotonic() - t0, 20)
-        self.assertEqual(list((self.share / "openclaw-upgrade" / "r-arch").glob("*.tmp")), [])
-
-    def test_off_writes_nothing(self):
-        g = self.gate()
-        g.j["archive_opt"] = {"mode": "off", "recipient": None}
-        g.save = lambda: None
-        g.phase_archive()
-        self.assertEqual(g.j["archive"]["mode"], "off")
-        self.assertFalse((self.share / "openclaw-upgrade" / "r-arch").exists())
-
-    def test_selective_workspace_over_limit(self):
-        g = self.gate()
-        with mock.patch.object(G, "WORKSPACE_FULL_LIMIT", 10):
-            (self.ws / "memory").mkdir()
-            (self.ws / "memory" / "m.md").write_text("m")
-            (self.ws / "big.bin").write_text("x" * 100)
-            ap = g.archive_plan()
-        self.assertEqual(ap["workspaces"][0]["mode"], "selective")
-        self.assertIn("clawd/AGENTS.md", ap["roots"])
-        self.assertIn("clawd/memory", ap["roots"])
-        self.assertNotIn("clawd/big.bin", ap["roots"])
-        self.assertTrue(any("2 GiB" in w for w in ap["warnings"]))
 
 
 # --- quarantine ----------------------------------------------------------------------------------
@@ -1390,6 +1183,17 @@ class HoldRetryTests(GateEnv):
         self.assertEqual(self.quiet(G.hold_after_start, "crash-loop", 1, emit=print), 0)
         self.assertEqual(self.journal()["hold"]["code"], "crash-loop")
 
+    def test_hold_after_start_on_a_state_that_still_needs_migration(self):
+        make_735_state(self.state)
+        self.write_cfg(CFG_735)
+        self.write_journal({"schema": 1, "run_id": "r1", "mode": "from-7x", "status": "done", "phases_done": [],
+                            "history": []})
+        self.assertEqual(self.quiet(G.hold_after_start, "exit78", None, emit=print), 0)
+        j = self.journal()
+        self.assertEqual((j["hold"]["code"], j["hold"]["sub"]), ("exit78", "gate"))
+        self.assertIn("Next: oc-upgrade retry runs the gate again (backup check, doctor), then restart the add-on",
+                      (self.upg / "hold.txt").read_text().splitlines())
+
     def test_find_openclaw_processes(self):
         proc = self.tmp / "proc"
 
@@ -1425,8 +1229,9 @@ class GateRunTests(GateEnv):
         rc = self.run_gate()
         self.assertEqual(rc, 0, self.out)
         self.assertIn("[gate] done: MIGRATED 2026.9.9", self.out)
-        for n in range(1, 10):
-            self.assertIn(f"[gate] {n}/9 ", self.out)
+        for n in range(1, 9):
+            self.assertIn(f"[gate] {n}/8 ", self.out)
+        self.assertNotRegex(self.out, r"\[gate\] \d/9 ")
         self.assertNotIn("SECRET", self.out)
         j = self.journal()
         self.assertEqual((j["status"], j["mode"]), ("done", "from-7x"))
@@ -1484,14 +1289,13 @@ class GateRunTests(GateEnv):
         j = self.journal()
         self.assertEqual((j["hold"]["code"], j["phase"]), ("doctor-migration-refused", "doctor1"))
         self.assertIn("partially migrated (doctor started)", (self.upg / "hold.txt").read_text())
-        archive_file = j["archive"].get("file")  # None with gate_archive off (no age on this host)
         self.hooks()
         G.retry_cmd([], emit=lambda s: None)
         rc = self.run_gate()
         self.assertEqual(rc, 0, self.out)
-        j = self.journal()
-        self.assertEqual(j["archive"].get("file"), archive_file)  # never retaken after the first write
-        self.assertEqual(len(list((self.share / "openclaw-upgrade").glob("*/*.tar.gz.age"))), 1 if HAVE_AGE else 0)
+        self.assertIn("4/8 doctor pass 1 rc=0", self.out)  # the failed pass is run again
+        self.assertEqual([d["pass"] for d in self.journal()["doctor"]], [1, 1, 2])
+        self.assertFalse((self.share / "openclaw-upgrade").exists())  # no gate archive, not even on a retry
 
     def test_interrupt_resume_once_then_interrupted_twice(self):
         self.build_735()
@@ -1533,24 +1337,6 @@ class GateRunTests(GateEnv):
         self.assertIn("openai-codex/*", (rd / "config.pre-gate.json").read_text())  # B2: write-once
         self.assertEqual(self.journal()["doctor"][-1]["pass"], 2)  # pass 1 not repeated
         self.assertEqual(sum(1 for d in self.journal()["doctor"] if d["pass"] == 1), 1)
-
-    @unittest.skipUnless(HAVE_AGE, "age not installed (the scenario needs an archive file)")
-    def test_resume_after_first_write_refuses_a_missing_archive(self):
-        """Codex review: never continue a partially migrated state without its verified archive."""
-        self.build_735()
-        self.hooks(raise_in_phase="fixups")
-        self.assertEqual(self.run_gate(), 1)
-        a = self.journal()["archive"]
-        arch = Path(a["dir"]) / a["file"]
-        moved = arch.with_name(arch.name + ".away")
-        os.rename(arch, moved)
-        self.hooks()
-        G.retry_cmd([], emit=lambda s: None)
-        self.assertEqual(self.run_gate(), 20, self.out)
-        self.assertEqual(self.journal()["hold"]["code"], "archive-missing")
-        os.rename(moved, arch)  # put it back: the retry continues
-        G.retry_cmd([], emit=lambda s: None)
-        self.assertEqual(self.run_gate(), 0, self.out)
 
     def test_postcondition_policy_hold_and_accept(self):
         self.build_735()
@@ -1735,7 +1521,9 @@ class GateRunMoreTests(GateEnv):
         self.assertEqual(j["mode"], "maintenance")
         self.assertNotIn("pins", j["phases_done"])
         self.assertTrue((self.upg / "gate" / "runs" / first / "journal.json").exists())
-        self.assertEqual(len(list((self.share / "openclaw-upgrade").glob("*/*.tar.gz.age"))), 2 if HAVE_AGE else 0)
+        self.assertEqual(j["phases_done"], ["precheck", "cleanup", "doctor1", "fixups", "doctor2", "postconditions",
+                                            "finalize"])
+        self.assertFalse((self.share / "openclaw-upgrade").exists())
 
     def test_B19_new_from7x_run_resets_pins_ledger(self):
         self.build_735()
@@ -1879,7 +1667,7 @@ print("Doctor complete.")
         finally:
             os.environ.pop("FAKE_CODEX_PKG", None)
         self.assertNotIn("keeps it disabled", self.out)
-        self.assertIn("[gate] 7/9 info: doctor installed the @openclaw/codex plugin", self.out)
+        self.assertIn("[gate] 6/8 info: doctor installed the @openclaw/codex plugin", self.out)
         self.assertIn("codex plugin entry restored: no (Codex was in use before the migration", self.out)
         self.assertTrue(self.journal()["fixups"]["codex_needed"])
 
@@ -1943,7 +1731,7 @@ print("Doctor complete.")
 
 
 class ReviewFixTests(GateEnv):
-    """Stage B review fixes: F1 symlinked archive roots, F4 pins retry, F5 lone surrogates, F15 cron."""
+    """Stage B review fixes: F1 symlinked state/workspace roots, F4 pins retry, F5 lone surrogates, F15 cron."""
 
     @staticmethod
     def move_aside(path, dest):
@@ -1975,7 +1763,7 @@ class ReviewFixTests(GateEnv):
         self.assertEqual(G.state_symlinks(self.state, cls), [str(self.state)])
 
     def test_F1_symlinked_agent_dir_holds_before_anything_is_written(self):
-        """Reviewer repro symstate.py: a symlinked directory gave a 'verified' archive without the DBs."""
+        """Reviewer repro symstate.py: a backup (tar) of a symlinked directory holds the link, not the DBs."""
         self.build_735()
         self.hooks()
         adir = self.state / "agents" / "main" / "agent"
@@ -1984,13 +1772,14 @@ class ReviewFixTests(GateEnv):
         j = self.journal()
         self.assertEqual((j["hold"]["code"], j["hold"]["acceptable"], j["first_write_at"]),
                          ("state-symlink", False, None))
-        self.assertIn(str(adir), j["hold"]["message"])
+        self.assertEqual(j["hold"]["message"], "symlinked director(ies) would be backed up as bare links, without "
+                                               f"the data they point to: {adir}")
         self.assertIn("replace the symlink by the real directory", (self.upg / "hold.txt").read_text())
         self.assertFalse((self.share / "openclaw-upgrade").exists())
         self.assertEqual(G.retry_cmd(["--accept", "state-symlink"], emit=lambda s: None), 1)
 
     def test_F1_symlinked_workspace_holds(self):
-        """Reviewer repro archive_test.py: only the link of a symlinked workspace was archived."""
+        """Reviewer repro archive_test.py: only the link of a symlinked workspace would be backed up."""
         self.build_735()
         self.hooks()
         ext = self.tmp / "elsewhere" / "ws2"
@@ -2003,8 +1792,12 @@ class ReviewFixTests(GateEnv):
         self.assertEqual(self.run_gate(), 20, self.out)
         h = self.journal()["hold"]
         self.assertEqual(h["code"], "state-symlink")
+        self.assertIn("would be backed up as bare links", h["message"])
         self.assertIn("clawd-helper", h["message"])
-        # a link whose target is archived anyway (another workspace root, the state dir) is fine
+        g = G.Gate(emit=lambda s: None)
+        g.cfg = cfg
+        self.assertEqual(g.workspace_symlinks(), [str(self.root / "clawd-helper")])
+        # a link whose target is covered anyway (another workspace root, the state dir) is fine
         os.unlink(self.root / "clawd-helper")
         os.symlink(self.ws, self.root / "clawd-helper")
         (self.state / "workspace-ops").mkdir()
@@ -2012,48 +1805,7 @@ class ReviewFixTests(GateEnv):
         cfg["agents"]["list"].append({"id": "ops", "workspace": str(self.root / "ws-ops")})
         g = G.Gate(emit=lambda s: None)
         g.cfg = cfg
-        ap = g.archive_plan()
-        self.assertEqual(ap["symlinks"], [])
-        self.assertEqual(ap["roots"][:2], [".openclaw", "clawd"])
-
-    def gate_for_archive(self, run_id):
-        g = G.Gate(emit=lambda s: None)
-        g.pkg = C.runtime_package()
-        g.cfg = json.loads(json.dumps(CFG_735))
-        g.j = {"run_id": run_id, "mode": "from-7x", "history": [], "source": {}, "auth_profiles": [],
-               "archive_opt": {"mode": "encrypted", "recipient": AGE_PUB or "age1" + "q" * 58}}
-        return g
-
-    def test_F1_archive_invariant_every_known_db_is_archived(self):
-        make_735_state(self.state)
-        self.write_cfg(CFG_735)
-        self.move_aside(self.state / "agents" / "main" / "agent", self.tmp / "media" / "agent")
-        g = self.gate_for_archive("r-inv")  # the precheck is bypassed: the archive phase refuses by itself
-        with self.assertRaises(G.HoldError) as cm:
-            g.phase_archive()
-        f = cm.exception.findings[0]
-        self.assertEqual(f["code"], "archive-verify-failed")
-        self.assertIn(".openclaw/agents/main/agent/openclaw-agent.sqlite", f["message"])
-        self.assertIsNone(g.j.get("archive"))
-        self.assertEqual(list((self.share / "openclaw-upgrade" / "r-inv").glob("*.tar.gz*")), [])
-
-    @unittest.skipUnless(HAVE_AGE, "age not installed")
-    def test_F1_archive_invariant_after_verification(self):
-        make_735_state(self.state)
-        self.write_cfg(CFG_735)
-        g = self.gate_for_archive("r-inv2")
-        real_compare = G.compare_members
-
-        def drop_agent_db(expected, found, links, members):
-            v = real_compare(expected, found, links, members)
-            v["matched"] = [m for m in v["matched"] if "/agents/" not in m]
-            return v
-        with mock.patch.object(G, "compare_members", side_effect=drop_agent_db):
-            with self.assertRaises(G.HoldError) as cm:
-                g.phase_archive()
-        self.assertEqual(cm.exception.findings[0]["code"], "archive-verify-failed")
-        self.assertIn("agents/main/agent/openclaw-agent.sqlite", cm.exception.findings[0]["message"])
-        self.assertEqual(list((self.share / "openclaw-upgrade" / "r-inv2").glob("*.tar.gz*")), [])
+        self.assertEqual(g.workspace_symlinks(), [])
 
     def test_F4_pins_retry_applies_pins_to_the_current_config(self):
         """Reviewer repro pins_stale.py: the retry used the first attempt's snapshot."""
@@ -2172,7 +1924,7 @@ class GlmThinkingLevelsGateTests(GateEnv):
         self.setup_glm(timezone="Europe/Vienna", glm_thinking_levels=False)
         self.assertEqual(self.run_gate(), 0, self.out)
         self.assertEqual(self.glm_compat()[0], {"thinkingFormat": "qwen-chat-template"})
-        self.assertIn(f"6/9 info: {GLM_REF} only switch thinking on/off", self.out)
+        self.assertIn(f"5/8 info: {GLM_REF} only switch thinking on/off", self.out)
         self.assertNotIn("glm_thinking", self.journal())
         self.assertEqual(self.g1_ledger(), [])
 
@@ -2183,8 +1935,8 @@ class GlmThinkingLevelsGateTests(GateEnv):
                 self.setUp_again()
                 self.build_735()
                 self.write_cfg(cfg_735_glm())
-                if opts is None:  # the key is missing (the archive options must exist: no plaintext archive)
-                    (self.tmp / "options.json").write_text(json.dumps(self.base_options))
+                if opts is None:  # no options file at all: the config.yaml defaults
+                    (self.tmp / "options.json").unlink()
                 else:
                     self.options(**opts)
                 self.hooks()
@@ -2207,7 +1959,7 @@ class GlmThinkingLevelsGateTests(GateEnv):
         self.setup_glm(glm_thinking_levels=True)
         with mock.patch.object(G, "glm_runtime_ok", lambda v: False):
             self.assertEqual(self.run_gate(), 0, self.out)
-        self.assertIn("6/9 info: GLM thinking levels need OpenClaw 2026.9+", self.out)
+        self.assertIn("5/8 info: GLM thinking levels need OpenClaw 2026.9+", self.out)
         self.assertEqual(self.glm_compat()[0], {"thinkingFormat": "qwen-chat-template"})
 
     def test_option_converts_and_ledgers(self):
@@ -2218,7 +1970,7 @@ class GlmThinkingLevelsGateTests(GateEnv):
         compat, cfg = self.glm_compat()
         self.assertEqual(compat, self.CONVERTED)
         self.assertEqual(cfg["agents"]["defaults"]["models"][GLM_REF], {"alias": "GLM"})  # no params added
-        self.assertIn(f"6/9 GLM thinking levels: {GLM_REF} send the level as reasoning_effort", self.out)
+        self.assertIn(f"5/8 GLM thinking levels: {GLM_REF} send the level as reasoning_effort", self.out)
         self.assertIn("4 change(s) in", self.out)
         self.assertEqual(len(self.g1_ledger()), 4)
         j = self.journal()
@@ -2237,7 +1989,7 @@ class GlmThinkingLevelsGateTests(GateEnv):
         self.options(glm_thinking_levels=True)
         self.hooks()
         self.assertEqual(self.run_gate(), 0, self.out)
-        self.assertIn(f"6/9 info: GLM thinking levels: {GLM_REF} left as is (has its own supportedReasoningEfforts",
+        self.assertIn(f"5/8 info: GLM thinking levels: {GLM_REF} left as is (has its own supportedReasoningEfforts",
                       self.out)
         self.assertEqual(self.glm_compat()[0]["thinkingFormat"], "qwen-chat-template")
 
@@ -2289,7 +2041,7 @@ class GlmThinkingLevelsGateTests(GateEnv):
         self.assertIs(G.Gate.glm_undo, orig_undo)
         os.environ["FAKE_OC_MODE"] = "invalid-glm"
         self.assertEqual(self.run_gate(), 0, self.out)
-        self.assertIn("6/9 GLM thinking levels: the step was interrupted before its check finished", self.out)
+        self.assertIn("5/8 GLM thinking levels: the step was interrupted before its check finished", self.out)
         self.assertIn("WARN [gate] GLM thinking levels not applied", self.out)
         self.assertNotIn("fixups-invalid", self.out)
         self.assertEqual(self.glm_compat()[0], {"thinkingFormat": "qwen-chat-template"})
@@ -2336,6 +2088,304 @@ class DryRunTests(GateEnv):
         after = {str(p): p.stat().st_mtime_ns for p in self.root.rglob("*") if p.is_file()}
         self.assertEqual(before, after)
         self.assertFalse((self.upg / "gate" / "journal.json").exists())
+
+    def test_dry_run_names_the_backup_as_the_rollback_point(self):
+        """0.5.94-full3: the readiness preview has no "archive:" line any more (the gate writes no archive)."""
+        self.build_735()
+        self.hooks()
+        lines = []
+        self.assertEqual(G.dry_run(network=False, emit=lines.append), 0, "\n".join(lines))
+        self.assertIn("[gate]   rollback point: the encrypted Home Assistant backup (no archive of the gate's own)",
+                      lines)
+        self.assertEqual([x for x in lines if "archive:" in x], [])
+        self.assertIn("[gate] dry-run: the precheck would pass", lines)
+        self.assertEqual(list(self.share.iterdir()), [])
+
+
+# Obviously fake age private key (the bech32 alphabet in order): a value a user might still have pasted into the
+# removed option gate_archive_age_recipient.
+FAKE_AGE_SECRET_KEY = "AGE-SECRET-KEY-1" + ("QPZRY9X8GF2TVDW0S3JN54KHCE6MUA7L" * 2)[:58]
+FAKE_AGE_RECIPIENT = "age1" + "q" * 58
+FULL3_PHASES_FROM7X = ["precheck", "cleanup", "premigrate", "doctor1", "fixups", "doctor2", "postconditions", "pins",
+                       "finalize"]
+MARKER_KEYS = {"schema", "runtime", "mode", "run_id", "completed_at", "binding", "accepted", "orphans",
+               "addon_version"}
+
+
+class NoGateArchiveTests(GateEnv):
+    """0.5.94-full3: the gate writes no archive of its own (the encrypted Home Assistant backup is the only
+    rollback point). Journals of 0.5.94-full2 with an archive record and stored values of the removed options
+    gate_archive / gate_archive_age_recipient still work."""
+
+    def marker(self):
+        return json.loads((self.upg / "gate" / "migrated.json").read_text())
+
+    def share_snapshot(self):
+        """Every entry below /share: (kind, bytes, inode, mtime_ns); a directory's mtime shows added/removed names."""
+        snap = {}
+        for p in [self.share, *self.share.rglob("*")]:
+            st = os.lstat(p)
+            data = p.read_bytes() if stat.S_ISREG(st.st_mode) else None
+            snap[str(p)] = (stat.S_IFMT(st.st_mode), data, st.st_ino, st.st_mtime_ns)
+        return snap
+
+    def make_full2_archive(self, run_id):
+        """The /share side of a 0.5.94-full2 run (encrypted archive, manifest.json, SHA256SUMS) and its journal
+        record. The archive bytes are a stand-in: the gate must never read them."""
+        adir = self.share / "openclaw-upgrade" / run_id
+        adir.mkdir(parents=True, mode=0o700)
+        name = f"openclaw-state-20261018-120000-before-{RUNTIME}.tar.gz.age"
+        data = b"age-encryption.org/v1\n-> X25519 not-a-real-stanza\n--- not-a-real-mac\n" + b"\x00" * 64
+        (adir / name).write_bytes(data)
+        sha = hashlib.sha256(data).hexdigest()
+        (adir / "manifest.json").write_text(json.dumps({"schema": 2, "kind": "openclaw-addon-pre-migration-archive",
+                                                         "format": "tar.gz+age", "run_id": run_id}))
+        (adir / "SHA256SUMS").write_text(f"{sha}  {name}\n")
+        rec = {"mode": "encrypted", "format": "tar.gz+age", "dir": str(adir), "file": name, "sha256": sha,
+               "size": len(data), "plaintext_sha256": "0" * 64, "plaintext_size": 1, "members": 1,
+               "recipient": FAKE_AGE_RECIPIENT, "verified": True, "created_at": "2026-10-18T12:00:00Z"}
+        return adir, rec
+
+    def to_full2_journal(self, j):
+        """Rewrite the journal as 0.5.94-full2 left it: phase "archive" done (right after the precheck), its record
+        and the validated option snapshot."""
+        adir, rec = self.make_full2_archive(j["run_id"])
+        done = j["phases_done"]
+        done.insert(done.index("precheck") + 1, "archive")
+        j.update({"archive": rec, "addon_version": "0.5.94-full2",
+                  "archive_opt": {"mode": "encrypted", "recipient": FAKE_AGE_RECIPIENT, "age_version": "v1.2.1"}})
+        (self.upg / "gate" / "journal.json").write_text(json.dumps(j))
+        return adir, rec
+
+    def assert_secret_nowhere(self, texts):
+        """The key body appears in no output and no file of the tree except the options file the user put it in."""
+        needles = [FAKE_AGE_SECRET_KEY[16:], FAKE_AGE_SECRET_KEY[16:].lower()]
+        for label, text in texts:
+            for n in needles:
+                self.assertNotIn(n, text, f"stored option value echoed in {label}")
+        opts = self.tmp / "options.json"
+        for p in self.tmp.rglob("*"):
+            if p == opts or p.is_symlink() or not p.is_file():
+                continue
+            data = p.read_bytes()
+            for n in needles:
+                self.assertNotIn(n.encode(), data, f"stored option value found in {p.relative_to(self.tmp)}")
+
+    # (a) a from-7x run: no archive phase, nothing below /share, no archive fields
+    def test_from_7x_run_writes_no_archive(self):
+        self.build_735()
+        self.hooks()
+        self.assertEqual(self.run_gate(), 0, self.out)
+        self.assertNotIn("archive", G.PHASES)
+        j = self.journal()
+        self.assertEqual((j["status"], j["mode"]), ("done", "from-7x"))
+        self.assertEqual(j["phases_done"], FULL3_PHASES_FROM7X)
+        self.assertFalse({"archive", "archive_opt"} & set(j), sorted(j))
+        self.assertEqual(list(self.share.iterdir()), [])  # not even /share/openclaw-upgrade
+        m = self.marker()
+        self.assertEqual(set(m), MARKER_KEYS)
+        self.assertEqual((m["mode"], m["run_id"]), ("from-7x", j["run_id"]))
+        self.assertNotIn("archive", self.out)
+        self.assertNotIn("sha256", self.out)
+        self.assertRegex(self.out, r"\[gate\] info: the doctor captures of this run are deleted after \S+ "
+                                   r"\(gate_cleanup_hours=48\)\n")
+        self.assertNotIn("archive", (self.upg / "gate" / "runs" / j["run_id"] / "events.log").read_text())
+        st = G.status_lines()
+        self.assertIn("Gate options: delete doctor captures 48 h after a run (0 = never); backup max age 24 h", st)
+        self.assertEqual([x for x in st if "archive" in x.lower()], [])
+
+    def test_finalize_with_cleanup_off_keeps_the_doctor_captures(self):
+        self.build_735()
+        self.hooks()
+        self.options(gate_cleanup_hours=0)
+        self.assertEqual(self.run_gate(), 0, self.out)
+        self.assertIn("[gate] info: the doctor captures of this run are kept (gate_cleanup_hours=0): delete them "
+                      "yourself", self.out)
+        self.assertEqual(list(self.share.iterdir()), [])
+
+    def test_precheck_space_check_needs_no_share(self):
+        self.build_735()
+        self.hooks(skip_space_check=False)
+        seen = []
+
+        def fake_space_check(needs, **_kw):
+            seen.append([(label, str(path), code) for label, path, _need, code in needs])
+            return [], "mocked"
+        with mock.patch.object(G, "space_check", side_effect=fake_space_check):
+            self.assertEqual(self.run_gate(), 0, self.out)
+        self.assertEqual(len(seen), 1)
+        self.assertEqual([(label, code) for label, _p, code in seen[0]],
+                         [("/config", "low-disk-config"), ("sqlite-tmp", "low-disk-tmp")])
+        self.assertFalse(any(str(self.share) in p for _l, p, _c in seen[0]))
+        self.assertIn("space ok (mocked)", self.out)
+
+    # (b) journals of 0.5.94-full2 with an archive phase and record
+    def test_full2_journal_after_first_write_resumes_without_touching_its_archive(self):
+        self.build_735()
+        self.hooks(raise_in_phase="fixups")
+        self.assertEqual(self.run_gate(), 1, self.out)
+        j0 = self.journal()
+        self.assertTrue(j0["first_write_at"])
+        adir, rec = self.to_full2_journal(j0)
+        before = self.share_snapshot()
+        self.hooks()
+        self.assertEqual(G.retry_cmd([], emit=lambda s: None), 0)
+        self.assertEqual(self.run_gate(), 0, self.out)
+        self.assertIn("[gate] done: MIGRATED 2026.9.9", self.out)
+        self.assertNotRegex(self.out, r"\[gate\] \d/9 ")
+        self.assertNotIn("archive:", self.out)
+        self.assertNotIn("archive-missing", self.out)
+        self.assertEqual(self.share_snapshot(), before)
+        j = self.journal()
+        self.assertEqual(j["status"], "done")
+        self.assertEqual(j["phases_done"], ["precheck", "archive"] + FULL3_PHASES_FROM7X[1:])
+        self.assertEqual(j["archive"], rec)  # the earlier version's record stays for status and the cleanup
+        self.assertEqual(set(self.marker()), MARKER_KEYS)
+        st = G.status_lines()
+        self.assertIn(f"  archive (earlier add-on version): {adir}/{rec['file']}", st)
+        self.assertIn("Gate archives in /share from earlier add-on versions (deleted automatically, see oc-upgrade "
+                      "cleanup):", st)
+        self.assertIn(f"  {adir / rec['file']} ({C.human(rec['size'])}, encrypted)", st)
+        self.assertNotIn(FAKE_AGE_RECIPIENT, "\n".join(st))
+
+    def test_full2_archive_missing_hold_continues_after_a_plain_retry(self):
+        """0.5.94-full2 held archive-missing (hard) when the archive of a partially migrated run was gone; without
+        a gate archive that hold is sticky until `oc-upgrade retry`, which then finishes the run."""
+        self.build_735()
+        self.hooks(raise_in_phase="fixups")
+        self.assertEqual(self.run_gate(), 1, self.out)
+        adir, rec = self.to_full2_journal(self.journal())
+        (adir / rec["file"]).unlink()
+        j0 = self.journal()
+        f = {"code": "archive-missing", "cls": "hard", "phase": "archive",
+             "message": f"the verified pre-migration archive {adir}/{rec['file']} is missing or changed, and the "
+                        "state was already partially migrated"}
+        j0.update({"phase": "archive", "hold": dict(f, codes=["archive-missing"], acceptable=False, retry="continue",
+                                                    state_changed=True, resume_after=False, findings=[f])})
+        (self.upg / "gate" / "journal.json").write_text(json.dumps(j0))
+        before = self.share_snapshot()
+        self.hooks()
+        self.assertEqual(self.run_gate(), 20, self.out)  # sticky until retried
+        self.assertEqual(self.journal()["hold"]["code"], "archive-missing")
+        self.assertEqual(G.retry_cmd([], emit=lambda s: None), 0)
+        d = self.plan()
+        self.assertEqual((d["rc"], d["action"], d["resume_phase"]), (10, "resume", "archive"))
+        self.assertEqual(self.run_gate(), 0, self.out)
+        self.assertIn("[gate] done: MIGRATED 2026.9.9", self.out)
+        self.assertEqual(self.share_snapshot(), before)
+        j = self.journal()
+        self.assertEqual((j["status"], j["hold"]), ("done", None))
+        self.assertEqual(j["phases_done"], ["precheck", "archive"] + FULL3_PHASES_FROM7X[1:])
+        self.assertEqual(j["previous_holds"][-1]["code"], "archive-missing")
+
+    def test_full2_journal_before_first_write_resumes_without_touching_its_archive(self):
+        self.build_735()
+        self.hooks(raise_in_phase="cleanup")
+        self.assertEqual(self.run_gate(), 1, self.out)
+        j0 = self.journal()
+        self.assertEqual((j0["hold"]["code"], j0["phase"], j0["first_write_at"]), ("internal-error", "cleanup", None))
+        adir, rec = self.to_full2_journal(j0)
+        before = self.share_snapshot()
+        self.hooks()
+        self.assertEqual(G.retry_cmd([], emit=lambda s: None), 0)
+        self.assertEqual(self.run_gate(), 0, self.out)
+        self.assertIn("journal empty (pre-journal 7.x)", self.out)  # nothing was written: the full precheck again
+        self.assertNotIn("archive:", self.out)
+        self.assertEqual(self.share_snapshot(), before)
+        j = self.journal()
+        self.assertEqual(j["status"], "done")
+        self.assertEqual(j["phases_done"], ["precheck", "archive"] + FULL3_PHASES_FROM7X[1:])
+        self.assertEqual(j["archive"], rec)
+        self.assertEqual(set(self.marker()), MARKER_KEYS)
+
+    def test_full2_journal_interrupted_in_the_archive_phase_resumes(self):
+        """A 0.5.94-full2 run stopped while it archived (phase "archive", no record yet) resumes automatically and
+        leaves the incomplete archive of that attempt to the cleanup."""
+        self.build_735()
+        self.hooks(raise_in_phase="cleanup")
+        self.assertEqual(self.run_gate(), 1, self.out)
+        j0 = self.journal()
+        tmp = self.share / "openclaw-upgrade" / j0["run_id"] / f"openclaw-state-x-before-{RUNTIME}.tar.gz.age.tmp"
+        tmp.parent.mkdir(parents=True)
+        tmp.write_bytes(b"age-encryption.org/v1\n")
+        j0.update({"status": "interrupted", "phase": "archive", "hold": None, "auto_resumes": 0,
+                   "phases_done": ["precheck"], "archive": None,
+                   "archive_opt": {"mode": "encrypted", "recipient": FAKE_AGE_RECIPIENT}})
+        (self.upg / "gate" / "journal.json").write_text(json.dumps(j0))
+        before = self.share_snapshot()
+        self.hooks()
+        d = self.plan()
+        self.assertEqual((d["rc"], d["action"], d["resume_phase"]), (10, "resume", "archive"))
+        self.assertEqual(self.run_gate(), 0, self.out)
+        self.assertEqual(self.share_snapshot(), before)
+        j = self.journal()
+        self.assertEqual((j["status"], j["phases_done"]), ("done", FULL3_PHASES_FROM7X))
+
+    # (c) stored values of the removed options are ignored
+    def test_removed_archive_options_are_ignored_and_never_echoed(self):
+        """An install updated from 0.5.94-full2 keeps the stored values (the Supervisor only warns about them):
+        no HOLD (full2 held archive-key-missing / archive-key-invalid for these) and no echo of the value."""
+        self.build_735()
+        self.hooks()
+        texts = []
+        variants = [("private key", {"gate_archive": "encrypted", "gate_archive_age_recipient": FAKE_AGE_SECRET_KEY}),
+                    ("whole key file", {"gate_archive_age_recipient": f"# created: 2026-10-18T00:00:00Z\n"
+                                                                      f"# public key: {FAKE_AGE_RECIPIENT}\n"
+                                                                      f"{FAKE_AGE_SECRET_KEY.lower()}\n"}),
+                    ("encrypted without recipient", {"gate_archive": "encrypted", "gate_archive_age_recipient": ""}),
+                    ("off", {"gate_archive": "off"}),
+                    ("invalid values", {"gate_archive": ["plain"], "gate_archive_age_recipient": 42})]
+        for label, opts in variants:
+            with self.subTest(label):
+                self.options(**opts)
+                self.assertEqual(C.gate_options(), {"cleanup_hours": 48, "backup_max_age_hours": 24, "problems": []})
+                lines = []
+                self.assertEqual(G.dry_run(network=False, emit=lines.append), 0, "\n".join(lines))
+                text = "\n".join(lines)
+                self.assertIn("[gate] dry-run: the precheck would pass", lines)
+                self.assertNotIn("gate_archive", text)
+                self.assertNotIn("archive-key", text)
+                texts.append((f"dry-run {label}", text))
+        self.options(gate_archive="encrypted", gate_archive_age_recipient=FAKE_AGE_SECRET_KEY)
+        self.assertEqual(self.run_gate(), 0, self.out)
+        self.assertIn("[gate] done: MIGRATED 2026.9.9", self.out)
+        self.assertFalse((self.upg / "hold.txt").exists())
+        j = self.journal()
+        self.assertEqual((j["status"], j["hold"]), ("done", None))
+        self.assertNotIn("gate_archive", self.out + self.err)
+        self.assertNotIn("archive-key", self.out + self.err)
+        self.assertEqual(list(self.share.iterdir()), [])
+        texts += [("stdout", self.out), ("stderr", self.err), ("status", "\n".join(G.status_lines()))]
+        self.assert_secret_nowhere(texts)
+
+    def test_missing_or_unreadable_options_file_means_the_defaults(self):
+        """0.5.94-full2 held archive-key-missing for these (fail-closed archive setting); now nothing depends on it."""
+        self.build_735()
+        self.hooks()
+        opts = self.tmp / "options.json"
+        for label, content in [("missing", None), ("not json", "{gate_archive: off"), ("json list", '["off"]'),
+                               ("empty object", "{}")]:
+            with self.subTest(label):
+                if content is None:
+                    opts.unlink(missing_ok=True)
+                else:
+                    opts.write_text(content)
+                self.assertEqual(C.gate_options(), {"cleanup_hours": 48, "backup_max_age_hours": 24, "problems": []})
+                lines = []
+                self.assertEqual(G.dry_run(network=False, emit=lines.append), 0, "\n".join(lines))
+                self.assertIn("[gate] dry-run: the precheck would pass", lines)
+                self.assertFalse([x for x in lines if x.startswith("WARN [gate] add-on option")], lines)
+
+    def test_invalid_integer_options_warn_without_echoing_the_value(self):
+        self.build_735()
+        self.hooks()
+        self.options(gate_cleanup_hours="SECRET-VALUE-1", gate_backup_max_age_hours=True)
+        lines = []
+        self.assertEqual(G.dry_run(emit=lines.append), 0, "\n".join(lines))
+        text = "\n".join(lines)
+        self.assertIn("WARN [gate] add-on option gate_cleanup_hours is not an integer in 0..720; using 48", text)
+        self.assertIn("WARN [gate] add-on option gate_backup_max_age_hours is not an integer in 1..168; using 24", text)
+        self.assertNotIn("SECRET-VALUE", text)
 
 
 class CodexAllowedPostconditionTests(unittest.TestCase):

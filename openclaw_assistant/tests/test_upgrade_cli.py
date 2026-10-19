@@ -197,7 +197,7 @@ class StateGuardCheckTests(CliEnv):
                       self.stdout)
 
 
-# --- 0.5.94-full2: cleanup / export / status ---------------------------------------------------------
+# --- 0.5.94-full2/full3: cleanup / status (the rehearsal export is gone since full3) ------------------
 
 import fcntl  # noqa: E402
 import signal  # noqa: E402
@@ -205,11 +205,10 @@ import time  # noqa: E402
 import uuid  # noqa: E402
 from datetime import datetime, timedelta, timezone  # noqa: E402
 
-import oc_common as C  # noqa: E402
-
 RC_ERROR = 1  # oc_upgrade.RC_ERROR (oc_upgrade is not imported here: its import rewrites sys.path)
 BECH32 = "qpzry9x8gf2tvdw0s3jn54khce6mua7l"
-FAKE_RECIPIENT = "age1" + (BECH32 * 2)[:58]  # shape-valid (regex), no real key behind it
+# Values the removed archive options of an earlier add-on version can leave in options.json (fakes, no real key)
+FAKE_RECIPIENT = "age1" + (BECH32 * 2)[:58]
 FAKE_SECRET_KEY = "AGE-SECRET-KEY-1" + (BECH32.upper() * 2)[:58]
 FAKE_SECRET_BODY = FAKE_SECRET_KEY[len("AGE-SECRET-KEY-1"):]
 
@@ -239,9 +238,19 @@ class Full2CliTests(CliEnv):
                     pass
         return hits
 
+    def tree(self, *roots):
+        """{path: (mode, bytes or link target)} below roots, by lstat: what a command must not touch."""
+        snap = {}
+        for root in roots:
+            for p in [root, *root.rglob("*")]:
+                st = os.lstat(p)
+                data = os.readlink(p) if p.is_symlink() else (p.read_bytes() if p.is_file() else None)
+                snap[str(p)] = (st.st_mode, data)
+        return snap
+
     def finished_run(self, hours_ago, captures=1):
-        """A gate run that finished `hours_ago` hours ago, with an (encrypted-looking) archive dir in /share and
-        `captures` doctor capture dirs named in its doctor log."""
+        """A gate run that finished `hours_ago` hours ago, with the (encrypted-looking) archive dir an earlier
+        add-on version wrote to /share and `captures` doctor capture dirs named in its doctor log."""
         fin = datetime.now(timezone.utc) - timedelta(hours=hours_ago)
         rid = fin.strftime("%Y%m%dT%H%M%SZ") + "-" + uuid.uuid4().hex[:6]
         rdir = self.upg / "gate" / "runs" / rid
@@ -276,9 +285,37 @@ class Full2CliTests(CliEnv):
                 self.assertEqual(self.cli(arg), 0)
                 self.assertIn("cleanup [--apply]", self.stdout)
                 self.assertIn("gate_cleanup_hours", self.stdout)
-                self.assertIn("no plaintext copies", self.stdout)
+                self.assertIn("checked Home Assistant backup", self.stdout)
+                self.assertNotRegex(self.stdout, r"(?m)^  export")  # no export command since 0.5.94-full3
+                self.assertNotRegex(self.stdout, r"(?i)\bage\b")  # nothing is age-encrypted any more
         self.assertEqual(self.cli(), 1)
         self.assertIn("cleanup [--apply]", self.stdout)
+
+    # 0.5.94-full3: the rehearsal export is gone. `export` (incl. --cancel) and run.sh's former internal
+    # `export-write` are unknown commands like any other: help text, the same rc, nothing written or removed.
+    def test_export_commands_are_unknown_now(self):
+        self.set_options({"gate_cleanup_hours": 48})
+        req = self.upg / "export-request"  # a request of an earlier add-on version (run.sh removes it)
+        req.write_text("2026-10-18T12:00:00+00:00\n")
+        leftover = self.share / "openclaw-rehearsal" / "20261018-120000-AbC123" / "openclaw-rehearsal.tar.gz.age.tmp"
+        leftover.parent.mkdir(parents=True)
+        leftover.write_bytes(b"age-encryption.org/v1\n")
+        self.assertEqual(self.cli("bogus"), RC_ERROR)
+        unknown_out, unknown_err = self.stdout, self.stderr
+        self.assertIn("cleanup [--apply]", unknown_out)
+        before = self.tree(self.upg, self.share)
+        for args in (("export",), ("export", "--cancel"), ("export-write", "--sweep"),
+                     ("export-write", "--begin", "20261019-120000"), ("export-write", "--abort", "x")):
+            for env in (None, {"OC_GATE_FROM_RUNSH": "1"}):
+                with self.subTest(args=args, env=env):
+                    self.assertEqual(self.cli(*args, env=env), RC_ERROR, self.stdout + self.stderr)
+                    self.assertEqual((self.stdout, self.stderr), (unknown_out, unknown_err))
+                    self.assertEqual(self.tree(self.upg, self.share), before)
+        self.assertTrue(req.exists() and leftover.exists())  # untouched: run.sh / cleanup remove them
+        self.assertFalse((self.share / "openclaw-upgrade").exists())
+        self.assertEqual(self.cli("status"), 0, self.stderr)
+        self.assertNotIn("Export requested", self.stdout)
+        self.assertNotIn("oc-upgrade export", self.stdout)
 
     # cleanup
     def test_cleanup_dry_run_on_an_empty_tree(self):
@@ -445,7 +482,7 @@ class Full2CliTests(CliEnv):
             self.assertTrue(p.exists(), f"{p} was deleted")
         self.assertEqual([p.name for p in self.archives.iterdir() if p.name.startswith(".oc-addon-deleting-")], [])
         self.assertEqual(self.cli("status"), 0)
-        self.assertIn("Rehearsal exports:\n  none\n", self.stdout)
+        self.assertIn("Rehearsal exports (earlier add-on versions):\n  none\n", self.stdout)
         self.assertNotIn(str(plain), self.stdout)
         self.assertNotIn(str(enc), self.stdout)
 
@@ -470,10 +507,13 @@ class Full2CliTests(CliEnv):
         self.assertEqual(self.stderr, "")
         self.assertNotIn("n/a (", self.stdout)  # the gate section (status_lines) did not fail either
         self.assertIn("Pre-upgrade archives (local, Stage A, 7.x only):\n  none\n", self.stdout)
-        self.assertIn(f"Rehearsal exports:\n  {exp} (22 B, encrypted; deleted automatically, see oc-upgrade "
-                      "cleanup)\nMigration gate:", self.stdout)
-        self.assertRegex(self.stdout, rf"\n    {adir}/openclaw-state-[^ ]+\.tar\.gz\.age \(2\.\d KiB, sha256 0{{12}}…, "
-                                      r"encrypted\)\n")
+        self.assertIn(f"Rehearsal exports (earlier add-on versions):\n  {exp} (22 B, encrypted; deleted "
+                      "automatically, see oc-upgrade cleanup)\nMigration gate:", self.stdout)
+        # the archive an earlier add-on version wrote: listed by lstat, no checksum (SHA256SUMS is not read)
+        self.assertRegex(self.stdout, rf"\n  Gate archives in /share from earlier add-on versions \(deleted "
+                                      rf"automatically, see oc-upgrade cleanup\):\n    {adir}/openclaw-state-[^ ]+"
+                                      r"\.tar\.gz\.age \(2\.\d KiB, encrypted\)\n")
+        self.assertNotIn("sha256", self.stdout)
         for name in ("0bad0f", "long-link", "LnkLnk", ".age.tmp", "2026.7.35", "20260901-000000-before"):
             self.assertNotIn(name, self.stdout)
         self.assertEqual(self.cli("cleanup"), 0, self.stdout + self.stderr)
@@ -503,77 +543,12 @@ class Full2CliTests(CliEnv):
                 p.kill()
                 p.communicate()
         self.assertEqual(p.returncode, 143, out)
-        self.assertIn("[cleanup] gate archives and doctor captures are deleted 48 h after their gate run", out)
+        self.assertIn("[cleanup] doctor captures are deleted 48 h after their gate run; gate archives and rehearsal "
+                      "exports of earlier add-on versions and the 2026.7 plaintext archives the same time after "
+                      "their run, export or migration (checked hourly)\n", out)
         self.assertIn(f"[cleanup] run {rid}: deleted 2 item(s)", out)
         self.assertFalse(adir.exists())
         self.assertFalse(caps[0].exists())
-
-    # export
-    def test_export_is_refused_without_encryption_and_writes_nothing(self):
-        cases = [
-            {"gate_archive": "off"},
-            {"gate_archive": "off", "gate_archive_age_recipient": FAKE_RECIPIENT},
-            {"gate_archive": "encrypted", "gate_archive_age_recipient": ""},
-            {"gate_archive": "encrypted"},
-            {"gate_archive": "encrypted", "gate_archive_age_recipient": "age1notakey"},
-            {"gate_archive": "plaintext", "gate_archive_age_recipient": FAKE_RECIPIENT},
-            {},
-            None,  # no options file at all
-        ]
-        for opts in cases:
-            with self.subTest(opts=opts):
-                if opts is None:
-                    (self.tmp / "options.json").unlink()
-                else:
-                    self.set_options(opts)
-                self.assertEqual(self.cli("export"), RC_ERROR, self.stdout + self.stderr)
-                self.assertIn("Export refused", self.stderr)
-                self.assertNotIn("Export requested", self.stdout)
-                self.assertFalse((self.upg / "export-request").exists())
-                self.assertEqual(self.share_files(), [])
-        self.assertEqual(self.cli("status"), 0)
-        self.assertIn("Export requested: no", self.stdout)
-
-    def test_export_refused_for_a_private_key_never_echoes_it(self):
-        keys = [FAKE_SECRET_KEY] + ([T.AGE_IDENTITY] if T.HAVE_AGE else [])
-        for key in keys:
-            with self.subTest(real=key != FAKE_SECRET_KEY):
-                self.set_options({"gate_archive": "encrypted", "gate_archive_age_recipient": key})
-                self.assertEqual(self.cli("export"), RC_ERROR)
-                self.assertIn("Export refused", self.stderr)
-                self.assertNotIn(key[16:], self.stdout + self.stderr)
-                self.assertFalse((self.upg / "export-request").exists())
-                self.assertEqual(self.share_files(), [])
-
-    def test_export_with_a_valid_recipient_only_records_a_request(self):
-        self.set_options({"gate_archive": "encrypted", "gate_archive_age_recipient": FAKE_RECIPIENT})
-        self.assertEqual(self.cli("export"), 0, self.stdout + self.stderr)
-        self.assertIn("Export requested.", self.stdout)
-        self.assertIn(f"encrypted with age to {C.short_recipient(FAKE_RECIPIENT)}", self.stdout)
-        self.assertIn("\n  - the add-on deletes it 48 h after it was written (gate_cleanup_hours).\n"
-                      "Withdraw with: oc-upgrade export --cancel\n", self.stdout)
-        self.assertNotIn(FAKE_RECIPIENT, self.stdout)
-        self.assertTrue((self.upg / "export-request").exists())
-        self.assertEqual(self.share_files(), [])  # the copy is made by run.sh on the next start
-        self.assertEqual(self.cli("status"), 0)
-        self.assertIn("Export requested: yes", self.stdout)
-        # a later switch to off: the pending request can still be withdrawn
-        self.set_options({"gate_archive": "off"})
-        self.assertEqual(self.cli("export", "--cancel"), 0)
-        self.assertIn("Export request withdrawn.", self.stdout)
-        self.assertFalse((self.upg / "export-request").exists())
-        self.assertEqual(self.cli("export", "--cancel"), 0)
-        self.assertIn("No export request pending.", self.stdout)
-
-    def test_export_says_how_long_the_copy_is_kept(self):
-        for hours, line in ((12, "  - the add-on deletes it 12 h after it was written (gate_cleanup_hours).\n"),
-                            (0, "  - it is kept (gate_cleanup_hours=0): delete it yourself after the rehearsal.\n")):
-            with self.subTest(hours=hours):
-                self.set_options({"gate_archive": "encrypted", "gate_archive_age_recipient": FAKE_RECIPIENT,
-                                  "gate_cleanup_hours": hours})
-                self.assertEqual(self.cli("export"), 0, self.stdout + self.stderr)
-                self.assertIn(line + "Withdraw with: oc-upgrade export --cancel\n", self.stdout)
-                self.assertEqual(self.cli("export", "--cancel"), 0)
 
     def test_status_labels_stage_a_archives_as_deleted_after_the_migration(self):
         stage_a = self.state / "upgrade-backups"
@@ -591,73 +566,81 @@ class Full2CliTests(CliEnv):
         return lines[0]
 
     def test_status_shows_the_gate_options_line(self):
-        self.set_options({"gate_archive": "encrypted", "gate_archive_age_recipient": FAKE_RECIPIENT,
-                          "gate_cleanup_hours": 12, "gate_backup_max_age_hours": 72})
+        self.set_options({"gate_cleanup_hours": 12, "gate_backup_max_age_hours": 72})
         self.assertEqual(self.cli("status"), 0, self.stderr)
-        line = self.gate_options_line()
-        self.assertTrue(line.startswith(f"Gate options: gate_archive encrypted to {C.short_recipient(FAKE_RECIPIENT)};"),
-                        line)
-        self.assertIn("12 h after a run (0 = never)", line)
-        self.assertIn("backup max age 72 h", line)
-        self.assertNotIn("problem", line)
+        self.assertEqual(self.gate_options_line(),
+                         "Gate options: delete doctor captures 12 h after a run (0 = never); backup max age 72 h")
 
-        self.set_options({"gate_archive": "off", "gate_archive_age_recipient": FAKE_RECIPIENT,
-                          "gate_cleanup_hours": 0})
+        self.set_options({"gate_cleanup_hours": 0})
         self.assertEqual(self.cli("status"), 0)
-        line = self.gate_options_line()
-        self.assertTrue(line.startswith("Gate options: gate_archive off;"), line)
-        self.assertIn(" 0 h after a run (0 = never)", line)
-        self.assertIn("backup max age 24 h", line)
+        self.assertEqual(self.gate_options_line(),
+                         "Gate options: delete doctor captures 0 h after a run (0 = never); backup max age 24 h")
 
         (self.tmp / "options.json").unlink()
         self.assertEqual(self.cli("status"), 0)
-        self.assertTrue(self.gate_options_line().startswith("Gate options: gate_archive encrypted (problem: missing);"))
+        self.assertEqual(self.gate_options_line(),
+                         "Gate options: delete doctor captures 48 h after a run (0 = never); backup max age 24 h")
 
-        self.set_options({"gate_archive": "plaintext", "gate_cleanup_hours": "secret-ish-48",
-                          "gate_backup_max_age_hours": 9999})
+        self.set_options({"gate_cleanup_hours": "secret-ish-48", "gate_backup_max_age_hours": 9999})
         self.assertEqual(self.cli("status"), 0)
-        line = self.gate_options_line()
-        self.assertIn("gate_archive ? (problem: invalid-mode)", line)
-        self.assertIn(" 48 h after a run", line)
-        self.assertIn("backup max age 24 h", line)
+        self.assertEqual(self.gate_options_line(),
+                         "Gate options: delete doctor captures 48 h after a run (0 = never); backup max age 24 h")
         self.assertNotIn("secret-ish", self.stdout + self.stderr)
         self.assertNotIn("9999", self.stdout + self.stderr)
 
-    def test_status_never_prints_a_pasted_private_key(self):
-        keys = [FAKE_SECRET_KEY, f"  {FAKE_SECRET_KEY.lower()}\n"] + ([T.AGE_IDENTITY] if T.HAVE_AGE else [])
+        # the archive options of an earlier add-on version are not shown (they are gone)
+        self.set_options({"gate_archive": "encrypted", "gate_archive_age_recipient": FAKE_RECIPIENT,
+                          "gate_cleanup_hours": 12})
+        self.assertEqual(self.cli("status"), 0)
+        self.assertEqual(self.gate_options_line(),
+                         "Gate options: delete doctor captures 12 h after a run (0 = never); backup max age 24 h")
+        self.assertNotIn("gate_archive", self.stdout)
+        self.assertNotIn(FAKE_RECIPIENT[:9], self.stdout)
+        self.assertNotIn("Export requested", self.stdout)
+
+    # options.json written by an earlier add-on version can still hold a private key pasted into the removed
+    # gate_archive_age_recipient option: no command prints it or copies it anywhere.
+    def test_a_private_key_left_in_the_options_is_never_printed(self):
+        keyfile = f"# created: 2026-10-18T12:00:00Z\n# public key: {FAKE_RECIPIENT}\n{FAKE_SECRET_KEY}\n"
         opts_file = self.tmp / "options.json"
-        for key in keys:
+        for key in (FAKE_SECRET_KEY, f"  {FAKE_SECRET_KEY.lower()}\n", keyfile):
             with self.subTest(key=key.strip()[:18]):
                 self.set_options({"gate_archive": "encrypted", "gate_archive_age_recipient": key})
-                body = key.strip()[16:]
                 self.assertEqual(self.cli("status"), 0, self.stderr)
-                self.assertIn("Gate options: gate_archive encrypted (problem: private-key);", self.gate_options_line())
+                self.assertEqual(self.gate_options_line(), "Gate options: delete doctor captures 48 h after a run "
+                                                           "(0 = never); backup max age 24 h")
                 out = self.stdout + self.stderr
                 for args in (("cleanup",), ("cleanup", "--apply"), ("export",), ("help",)):
                     self.cli(*args)
                     out += self.stdout + self.stderr
-                self.assertNotIn(body, out)
-                self.assertNotIn(body.lower(), out.lower())
-                self.assertEqual(self.files_containing(body, skip=(opts_file,)), [])
+                self.assertNotIn(FAKE_SECRET_BODY.lower(), out.lower())
+                self.assertNotIn("AGE-SECRET-KEY", out.upper())  # not even redacted: nothing reads the value
+                self.assertEqual(self.files_containing(FAKE_SECRET_BODY, skip=(opts_file,)), [])
+                self.assertEqual(self.files_containing(FAKE_SECRET_BODY.lower(), skip=(opts_file,)), [])
                 self.assertEqual(self.share_files(), [])
 
-    def test_check_and_dry_run_name_the_private_key_problem_without_echoing_it(self):
+    def test_check_and_dry_run_name_the_backup_as_the_rollback_point(self):
+        """No archive step and no archive-key HOLD any more, even with a private key left in the options of an
+        earlier add-on version; the readiness names the HA backup as the only rollback point."""
         self.build_735()
         self.hooks()
         self.set_options({"gate_archive": "encrypted", "gate_archive_age_recipient": FAKE_SECRET_KEY})
         env = {"OPENCLAW_RUNTIME_VERSION": T.RUNTIME}
-        self.assertEqual(self.cli("check", env=env), 4, self.stdout + self.stderr)
-        self.assertIn("a gate would HOLD with: archive-key-invalid", self.stdout)
+        rollback = "rollback point: the encrypted Home Assistant backup (no archive of the gate's own)\n"
+        self.assertIn(self.cli("check", env=env), (0, 4), self.stdout + self.stderr)
+        self.assertIn("\n  " + rollback, self.stdout)  # section I prints the readiness without the [gate] prefix
         out = self.stdout + self.stderr
-        self.assertEqual(self.cli("gate", "--dry-run", env=env), 20, self.stdout + self.stderr)
-        self.assertIn("[gate] dry-run: would HOLD: archive-key-invalid", self.stdout)
+        self.assertIn(self.cli("gate", "--dry-run", env=env), (0, 20), self.stdout + self.stderr)
+        self.assertIn("a gate would run in mode from-7x", self.stdout)
+        self.assertIn("\n[gate]   " + rollback, self.stdout)
         out += self.stdout + self.stderr
-        self.assertIn("PRIVATE key", out)
+        for gone in ("archive-key", "archive-age", "archive-off", "gate_archive", "low-disk-share", "PRIVATE key"):
+            self.assertNotIn(gone, out)
+        self.assertNotIn("archive:", out)
         self.assertNotIn(FAKE_SECRET_BODY, out)
         self.assertEqual(self.files_containing(FAKE_SECRET_BODY, skip=(self.tmp / "options.json",)), [])
         self.assertEqual(self.share_files(), [])
         self.assertFalse((self.upg / "gate" / "journal.json").exists())
-
 
 if __name__ == "__main__":
     unittest.main()

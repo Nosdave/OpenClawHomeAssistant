@@ -151,18 +151,10 @@ configuration:
     name: GLM Thinking Levels
     description: "A GLM model set up with the 'qwen-chat-template' thinking format only gets thinking on/off. When ON, the migration gate switches it to reasoning_effort at its next run (an OpenClaw update, or 'oc-upgrade retry --doctor' and a restart; a normal restart does not apply it), so /think and thinkingDefault levels reach the model. Off is then sent as 'none' instead of enable_thinking: check your GLM server first (see the documentation). Switching this OFF again does not undo the change. Every change is recorded in the gate's transform ledger."
 
-  gate_archive:
-    name: Gate Archive
-    description: "What the migration gate writes to /share/openclaw-upgrade before it changes the OpenClaw state (an OpenClaw update or 'oc-upgrade retry --doctor'). 'encrypted' (default): an archive encrypted with age to the public key below; no plaintext is ever written to disk. 'off': no archive; the rollback is only your encrypted Home Assistant backup. 'encrypted' without a key holds the gate before anything is changed."
-
-  gate_archive_age_recipient:
-    name: Gate Archive age Public Key
-    description: "Your age PUBLIC key (age1..., 62 characters), created with 'age-keygen' on a trusted device. Never paste the private key (AGE-SECRET-KEY-...); keep it off this host. You need the private key only to decrypt the archive for a rollback."
-
   gate_cleanup_hours:
-    name: Delete Gate Archive After (Hours)
-    description: Hours after a finished migration gate run before the add-on deletes that run's /share/openclaw-upgrade/<run>/ and OpenClaw's doctor captures (/config/.openclaw.update-captures/doctor-*). Rehearsal exports and the old plaintext pre-upgrade archives (/config/.openclaw/upgrade-backups) are deleted the same time after they were written or after the migration. 0 = never. Range 0-720, default 48.
+    name: Delete Doctor Captures After (Hours)
+    description: Hours after a finished migration gate run before the add-on deletes OpenClaw's doctor captures of that run (/config/.openclaw.update-captures/doctor-*). Copies left by earlier add-on versions (gate archives in /share/openclaw-upgrade, rehearsal exports in /share/openclaw-rehearsal, the plaintext 2026.7 archives in /config/.openclaw/upgrade-backups) are deleted the same number of hours after their run, export or migration. 0 = never. A change applies from the next add-on start. Range 0-720, default 48.
 
   gate_backup_max_age_hours:
     name: Required Backup Age (Hours)
-    description: "Before it changes the OpenClaw state, the migration gate requires an encrypted Home Assistant backup that contains this add-on, was taken before the update and is at most this many hours old; otherwise it holds (acceptable with 'oc-upgrade retry --accept ha-backup-missing'). Range 1-168, default 24."
+    description: "Before it changes the OpenClaw state, the migration gate requires an encrypted Home Assistant backup that contains this add-on, was taken before the update and is at most this many hours old; otherwise it holds (acceptable with 'oc-upgrade retry --accept ha-backup-missing'). This backup is the only rollback point: the gate writes no archive of its own. Range 1-168, default 24."

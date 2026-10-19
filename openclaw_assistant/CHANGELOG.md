@@ -5,6 +5,32 @@ All notable changes to the OpenClaw Assistant Home Assistant Add-on will be docu
 > **Private fork** (`Nosdave/OpenClawHomeAssistant`): `-ghcrN` / `-fullN` suffixes are fork build iterations on top of the upstream `techartdev` base version. The image is pre-built on GitHub Actions (native `aarch64`) and pulled from GHCR. `-fullN` marks the un-stripped "full" build line (see `0.5.80-full1`).
 
 
+## [0.5.94-full3] - 2026-10-19
+
+**OpenClaw stays `2026.10.4`. One rollback mechanism instead of two:** the migration gate no longer writes an archive of its own, and the rehearsal export is gone. The only rollback point is the encrypted Home Assistant backup that the gate already requires before it changes anything; a rollback is a restore of that backup. No keys to create, keep or test.
+
+- **Coming from `0.5.94-full1` or `0.5.94-full2`:** no action needed. No gate runs on this update (same OpenClaw). The add-on deletes what earlier versions left, `gate_cleanup_hours` (default 48) after their run or export, so at once if that was longer ago: the gate archives in `/share/openclaw-upgrade/<run>/` (encrypted from full2, plaintext from full1) with that run's doctor captures, rehearsal exports in `/share/openclaw-rehearsal/`, and the plaintext 2026.7 archives in `/config/.openclaw/upgrade-backups/` (counted from the 2026.10 migration). The age key pair created for full2 is no longer needed.
+- **Coming from `0.5.93-full2`:** the full migration gate runs. Turn auto-update off, **stop the add-on** and create an **encrypted** Home Assistant backup that includes it, right before the update (Settings → System → Backups, stored on this system or on a network mount: the add-on cannot see cloud-only copies). No download, no copies elsewhere. Then update and start (DOCS: runbook). Plan 1–3 hours.
+
+### Removed
+- **The gate's own archive** (old gate step 2: the age-encrypted `tar.gz` in `/share/openclaw-upgrade/<run>/` with `manifest.json`, `SHA256SUMS`, verification, read-back and the `[gate] info: archive sha256 …` line), with its HOLD codes `archive-key-missing`, `archive-key-invalid`, `archive-age-missing`, `archive-failed`, `archive-verify-failed`, `archive-timeout`, `archive-missing` and `low-disk-share` and the `archive-off` warning. The precheck no longer needs free space in `/share`.
+- **Options `gate_archive` and `gate_archive_age_recipient`.** The Supervisor ignores a stored value of a removed option with a warning in its log; nothing to do.
+- **The rehearsal export**: `oc-upgrade export [--cancel]` (now an unknown command, which prints the help), the internal `oc-upgrade export-write` and the export at add-on start. A request still pending from an earlier version is dropped at the next start.
+- **`age` from the image** (Debian package, build-time self-test and the recorded `age` path).
+
+### Changed
+- **The gate has 8 steps** (was 9): 1 precheck (including the Home Assistant backup check), 2 cleanup, 3 pre-migrate, 4 doctor pass 1, 5 fixups, 6 doctor pass 2, 7 postconditions, 8 pins. Log lines are numbered `1/8` … `8/8` (for example `[gate] 5/8 GLM thinking levels: …`). A gate run started by an earlier version resumes with these steps (its archive step is no longer run); a HOLD with an `archive-*` code from 0.5.94-full2 clears as usual with `oc-upgrade retry` and a restart.
+- **The only rollback point is the encrypted Home Assistant backup** the precheck requires (at most `gate_backup_max_age_hours` old; for an OpenClaw update holding the add-on version before the update). `ha-backup-missing` and `ha-backup-unverified` messages end with "the Home Assistant backup is the only rollback point"; both stay acceptable.
+- Texts: `gate --dry-run` and the readiness section of `oc-upgrade check` print `rollback point: the encrypted Home Assistant backup (no archive of the gate's own)` instead of the archive setting. The gate's last lines say when this run's doctor captures are deleted. `oc-upgrade status` shows the gate options as "delete doctor captures N h after a run; backup max age M h", lists gate archives in `/share` only when earlier versions left some (`encrypted` or `PLAINTEXT`, no sha256 any more) and labels rehearsal exports as from earlier add-on versions; the "Export requested" line is gone. A symlinked state or workspace directory is now reported as "would be backed up as bare links". The wrapper's `openclaw doctor` refusal and the retry advice say the gate first checks for an encrypted Home Assistant backup. The `gate_cleanup_hours` and `gate_backup_max_age_hours` option texts (all six languages) follow.
+
+### Kept
+- The check for an encrypted Home Assistant backup through the Supervisor API (`hassio_api`, role `default`) and all of its hardening; the accepted risk of the Supervisor token is unchanged (SECURITY.md, section 9).
+- **Automatic deletion** (`gate_cleanup_hours`): doctor captures of finished gate runs and every copy earlier versions left: the encrypted gate archives and rehearsal exports of 0.5.94-full2, the plaintext ones of 0.5.94-full1 and Stage A (0.5.93), orphaned archive directories and interrupted deletions. Deletes in `/share` keep going through directory handles that never follow a symbolic link.
+- The memory search half-life patch (365 days), the GLM thinking-levels step and everything else.
+
+### Security
+- The add-on writes no copy of the OpenClaw state outside the Home Assistant backup system: no archive and no export in `/share`, no key on the host or in the options. In `/share` it only deletes what earlier versions left there.
+
 ## [0.5.94-full2] - 2026-10-18
 
 **OpenClaw stays `2026.10.4`.** The migration gate no longer writes a plaintext archive: it encrypts it with age to your public key (or writes none), it checks for an encrypted Home Assistant backup before it changes anything, and the add-on deletes gate archives and doctor captures 48 h after a gate run, rehearsal exports 48 h after they were written and the old plaintext 2026.7 archives 48 h after the 2026.10 migration. Memory search finds older dated notes again (half-life 365 days instead of 30). Rule behind these changes: no plaintext secrets in archives or backups; Home Assistant backups only in the Home Assistant backup system and encrypted.

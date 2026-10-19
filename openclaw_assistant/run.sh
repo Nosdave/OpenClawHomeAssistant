@@ -1007,7 +1007,7 @@ fi
 # A rehearsal export request of an earlier add-on version is void (no copies of the
 # state outside the encrypted Home Assistant backup); leftover exports in /share are
 # deleted by the cleanup loop below.
-rm -f "${UPG_DIR}/export-request"
+rm -f "${UPG_DIR}/export-request" 2>/dev/null || true
 
 # ------------------------------------------------------------------------------
 # Session lock cleanup helpers

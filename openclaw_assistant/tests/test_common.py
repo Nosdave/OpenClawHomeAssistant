@@ -420,16 +420,13 @@ class ParseJsonTests(unittest.TestCase):
         self.assertIsNone(C.parse_json_output(None))
 
 
-# --- 0.5.94-full2: gate archive / backup / cleanup options, age, Supervisor token -----------------
+# --- 0.5.94-full2/full3: gate backup / cleanup options, Supervisor token, AGE-SECRET-KEY redaction -------
 
-_TESTS = Path(__file__).resolve().parent
-if str(_TESTS) not in sys.path:
-    sys.path.insert(0, str(_TESTS))
 import re  # noqa: E402
-import test_gate as T  # noqa: E402  (AGE_IDENTITY / AGE_PUB / HAVE_AGE: a throwaway age key pair)
 
 BECH32 = "qpzry9x8gf2tvdw0s3jn54khce6mua7l"  # the bech32 data charset (no 1, b, i, o)
-# Shape-valid fakes (the recipient regex checks the charset and length, not the bech32 checksum).
+# Shape-valid fakes of an age key pair (no real key behind them): options.json of an earlier add-on version can
+# still hold them, and a pasted private key must never be echoed.
 FAKE_RECIPIENT = "age1" + (BECH32 * 2)[:58]
 FAKE_SECRET_KEY = "AGE-SECRET-KEY-1" + (BECH32.upper() * 2)[:58]
 FAKE_SECRET_BODY = FAKE_SECRET_KEY[len("AGE-SECRET-KEY-1"):]
@@ -443,7 +440,7 @@ class OptionsCase(TmpCase):
         super().setUp()
         self.opts = self.tmp / "options.json"
         os.environ["OC_ADDON_OPTIONS_FILE"] = str(self.opts)
-        for k in ("OC_ADDON_AGE", "SUPERVISOR_TOKEN", "HASSIO_TOKEN"):
+        for k in ("SUPERVISOR_TOKEN", "HASSIO_TOKEN"):
             os.environ.pop(k, None)
 
     def write(self, obj=None, raw=None):
@@ -451,143 +448,52 @@ class OptionsCase(TmpCase):
 
 
 class GateOptionsTests(OptionsCase):
-    DEFAULT_ARCHIVE = {"mode": "encrypted", "recipient": None, "problem": "missing"}
+    KEYS = {"cleanup_hours", "backup_max_age_hours", "problems"}
 
-    def assert_fail_closed_defaults(self, o):
-        self.assertEqual(o["archive"], self.DEFAULT_ARCHIVE)
-        self.assertEqual((o["cleanup_hours"], o["backup_max_age_hours"]), (48, 24))
-        self.assertEqual(o["problems"], [])
+    def assert_defaults(self, o):
+        self.assertEqual(o, {"cleanup_hours": 48, "backup_max_age_hours": 24, "problems": []})
 
     def test_result_shape_and_defaults_constant(self):
         self.write({})
         o = C.gate_options()
-        self.assertEqual(set(o), {"archive", "cleanup_hours", "backup_max_age_hours", "problems"})
-        self.assertEqual(set(o["archive"]), {"mode", "recipient", "problem"})
-        self.assertEqual(C.GATE_OPTION_DEFAULTS, {"gate_archive": "encrypted", "gate_archive_age_recipient": "",
-                                                  "gate_cleanup_hours": 48, "gate_backup_max_age_hours": 24})
+        self.assertEqual(set(o), self.KEYS)
+        self.assertEqual(C.GATE_OPTION_DEFAULTS, {"gate_cleanup_hours": 48, "gate_backup_max_age_hours": 24})
         self.assertEqual(C._GATE_INT_RANGES, {"gate_cleanup_hours": (0, 720), "gate_backup_max_age_hours": (1, 168)})
 
     def test_defaults_match_config_yaml(self):
-        """The fail-closed defaults and ranges in oc_common are the ones config.yaml declares."""
+        """The defaults and ranges in oc_common are the ones config.yaml declares; the archive options are gone."""
         text = (ADDON / "config.yaml").read_text(encoding="utf-8")
         opts_block = text.split("\noptions:", 1)[1].split("\nschema:", 1)[0]
         schema_block = text.split("\nschema:", 1)[1]
         for key, want in C.GATE_OPTION_DEFAULTS.items():
             m = re.search(rf"^  {key}: (.*)$", opts_block, re.M)
             self.assertIsNotNone(m, key)
-            self.assertEqual(m.group(1).strip(), '""' if want == "" else str(want), key)
+            self.assertEqual(m.group(1).strip(), str(want), key)
         for key, (lo, hi) in C._GATE_INT_RANGES.items():
             self.assertRegex(schema_block, rf"(?m)^  {key}: int\({lo},{hi}\)\?$")
-        self.assertRegex(schema_block, r"(?m)^  gate_archive: list\(encrypted\|off\)\?$")
-        m = re.search(r'(?m)^  gate_archive_age_recipient: "match\(\^\((.*)\)\?\$\)\?"$', schema_block)
-        self.assertIsNotNone(m)
-        self.assertEqual(m.group(1), C.AGE_RECIPIENT_RE.pattern)
+        for block in (opts_block, schema_block):
+            self.assertNotRegex(block, r"(?m)^  gate_archive")
 
-    def test_missing_empty_or_broken_options_file_is_encrypted_without_recipient(self):
-        """No options means the config.yaml defaults: encrypted, no recipient -> problem 'missing' (never plaintext)."""
+    def test_missing_empty_or_broken_options_file_uses_the_defaults(self):
+        """No options means the config.yaml defaults."""
         self.assertFalse(self.opts.exists())
-        self.assert_fail_closed_defaults(C.gate_options())
-        for raw in ("", "   \n", "{not json", '{"gate_archive": "off"', "[1, 2]", "null", '"off"', "42"):
+        self.assert_defaults(C.gate_options())
+        for raw in ("", "   \n", "{not json", '{"gate_cleanup_hours": 12', "[1, 2]", "null", '"off"', "42"):
             with self.subTest(raw=raw):
                 self.write(raw=raw)
-                self.assert_fail_closed_defaults(C.gate_options())
+                self.assert_defaults(C.gate_options())
         self.opts.write_bytes(b"\xff\xfe{\x00")  # not UTF-8
-        self.assert_fail_closed_defaults(C.gate_options())
+        self.assert_defaults(C.gate_options())
         self.opts.unlink()
         self.opts.mkdir()  # unreadable as a file
-        self.assert_fail_closed_defaults(C.gate_options())
+        self.assert_defaults(C.gate_options())
 
     def test_options_file_is_read_at_call_time(self):
-        self.write({"gate_archive": "off"})
-        self.assertEqual(C.gate_options()["archive"]["mode"], "off")
-        self.write({"gate_archive": "encrypted", "gate_archive_age_recipient": FAKE_RECIPIENT})
-        self.assertEqual(C.gate_options()["archive"]["recipient"], FAKE_RECIPIENT)
-
-    def test_encrypted_with_valid_recipient(self):
-        self.write({"gate_archive": "encrypted", "gate_archive_age_recipient": FAKE_RECIPIENT,
-                    "gate_cleanup_hours": 12, "gate_backup_max_age_hours": 72})
+        self.write({"gate_cleanup_hours": 12})
+        self.assertEqual(C.gate_options()["cleanup_hours"], 12)
+        self.write({"gate_cleanup_hours": 0, "gate_backup_max_age_hours": 72})
         o = C.gate_options()
-        self.assertEqual(o["archive"], {"mode": "encrypted", "recipient": FAKE_RECIPIENT, "problem": None})
-        self.assertEqual((o["cleanup_hours"], o["backup_max_age_hours"], o["problems"]), (12, 72, []))
-        # gate_archive left out: the default (encrypted) applies to the recipient
-        self.write({"gate_archive_age_recipient": FAKE_RECIPIENT})
-        self.assertEqual(C.gate_options()["archive"], {"mode": "encrypted", "recipient": FAKE_RECIPIENT,
-                                                       "problem": None})
-
-    @unittest.skipUnless(T.HAVE_AGE, "age not installed")
-    def test_real_age_public_key_is_valid(self):
-        self.write({"gate_archive": "encrypted", "gate_archive_age_recipient": T.AGE_PUB})
-        self.assertEqual(C.gate_options()["archive"], {"mode": "encrypted", "recipient": T.AGE_PUB, "problem": None})
-
-    def test_recipient_whitespace_is_stripped(self):
-        for raw in (f"  {FAKE_RECIPIENT}  ", f"{FAKE_RECIPIENT}\n", f"\t{FAKE_RECIPIENT}\r\n"):
-            with self.subTest(raw=repr(raw)):
-                self.write({"gate_archive": "encrypted", "gate_archive_age_recipient": raw})
-                a = C.gate_options()["archive"]
-                self.assertEqual((a["recipient"], a["problem"]), (FAKE_RECIPIENT, None))
-
-    def test_empty_or_non_string_recipient_is_missing(self):
-        for rec in ("", "   ", None, 123, ["age1x"], {"k": FAKE_RECIPIENT}, True):
-            with self.subTest(rec=rec):
-                self.write({"gate_archive": "encrypted", "gate_archive_age_recipient": rec})
-                self.assertEqual(C.gate_options()["archive"], self.DEFAULT_ARCHIVE)
-
-    def test_private_key_is_refused_and_never_returned(self):
-        for raw in (FAKE_SECRET_KEY, f"  {FAKE_SECRET_KEY}\n", FAKE_SECRET_KEY.lower(),
-                    "AGE-SECRET-KEY-1", f"Age-Secret-Key-1{FAKE_SECRET_BODY}"):
-            with self.subTest(raw=raw[:20]):
-                self.write({"gate_archive": "encrypted", "gate_archive_age_recipient": raw,
-                            "gate_cleanup_hours": 48})
-                o = C.gate_options()
-                self.assertEqual(o["archive"], {"mode": "encrypted", "recipient": None, "problem": "private-key"})
-                dumped = json.dumps(o, ensure_ascii=False)
-                self.assertNotIn(raw.strip(), dumped)
-                self.assertNotIn(FAKE_SECRET_BODY.lower(), dumped.lower())
-                self.assertNotIn("SECRET", dumped.upper())
-
-    @unittest.skipUnless(T.HAVE_AGE, "age not installed")
-    def test_real_age_identity_is_refused_and_never_returned(self):
-        self.write({"gate_archive": "encrypted", "gate_archive_age_recipient": T.AGE_IDENTITY})
-        o = C.gate_options()
-        self.assertEqual(o["archive"]["problem"], "private-key")
-        self.assertIsNone(o["archive"]["recipient"])
-        self.assertNotIn(T.AGE_IDENTITY[16:], json.dumps(o))
-
-    def test_whole_key_file_pasted_is_refused_and_never_returned(self):
-        """age-keygen's key file (comments, public key, private key) pasted as a whole: refused, not echoed."""
-        keyfile = (f"# created: 2026-10-18T12:00:00Z\n# public key: {FAKE_RECIPIENT}\n{FAKE_SECRET_KEY}\n")
-        self.write({"gate_archive": "encrypted", "gate_archive_age_recipient": keyfile})
-        o = C.gate_options()
-        self.assertIn(o["archive"]["problem"], ("private-key", "malformed"))
-        self.assertIsNone(o["archive"]["recipient"])
-        self.assertNotIn(FAKE_SECRET_BODY, json.dumps(o))
-
-    def test_malformed_recipient_is_refused_and_never_returned(self):
-        for raw in ("age1", "age1tooshort", FAKE_RECIPIENT[:-1], FAKE_RECIPIENT + "q", FAKE_RECIPIENT.upper(),
-                    "AGE1" + FAKE_RECIPIENT[4:], FAKE_RECIPIENT[:10] + "b" + FAKE_RECIPIENT[11:],
-                    f"{FAKE_RECIPIENT} {FAKE_RECIPIENT}", f"{FAKE_RECIPIENT},{FAKE_RECIPIENT}",
-                    f"-r {FAKE_RECIPIENT}", "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGxvbmcta2V5LW5vdC1yZWFs x@y",
-                    "age2" + FAKE_RECIPIENT[4:], f"{FAKE_RECIPIENT[:30]} {FAKE_RECIPIENT[30:]}"):
-            with self.subTest(raw=raw[:24]):
-                self.write({"gate_archive": "encrypted", "gate_archive_age_recipient": raw})
-                o = C.gate_options()
-                self.assertEqual(o["archive"], {"mode": "encrypted", "recipient": None, "problem": "malformed"})
-                self.assertNotIn(raw, json.dumps(o))
-
-    def test_mode_off_never_returns_a_recipient(self):
-        for rec in ("", FAKE_RECIPIENT, FAKE_SECRET_KEY, "garbage"):
-            with self.subTest(rec=rec[:12]):
-                self.write({"gate_archive": "off", "gate_archive_age_recipient": rec})
-                o = C.gate_options()
-                self.assertEqual(o["archive"], {"mode": "off", "recipient": None, "problem": None})
-                self.assertNotIn(FAKE_SECRET_BODY, json.dumps(o))
-
-    def test_invalid_mode(self):
-        for mode in ("plaintext", "Encrypted", "OFF", "", "none", None, True, False, 1, ["encrypted"]):
-            with self.subTest(mode=mode):
-                self.write({"gate_archive": mode, "gate_archive_age_recipient": FAKE_RECIPIENT})
-                o = C.gate_options()
-                self.assertEqual(o["archive"], {"mode": None, "recipient": None, "problem": "invalid-mode"})
+        self.assertEqual((o["cleanup_hours"], o["backup_max_age_hours"], o["problems"]), (0, 72, []))
 
     def test_integer_ranges(self):
         ok = {"gate_cleanup_hours": (0, 1, 48, 719, 720), "gate_backup_max_age_hours": (1, 24, 167, 168)}
@@ -595,7 +501,7 @@ class GateOptionsTests(OptionsCase):
         for key, values in ok.items():
             for v in values:
                 with self.subTest(key=key, v=v):
-                    self.write({**self.base(), key: v})
+                    self.write({key: v})
                     o = C.gate_options()
                     self.assertEqual(o[out_key[key]], v)
                     self.assertEqual(o["problems"], [])
@@ -609,161 +515,55 @@ class GateOptionsTests(OptionsCase):
             out_key, dflt, rng = default[key]
             for v in values:
                 with self.subTest(key=key, v=v):
-                    self.write({**self.base(), key: v})
+                    self.write({key: v})
                     o = C.gate_options()
                     self.assertEqual(o[out_key], dflt)
                     self.assertEqual(len(o["problems"]), 1, o["problems"])
                     self.assertIn(key, o["problems"][0])
                     self.assertIn(rng, o["problems"][0])
                     self.assertIn(f"using {dflt}", o["problems"][0])
-                    # the archive part is unaffected by a bad integer
-                    self.assertEqual(o["archive"]["problem"], None)
 
     def test_bool_is_not_an_integer_even_inside_the_range(self):
         """False == 0 and True == 1 in Python, both inside the ranges: still rejected (a YAML/JSON bool)."""
-        self.write({**self.base(), "gate_cleanup_hours": False, "gate_backup_max_age_hours": True})
+        self.write({"gate_cleanup_hours": False, "gate_backup_max_age_hours": True})
         o = C.gate_options()
         self.assertEqual((o["cleanup_hours"], o["backup_max_age_hours"]), (48, 24))
         self.assertEqual(len(o["problems"]), 2)
 
     def test_problems_never_echo_values(self):
-        self.write({"gate_archive": "encrypted", "gate_archive_age_recipient": FAKE_SECRET_KEY,
-                    "gate_cleanup_hours": FAKE_SECRET_KEY, "gate_backup_max_age_hours": "hunter2-" + FAKE_SECRET_BODY})
+        self.write({"gate_cleanup_hours": FAKE_SECRET_KEY, "gate_backup_max_age_hours": "hunter2-" + FAKE_SECRET_BODY})
         o = C.gate_options()
         self.assertEqual(len(o["problems"]), 2)
         dumped = json.dumps(o)
         self.assertNotIn(FAKE_SECRET_BODY, dumped)
         self.assertNotIn("hunter2", dumped)
 
-    def base(self):
-        return {"gate_archive": "encrypted", "gate_archive_age_recipient": FAKE_RECIPIENT}
-
-
-class AgeRecipientTests(unittest.TestCase):
-    def test_fake_recipient_is_shape_valid(self):
-        self.assertEqual(len(FAKE_RECIPIENT), 62)
-        self.assertTrue(C.AGE_RECIPIENT_RE.fullmatch(FAKE_RECIPIENT))
-
-    @unittest.skipUnless(T.HAVE_AGE, "age not installed")
-    def test_real_public_key_matches(self):
-        self.assertTrue(C.AGE_RECIPIENT_RE.fullmatch(T.AGE_PUB))
-        self.assertFalse(C.AGE_RECIPIENT_RE.fullmatch(T.AGE_IDENTITY))
-
-    def test_every_bech32_character_is_accepted(self):
-        for ch in BECH32:
-            with self.subTest(ch=ch):
-                self.assertTrue(C.AGE_RECIPIENT_RE.fullmatch("age1" + ch * 58))
-
-    def test_non_bech32_characters_after_the_prefix_are_rejected(self):
-        for ch in "bio1BIOQ-_.+/= \t\nä":
-            for pos in (4, 30, 61):
-                with self.subTest(ch=ch, pos=pos):
-                    bad = FAKE_RECIPIENT[:pos] + ch + FAKE_RECIPIENT[pos + 1:]
-                    self.assertEqual(len(bad), 62)
-                    self.assertIsNone(C.AGE_RECIPIENT_RE.fullmatch(bad))
-
-    def test_wrong_length_prefix_or_case(self):
-        for bad in ("", "age1", FAKE_RECIPIENT[:-1], FAKE_RECIPIENT + "q", FAKE_RECIPIENT + FAKE_RECIPIENT[4:],
-                    "age" + FAKE_RECIPIENT[4:] + "q", "age0" + FAKE_RECIPIENT[4:], "AGE1" + FAKE_RECIPIENT[4:],
-                    FAKE_RECIPIENT.upper(), " " + FAKE_RECIPIENT, FAKE_RECIPIENT + "\n"):
-            with self.subTest(bad=bad[:16]):
-                self.assertIsNone(C.AGE_RECIPIENT_RE.fullmatch(bad))
-
-
-class ShortRecipientTests(unittest.TestCase):
-    def test_long_recipient_is_shortened(self):
-        s = C.short_recipient(FAKE_RECIPIENT)
-        head, sep, tail = s.partition("…")
-        self.assertEqual(sep, "…")
-        self.assertTrue(head.startswith("age1") and FAKE_RECIPIENT.startswith(head), s)
-        self.assertIn(len(head), (8, 9))  # spec: 8 characters; the implementation keeps 9
-        self.assertEqual(tail, FAKE_RECIPIENT[-6:])
-        self.assertLess(len(s), 20)
-        self.assertNotEqual(s, FAKE_RECIPIENT)
-
-    def test_short_form_survives_redaction_where_the_full_key_would_not(self):
-        """The reason for the short form: the 40-character token rule would turn the full key into ***."""
-        s = C.short_recipient(FAKE_RECIPIENT)
-        self.assertEqual(C.redact_text(f"encrypted to {s}"), f"encrypted to {s}")
-        self.assertNotIn(FAKE_RECIPIENT, C.redact_text(f"encrypted to {FAKE_RECIPIENT}"))
-
-    @unittest.skipUnless(T.HAVE_AGE, "age not installed")
-    def test_real_key(self):
-        s = C.short_recipient(T.AGE_PUB)
-        self.assertTrue(s.endswith(T.AGE_PUB[-6:]))
-        self.assertTrue(T.AGE_PUB.startswith(s.split("…")[0]))
-
-    def test_empty_and_short_values(self):
-        self.assertEqual(C.short_recipient(""), "")
-        self.assertEqual(C.short_recipient(None), "")
-        self.assertEqual(C.short_recipient("age1short"), "age1short")
-        self.assertEqual(C.short_recipient("x" * 16), "x" * 16)
-        s = C.short_recipient("abcdefghijklmnopq")  # 17 characters: shortened
-        self.assertIn("…", s)
-        self.assertTrue(s.endswith("lmnopq"))
-        self.assertTrue("abcdefghijklmnopq".startswith(s.split("…")[0]))
-
-
-class AgeBinTests(OptionsCase):
-    def setUp(self):
-        super().setUp()
-        self.pathbin = self.tmp / "pathbin"
-        self.imgbin = self.tmp / "img"
-        self.empty = self.tmp / "emptybin"
-        for d in (self.pathbin, self.imgbin, self.empty):
-            d.mkdir()
-        self.path_age = self.exe(self.pathbin / "age")
-        self.img_age = self.exe(self.imgbin / "age")
-        self.record = self.tmp / "libexec" / "age-bin"
-        self.record.parent.mkdir()
-        os.environ["PATH"] = str(self.pathbin)
-        self.rec_patch = mock.patch.object(C, "AGE_BIN_RECORD", str(self.record))
-        self.rec_patch.start()
-        self.addCleanup(self.rec_patch.stop)
-
-    @staticmethod
-    def exe(p, mode=0o755):
-        p.write_text("#!/bin/sh\necho age-fake\n")
-        p.chmod(mode)
-        return p
-
-    def test_record_constant_is_the_one_the_dockerfile_writes(self):
-        self.rec_patch.stop()
-        try:
-            self.assertEqual(C.AGE_BIN_RECORD, "/usr/local/libexec/oc-addon/age-bin")
-            self.assertIn(f"> {C.AGE_BIN_RECORD}", (ADDON / "Dockerfile").read_text(encoding="utf-8"))
-        finally:
-            self.rec_patch.start()
-
-    def test_env_override_wins(self):
-        self.record.write_text(f"{self.img_age}\n")
-        with mock.patch.dict(os.environ, {"OC_ADDON_AGE": "/nonexistent/test-age"}):
-            self.assertEqual(C.age_bin(), "/nonexistent/test-age")  # a test hook: taken as given
-        with mock.patch.dict(os.environ, {"OC_ADDON_AGE": ""}):
-            self.assertEqual(C.age_bin(), str(self.img_age))  # empty means unset
-
-    def test_build_time_record_wins_over_path(self):
-        """A Homebrew age earlier on PATH must never win over the image's recorded age."""
-        self.record.write_text(f"{self.img_age}\n")
-        self.assertEqual(C.age_bin(), str(self.img_age))
-        self.record.write_text(f"  {self.img_age}  \n/some/other/age\n")  # first line, stripped
-        self.assertEqual(C.age_bin(), str(self.img_age))
-
-    def test_stale_or_broken_record_falls_back_to_path(self):
-        noexec = self.imgbin / "age-noexec"
-        self.exe(noexec, 0o644)
-        for content in (f"{self.tmp / 'gone' / 'age'}\n", f"{noexec}\n", "", "\n", f"\n{self.img_age}\n"):
-            with self.subTest(content=content.strip()[-20:]):
-                self.record.write_text(content)
-                self.assertEqual(C.age_bin(), str(self.path_age))
-        self.record.unlink()
-        self.assertEqual(C.age_bin(), str(self.path_age))
-        self.record.mkdir()  # unreadable record
-        self.assertEqual(C.age_bin(), str(self.path_age))
-
-    def test_nothing_found_returns_bare_age(self):
-        os.environ["PATH"] = str(self.empty)
-        self.assertEqual(C.age_bin(), "age")
+    # 0.5.94-full3: gate_archive / gate_archive_age_recipient are gone. An options.json that still holds them
+    # (written by an earlier add-on version) is no problem, and none of their values reaches the result.
+    def test_stray_archive_options_of_an_earlier_version_are_ignored_and_never_echoed(self):
+        keyfile = f"# created: 2026-10-18T12:00:00Z\n# public key: {FAKE_RECIPIENT}\n{FAKE_SECRET_KEY}\n"
+        for mode, rec in (("encrypted", FAKE_SECRET_KEY), ("encrypted", f"  {FAKE_SECRET_KEY.lower()}\n"),
+                          ("encrypted", keyfile), ("encrypted", FAKE_RECIPIENT), ("off", FAKE_SECRET_KEY),
+                          ("plaintext", FAKE_SECRET_KEY), (FAKE_SECRET_KEY, "")):
+            with self.subTest(mode=mode[:12], rec=rec.strip()[:12]):
+                self.write({"gate_archive": mode, "gate_archive_age_recipient": rec,
+                            "gate_cleanup_hours": 12, "gate_backup_max_age_hours": 72})
+                o = C.gate_options()
+                self.assertEqual(o, {"cleanup_hours": 12, "backup_max_age_hours": 72, "problems": []})
+                self.assertNotIn("archive", o)
+                dumped = json.dumps(o, ensure_ascii=False)
+                for value in (FAKE_SECRET_BODY, FAKE_RECIPIENT, "SECRET", "plaintext"):
+                    self.assertNotIn(value.lower(), dumped.lower())
+                # next to an invalid integer: the one problem names that integer, never a stray value
+                self.write({"gate_archive": mode, "gate_archive_age_recipient": rec, "gate_cleanup_hours": "x"})
+                o = C.gate_options()
+                self.assertNotIn("archive", o)
+                self.assertEqual(len(o["problems"]), 1, o["problems"])
+                self.assertTrue(o["problems"][0].startswith("gate_cleanup_hours "), o["problems"])
+                for prob in o["problems"]:
+                    self.assertNotIn(FAKE_SECRET_BODY.lower(), prob.lower())
+                    self.assertNotIn("SECRET", prob.upper())
+                    self.assertNotIn(FAKE_RECIPIENT, prob)
 
 
 class SupervisorTokenTests(OptionsCase):
@@ -848,12 +648,6 @@ class Full2RedactTests(unittest.TestCase):
             with self.subTest(raw=raw[:30]):
                 self.assertNotIn(FAKE_SECRET_BODY.lower(), C.redact_text(raw).lower())
 
-    @unittest.skipUnless(T.HAVE_AGE, "age not installed")
-    def test_real_identity(self):
-        r = C.redact_text(f"pasted {T.AGE_IDENTITY} by mistake")
-        self.assertEqual(r, "pasted AGE-SECRET-KEY-*** by mistake")
-        self.assertNotIn(T.AGE_IDENTITY[16:], r)
-
     def test_age_secret_key_rule_is_first(self):
         rx, rep = C._REDACT_RES[0]
         self.assertEqual(rep, "AGE-SECRET-KEY-***")
@@ -861,7 +655,8 @@ class Full2RedactTests(unittest.TestCase):
 
     def test_plain_words_untouched(self):
         for line in ("gate_archive_age_recipient holds an age PRIVATE key (AGE-SECRET-KEY-…): remove it",
-                     "never the AGE-SECRET-KEY private key", "Gate options: gate_archive encrypted (problem: private-key)"):
+                     "never the AGE-SECRET-KEY private key",
+                     "Gate options: delete doctor captures 48 h after a run (0 = never); backup max age 24 h"):
             with self.subTest(line=line[:30]):
                 self.assertEqual(C.redact_text(line), line)
 
