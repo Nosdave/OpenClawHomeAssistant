@@ -150,3 +150,19 @@ configuration:
   glm_thinking_levels:
     name: Niveles de razonamiento GLM
     description: "Un modelo GLM configurado con el formato de razonamiento 'qwen-chat-template' solo puede activar o desactivar el razonamiento. Si está ACTIVADO, el gate de migración lo cambia a reasoning_effort en su próxima ejecución (una actualización de OpenClaw, o 'oc-upgrade retry --doctor' y un reinicio; un reinicio normal no lo aplica), para que los niveles de /think y thinkingDefault lleguen al modelo. 'Desactivado' se envía entonces como 'none' en lugar de enable_thinking: compruebe antes su servidor GLM (véase la documentación). Volver a DESACTIVAR la opción no deshace el cambio. Cada cambio queda registrado en el registro de transformaciones del gate."
+
+  gate_archive:
+    name: Archivo del gate
+    description: "Lo que el gate de migración escribe en /share/openclaw-upgrade antes de cambiar el estado de OpenClaw (una actualización de OpenClaw o 'oc-upgrade retry --doctor'). 'encrypted' (por defecto): un archivo cifrado con age para la clave pública indicada abajo; nunca se escribe texto sin cifrar en el disco. 'off': sin archivo; la única vía de reversión es su copia de seguridad cifrada de Home Assistant. 'encrypted' sin clave detiene el gate antes de que se cambie nada."
+
+  gate_archive_age_recipient:
+    name: Clave pública age del archivo del gate
+    description: "Su clave PÚBLICA de age (age1..., 62 caracteres), creada con 'age-keygen' en un dispositivo de confianza. Nunca pegue la clave privada (AGE-SECRET-KEY-...); manténgala fuera de este host. Solo necesita la clave privada para descifrar el archivo en caso de reversión."
+
+  gate_cleanup_hours:
+    name: Eliminar el archivo del gate tras (horas)
+    description: Horas tras una ejecución finalizada del gate de migración antes de que el complemento elimine el /share/openclaw-upgrade/<run>/ de esa ejecución y las capturas del doctor de OpenClaw (/config/.openclaw.update-captures/doctor-*). Las exportaciones de ensayo y los antiguos archivos sin cifrar anteriores a la actualización (/config/.openclaw/upgrade-backups) se eliminan el mismo tiempo después de crearse o de la migración. 0 = nunca. Rango 0-720, por defecto 48.
+
+  gate_backup_max_age_hours:
+    name: Antigüedad requerida de la copia de seguridad (horas)
+    description: "Antes de cambiar el estado de OpenClaw, el gate de migración exige una copia de seguridad cifrada de Home Assistant que contenga este complemento, se haya creado antes de la actualización y tenga como máximo esta cantidad de horas de antigüedad; de lo contrario, se detiene (aceptable con 'oc-upgrade retry --accept ha-backup-missing'). Rango 1-168, por defecto 24."

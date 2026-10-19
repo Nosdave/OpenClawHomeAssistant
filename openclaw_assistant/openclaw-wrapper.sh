@@ -224,7 +224,7 @@ fi
 if [ "$cmd" = "doctor" ] && [ "$doctor_guarded" = "true" ] && ! doctor_is_read_only; then
   cat >&2 <<'EOF'
 openclaw doctor (without --lint/--json/--post-upgrade) migrates config and state and is not run by hand in this add-on.
-Run: oc-upgrade retry --doctor   and restart the add-on — it archives the state first, then runs doctor --fix twice with checks.
+Run: oc-upgrade retry --doctor   and restart the add-on — it archives the state first (age-encrypted, or none with gate_archive: off), then runs doctor --fix twice with checks.
 Read-only check: openclaw doctor --lint
 EOF
   exit 2

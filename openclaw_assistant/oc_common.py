@@ -14,6 +14,8 @@ whole module at a temporary tree:
   OC_CONFIG_ROOT         default /config   (HOME of every OpenClaw subprocess)
   OC_ADDON_ENTRY_FILE    default /usr/local/libexec/oc-addon/openclaw-entry
                          (the image's Node binary is recorded next to it in openclaw-node)
+  OC_ADDON_OPTIONS_FILE  default /data/options.json (add-on options)
+  OC_ADDON_AGE           default: the age binary recorded at build time (/usr/local/libexec/oc-addon/age-bin)
 """
 
 import hashlib
@@ -22,6 +24,7 @@ import os
 import re
 import shutil
 import signal
+import socket
 import sqlite3
 import stat
 import subprocess
@@ -385,6 +388,200 @@ def glm_thinking_option():
     return addon_options().get("glm_thinking_levels", True) is True
 
 
+# --- gate archive / backup / cleanup options ----------------------------------------------
+
+AGE_RECIPIENT_RE = re.compile(r"age1[02-9ac-hj-np-z]{58}")
+AGE_BIN_RECORD = "/usr/local/libexec/oc-addon/age-bin"
+GATE_OPTION_DEFAULTS = {"gate_archive": "encrypted", "gate_archive_age_recipient": "",
+                        "gate_cleanup_hours": 48, "gate_backup_max_age_hours": 24}
+_GATE_INT_RANGES = {"gate_cleanup_hours": (0, 720), "gate_backup_max_age_hours": (1, 168)}
+
+
+def gate_options():
+    """The migration gate's archive/backup/cleanup options from /data/options.json (no environment needed,
+    so this works under s6's cleared environment). A missing file means the config.yaml defaults: encrypted
+    without a recipient, which the precheck refuses (fail-closed, never plaintext). Values are never echoed
+    in `problems` (a pasted private key must not reach a log)."""
+    o = addon_options()
+    problems = []
+    mode = o.get("gate_archive", GATE_OPTION_DEFAULTS["gate_archive"])
+    rec = o.get("gate_archive_age_recipient", "")
+    rec = rec.strip() if isinstance(rec, str) else ""
+    problem = None
+    if mode not in ("encrypted", "off"):
+        problem, mode = "invalid-mode", None
+    elif mode == "encrypted":
+        if not rec:
+            problem = "missing"
+        elif "AGE-SECRET-KEY-" in rec.upper():  # also a whole pasted key file
+            problem, rec = "private-key", ""
+        elif not AGE_RECIPIENT_RE.fullmatch(rec):
+            problem, rec = "malformed", ""
+    ints = {}
+    for key, (lo, hi) in _GATE_INT_RANGES.items():
+        default = GATE_OPTION_DEFAULTS[key]
+        v = o.get(key, default)
+        if isinstance(v, bool) or not isinstance(v, int) or not lo <= v <= hi:
+            problems.append(f"{key} is not an integer in {lo}..{hi}; using {default}")
+            v = default
+        ints[key] = v
+    return {"archive": {"mode": mode, "recipient": rec if mode == "encrypted" and not problem else None,
+                        "problem": problem},
+            "cleanup_hours": ints["gate_cleanup_hours"],
+            "backup_max_age_hours": ints["gate_backup_max_age_hours"],
+            "problems": problems}
+
+
+def safe_children(root):
+    """[(path, lstat)] of a directory's entries, sorted, never following a link (root included) and never raising:
+    other add-ons can write /share, and one odd entry (a link with an over-long target) must not break a listing."""
+    try:
+        if not stat.S_ISDIR(os.lstat(root).st_mode):
+            return []
+        out = []
+        with os.scandir(root) as it:
+            for e in it:
+                try:
+                    out.append((Path(e.path), e.stat(follow_symlinks=False)))
+                except OSError:
+                    continue
+        return sorted(out, key=lambda x: str(x[0]))
+    except OSError:
+        return []
+
+
+def safe_files_below(root, name_pred):
+    """Regular files <root>/<dir>/<file> with name_pred(file name), through real directories only."""
+    return [(f, fst) for d, dst in safe_children(root) if stat.S_ISDIR(dst.st_mode)
+            for f, fst in safe_children(d) if stat.S_ISREG(fst.st_mode) and name_pred(f.name)]
+
+
+def short_recipient(rec):
+    """age1abcd…uvwxyz: a full 62-character recipient would be mangled to *** by the 40-character redaction."""
+    return f"{rec[:9]}…{rec[-6:]}" if rec and len(rec) > 16 else (rec or "")
+
+
+def age_bin():
+    """The image's age binary: env OC_ADDON_AGE (tests), then the build-time record (a Homebrew age earlier on
+    PATH must never win), then PATH."""
+    env = os.environ.get("OC_ADDON_AGE")
+    if env:
+        return env
+    try:
+        with open(AGE_BIN_RECORD, encoding="utf-8") as f:
+            rec = f.readline().strip()
+        if rec and os.access(rec, os.X_OK):
+            return rec
+    except OSError:
+        pass
+    return shutil.which("age") or "age"
+
+
+# --- Supervisor API (read-only backup check) -------------------------------------------------
+
+S6_TOKEN_FILE = "/run/s6/container_environment/SUPERVISOR_TOKEN"
+# The Supervisor's fixed address (supervisor const DOCKER_IPV4_NETWORK_MASK[2]). Connecting to it directly
+# keeps the bearer token away from whatever a host_network add-on's resolver answers for "supervisor".
+SUPERVISOR_ADDR = ("172.30.32.2", 80)
+
+
+class SupervisorError(Exception):
+    def __init__(self, status, message):
+        super().__init__(message)
+        self.status = status  # HTTP status, 0 = no connection / timeout / invalid response
+        self.message = message
+
+
+def supervisor_token(path=None):
+    """The add-on's Supervisor token. Under s6-overlay run.sh and its children run with a reset environment,
+    so the token is read from s6's container environment first; the process environment is the fallback
+    (images without s6). None when neither has one."""
+    p = path or S6_TOKEN_FILE
+    try:
+        with open(p, encoding="utf-8") as f:
+            t = f.read(4096).strip()
+        if _token_ok(t):
+            return t
+    except (OSError, UnicodeDecodeError):  # unreadable file: fall back to the environment
+        pass
+    t = (os.environ.get("SUPERVISOR_TOKEN") or "").strip()
+    return t if _token_ok(t) else None
+
+
+def _token_ok(t):
+    """A usable bearer token: printable ASCII without whitespace (anything else would break the header)."""
+    return bool(t) and len(t) <= 1024 and all(33 <= ord(c) <= 126 for c in t)
+
+
+def supervisor_get(path, token, base=None, timeout=10, max_bytes=4 * MIB):
+    """GET <path> on the Supervisor API and return its `data`. http.client on purpose: no proxy environment,
+    no redirects. `base` ("http://host:port", test hook) overrides the fixed address. Errors never carry the
+    token or the response body."""
+    import http.client
+    if base:
+        m = re.fullmatch(r"http://([^/:]+)(?::(\d+))?/?", base)
+        if not m:
+            raise SupervisorError(0, "invalid Supervisor base URL")
+        host, port = m.group(1), int(m.group(2) or 80)
+    else:
+        host, port = SUPERVISOR_ADDR
+    if not _token_ok(token or ""):
+        raise SupervisorError(0, "invalid Supervisor token")
+    conn = http.client.HTTPConnection(host, port, timeout=timeout)
+    deadline = time.monotonic() + 3 * timeout  # overall limit: a slow drip never keeps the precheck waiting
+
+    held = {}
+
+    def cut_off():  # a read blocked on a dripping socket returns once the socket is shut down
+        sock = held.get("sock")  # kept here: http.client drops conn.sock after a "Connection: close" reply
+        if sock is not None:
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+    timer = threading.Timer(3 * timeout, cut_off)
+    timer.daemon = True
+    timer.start()
+    try:
+        if hasattr(conn, "connect"):
+            conn.connect()
+        held["sock"] = getattr(conn, "sock", None)
+        conn.request("GET", path, headers={"Authorization": f"Bearer {token}", "Host": "supervisor",
+                                           "Accept": "application/json"})
+        resp = conn.getresponse()
+        chunks, n = [], 0
+        while n <= max_bytes:
+            if time.monotonic() > deadline:
+                raise TimeoutError("response not complete in time")
+            b = resp.read(min(64 * 1024, max_bytes + 1 - n))
+            if not b:
+                break
+            chunks.append(b)
+            n += len(b)
+        body = b"".join(chunks)
+        status = resp.status
+    except (OSError, http.client.HTTPException) as exc:
+        raise SupervisorError(0, f"{type(exc).__name__}: {redact_text(str(exc))[:120]}") from None
+    except (ValueError, UnicodeError):  # e.g. an invalid header value; the text could carry the token
+        raise SupervisorError(0, "invalid request") from None
+    finally:
+        timer.cancel()
+        conn.close()
+    if time.monotonic() > deadline:
+        raise SupervisorError(0, "TimeoutError: response not complete in time")
+    if status != 200:
+        raise SupervisorError(status, f"HTTP {status}")
+    if len(body) > max_bytes:
+        raise SupervisorError(0, "response too large")
+    try:
+        obj = json.loads(body)
+    except (ValueError, RecursionError):
+        raise SupervisorError(0, "invalid JSON response") from None
+    if not isinstance(obj, dict) or obj.get("result") != "ok" or not isinstance(obj.get("data"), dict):
+        raise SupervisorError(0, "unexpected response")
+    return obj["data"]
+
+
 def sha256_file(path, stop_event=None, chunk=MIB):
     """sha256 of a regular file without following a final symlink. Polls stop_event (B17)."""
     flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
@@ -489,6 +686,8 @@ ENV_REMOVE = {
     # doctor's SQLite NOCOW rewrite during `openclaw update`; a standalone doctor --fix rewrites stores on btrfs
     # without NOCOW whatever it says (doctor-health in 2026.10.2 to 10.4).
     "OPENCLAW_GATEWAY_HOST_LIFELINE", "OPENCLAW_DOCTOR_SQLITE_NOCOW_REPAIR",
+    # the add-on's Supervisor credentials are for the gate's read-only backup check only
+    "SUPERVISOR_TOKEN", "HASSIO_TOKEN",
 }
 _HEAP_CAP_RE = re.compile(r"(?:^|\s)--max[-_]old[-_]space[-_]size(?:=\S*|\s+\d+)")
 
@@ -527,6 +726,7 @@ _SECRET_KEY = r"[A-Za-z0-9_.-]*(?:token|secret|password|apikey|api_key|bottoken)
 # a key that names a secret (token, botToken, apiKey, x-api-key, password ...), for "key: value" forms
 _SECRET_WORD = r"[A-Za-z0-9_.-]*?(?:token|secret|password|passwd|api[_-]?key)"
 _REDACT_RES = [
+    (re.compile(r"AGE-SECRET-KEY-1[0-9A-Za-z]{20,}"), "AGE-SECRET-KEY-***"),
     (re.compile(r'("(?:' + _SECRET_KEY + r')"\s*:\s*)"(?:[^"\\]|\\.)*"', re.I), r'\1"***"'),
     (re.compile(r"\b((?:" + _SECRET_KEY + r")=)[^\s&\"']+", re.I), r"\1***"),
     # token: value / apiKey: 'value' / x-api-key: value (YAML, JS object inspection, HTTP headers)

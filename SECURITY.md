@@ -144,6 +144,44 @@ AI agents that process external content (web pages, documents, emails) are vulne
 - Review agent actions in the logs
 - Limit the entities and services exposed to the agent
 
+### 9. Supervisor API Access (`hassio_api`)
+
+Since `0.5.94-full2` the add-on declares `hassio_api: true` with `hassio_role: default`. The migration gate needs it for one read-only check before it changes the OpenClaw state: is there a recent, encrypted Home Assistant backup that contains this add-on? Restoring that backup is the first rollback point after a one-way OpenClaw migration.
+
+**What the add-on reads** (and nothing else):
+- `GET /addons/self/info`: only this add-on's slug and version are used. The response also contains this add-on's options in clear (for example `homeassistant_token`); it is never logged or stored.
+- `GET /backups/info`: the backup list (name, date, type, contained add-ons, encryption per storage location).
+- `GET /backups/<slug>/info`: for up to five candidate backups, the version of this add-on inside them.
+
+Nothing is created, changed, restored or downloaded. The gate journal records only the chosen backup's slug, name, date, type, locations and add-on version.
+
+**Why `default` and not `backup`**: the `default` role allows only `GET` on the Supervisor's `…/info` endpoints. The `backup` role would also allow creating, deleting, restoring and downloading backups.
+
+**How the token is handled**:
+- It is read from s6's container environment (`/run/s6/container_environment/SUPERVISOR_TOKEN`), with the process environment as fallback.
+- It is sent only to the Supervisor's fixed address `172.30.32.2:80` (with `Host: supervisor`), using Python's `http.client`: no proxy (the `http_proxy` option does not apply), no redirects, and never to whatever the name `supervisor` resolves to on the host network.
+- It is never logged; error messages contain neither the token nor a response body. A token with characters that do not belong in an HTTP header, or a malformed, oversized or too slow answer, leads to `ha-backup-unverified`, and the text and traceback of an unexpected gate error (`internal-error`) pass through the log redaction.
+- It is removed from the environment of every OpenClaw process that the migration gate and `oc-upgrade` start (doctor, CLI checks), and `gateway_env_vars` refuses `SUPERVISOR_TOKEN`, `SUPERVISOR_API` and `HASSIO_TOKEN`.
+
+**Accepted risk: everything in the container can use the token.** The gate needs the token for a few seconds of its precheck, but the Supervisor issues one token at every add-on start, valid as long as the add-on runs, and it cannot be limited to the gate:
+- The token is readable by every process in the add-on container: the OpenClaw gateway, the agent and its shell tools, skills, the web terminal. s6 keeps it in `/run/s6/container_environment/SUPERVISOR_TOKEN`. Removing it from the environment of the gate's child processes does not change that; a prompt-injected agent or a malicious skill can read the file.
+- With `hassio_api: true` and the role `default`, whoever holds the token can `GET` every `/<something>/info` endpoint of the Supervisor: the backup list and each backup's info (names, dates, type, contained add-ons and folders, encryption, sizes), host, network, OS, Supervisor, Core and hardware information (versions, host name, network interfaces and addresses, disks and devices), the list of installed add-ons and other add-ons' info.
+- Other add-ons' options (which can hold their passwords and tokens): current Supervisor versions return them empty (`{}`) to an add-on with the role `default`; they are given only to Home Assistant Core, to the add-on itself, or to add-ons with the role `manager` or `admin`. Older Supervisor versions returned them in clear. Keep Home Assistant's Supervisor up to date.
+- Before `0.5.94-full2`, without `hassio_api`, the token already reached what every add-on token reaches, such as this add-on's own `/addons/self/…` endpoints (its info and options in clear, `homeassistant_token` included, restart, stop) and `/info`.
+- `hassio_api` with the role `default` adds no write access: the token still cannot create, restore, delete or download backups, read backup contents, or change or control other add-ons, the host or Home Assistant Core.
+
+### 10. Archives, Backups and the age Key
+
+The add-on's data contains secrets: tokens, OAuth logins, API keys. Rule: **no plaintext secrets in archives or backups. Home Assistant backups stay inside the Home Assistant backup system and are encrypted.**
+
+- **Gate archive**: before a migration the gate streams the state from `tar` through gzip into [age](https://github.com/FiloSottile/age), encrypted to your public key (`gate_archive_age_recipient`), into `/share/openclaw-upgrade/<run>/…tar.gz.age`. No plaintext is written to disk; files are `0600` in a `0700` directory; `manifest.json` holds hashes, sizes and auth provider/type/expiry, no secret values and no profile ids. Without a public key the gate holds (`archive-key-missing`) instead of writing a plaintext archive. With `gate_archive: off` there is no archive at all.
+- **`/share` is shared with other add-ons**: any add-on with `/share` access can write there and plant symbolic links. The add-on's writes and deletes in `/share` never follow a symbolic link: the gate archive directory and every cleanup delete go through directory handles opened component by component with `O_NOFOLLOW`, so a planted link makes the step fail (the gate holds with `archive-failed`) or is removed as a link, and never redirects a write or a delete into `/config` or elsewhere. Such an add-on can still delete or replace the files there: the archive's `manifest.json` and `SHA256SUMS` are informational only. The trusted record of the archive's sha256 (encrypted file and plaintext) is the gate journal in `/config` (`oc-upgrade status`) and the `[gate] info: archive sha256 …` line at the end of the gate run; the rollback steps in DOCS compare against those. Names read from `/share` are escaped before they are logged, so a crafted file name cannot add lines to the add-on log.
+- **Only the public key on Home Assistant**: create the key pair on your own computer and keep the private key (`AGE-SECRET-KEY-1…`) offline. Home Assistant refuses to save a private key in the option (its error message can show the value: create a new key pair then); if one reaches the options anyway, the gate holds with `archive-key-invalid` without printing it, and logs redact `AGE-SECRET-KEY-1…`. The gate cannot check that you hold the matching private key; test it once (DOCS: "Creating the age key pair").
+- **Automatic deletion** (`gate_cleanup_hours`, default 48; `0` keeps everything): the add-on deletes a gate run's archive and the doctor captures it created (plaintext database copies that OpenClaw 2026.10 doctor leaves in `/config/.openclaw.update-captures/`) that many hours after the run ended, or after a hold that followed the run was cleared, whichever is later. Captures that OpenClaw would keep (marked with `outcome.json`) go too: the rule against plaintext secrets takes precedence over OpenClaw's own retention. Orphaned archive directories, the plaintext archives of `0.5.94-full1` and rehearsal exports (encrypted and unencrypted) are deleted as well, and so are the plaintext 2026.7 archives in `/config/.openclaw/upgrade-backups/`, counted from the later of their modification time and the completion of the 2026.8+ migration.
+- **Rehearsal export** (`oc-upgrade export`): only encrypted to the same public key; refused otherwise. It is written into a fresh directory with a random name (`/share/openclaw-rehearsal/<timestamp>-<random>/`, mode `0700`), and its files are created with `O_EXCL|O_NOFOLLOW` (mode `0600`), so nothing planted in advance can redirect it; if `/share/openclaw-rehearsal` is a symbolic link or not a directory, no export is written. The export writer hashes the bytes as it writes them and refuses to finish if the file changed afterwards; the log line `Rehearsal export ready: … (sha256 …)` is the record to compare a copy against before you decrypt it. It is deleted `gate_cleanup_hours` after it was written; only its own files are removed, the directory only if it is then empty.
+- **Home Assistant backups**: create them encrypted, in **Settings → System → Backups**; do not download them, copy them to other machines or create unencrypted ones. The gate requires a recent encrypted backup before a migration and names unencrypted backups that contain this add-on in a `WARN`.
+- **Still plaintext, inside `/config` only** (and so only in your encrypted Home Assistant backups): `openclaw.json` and its snapshots in `/config/.openclaw/backups/`, `/config/secrets/`, the gate's run records and quarantine under `/config/.openclaw-upgrade/gate/`, doctor captures until they are deleted, and the 2026.7 pre-upgrade archives in `/config/.openclaw/upgrade-backups/` until they are deleted (`gate_cleanup_hours` after the 2026.8+ migration; never with `0`). Do not copy these paths out of Home Assistant.
+
 ---
 
 ## Best Practices Summary
@@ -156,11 +194,14 @@ AI agents that process external content (web pages, documents, emails) are vulne
 | Only install skills from trusted sources | High |
 | Review exposed entities in Assist pipeline | High |
 | Keep the add-on updated | High |
+| Use only encrypted Home Assistant backups; never download or copy them elsewhere | High |
+| Keep the age private key off the Home Assistant host (only the `age1…` public key goes into the add-on) | High |
 | Use a dedicated HA user for the `homeassistant_token` | Medium |
+| Keep the Home Assistant Supervisor up to date (older versions show other add-ons' options to this add-on's token) | Medium |
 | Monitor add-on logs regularly | Medium |
 | Rotate gateway tokens periodically | Medium |
 | Restrict router SSH user permissions | Medium |
-| Back up your configuration regularly | Low |
+| Back up your configuration regularly (encrypted Home Assistant backups) | Low |
 
 ---
 

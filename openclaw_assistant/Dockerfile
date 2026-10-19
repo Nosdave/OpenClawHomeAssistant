@@ -31,6 +31,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     bat \
     less \
     openssl \
+    age \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
@@ -161,6 +162,65 @@ RUN npm config set fund false && npm config set audit false \
     && NODE_OPTIONS="--disable-sigusr1 --disable-warning=ExperimentalWarning" node -e 0 \
     && test "$(npm view "@openclaw/brave-plugin@${BRAVE_PLUGIN_VERSION}" version)" = "${BRAVE_PLUGIN_VERSION}"
 
+# Memory search recency: OpenClaw 2026.10.4 hard-codes the temporal-decay half-life of memory search at
+# 30 days (resolver literal in dist/memory-search-*.mjs, //#region src/agents/memory-search.ts; no config key,
+# doctor removes the old ones). With minScore 0.35 checked after the decay, dated memory notes older than
+# ~45 days can never be found. The add-on ships 365 days. Guarded by sha256 before and after, for exactly
+# this OpenClaw version: any other version or a re-packed file fails the build (re-derive both hashes and
+# the content-inventory entry on every OpenClaw bump). OpenClaw's own content inventory is updated to match.
+ARG MEMSEARCH_FILE=memory-search-BKCwFNk2.mjs
+ARG MEMSEARCH_STOCK_SHA256=08fa5e995ea9138df3278eb136a7139e9310132ae24dcef53143e790941af38a
+ARG MEMSEARCH_PATCHED_SHA256=be0f0ea95fcf0a6f0ed9c36a4f711e3e5b94141b98cbe67ab67e51a6908fa8e3
+RUN set -eu; \
+    if [ "${OPENCLAW_VERSION}" != "2026.10.4" ]; then echo "memory half-life patch is for OpenClaw 2026.10.4 only (OPENCLAW_VERSION=${OPENCLAW_VERSION}): re-derive it" >&2; exit 1; fi; \
+    pkg="$(npm root -g)/openclaw"; \
+    test "$(jq -r .version "$pkg/package.json")" = "2026.10.4"; \
+    f="$pkg/dist/${MEMSEARCH_FILE}"; \
+    test "$(grep -l -F '//#region src/agents/memory-search.ts' "$pkg"/dist/*.mjs)" = "$f"; \
+    echo "${MEMSEARCH_STOCK_SHA256}  $f" | sha256sum -c -; \
+    test "$(grep -c -E '^[[:space:]]+halfLifeDays: 30$' "$f")" = 1; \
+    sed -i '/^\t\t\t\ttemporalDecay: {$/,/^\t\t\t\t}$/ s/^\(\t\t\t\t\t\)halfLifeDays: 30$/\1halfLifeDays: 365/' "$f"; \
+    echo "${MEMSEARCH_PATCHED_SHA256}  $f" | sha256sum -c -; \
+    node --check "$f"; \
+    OC_PKG="$pkg" python3 - <<'PY'
+import hashlib, json, os, stat, sys
+pkg = os.environ["OC_PKG"]
+rel = "dist/" + os.environ["MEMSEARCH_FILE"]
+stock, patched = os.environ["MEMSEARCH_STOCK_SHA256"], os.environ["MEMSEARCH_PATCHED_SHA256"]
+inv = os.path.join(pkg, "dist", "postinstall-content-inventory.json")
+raw = open(inv, "rb").read()
+data = json.loads(raw)
+if (json.dumps(data, indent=2) + "\n").encode() != raw:
+    sys.exit("content inventory format changed")
+hits = [e for e in data if e.get("path") == rel]
+if len(hits) != 1 or hits[0].get("sha256") != stock:
+    sys.exit(f"unexpected content inventory entry for {rel}")
+body = open(os.path.join(pkg, rel), "rb").read()
+if hashlib.sha256(body).hexdigest() != patched:
+    sys.exit("patched resolver differs")
+hits[0]["sha256"], hits[0]["size"] = patched, len(body)
+mode = stat.S_IMODE(os.stat(inv).st_mode)
+tmp = inv + ".tmp"
+with open(tmp, "w", encoding="utf-8") as o:
+    o.write(json.dumps(data, indent=2) + "\n")
+os.chmod(tmp, mode)
+os.replace(tmp, inv)
+bad = []
+for e in data:  # OpenClaw's own comparison: path, sha256, size, exec bit
+    p = os.path.join(pkg, e["path"])
+    try:
+        b = open(p, "rb").read()
+        m = os.stat(p).st_mode
+    except OSError:
+        bad.append(e["path"])
+        continue
+    if hashlib.sha256(b).hexdigest() != e["sha256"] or len(b) != e["size"] or (m & 0o111) != (e["mode"] & 0o111):
+        bad.append(e["path"])
+if bad:
+    sys.exit("content inventory mismatch: " + ", ".join(bad[:10]))
+print(f"memory search half-life 365 days; content inventory updated, {len(data)} entries re-checked")
+PY
+
 # ACP / ACPX harness: lets OpenClaw drive external coding agents (Codex, Claude Code)
 # via the Agent Client Protocol. Volt authenticates Anthropic + OpenAI via OAuth
 # (not API keys), so the harness must ship in the image. Codex is NOT bundled in
@@ -241,6 +301,17 @@ RUN set -eu; \
     printf '%s\n' "$pkg/openclaw.mjs" > /usr/local/libexec/oc-addon/openclaw-entry; \
     jq -r .version "$pkg/package.json" > /usr/local/libexec/oc-addon/openclaw-pinned-version; \
     printf '%s\n' "${BRAVE_PLUGIN_VERSION}" > /usr/local/libexec/oc-addon/brave-plugin-version; \
+    age_bin="$(command -v age)"; \
+    case "$age_bin" in *linuxbrew*|"") echo "unexpected age: '$age_bin'" >&2; exit 1 ;; esac; \
+    printf '%s\n' "$age_bin" > /usr/local/libexec/oc-addon/age-bin; \
+    "$age_bin" --version; \
+    k="$(mktemp -d)"; age-keygen -o "$k/key" 2>/dev/null; pub="$(age-keygen -y "$k/key")"; \
+    test "$(printf ok | "$age_bin" -r "$pub" | "$age_bin" -d -i "$k/key")" = ok; \
+    for n in 0 1 65537; do \
+      head -c "$n" /dev/zero | "$age_bin" -r "$pub" -o "$k/t.age"; \
+      python3 -c 'import sys; d = open(sys.argv[1], "rb").read(); i = d.index(b"\n--- ") + 1; hl = d.index(b"\n", i) + 1; n = int(sys.argv[2]); assert d.startswith(b"age-encryption.org/v1\n") and b"\n-> X25519 " in d[:hl], "age header"; assert len(d) == hl + 16 + n + 16 * max(1, -(-n // 65536)), "age size formula"' "$k/t.age" "$n"; \
+    done; \
+    rm -rf "$k"; \
     for bin in $(IFS=:; for d in $PATH; do [ -e "$d/openclaw" ] && echo "$d/openclaw"; done | sort -u); do \
       if [ "$(readlink -f "$bin")" != "$(readlink -f "$W")" ]; then ln -sf "$W" "$bin"; fi; \
     done; \
