@@ -1,4 +1,7 @@
 """0.5.94-full2: the migration gate's Home Assistant backup check (precheck 10b) and its Supervisor client.
+Since 0.5.94-full3 the gate writes no archive of its own: that backup is the only rollback point, and every
+ha-backup-missing / ha-backup-unverified message says so (ROLLBACK_TAIL), whatever an earlier version's
+gate_archive options left in options.json.
 
 BackupEvalTests: pure tests of oc_gate.evaluate_ha_backups / backup_protected / backup_locations /
 _parse_backup_date / backup_addon_version.
@@ -36,10 +39,11 @@ import oc_gate as G  # noqa: E402
 import test_gate as T  # noqa: E402  (GateEnv: temp tree, fake node, fake doctor)
 
 SLUG = "a0d7b954_openclaw_assistant"
-RUNNING_VER = "0.5.94-full2"
+RUNNING_VER = "0.5.94-full3"
 PREV_VER = "0.5.93"
 NOW = datetime(2026, 10, 18, 12, 0, 0, tzinfo=timezone.utc)
 H = 3600
+ROLLBACK_TAIL = "; the Home Assistant backup is the only rollback point"
 
 
 def _short_secret(prefix):
@@ -585,8 +589,13 @@ class BackupCheckGateTests(T.GateEnv):
         self.assertTrue(j["hold"]["acceptable"])
         self.assertIsNone(j.get("first_write_at"))
         self.assertNotIn("ha_backup", j)
+        msg = j["hold"]["message"]
+        self.assertTrue(msg.endswith(ROLLBACK_TAIL), msg)
+        self.assertEqual(msg.count(ROLLBACK_TAIL), 1, msg)
+        self.assertNotIn("gate_archive", msg)
         txt = (self.upg / "hold.txt").read_text()
         self.assertIn(f"Reason [{code}]:", txt)
+        self.assertIn(f"{ROLLBACK_TAIL}\n", txt)
         self.assertIn(f"oc-upgrade retry --accept {code}", txt)
         self.assertIn("State: unchanged (nothing written yet)", txt)
         self.assertIn(f"[gate] HOLD {code} in precheck:", self.out)
@@ -843,6 +852,8 @@ class BackupCheckGateTests(T.GateEnv):
         self.assertEqual(self.retry("--accept", "ha-backup-missing"), 0)
         self.assertEqual(self.run_gate(), 0, self.out)
         self.assertIn("WARN [gate] accepted ha-backup-missing:", self.out)
+        accepted = [x for x in self.out.splitlines() if x.startswith("WARN [gate] accepted ha-backup-missing:")]
+        self.assertTrue(accepted and all(x.endswith(ROLLBACK_TAIL) for x in accepted), self.out)
         self.assertIn("HA backup MISSING", self.out)
         j = self.journal()
         self.assertEqual(j["status"], "done")
@@ -857,6 +868,8 @@ class BackupCheckGateTests(T.GateEnv):
         self.assertEqual(self.retry("--accept", "ha-backup-unverified"), 0)
         self.assertEqual(self.run_gate(), 0, self.out)
         self.assertIn("WARN [gate] accepted ha-backup-unverified:", self.out)
+        accepted = [x for x in self.out.splitlines() if x.startswith("WARN [gate] accepted ha-backup-unverified:")]
+        self.assertTrue(accepted and all(x.endswith(ROLLBACK_TAIL) for x in accepted), self.out)
         self.assertIn("HA backup UNVERIFIED", self.out)
 
     def test_hold_clears_after_a_backup_is_made_and_retried(self):
@@ -867,7 +880,7 @@ class BackupCheckGateTests(T.GateEnv):
         self.assertEqual(self.run_gate(), 0, self.out)
         self.assertEqual(self.journal()["ha_backup"]["slug"], "pre1")
 
-    def test_resume_after_the_first_write_skips_the_check(self):
+    def interrupted_after_the_first_write(self):
         self.build_735()
         self.set_backups([self.backup("pre1", "Before update", 1)])
         self.sup_hooks(raise_in_phase="fixups")
@@ -876,17 +889,51 @@ class BackupCheckGateTests(T.GateEnv):
         self.assertEqual((j["hold"]["code"], j["phase"]), ("internal-error", "fixups"))
         self.assertTrue(j.get("first_write_at"))
         self.assertEqual(j["ha_backup"]["slug"], "pre1")
-        # the backup list is gone and the Supervisor refuses: the resume must not care
+
+    def test_resume_after_the_first_write_rechecks_only_the_recorded_backup(self):
+        self.interrupted_after_the_first_write()
+        # the backup list is refused and the backup is older than gate_backup_max_age_hours by now: the resume
+        # asks only for the recorded backup
         self.fake.clear()
-        self.set_backups([])
+        self.set_backups([self.backup("pre1", "Before update", 30)])
         self.fake.route("/backups/info", {"result": "error"}, status=500)
         self.sup_hooks()
         self.assertEqual(self.retry(), 0)
         self.assertEqual(self.run_gate(), 0, self.out)
-        self.assertIn("HA backup not re-checked (resume after the first write)", self.out)
-        self.assertEqual(self.fake.requests, [])
+        self.assertIn("HA backup still there ('Before update' (pre1), encrypted)", self.out)
+        self.assertEqual([r["path"] for r in self.fake.requests], ["/backups/pre1/info"])
         self.assertEqual(self.journal()["ha_backup"]["slug"], "pre1")  # the record of the first attempt stays
         self.assert_no_secrets()
+
+    def test_resume_holds_when_the_recorded_backup_is_gone(self):
+        self.interrupted_after_the_first_write()
+        self.set_backups([])  # deleted between the interruption and the retry
+        self.fake.routes.pop("/backups/pre1/info")
+        self.sup_hooks()
+        self.assertEqual(self.retry(), 0)
+        self.assertEqual(self.run_gate(), 20, self.out)
+        j = self.journal()
+        self.assertEqual((j["hold"]["code"], j["hold"]["phase"], j["hold"]["acceptable"]),
+                         ("ha-backup-missing", "precheck", True))
+        self.assertIn("'Before update' (pre1) this run relies on no longer exists", j["hold"]["message"])
+        self.assertTrue(j["hold"]["message"].endswith(ROLLBACK_TAIL))
+        self.assertIn("partially migrated", (self.upg / "hold.txt").read_text())
+        self.assertEqual(j["phases_done"].count("doctor1"), 1)  # nothing re-ran before the HOLD
+        # accepting it continues the migration
+        self.assertEqual(self.retry("--accept", "ha-backup-missing"), 0)
+        self.assertEqual(self.run_gate(), 0, self.out)
+        self.assertEqual(self.journal()["status"], "done")
+        self.assert_no_secrets()
+
+    def test_resume_holds_when_the_recorded_backup_cannot_be_rechecked(self):
+        self.interrupted_after_the_first_write()
+        self.fake.route("/backups/pre1/info", {"result": "error"}, status=500)
+        self.sup_hooks()
+        self.assertEqual(self.retry(), 0)
+        self.assertEqual(self.run_gate(), 20, self.out)
+        h = self.journal()["hold"]
+        self.assertEqual((h["code"], h["acceptable"]), ("ha-backup-unverified", True))
+        self.assertIn("could not be re-checked: HTTP 500", h["message"])
 
     def test_dry_run_previews_the_check(self):
         self.build_735()
@@ -895,6 +942,10 @@ class BackupCheckGateTests(T.GateEnv):
         out = "\n".join(lines)
         self.assertIn("ha-backup-missing", out)
         self.assertIn("would HOLD", out)
+        preview = [x for x in lines if "ha-backup-missing: " in x]
+        self.assertTrue(preview and all(x.endswith(ROLLBACK_TAIL) for x in preview), out)
+        self.assertIn("[gate]   rollback point: the encrypted Home Assistant backup (no archive of the gate's own)",
+                      lines)
         self.assertFalse((self.upg / "gate" / "journal.json").exists())
         self.set_backups([self.backup("pre1", "Before update", 1)])
         lines = []
@@ -918,6 +969,35 @@ class BackupCheckGateTests(T.GateEnv):
         self.assertEqual(self.run_gate(), 0, self.out)
         for name in ("journal.json", "migrated.json"):
             self.assertNotIn(self.token, (self.upg / "gate" / name).read_text())
+        self.assert_no_secrets()
+
+    # Regression (0.5.94-full3): the gate's own archive is gone, so a missing or unverified backup is always
+    # reported as the only rollback point, also when options.json still holds an earlier version's gate_archive
+    # options (gate_archive: off used to add its own tail; a missing recipient used to HOLD archive-key-missing).
+    def test_backup_holds_name_the_only_rollback_point_whatever_stale_archive_options_say(self):
+        self.build_735()
+        stale = [{"gate_archive": "off"}, {"gate_archive": "encrypted", "gate_archive_age_recipient": ""},
+                 {"gate_archive": "encrypted", "gate_archive_age_recipient": "age1" + "q" * 58}]
+        for i, opts in enumerate(stale):
+            with self.subTest(sorted(opts)):
+                self.base_options = opts
+                self.options()
+                if i:
+                    self.assertEqual(self.retry(), 0)
+                self.assertEqual(self.run_gate(), 20, self.out)
+                msg = self.assert_hold("ha-backup-missing")
+                self.assertTrue(msg.startswith("no encrypted Home Assistant backup containing this add-on"), msg)
+                self.assertEqual(self.hold()["codes"], ["ha-backup-missing"])
+                self.assertNotIn("archive-key", self.out)
+                self.assertNotIn("archive-off", self.out)
+                self.assertNotIn("no other rollback point", self.out)
+                self.assertNotIn("gate_archive", self.out + (self.upg / "hold.txt").read_text())
+        # the unverified messages carry the same tail
+        self.fake.route("/backups/info", {"result": "error", "message": "Forbidden"}, status=403)
+        self.assertEqual(self.retry(), 0)
+        self.assertEqual(self.run_gate(), 20, self.out)
+        self.assertIn("HTTP 403", self.assert_hold("ha-backup-unverified"))
+        self.assertTrue(self.hold()["message"].endswith(" /backups/info)" + ROLLBACK_TAIL), self.hold()["message"])
         self.assert_no_secrets()
 
     # Regression: for from-7x/bump runs an unreadable add-on version in the backup is not "older": the check

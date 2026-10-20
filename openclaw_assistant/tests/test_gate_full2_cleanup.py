@@ -1,13 +1,21 @@
-"""Tests of the 0.5.94-full2 automatic deletion of gate archives and doctor captures (gate_cleanup_hours) and of
-the archive / backup / cleanup lines of `oc-upgrade status` (status_lines) and the readiness preview.
+"""Tests of the automatic deletion (gate_cleanup_hours) of OpenClaw's doctor captures of finished gate runs and
+of the copies earlier add-on versions left behind, and of the backup / cleanup lines of `oc-upgrade status`
+(status_lines) and the readiness preview.
+
+Since 0.5.94-full3 the gate writes no archive of its own (the encrypted Home Assistant backup is the only
+rollback point): a new run only leaves doctor captures. The leftovers of 0.5.94-full1/full2 are still deleted:
+gate archive dirs in /share/openclaw-upgrade/<run>/ (full1 plaintext .tar.gz, full2 age-encrypted .tar.gz.age,
+each with manifest.json and SHA256SUMS), orphaned archive dirs, tombstones, rehearsal exports in
+/share/openclaw-rehearsal/ (encrypted and plaintext, incl. .tmp leftovers) and the Stage A plaintext archives
+after a 2026.8+ marker.
 
 Covers oc_gate.captures_root, _run_journals, cleanup_blocked, run_captures, _delete_tree, _archive_dir_ok,
 cleanup_targets, cleanup_pass, cleanup_loop and cleanup_cmd in the temporary tree of test_gate.GateEnv, partly
 on the state a real gate run leaves (fake node, a fake doctor that writes OpenClaw-style doctor captures) and
 partly on journals written directly. The safety rules under test: nothing is deleted before finished_at +
 gate_cleanup_hours, never during a HOLD / running gate / pending retry / held gate lock, never outside
-<state>.update-captures and /share/openclaw-upgrade, never through a symlink; and no status line prints the
-full age recipient, a token or a secret.
+<state>.update-captures, /share/openclaw-upgrade, /share/openclaw-rehearsal and <state>/upgrade-backups, never
+through a symlink; and no status line prints an age key, a token or a secret.
 """
 
 import fcntl
@@ -30,13 +38,19 @@ for _p in (str(ADDON), str(TESTS)):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-import test_gate as T  # noqa: E402  (GateEnv, fake node/doctor, synthetic 7.35 state, throwaway age keys)
+import test_gate as T  # noqa: E402  (GateEnv, fake node/doctor, synthetic 7.35 state)
 
 C, G = T.C, T.G
 
-NEEDS_AGE = unittest.skipUnless(T.HAVE_AGE, "age / age-keygen not installed")
-# A syntactically valid recipient for the journal-only tests (age itself never runs with it).
+# What 0.5.94-full2 left behind: the age v1 magic of its encrypted archives, the recipient its journals recorded
+# and the option values it stored in options.json (all obviously fake; age never runs in these tests).
+AGE_MAGIC = b"age-encryption.org/v1\n"
 FAKE_PUB = "age1" + "q" * 58
+FAKE_PRIV = "AGE-SECRET-KEY-1" + ("QPZRY9X8GF2TVDW0S3JN54KHCE6MUA7L" * 2)[:58]
+STALE_OPTIONS = ({"gate_archive": "off"},
+                 {"gate_archive": "encrypted", "gate_archive_age_recipient": ""},
+                 {"gate_archive": "encrypted", "gate_archive_age_recipient": FAKE_PUB},
+                 {"gate_archive": "encrypted", "gate_archive_age_recipient": FAKE_PRIV})
 T0 = datetime(2026, 10, 1, 12, 0, 0, tzinfo=timezone.utc)
 H48 = timedelta(hours=48)
 SEC = timedelta(seconds=1)
@@ -96,11 +110,13 @@ class CleanupEnv(T.GateEnv):
         return f"\x1b[90m│\x1b[39m  \x1b[2m{line}\x1b[22m" if ansi else line
 
     def make_archive(self, rid, kind="age", root=None):
+        """A gate archive dir as an earlier add-on version wrote it: kind "age" (0.5.94-full2: encrypted
+        .tar.gz.age) or "plain" (0.5.94-full1: plaintext .tar.gz), each with SHA256SUMS and manifest.json."""
         adir = (root or self.arch) / rid
         adir.mkdir(parents=True)
         name = f"openclaw-state-20261001-120000-before-{T.RUNTIME}.tar.gz" + (".age" if kind == "age" else "")
         f = adir / name
-        body = (G.AGE_MAGIC + b"-> X25519 stanza\n") if kind == "age" else b"\x1f\x8b\x08\x00"
+        body = (AGE_MAGIC + b"-> X25519 stanza\n") if kind == "age" else b"\x1f\x8b\x08\x00"
         f.write_bytes(body + os.urandom(3000))
         sha = C.sha256_file(f)
         (adir / "SHA256SUMS").write_text(f"{sha}  {name}\n")
@@ -113,8 +129,10 @@ class CleanupEnv(T.GateEnv):
 
     def make_run(self, finished=T0, status="done", archive="age", captures=1, current=False, extra_lines=(),
                  rid=None, **extra):
-        """A gate run as the gate leaves it: journal (current or runs/<id>/journal.json), its archive dir under
-        /share/openclaw-upgrade and its doctor captures, named in runs/<id>/doctor-pass1.log / -pass2.log."""
+        """A gate run as the gate leaves it: journal (current or runs/<id>/journal.json) and its doctor captures,
+        named in runs/<id>/doctor-pass1.log / -pass2.log. archive: "age" / "plain" / "off" is a run of
+        0.5.94-full2 / full1 / full2 with gate_archive: off (its journal "archive" record, plus the archive dir
+        under /share/openclaw-upgrade); None is a run of this version (no "archive" key, no archive dir)."""
         rid = rid or self.new_rid()
         rd = self.gp["RUNS"] / rid
         rd.mkdir(parents=True, exist_ok=True)
@@ -144,6 +162,35 @@ class CleanupEnv(T.GateEnv):
     def age_old(self, path, when):
         ts = when.timestamp()
         os.utime(path, (ts, ts), follow_symlinks=False)
+
+    def make_export(self, name, files, when):
+        """A rehearsal export dir /share/openclaw-rehearsal/<name>/ of an earlier add-on version: `files` (export
+        file names, written with mtime `when`) plus its manifest.txt."""
+        d = self.share / "openclaw-rehearsal" / name
+        d.mkdir(parents=True, exist_ok=True)
+        for fn in files:
+            body = (AGE_MAGIC + b"-> X25519 stanza\n") if ".age" in fn else b"\x1f\x8b\x08\x00"
+            (d / fn).write_bytes(body + b"x" * 100)
+            self.age_old(d / fn, when)
+        (d / "manifest.txt").write_text("contains_secrets=yes\n")
+        return d
+
+    def make_stage_a(self, name, when):
+        """A Stage A (0.5.93) plaintext archive in <state>/upgrade-backups/ with mtime `when`."""
+        sa = G.stage_a_root(self.gp)
+        sa.mkdir(parents=True, exist_ok=True)
+        f = sa / name
+        f.write_bytes(b"\x1f\x8b plaintext stage A archive")
+        self.age_old(f, when)
+        return f
+
+    def write_marker_at(self, rid, completed_at, runtime=T.RUNTIME):
+        """migrated.json as this version's finalize writes it (G.write_marker), completed at `completed_at`."""
+        G.write_marker(mode="from-7x", run_id=rid, binding={}, runtime=runtime, accepted=[], orphans=[])
+        m = json.loads(self.gp["MARKER"].read_text())
+        m["completed_at"] = iso(completed_at)
+        self.gp["MARKER"].write_text(json.dumps(m))
+        return m
 
     # ----- runners -----
     def cleanup(self, now, hours=48, state=None):
@@ -191,48 +238,60 @@ class CleanupEnv(T.GateEnv):
 
 class CleanupTests(CleanupEnv):
     # ----- a real gate run ------------------------------------------------------------------------
-    @NEEDS_AGE
-    def test_real_gate_run_archive_and_captures_kept_until_due_then_deleted_once(self):
+    def test_real_gate_run_writes_no_archive_and_its_captures_are_deleted_once_when_due(self):
         j, caps = self.real_gate_with_captures()
         rid = j["run_id"]
-        adir = Path(j["archive"]["dir"])
-        self.assertEqual(adir, self.arch / rid)
-        self.assertTrue(list(adir.glob("*.tar.gz.age")))
-        self.assertIn("info: the archive and the doctor captures of this run are deleted after", self.out)
-        self.assertIn("(gate_cleanup_hours=48)", self.out)
+        # 0.5.94-full3: no archive of its own, in the journal, the marker or /share
+        self.assertNotIn("archive", j)
+        self.assertNotIn("archive_opt", j)
+        self.assertNotIn("archive", j["phases_done"])
+        marker = json.loads(self.gp["MARKER"].read_text())
+        self.assertNotIn("archive", marker)
+        self.assertNotIn("archive_mode", marker)
+        self.assertFalse(os.path.lexists(self.arch / rid))
+        self.assertEqual([p for p in self.share.rglob("*") if not p.is_dir()], [])
+        self.assertNotIn("archive sha256", self.out)
+        self.assertNotIn("the archive and the doctor captures", self.out)
         stray = self.capture()  # a capture no run log names (doctor run by hand): never touched
-        fin = datetime.strptime(j["finished_at"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
-        due = fin + H48
+        due = G.run_due_base(j) + H48
+        self.assertEqual(G.run_due_base(j), datetime.strptime(j["finished_at"], "%Y-%m-%dT%H:%M:%SZ")
+                         .replace(tzinfo=timezone.utc))
+        # finalize names the same due time the cleanup uses (computed a moment after finished_at)
+        said = [x for x in self.out.splitlines() if "info: the doctor captures of this run are deleted after " in x]
+        self.assertEqual(len(said), 1, self.out)
+        self.assertTrue(said[0].endswith(" (gate_cleanup_hours=48)"), said[0])
+        announced = datetime.strptime(said[0].split(" deleted after ")[1].split(" ")[0], "%Y-%m-%dT%H:%M:%SZ") \
+            .replace(tzinfo=timezone.utc)
+        self.assertTrue(due <= announced <= due + timedelta(seconds=5), (said[0], iso(due)))
 
         keep, refused = G.run_captures(self.gp, j)
         self.assertEqual((sorted(keep), refused), (caps, []))
+        self.assertEqual([t[2:4] for t in G.cleanup_targets(self.gp, due, 48) if t[0] == rid], [(due, caps)])
 
         # one second before: nothing deleted, announced once
         self.assertEqual(self.cleanup(due - SEC), 0)
-        self.assertEqual(self.lines, [f"[cleanup] run {rid}: 3 item(s) (archive / doctor captures) will be deleted "
+        self.assertEqual(self.lines, [f"[cleanup] run {rid}: 2 item(s) (doctor captures / archive) will be deleted "
                                       f"at {iso(due)}"])
         rec = self.record(rid)
         self.assertEqual((rec["due_at"], rec["announced_at"]), (iso(due), iso(due - SEC)))
-        self.assertTrue(adir.is_dir() and all(c.is_dir() for c in caps))
+        self.assertTrue(all(c.is_dir() for c in caps))
         self.assertEqual(self.cleanup(due - SEC), 0)
         self.assertEqual(self.lines, [])  # repeated passes are silent
 
-        # at the due time: archive dir and both captures go, nothing else
-        self.assertEqual(self.cleanup(due), 3)
+        # at the due time: both captures go, nothing else
+        self.assertEqual(self.cleanup(due), 2)
         self.assertEqual(len(self.lines), 1, self.text)
-        self.assertTrue(self.lines[0].startswith(f"[cleanup] run {rid}: deleted 3 item(s), "), self.text)
-        self.assertFalse(os.path.lexists(adir))
+        self.assertTrue(self.lines[0].startswith(f"[cleanup] run {rid}: deleted 2 item(s), "), self.text)
         for c in caps:
             self.assertFalse(os.path.lexists(c), c)
         self.assertTrue(stray.is_dir())
         self.assertTrue(self.caps.is_dir())
-        self.assertEqual(sorted(p.name for p in self.arch.iterdir()), [])  # no tombstone left behind
-        self.assertEqual([p.name for p in self.caps.iterdir()], [stray.name])
+        self.assertEqual([p.name for p in self.caps.iterdir()], [stray.name])  # no tombstone left behind
         rec = self.record(rid)
         self.assertEqual(rec["deleted_at"], iso(due))
-        self.assertEqual(sorted(d["path"] for d in rec["deleted"]), sorted([str(adir)] + [str(c) for c in caps]))
+        self.assertEqual(sorted(d["path"] for d in rec["deleted"]), sorted(str(c) for c in caps))
         self.assertTrue(all(d["bytes"] > 0 for d in rec["deleted"]), rec)
-        # the gate's own records survive (only /share and the captures are deleted)
+        # the gate's own records survive (only the captures are deleted)
         self.assertTrue((self.gp["RUNS"] / rid / "doctor-pass1.log").exists())
         self.assertTrue((self.upg / "gate" / "migrated.json").exists())
 
@@ -242,18 +301,114 @@ class CleanupTests(CleanupEnv):
         self.assertEqual(self.record(rid), rec)
         self.assertNotIn("SECRET", self.out)
 
-    def test_real_gate_run_with_archive_off_deletes_only_the_captures(self):
-        self.base_options = {"gate_archive": "off"}
+    def test_real_gate_run_with_stale_archive_options_deletes_only_the_captures(self):
+        # options.json of an earlier add-on version may still hold gate_archive / gate_archive_age_recipient
+        self.base_options = {"gate_archive": "encrypted", "gate_archive_age_recipient": FAKE_PUB}
         self.options()
         j, caps = self.real_gate_with_captures()
+        self.assertNotIn("archive", j)
         self.assertIn("info: the doctor captures of this run are deleted after", self.out)
-        self.assertFalse(self.arch.exists() and any(self.arch.iterdir()))
-        fin = datetime.strptime(j["finished_at"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+        self.assertFalse(os.path.lexists(self.arch / j["run_id"]))
+        self.assertNotIn(FAKE_PUB, self.out + self.err)
+        fin = G.run_due_base(j)
         self.assertEqual(self.cleanup(fin + H48 - SEC), 0)
         self.assertIn("2 item(s)", self.text)
         self.assertEqual(self.cleanup(fin + H48), 2)
         for c in caps:
             self.assertFalse(os.path.lexists(c))
+
+    def test_full3_run_journal_without_archive_key_due_time_and_hours_option(self):
+        """A journal of this version has no "archive" key: its captures are due at finished_at +
+        gate_cleanup_hours (the option, when the pass is not told), and a moved due time is announced."""
+        self.options(gate_cleanup_hours=6)
+        r = self.make_run(finished=T0, archive=None, captures=2)
+        self.assertNotIn("archive", r.j)
+        due = T0 + timedelta(hours=6)
+        self.assertEqual([(t[1], t[2], t[3], t[4]) for t in G.cleanup_targets(self.gp, T0, 6) if t[0] == r.rid],
+                         [(f"run {r.rid}", due, sorted(r.caps), [])])
+        lines = []
+        self.assertEqual(G.cleanup_pass(now=due - SEC, emit=lines.append), 0)
+        self.assertEqual(lines, [f"[cleanup] run {r.rid}: 2 item(s) (doctor captures / archive) will be deleted at "
+                                 f"{iso(due)}"])
+        self.assertEqual(self.cmd(), 0)
+        self.assertEqual(self.lines[0], "gate_cleanup_hours=6")
+        self.assertIn(f"  run {r.rid}: " + ("due now" if C.utc_now() >= due else f"due {iso(due)}"), self.lines)
+        # a hold after the run that was cleared later moves the due time (retention restarts there)
+        cleared = T0 + timedelta(hours=3)
+        j = dict(r.j, history=[{"at": iso(cleared), "event": "journal done: retry after exit78: hold cleared"}])
+        (r.rd / "journal.json").write_text(json.dumps(j))
+        lines = []
+        self.assertEqual(G.cleanup_pass(now=due, emit=lines.append), 0)
+        self.assertEqual(lines, [f"[cleanup] run {r.rid}: deletion moved to {iso(cleared + timedelta(hours=6))}"])
+        self.assertTrue(all(c.is_dir() for c in r.caps))
+        lines = []
+        self.assertEqual(G.cleanup_pass(now=cleared + timedelta(hours=6), emit=lines.append), 2)
+        self.assertFalse(any(os.path.lexists(c) for c in r.caps))
+        self.assertEqual(self.record(r.rid)["deleted_at"], iso(cleared + timedelta(hours=6)))
+        self.assertFalse(self.arch.exists() and any(self.arch.iterdir()))
+
+    # ----- leftovers of earlier add-on versions -----------------------------------------------------------
+    def test_leftovers_of_earlier_versions_are_deleted_after_gate_cleanup_hours(self):
+        """An install that ran 0.5.93, 0.5.94-full1 and -full2 before this version: every copy they left goes
+        gate_cleanup_hours after its run, export or the migration; the full3 run's captures on their own time."""
+        old = T0 - timedelta(hours=1)
+        full1 = self.make_run(finished=old, archive="plain", captures=1)
+        full2 = self.make_run(finished=old, archive="age", captures=1)
+        full2_off = self.make_run(finished=old, archive="off", captures=1)
+        for r, suffix in ((full1, ".tar.gz"), (full2, ".tar.gz.age")):
+            self.assertEqual(sorted(p.name for p in r.adir.iterdir()),
+                             ["SHA256SUMS", "manifest.json", r.afile.name])
+            self.assertTrue(r.afile.name.endswith(suffix))
+        self.assertEqual(full2.j["archive"]["mode"], "encrypted")
+        self.assertNotIn("mode", full1.j["archive"])  # full1 journals predate the mode field
+        orphan, _f, _rec = self.make_archive(self.new_rid())  # a full2 archive dir no journal names
+        self.age_old(orphan, old)
+        tomb = self.arch / ".oc-addon-deleting-20260101T000000Z-abcdef"  # a full2 delete interrupted
+        tomb.mkdir()
+        (tomb / "x.tar.gz.age").write_bytes(AGE_MAGIC)
+        exports = {  # full1: <ts>, plaintext; full2: <ts>-XXXXXX, encrypted; .tmp: an interrupted export
+            "plaintext rehearsal export 20260901-000000": self.make_export(
+                "20260901-000000", ["openclaw-rehearsal.tar.gz"], old),
+            "plaintext rehearsal export 20260902-000000": self.make_export(
+                "20260902-000000", ["openclaw-rehearsal.tar.gz.tmp"], old),
+            "encrypted rehearsal export 20260903-000000-aB3dE9": self.make_export(
+                "20260903-000000-aB3dE9", ["openclaw-rehearsal.tar.gz.age"], old),
+            "encrypted rehearsal export 20260904-000000-Zz09yX": self.make_export(
+                "20260904-000000-Zz09yX", ["openclaw-rehearsal.tar.gz.age.tmp"], old)}
+        stage_a = [self.make_stage_a(f"openclaw-state-2026010{i}-120000-before-2026.7.35.tar.gz{sfx}",
+                                     T0 - timedelta(days=30)) for i, sfx in ((1, ""), (2, ".tmp"))]
+        # then this version migrated (marker without archive fields) and left its own doctor captures
+        new = self.make_run(finished=T0, archive=None, captures=2, current=True)
+        m = self.write_marker_at(new.rid, T0)
+        self.assertFalse({"archive", "archive_mode"} & set(m), m)
+
+        self.assertEqual(self.cleanup(old + H48 - SEC), 1)  # only the tombstone goes at once
+        self.assertFalse(os.path.lexists(tomb))
+        for p in [full1.adir, full2.adir, orphan, *exports.values(), *stage_a,
+                  *full1.caps, *full2.caps, *full2_off.caps, *new.caps]:
+            self.assertTrue(os.path.lexists(p), p)
+
+        self.assertEqual(self.cleanup(old + H48), 2 + 2 + 1 + 1 + 4)
+        want = {f"run {full1.rid}": 2, f"run {full2.rid}": 2, f"run {full2_off.rid}": 1,
+                f"orphaned archive {orphan.name}": 1, **{k: 1 for k in exports}}
+        for label, n in want.items():
+            self.assertIn(f"[cleanup] {label}: deleted {n} item(s)", self.text)
+        for p in [full1.adir, full2.adir, orphan, *exports.values(), *full1.caps, *full2.caps, *full2_off.caps]:
+            self.assertFalse(os.path.lexists(p), p)
+        self.assertEqual(list(self.arch.iterdir()), [])
+        self.assertEqual(list((self.share / "openclaw-rehearsal").iterdir()), [])
+        # the Stage A archives count from the migration (marker completed_at), the full3 captures from their run
+        self.assertTrue(all(f.exists() for f in stage_a) and all(c.is_dir() for c in new.caps))
+        self.assertEqual(self.cleanup(T0 + H48 - SEC), 0)
+        self.assertEqual(self.cleanup(T0 + H48), 2 + 2)
+        for f in stage_a:
+            self.assertIn(f"[cleanup] Stage A plaintext archive {f.name}: deleted 1 item(s)", self.text)
+            self.assertFalse(os.path.lexists(f))
+        self.assertIn(f"[cleanup] run {new.rid}: deleted 2 item(s)", self.text)
+        self.assertFalse(any(os.path.lexists(c) for c in new.caps))
+        self.assertTrue(G.stage_a_root(self.gp).is_dir())
+        self.assertEqual(self.cleanup(T0 + H48 * 10), 0)
+        self.assertEqual(self.lines, [])
 
     # ----- capture parsing and path validation ---------------------------------------------------------
     def test_captures_root_is_next_to_the_resolved_state_dir(self):
@@ -778,7 +933,7 @@ class CleanupTests(CleanupEnv):
     def test_leftover_tombstone_is_removed_even_before_any_run_is_due(self):
         tomb = self.arch / ".oc-addon-deleting-20260101T000000Z-abcdef"
         (tomb / "deep").mkdir(parents=True)
-        (tomb / "deep" / "x.tar.gz.age").write_bytes(G.AGE_MAGIC)
+        (tomb / "deep" / "x.tar.gz.age").write_bytes(AGE_MAGIC)
         r = self.make_run(finished=T0)
         self.assertEqual(self.cleanup(T0), 1)
         self.assertFalse(os.path.lexists(tomb))
@@ -892,9 +1047,9 @@ class CleanupTests(CleanupEnv):
             timer.join()
         self.assertLess(time.monotonic() - t, 10)
         self.assertEqual(rc, 143)
-        self.assertEqual(lines[0], "[cleanup] gate archives and doctor captures are deleted 48 h after their gate "
-                                   "run, rehearsal exports and 2026.7 plaintext archives the same time after they "
-                                   "were written or migrated (checked hourly)")
+        self.assertEqual(lines[0], "[cleanup] doctor captures are deleted 48 h after their gate run; gate archives "
+                                   "and rehearsal exports of earlier add-on versions and the 2026.7 plaintext "
+                                   "archives the same time after their run, export or migration (checked hourly)")
         self.assertFalse(os.path.lexists(r.adir))  # the first pass runs at once
 
     def test_loop_exits_143_on_sigterm(self):
@@ -1045,6 +1200,8 @@ class CleanupTests(CleanupEnv):
 
 
 class StatusTests(CleanupEnv):
+    OPTIONS_LINE = "Gate options: delete doctor captures 48 h after a run (0 = never); backup max age 24 h"
+
     def status(self):
         self.st = "\n".join(G.status_lines())
         return self.st
@@ -1054,79 +1211,87 @@ class StatusTests(CleanupEnv):
         self.assertEqual(len(hits), 1, f"{prefix!r} in:\n{self.st}")
         return hits[0]
 
-    @NEEDS_AGE
-    def test_encrypted_run_short_recipient_cleanup_progress_and_captures(self):
+    def no_line(self, prefix):
+        self.assertEqual([x for x in self.st.splitlines() if x.lstrip().startswith(prefix)], [], self.st)
+
+    def test_real_run_capture_cleanup_progress_and_no_archive_lines(self):
         j, caps = self.real_gate_with_captures()
-        short = C.short_recipient(T.AGE_PUB)
         self.status()
-        a = self.line("archive: ")
-        want = f"  archive: encrypted (age, {short}) {j['archive']['dir']}/{j['archive']['file']}"
-        self.assertTrue(a.startswith(want), a)
-        self.assertIn(f"sha256 {j['archive']['sha256']})", a)  # in full: the trusted record (journal in /config)
-        self.assertNotIn("auto-delete", a)
-        self.assertEqual(self.line("Gate options: "),
-                         f"Gate options: gate_archive encrypted to {short}; delete archives/doctor captures 48 h after "
-                         "a run (0 = never); backup max age 24 h")
-        self.assertEqual(self.line("Gate archives in /share"), "Gate archives in /share:")
-        f = Path(j["archive"]["dir"]) / j["archive"]["file"]
-        self.assertIn(f"  {f} (", self.st)
-        self.assertTrue(self.line(str(f)).endswith(", encrypted)"))
+        self.assertNotIn("archive", self.line("phases done: "))
+        self.no_line("archive")  # this version writes none
+        self.no_line("doctor captures;")  # nothing announced yet
+        self.assertEqual(self.line("Gate options: "), self.OPTIONS_LINE)
+        self.no_line("Gate archives in /share")  # listed only when an earlier add-on version left some
         self.assertEqual(self.line("Doctor captures: "),
                          f"Doctor captures: 2 in {self.caps} (pre-repair database copies; deleted with their gate run)")
-        self.assertNotIn(T.AGE_PUB, self.st)
         self.assertNotIn("SECRET", self.st)
         self.assertNotIn("HA backup checked", self.st)  # skip_backup_check hook: nothing recorded
 
-        fin = datetime.strptime(j["finished_at"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
-        self.cleanup(fin)
+        due = G.run_due_base(j) + H48
+        self.cleanup(due - H48)
         self.status()
-        self.assertTrue(self.line("archive: ").endswith(f"; auto-delete due {iso(fin + H48)}"), self.st)
-        self.cleanup(fin + H48)
+        self.assertEqual(self.line("doctor captures; "), f"  doctor captures; auto-delete due {iso(due)}")
+        self.cleanup(due)
         self.status()
-        self.assertTrue(self.line("archive: ").endswith(f"; deleted {iso(fin + H48)}"), self.st)
-        self.assertEqual(self.line("Gate archives in /share"), "Gate archives in /share: none")
+        self.assertEqual(self.line("doctor captures; "), f"  doctor captures; deleted {iso(due)}")
+        self.no_line("archive")
         self.assertEqual(self.line("Doctor captures: ").split(" (")[0], f"Doctor captures: 0 in {self.caps}")
-        self.assertNotIn(T.AGE_PUB, self.st)
 
-    def test_off_run_lines(self):
-        self.base_options = {"gate_archive": "off"}
-        self.options()
-        self.build_735()
-        self.hooks()
-        self.assertEqual(self.run_gate(), 0, self.out)
-        j = self.journal()
-        self.assertEqual(j["archive"]["mode"], "off")
+    def test_full2_off_run_journal_shows_only_the_capture_progress(self):
+        r = self.make_run(archive="off", captures=1, current=True)
         self.status()
-        self.assertEqual(self.line("archive: "), "  archive: off for this run (gate_archive: off)")
-        self.assertEqual(self.line("Gate options: "),
-                         "Gate options: gate_archive off; delete archives/doctor captures 48 h after a run "
-                         "(0 = never); backup max age 24 h")
-        self.assertEqual(self.line("Gate archives in /share"), "Gate archives in /share: none")
-        self.assertNotIn("Doctor captures:", self.st)  # no capture root yet
-        self.assertNotIn("SECRET", self.st)
+        self.no_line("archive")
+        self.no_line("doctor captures;")
+        (r.rd / "cleanup.json").write_text(json.dumps({"schema": 1, "due_at": iso(T0 + H48)}))
+        self.status()
+        self.assertEqual(self.line("doctor captures; "), f"  doctor captures; auto-delete due {iso(T0 + H48)}")
+        self.no_line("archive")
+        self.no_line("Gate archives in /share")
 
-    def test_legacy_plaintext_run_and_archive_kinds(self):
+    def test_full1_plaintext_record_and_listing_of_archives_of_earlier_versions(self):
         r = self.make_run(archive="plain", captures=0, current=True)
         enc_dir, enc_file, _rec = self.make_archive(self.new_rid())
-        (self.gp["RUNS"] / r.rid / "cleanup.json").write_text(json.dumps({"schema": 1, "due_at": iso(T0 + H48)}))
         self.status()
-        a = self.line("archive: ")
-        self.assertTrue(a.startswith(f"  archive: {r.adir}/{r.afile.name} PLAINTEXT (0.5.94-full1) ("), a)
-        self.assertTrue(a.endswith(f"; auto-delete due {iso(T0 + H48)}"), a)
-        self.assertIn(f"sha256 {r.j['archive']['sha256'][:12]}…", a)
-        self.assertTrue(self.line(str(r.afile)).endswith(", PLAINTEXT from 0.5.94-full1: unencrypted secrets)"))
-        self.assertTrue(self.line(str(enc_file)).endswith(", encrypted)"))
-        sha = (r.adir / "SHA256SUMS").read_text().split()[0][:12]
-        self.assertIn(f"sha256 {sha}…", self.line(str(r.afile)))
+        self.assertEqual(self.line("archive (earlier add-on version): "),
+                         f"  archive (earlier add-on version): {r.adir}/{r.afile.name}")
+        (r.rd / "cleanup.json").write_text(json.dumps({"schema": 1, "due_at": iso(T0 + H48)}))
+        self.status()
+        self.assertEqual(self.line("archive (earlier add-on version): "),
+                         f"  archive (earlier add-on version): {r.adir}/{r.afile.name}; auto-delete due "
+                         f"{iso(T0 + H48)}")
+        self.no_line("doctor captures;")  # the archive line carries the progress
+        self.assertEqual(self.line("Gate archives in /share"),
+                         "Gate archives in /share from earlier add-on versions (deleted automatically, see "
+                         "oc-upgrade cleanup):")
+        self.assertEqual(self.line(str(r.afile)),
+                         f"  {r.afile} ({C.human(r.afile.stat().st_size)}, PLAINTEXT: unencrypted secrets)")
+        self.assertEqual(self.line(str(enc_file)), f"  {enc_file} ({C.human(enc_file.stat().st_size)}, encrypted)")
+        self.assertNotIn("sha256", self.st)  # SHA256SUMS in /share is no longer read
 
-    def test_encrypted_journal_record_uses_the_short_recipient(self):
-        r = self.make_run(archive="age", captures=0, current=True)
+    def test_full2_encrypted_record_without_recipient_until_deleted(self):
+        r = self.make_run(archive="age", captures=1, current=True)
+        self.assertEqual(r.j["archive"]["recipient"], FAKE_PUB)
         self.status()
-        a = self.line("archive: ")
-        self.assertIn(f"encrypted (age, {C.short_recipient(FAKE_PUB)})", a)
-        self.assertNotIn(FAKE_PUB, self.st)
-        self.assertEqual(C.short_recipient(FAKE_PUB), FAKE_PUB[:9] + "…" + FAKE_PUB[-6:])
-        self.assertIn(str(r.afile), self.st)
+        self.assertEqual(self.line("archive (earlier add-on version): "),
+                         f"  archive (earlier add-on version): {r.adir}/{r.afile.name}")
+        self.assertTrue(self.line(str(r.afile)).endswith(", encrypted)"))
+        self.assertNotIn(FAKE_PUB[:9], self.st)  # neither the recipient nor its short form of earlier versions
+        self.cleanup(T0 + H48)
+        self.status()
+        self.assertEqual(self.line("archive (earlier add-on version): "),
+                         f"  archive (earlier add-on version): {r.adir}/{r.afile.name}; deleted {iso(T0 + H48)}")
+        self.no_line("Gate archives in /share")
+        self.no_line(str(r.afile))
+
+    def test_archive_record_names_are_printed_escaped(self):
+        r = self.make_run(archive="age", captures=0, current=True)
+        j = dict(r.j, archive={**r.j["archive"], "file": "x.tar.gz.age\nGate options: forged\x1b[2J"})
+        self.write_current(j)
+        self.status()
+        self.assertTrue(self.line("archive (earlier add-on version): ")
+                        .endswith("/x.tar.gz.age\\x0aGate options: forged\\x1b[2J"), self.st)
+        self.assertEqual(self.line("Gate options: "), self.OPTIONS_LINE)  # no forged second line
+        self.assertNotIn("\x1b", self.st)
 
     def test_ha_backup_line_and_tokens_never_printed(self):
         sv_token = "svtok-" + "Zx9" * 15
@@ -1149,36 +1314,27 @@ class StatusTests(CleanupEnv):
         self.status()
         self.assertEqual(self.line("HA backup checked: "), "  HA backup checked: 'b' (s, d, add-on ?)")
 
-    def test_gate_options_line_problem_codes_never_values(self):
-        priv = (T.AGE_IDENTITY or "AGE-SECRET-KEY-1" + "QPZRY9X8GF2TVDW0S3JN54KHCE6MUA7L" * 2)[:74]
-        cases = [
-            ({"gate_archive": "encrypted", "gate_archive_age_recipient": ""},
-             "Gate options: gate_archive encrypted (problem: missing); "),
-            ({"gate_archive": "encrypted", "gate_archive_age_recipient": priv},
-             "Gate options: gate_archive encrypted (problem: private-key); "),
-            ({"gate_archive": "encrypted", "gate_archive_age_recipient": "age1-not-a-key-but-long-enough-to-show"},
-             "Gate options: gate_archive encrypted (problem: malformed); "),
-            ({"gate_archive": "plaintext"}, "Gate options: gate_archive ? (problem: invalid-mode); "),
-            ({"gate_archive": "encrypted", "gate_archive_age_recipient": f"  {FAKE_PUB}\n"},
-             f"Gate options: gate_archive encrypted to {C.short_recipient(FAKE_PUB)}; "),
-        ]
-        for opts, want in cases:
-            with self.subTest(want):
+    def test_gate_options_line_ignores_stale_archive_options_and_never_prints_them(self):
+        for opts in STALE_OPTIONS:
+            with self.subTest(sorted(opts)):
                 self.base_options = opts
                 self.options()
                 self.status()
-                self.assertTrue(self.line("Gate options: ").startswith(want), self.st)
-                rec = opts.get("gate_archive_age_recipient", "").strip()
-                if rec and rec != FAKE_PUB:
-                    self.assertNotIn(rec, self.st)
-                    self.assertNotIn(rec[16:40], self.st)
+                self.assertEqual(self.line("Gate options: "), self.OPTIONS_LINE)
+                self.assertNotIn("gate_archive", self.st)
                 self.assertNotIn(FAKE_PUB, self.st)
+                self.assertNotIn("AGE-SECRET-KEY", self.st)
+                self.assertNotIn(FAKE_PRIV[16:40], self.st)
         self.base_options = {"gate_archive": "off"}
         self.options(gate_cleanup_hours=0, gate_backup_max_age_hours=72)
         self.status()
         self.assertEqual(self.line("Gate options: "),
-                         "Gate options: gate_archive off; delete archives/doctor captures 0 h after a run (0 = never); "
-                         "backup max age 72 h")
+                         "Gate options: delete doctor captures 0 h after a run (0 = never); backup max age 72 h")
+        # out of range / not an integer: the defaults (the precheck warns about it, never with the value)
+        self.options(gate_cleanup_hours=721, gate_backup_max_age_hours="72")
+        self.status()
+        self.assertEqual(self.line("Gate options: "), self.OPTIONS_LINE)
+        self.assertEqual(sorted(C.gate_options()), ["backup_max_age_hours", "cleanup_hours", "problems"])
 
     def test_doctor_captures_count_only_doctor_uuid_dirs(self):
         for _ in range(3):
@@ -1192,32 +1348,30 @@ class StatusTests(CleanupEnv):
     def test_no_run_recorded(self):
         self.status()
         self.assertIn("Gate: no run recorded.", self.st)
-        self.assertTrue(self.line("Gate options: ").startswith("Gate options: gate_archive "))
-        self.assertEqual(self.line("Gate archives in /share"), "Gate archives in /share: none")
+        self.assertEqual(self.line("Gate options: "), self.OPTIONS_LINE)
+        self.no_line("Gate archives in /share")
+        self.no_line("archive")
 
-    def test_readiness_archive_preview_agrees_with_status_options(self):
+    def test_readiness_names_the_ha_backup_as_the_rollback_point_whatever_stale_options_say(self):
         self.build_735()
         self.hooks()
-        cases = [({"gate_archive": "off"}, "[gate]   archive: off (rollback only through the encrypted Home "
-                                           "Assistant backup)", "gate_archive off;"),
-                 ({"gate_archive": "encrypted", "gate_archive_age_recipient": ""}, "[gate]   archive: NOT CONFIGURED",
-                  "gate_archive encrypted (problem: missing)")]
-        if T.HAVE_AGE:
-            short = C.short_recipient(T.AGE_PUB)
-            cases.append(({"gate_archive": "encrypted", "gate_archive_age_recipient": T.AGE_PUB},
-                          f"[gate]   archive: encrypted to {short} -> ", f"gate_archive encrypted to {short};"))
-        for opts, ready, opt_line in cases:
-            with self.subTest(ready):
+        for opts in ({},) + STALE_OPTIONS:
+            with self.subTest(sorted(opts)):
                 self.base_options = opts
                 self.options()
                 lines = []
-                G.dry_run(emit=lines.append)
+                rc = G.dry_run(emit=lines.append)
                 text = "\n".join(lines)
-                self.assertTrue(any(x.startswith(ready) for x in lines), text)
+                self.assertEqual(rc, 0, text)  # no archive-key HOLD any more
+                self.assertEqual([x for x in lines if x.startswith("[gate]   rollback point: ")],
+                                 ["[gate]   rollback point: the encrypted Home Assistant backup (no archive of the "
+                                  "gate's own)"], text)
+                self.assertEqual([x for x in lines if x.startswith("[gate]   archive")], [], text)
+                self.assertNotIn("archive-key", text)
+                self.assertNotIn("gate_archive", text)
                 self.status()
-                self.assertIn(opt_line, self.line("Gate options: "))
-                if T.HAVE_AGE:
-                    self.assertNotIn(T.AGE_PUB, text + self.st)
+                self.assertEqual(self.line("Gate options: "), self.OPTIONS_LINE)
+                self.assertNotIn(FAKE_PUB, text + self.st)
                 self.assertNotIn("SECRET", text + self.st)
 
 

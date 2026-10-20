@@ -151,18 +151,10 @@ configuration:
     name: Poziomy myślenia GLM
     description: "Model GLM skonfigurowany z formatem myślenia 'qwen-chat-template' ma tylko włączone lub wyłączone myślenie. Gdy WŁĄCZONE, bramka migracji przy następnym uruchomieniu (aktualizacja OpenClaw albo 'oc-upgrade retry --doctor' i restart; zwykły restart tego nie stosuje) przełącza go na reasoning_effort, aby poziomy /think i thinkingDefault docierały do modelu. 'Wyłączone' jest wtedy wysyłane jako 'none' zamiast enable_thinking: najpierw sprawdź swój serwer GLM (zobacz dokumentację). Ponowne WYŁĄCZENIE opcji nie cofa zmiany. Każda zmiana jest zapisywana w dzienniku transformacji bramki."
 
-  gate_archive:
-    name: Archiwum bramki
-    description: "Co bramka migracji zapisuje w /share/openclaw-upgrade, zanim zmieni stan OpenClaw (aktualizacja OpenClaw albo 'oc-upgrade retry --doctor'). 'encrypted' (domyślnie): archiwum zaszyfrowane narzędziem age dla poniższego klucza publicznego; na dysk nigdy nie trafiają niezaszyfrowane dane. 'off': brak archiwum; jedyną możliwością wycofania zmian jest wtedy Twoja zaszyfrowana kopia zapasowa Home Assistant. 'encrypted' bez klucza wstrzymuje bramkę, zanim cokolwiek zostanie zmienione."
-
-  gate_archive_age_recipient:
-    name: Klucz publiczny age dla archiwum bramki
-    description: "Twój PUBLICZNY klucz age (age1..., 62 znaki), utworzony poleceniem 'age-keygen' na zaufanym urządzeniu. Nigdy nie wklejaj klucza prywatnego (AGE-SECRET-KEY-...); trzymaj go z dala od tego hosta. Klucz prywatny jest potrzebny tylko do odszyfrowania archiwum przy wycofywaniu zmian."
-
   gate_cleanup_hours:
-    name: Usuń archiwum bramki po (godzinach)
-    description: Liczba godzin od zakończonego przebiegu bramki migracji, po której dodatek usuwa katalog /share/openclaw-upgrade/<run>/ tego przebiegu oraz zrzuty doctor OpenClaw (/config/.openclaw.update-captures/doctor-*). Eksporty próbne i stare nieszyfrowane archiwa sprzed aktualizacji (/config/.openclaw/upgrade-backups) są usuwane po tym samym czasie od ich utworzenia lub od migracji. 0 = nigdy. Zakres 0-720, domyślnie 48.
+    name: Usuń zrzuty doctor po (godzinach)
+    description: Liczba godzin od zakończonego przebiegu bramki migracji, po której dodatek usuwa zrzuty doctor OpenClaw z tego przebiegu (/config/.openclaw.update-captures/doctor-*). Kopie pozostawione przez wcześniejsze wersje dodatku (archiwa bramki w /share/openclaw-upgrade, eksporty próbne w /share/openclaw-rehearsal, nieszyfrowane archiwa z 2026.7 w /config/.openclaw/upgrade-backups) są usuwane po tym samym czasie od ich przebiegu, eksportu lub migracji. 0 = nigdy. Zmiana obowiązuje od następnego uruchomienia dodatku. Zakres 0-720, domyślnie 48.
 
   gate_backup_max_age_hours:
     name: Wymagany wiek kopii zapasowej (godziny)
-    description: "Zanim zmieni stan OpenClaw, bramka migracji wymaga zaszyfrowanej kopii zapasowej Home Assistant, która zawiera ten dodatek, została wykonana przed aktualizacją i ma co najwyżej tyle godzin; w przeciwnym razie bramka wstrzymuje się (można to zaakceptować poleceniem 'oc-upgrade retry --accept ha-backup-missing'). Zakres 1-168, domyślnie 24."
+    description: "Zanim zmieni stan OpenClaw, bramka migracji wymaga zaszyfrowanej kopii zapasowej Home Assistant, która zawiera ten dodatek, została wykonana przed aktualizacją i ma co najwyżej tyle godzin; w przeciwnym razie bramka wstrzymuje się (można to zaakceptować poleceniem 'oc-upgrade retry --accept ha-backup-missing'). Ta kopia zapasowa jest jedynym punktem wycofania zmian: bramka nie zapisuje własnego archiwum. Zakres 1-168, domyślnie 24."
