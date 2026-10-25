@@ -1,0 +1,13 @@
+{
+  "openclaw_version": "2026.10.4",
+  "patches": [
+    {
+      "name": "memory search half-life 365 days",
+      "file": "dist/memory-search-BKCwFNk2.mjs",
+      "region": "//#region src/agents/memory-search.ts",
+      "stock_sha256": "08fa5e995ea9138df3278eb136a7139e9310132ae24dcef53143e790941af38a",
+      "patched_sha256": "be0f0ea95fcf0a6f0ed9c36a4f711e3e5b94141b98cbe67ab67e51a6908fa8e3",
+      "diff": "memory-search-half-life.patch"
+    }
+  ]
+}
