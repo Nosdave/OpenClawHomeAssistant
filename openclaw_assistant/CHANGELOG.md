@@ -5,6 +5,27 @@ All notable changes to the OpenClaw Assistant Home Assistant Add-on will be docu
 > **Private fork** (`Nosdave/OpenClawHomeAssistant`): `-ghcrN` / `-fullN` suffixes are fork build iterations on top of the upstream `techartdev` base version. The image is pre-built on GitHub Actions (native `aarch64`) and pulled from GHCR. `-fullN` marks the un-stripped "full" build line (see `0.5.80-full1`).
 
 
+## [0.5.94-full4] - 2026-10-25
+
+**OpenClaw stays `2026.10.4`.** The Telegram hotfix VOLT-TG-20261023 that Volt applied in the running container on 2026-10-23 is now part of the image, byte-identical to the live files, so it survives add-on restarts and updates. The image requires the patched Node.js `24.22.1`.
+
+- **Coming from `0.5.94-full3`:** no action needed. No gate runs (same OpenClaw). The container hotfix is replaced by the same files from the image.
+- Why not OpenClaw `2026.10.6`/`2026.10.7` (upstream `0.5.96` ships `2026.10.6`): neither contains the hotfix, and since `2026.10.5` there are open upstream regressions that hit this setup: completion turns of background commands post into Telegram without the stay-silent guidance (openclaw/openclaw#182179) and the second message of a Control UI conversation fails (openclaw/openclaw#182744). Both are fixed only on OpenClaw's main branch. The agent databases would also move to schema 25 (one-way). The add-on follows with the next stable OpenClaw release that carries those fixes.
+
+### Added
+- **Telegram hotfix VOLT-TG-20261023** (written by Volt, the add-on's OpenClaw agent; DOCS: "Telegram replies with voice"):
+  1. A voice reply whose text is longer than a Telegram caption sends the text first, then the audio without caption. If the audio then fails on the network or is refused by the recipient's voice-privacy setting, the text stays delivered and the audio is not retried. Before, the text was only sent after the audio, so a hanging upload lost both.
+  2. The notice "I couldn't confirm whether my previous reply reached this chat …" is no longer sent while that reply is still being delivered (for example when a new message arrives during a voice upload). Replies whose outcome stayed unknown are still reported once. Same principle as openclaw/openclaw#154417, which is not in any OpenClaw release yet.
+  3. Voice and audio uploads use a fresh connection and the strict retry check that text messages already had, so an upload Telegram may have accepted is not sent again.
+
+### Changed
+- **Patches to OpenClaw's files** are now kept per OpenClaw version in `oc-patches/<version>/` (one unified diff per file plus `manifest.json`) and applied by `oc_dist_patch.py` at build time. Each patch must match the stock file's sha256, apply exactly at its stated lines and produce the expected sha256; OpenClaw's content inventory is updated and re-checked. Any other OpenClaw version fails the build until the patches are re-derived. The memory search half-life patch (365 days) moved there unchanged (same result, `be0f0ea9…`).
+- **Node.js:** the image requires `>=24.22.1 <25 || >=26.12.1`, the October 2026 Node security releases (TLS chains signed with compromised certificate keys are rejected). OpenClaw `2026.10.6` and later require the same.
+- Merged upstream `techartdev` `0.5.95`/`0.5.96`: they only bump OpenClaw; this fork keeps its own pins.
+
+### Not changed
+- Replies that do not go through OpenClaw's queued delivery (some fallback paths of the Telegram channel) still send a long voice reply's audio before its text; the notice change (2) covers them.
+
 ## [0.5.94-full3] - 2026-10-19
 
 **OpenClaw stays `2026.10.4`. One rollback mechanism instead of two:** the migration gate no longer writes an archive of its own, and the rehearsal export is gone. The only rollback point is the encrypted Home Assistant backup that the gate already requires before it changes anything; a rollback is a restore of that backup. No keys to create, keep or test.

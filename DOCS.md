@@ -1334,10 +1334,8 @@ OpenClaw 2026.10.10-beta.1 applies `minScore` before the decay
 (openclaw/openclaw#168692).
 
 **What the add-on changes.** The image sets the half-life to 365 days in OpenClaw's
-memory-search resolver (`dist/memory-search-BKCwFNk2.mjs`). The build checks the
-file's sha256 before and after the change, updates the file's entry in OpenClaw's
-content inventory (so OpenClaw's own package integrity check still passes), and fails
-for any OpenClaw version other than 2026.10.4. There is no option for it.
+memory-search resolver (`dist/memory-search-BKCwFNk2.mjs`), as one of the add-on's
+patches to OpenClaw (see "Patches to OpenClaw's files" below). There is no option for it.
 
 **Effect.** A note keeps 84 % of its score after 90 days (12.5 % with 30 days) and
 half of it after one year; a perfect match stays above 0.35 for about 553 days. Among
@@ -1357,6 +1355,55 @@ undated files under `memory/` do not decay.
 `minScore` can stay at the default 0.35. If you lowered it as a workaround, you can
 remove that override again (`openclaw config unset memory.search.query.minScore`, and
 per agent where you set one).
+
+#### Telegram replies with voice (hotfix VOLT-TG-20261023)
+
+Volt (the add-on's OpenClaw agent) wrote this hotfix on 2026-10-23, after a Telegram
+outage on 21/22 October had swallowed voice replies together with their text. It ran
+in the container until 0.5.94-full4 put the same files into the image. It does not
+change timeouts, DNS, proxy or the Telegram API address, and it cannot prevent a
+Telegram outage; it makes replies robust against one. Three changes, in OpenClaw's
+queued reply delivery:
+
+1. **Long voice replies send their text first.** A voice reply whose text is longer
+   than a Telegram caption (1024 characters) is sent as text first and then as audio
+   without caption. If the audio then fails on the network or is refused by the
+   recipient's voice-privacy setting, the text stays delivered, the add-on logs
+   `telegram optional voice failed after confirmed text; text retained, audio not
+   replayed`, and the audio is not retried. A short reply still travels as the caption
+   of the voice message. Without the hotfix the text followed the audio, so a hanging
+   upload (30 s timeout) lost both.
+2. **No false "couldn't confirm" notice during a delivery.** OpenClaw sends "I couldn't
+   confirm whether my previous reply reached this chat, so I won't resend it
+   automatically. Please ask for any missing remainder." before the next answer when the
+   outcome of a reply stayed unknown. Without the hotfix this could also happen while
+   the reply was still being sent (for example when you wrote again during a voice
+   upload). Now the notice waits until that delivery has ended; a reply whose outcome
+   really stayed unknown is still reported once. OpenClaw fixed this on its main branch
+   (openclaw/openclaw#154417), but no release contains it yet (2026.10.7 does not).
+3. **Voice and audio uploads are not sent twice.** They use a fresh connection and the
+   strict retry check that text messages already had: an upload that broke off after
+   Telegram may have received it is not repeated; one that provably failed before the
+   connection was made may try the next route.
+
+A lost reply is never resent automatically; ask Volt to repeat it. Replies that do not
+go through the queued delivery (some fallback paths of the Telegram channel) still send
+the audio before the text; change 2 covers them. The regression tests are in
+`tests/oc_patches/telegram_hotfix_2026.10.4.test.mjs` (run in the image with
+`node --test`).
+
+#### Patches to OpenClaw's files
+
+The add-on changes a few of OpenClaw's own files in the image: the memory search
+half-life and the Telegram hotfix above. They are kept per OpenClaw version in
+`openclaw_assistant/oc-patches/<version>/`: one unified diff per file and a
+`manifest.json` with each file's sha256 before and after. `oc_dist_patch.py` applies
+them at build time and fails the build when the installed OpenClaw is another version,
+a file is not the stock file, a diff does not apply exactly at its stated lines, or the
+result differs from the expected sha256. It then updates OpenClaw's content inventory
+(`dist/postinstall-content-inventory.json`), so OpenClaw's own package integrity check
+still passes, and re-checks every entry. Every OpenClaw bump needs the patches
+re-derived (or dropped where OpenClaw fixed the problem itself).
 
 ### Backup
 

@@ -1,0 +1,11 @@
+--- a/dist/fetch-DRGAKny1.mjs
++++ b/dist/fetch-DRGAKny1.mjs
+@@ -720,7 +720,7 @@
+ 	const resolvedFetch = (async (input, init) => {
+ 		if (closed) throw new TelegramRequestNotStartedError("Telegram transport is closed");
+ 		const method = extractTelegramApiMethod(input);
+-		const freshConnection = method === "sendmessage" || method === "sendrichmessage";
++		const freshConnection = method === "sendmessage" || method === "sendrichmessage" || method === "sendvoice" || method === "sendaudio"; // VOLT-TG-20261023
+ 		const shouldRetryRequest = (error) => shouldRetryTelegramTransportFallback(error) && (!freshConnection || isSafeToRetrySendError(error));
+ 		const requestFetch = bindTelegramTransportAuthority(sourceFetch, getTelegramRequestAuthority(init));
+ 		const signal = init?.signal ?? (input instanceof Request ? input.signal : void 0);
