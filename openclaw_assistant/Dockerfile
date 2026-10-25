@@ -165,21 +165,25 @@ RUN npm config set fund false && npm config set audit false \
     && test "$(npm view "@openclaw/brave-plugin@${BRAVE_PLUGIN_VERSION}" version)" = "${BRAVE_PLUGIN_VERSION}"
 
 # Patches to the installed OpenClaw dist (oc-patches/<OpenClaw version>/manifest.json, applied by
-# oc_dist_patch.py). Each patch is a unified diff for exactly one dist file of exactly this OpenClaw
-# version, guarded by sha256 before and after; another version, a re-packed file or a diff that does
-# not apply at its stated lines fails the build (re-derive every patch on each OpenClaw bump).
-# OpenClaw's own content inventory is updated to match and re-checked as a whole.
+# oc_dist_patch.py; DOCS: "Patches to OpenClaw's files"). Each patch is a unified diff for exactly one
+# dist file of exactly this OpenClaw version, guarded by sha256 before and after; another version, a
+# re-packed file or a diff that does not apply at its stated lines fails the build (re-derive every
+# patch on each OpenClaw bump). OpenClaw's content inventory and runtime-dependency ownership hashes
+# are updated to match; every inventory entry is re-checked.
 #  - memory search half-life 365 days: 2026.10.4 hard-codes the temporal-decay half-life of memory
 #    search at 30 days (dist/memory-search-*.mjs, //#region src/agents/memory-search.ts; no config
 #    key, doctor removes the old ones). With minScore 0.35 checked after the decay, dated memory
 #    notes older than ~45 days can never be found.
+#  - Telegram hotfix VOLT-TG-20261023 (send-, lifecycle-, execution-, fetch-*.mjs): long voice
+#    replies send their text first, no "couldn't confirm" notice while a reply is still being
+#    delivered, voice/audio uploads on a fresh connection without replay.
 COPY oc_dist_patch.py /usr/local/lib/oc-addon/oc_dist_patch.py
 COPY oc-patches/ /usr/local/lib/oc-addon/oc-patches/
 RUN set -eu; \
     pkg="$(npm root -g)/openclaw"; \
     test -f "/usr/local/lib/oc-addon/oc-patches/${OPENCLAW_VERSION}/manifest.json" \
       || { echo "no dist patches for OpenClaw ${OPENCLAW_VERSION}: re-derive oc-patches/" >&2; exit 1; }; \
-    PYTHONDONTWRITEBYTECODE=1 python3 -I /usr/local/lib/oc-addon/oc_dist_patch.py \
+    python3 -I -B /usr/local/lib/oc-addon/oc_dist_patch.py \
       "$pkg" "/usr/local/lib/oc-addon/oc-patches/${OPENCLAW_VERSION}"
 
 # ACP / ACPX harness: lets OpenClaw drive external coding agents (Codex, Claude Code)

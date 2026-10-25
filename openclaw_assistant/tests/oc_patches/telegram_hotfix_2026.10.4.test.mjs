@@ -3,6 +3,9 @@
 // paths from OC_DIST / OC_STOCK_DIST instead of the live box's staged/ and backup folders.
 // They exercise the patched function bodies with synthetic fake transports (no bot token, no gateway).
 // Run in the image: node --test tests/oc_patches/telegram_hotfix_2026.10.4.test.mjs
+// Limits (0.5.94-full4 review): the transport harness's sourceFetch ignores init.body, so the two
+// fetch cases about fallbacks do not model grammY's one-shot multipart upload body (a real transport
+// fallback re-sends a consumed body); sendChunkedText and the lifecycle wiring are stubbed.
 import fs from 'node:fs';
 import vm from 'node:vm';
 import assert from 'node:assert/strict';

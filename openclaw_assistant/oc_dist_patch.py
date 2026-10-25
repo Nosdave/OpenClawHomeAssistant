@@ -11,22 +11,29 @@ file, its sha256 before and after, and a unified diff (one file per diff, paths 
    "patches": [{"name": "...", "file": "dist/x-HASH.mjs", "region": "//#region src/....ts",
                 "stock_sha256": "...", "patched_sha256": "...", "diff": "x.patch"}]}
 
+An empty "patches" list states that this OpenClaw version needs none. Lines are separated by "\\n"
+only, in the dist files and in the diffs (derive diffs with `diff -u` or `git diff --no-index`).
 Every check fails the build instead of skipping a patch: another OpenClaw version, a missing or
 re-packed file, a region that is not in exactly that one file, a hunk whose context is not at the
-stated line (no offset, no fuzz), or a result that is not byte-identical to patched_sha256.
-OpenClaw's content inventory (dist/postinstall-content-inventory.json) is updated for the patched
-files and then re-checked as a whole, the way OpenClaw compares it (path, sha256, size, exec bit).
+stated line (no offset, no fuzz), or a result that is not byte-identical to patched_sha256. All
+checks, including `node --check` of the patched files, run before the first file is replaced.
+OpenClaw's content inventory (dist/postinstall-content-inventory.json) and the chunk hashes in
+dist/runtime-dependency-ownership.json are updated for the patched files; then every inventory
+entry is re-checked (path, sha256, size, exact exec bits).
 """
 
 import hashlib
 import json
 import os
 import re
+import shutil
 import stat
 import subprocess
 import sys
+import tempfile
 
 INVENTORY = "dist/postinstall-content-inventory.json"
+OWNERSHIP = "dist/runtime-dependency-ownership.json"
 HUNK_RE = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
 
 
@@ -55,42 +62,56 @@ def read_regular(path):
 
 
 def parse_diff(text, rel):
-    """The hunks of a single-file unified diff for a/<rel> -> b/<rel>."""
+    """The hunks of a single-file unified diff for a/<rel> -> b/<rel>.
+
+    The diff must start with its two header lines. Hunk bodies are read by their declared line
+    counts (so a removed line that starts with "-- " is not taken for a header), the new-side
+    start line must agree with the old side, and nothing may follow the last hunk.
+    """
     lines = text.split("\n")
     if lines and lines[-1] == "":
         lines.pop()
-    heads = [i for i, ln in enumerate(lines) if ln.startswith("--- ")]
-    if len(heads) != 1 or heads[0] + 1 >= len(lines) or not lines[heads[0] + 1].startswith("+++ "):
-        raise PatchError(f"diff for {rel} must hold exactly one file")
-    old_name = lines[heads[0]][4:].split("\t")[0]
-    new_name = lines[heads[0] + 1][4:].split("\t")[0]
+    if len(lines) < 3 or not lines[0].startswith("--- ") or not lines[1].startswith("+++ "):
+        raise PatchError(f"diff for {rel} must start with its '--- a/' and '+++ b/' header lines")
+    old_name = lines[0][4:].split("\t")[0]
+    new_name = lines[1][4:].split("\t")[0]
     if old_name != f"a/{rel}" or new_name != f"b/{rel}":
         raise PatchError(f"diff names {old_name} -> {new_name}, expected a/{rel} -> b/{rel}")
-    hunks, i = [], heads[0] + 2
+    hunks, i, delta = [], 2, 0
     while i < len(lines):
         m = HUNK_RE.match(lines[i])
         if not m:
-            raise PatchError(f"unexpected diff line {i + 1}: {lines[i][:60]!r}")
+            what = "a second file" if lines[i].startswith("--- ") else "unexpected diff line"
+            raise PatchError(f"diff for {rel}: {what} at line {i + 1}: {lines[i][:60]!r}")
         old_start, old_len = int(m.group(1)), int(m.group(2) or "1")
-        new_len = int(m.group(4) or "1")
+        new_start, new_len = int(m.group(3)), int(m.group(4) or "1")
+        first_old = old_start if old_len else old_start + 1
+        first_new = new_start if new_len else new_start + 1
+        if first_new != first_old + delta:
+            raise PatchError(f"diff for {rel}: hunk at -{old_start} has new start +{new_start}, "
+                             f"expected +{first_old + delta - (0 if new_len else 1)}")
         old, new, i = [], [], i + 1
-        while i < len(lines) and not lines[i].startswith("@@"):
+        while len(old) < old_len or len(new) < new_len:
+            if i >= len(lines):
+                raise PatchError(f"diff for {rel}: hunk at -{old_start} has wrong line counts")
             ln = lines[i]
             if ln.startswith("\\"):
                 raise PatchError(f"diff for {rel}: missing final newlines are not supported")
             tag, body = ln[:1], ln[1:]
-            if tag == " ":
+            if tag == " " and len(old) < old_len and len(new) < new_len:
                 old.append(body)
                 new.append(body)
-            elif tag == "-":
+            elif tag == "-" and len(old) < old_len:
                 old.append(body)
-            elif tag == "+":
+            elif tag == "+" and len(new) < new_len:
                 new.append(body)
             else:
-                raise PatchError(f"unexpected diff line {i + 1}: {ln[:60]!r}")
+                raise PatchError(f"diff for {rel}: hunk at -{old_start} has wrong line counts "
+                                 f"(line {i + 1}: {ln[:60]!r})")
             i += 1
-        if len(old) != old_len or len(new) != new_len:
-            raise PatchError(f"diff for {rel}: hunk at -{old_start} has wrong line counts")
+        if i < len(lines) and lines[i].startswith("\\"):
+            raise PatchError(f"diff for {rel}: missing final newlines are not supported")
+        delta += new_len - old_len
         hunks.append((old_start, old, new))
     if not hunks:
         raise PatchError(f"diff for {rel} has no hunks")
@@ -111,13 +132,13 @@ def apply_hunks(data, hunks, rel):
         at = old_start - 1 if old else old_start
         if at < pos:
             raise PatchError(f"{rel}: hunks overlap or are out of order at line {old_start}")
-        if src[at:at + len(old)] != old:
+        if at + len(old) > len(src) or src[at:at + len(old)] != old:
             raise PatchError(f"{rel}: hunk context does not match at line {old_start}")
         out.extend(src[pos:at])
         out.extend(new)
         pos = at + len(old)
     out.extend(src[pos:])
-    return ("\n".join(out) + "\n").encode("utf-8")
+    return ("\n".join(out) + "\n").encode("utf-8") if out else b""
 
 
 def write_like(path, data, mode):
@@ -140,8 +161,8 @@ def load_manifest(patch_dir):
     with open(os.path.join(patch_dir, "manifest.json"), encoding="utf-8") as f:
         man = json.load(f)
     entries = man.get("patches")
-    if not isinstance(man.get("openclaw_version"), str) or not isinstance(entries, list) or not entries:
-        raise PatchError("manifest needs openclaw_version and a non-empty patches list")
+    if not isinstance(man.get("openclaw_version"), str) or not isinstance(entries, list):
+        raise PatchError("manifest needs openclaw_version and a patches list")
     seen = set()
     for e in entries:
         for key in ("name", "file", "stock_sha256", "patched_sha256", "diff"):
@@ -176,21 +197,71 @@ def region_files(pkg, regions):
     return hits
 
 
-def update_inventory(pkg, changed):
-    """changed: {rel: (stock_sha, patched_sha, size)}. Rewrite the entries, then re-check all."""
-    inv = os.path.join(pkg, INVENTORY)
-    raw, st = read_regular(inv)
+def load_json_exact(path, dump):
+    """(data, stat) of a JSON file that must round-trip byte-exactly through dump()."""
+    raw, st = read_regular(path)
     data = json.loads(raw)
-    if (json.dumps(data, indent=2) + "\n").encode() != raw:
-        raise PatchError("content inventory format changed")
-    for rel, (stock, patched, size) in changed.items():
-        hits = [e for e in data if e.get("path") == rel]
+    if dump(data).encode() != raw:
+        raise PatchError(f"{os.path.basename(path)} format changed")
+    return data, st
+
+
+def inventory_dump(data):
+    return json.dumps(data, indent=2) + "\n"
+
+
+def ownership_dump(data):
+    return json.dumps(data, separators=(",", ":")) + "\n"
+
+
+def stage_metadata(pkg, changed):
+    """New bytes of the inventory and (if present) the ownership file for changed {rel: (stock, new_bytes)}.
+
+    Returns [(path, bytes, mode, inventory_entries)], everything validated before any write.
+    """
+    inv_path = os.path.join(pkg, INVENTORY)
+    inv, inv_st = load_json_exact(inv_path, inventory_dump)
+    by_path = {}
+    for e in inv:
+        by_path.setdefault(e.get("path"), []).append(e)
+    sizes = {}
+    for rel, (stock, body) in changed.items():
+        hits = by_path.get(rel, [])
         if len(hits) != 1 or hits[0].get("sha256") != stock:
             raise PatchError(f"unexpected content inventory entry for {rel}")
-        hits[0]["sha256"], hits[0]["size"] = patched, size
-    write_like(inv, (json.dumps(data, indent=2) + "\n").encode(), stat.S_IMODE(st.st_mode))
+        hits[0]["sha256"], hits[0]["size"] = sha256(body), len(body)
+        sizes[rel] = len(body)
+    out = []
+    own_path = os.path.join(pkg, OWNERSHIP)
+    if os.path.lexists(own_path):
+        own, own_st = load_json_exact(own_path, ownership_dump)
+        chunks = own.get("chunks") if isinstance(own, dict) else None
+        if not isinstance(chunks, dict):
+            raise PatchError(f"{OWNERSHIP} has no chunks map")
+        touched = False
+        for rel, (stock, body) in changed.items():
+            entry = chunks.get(rel[len("dist/"):])
+            if entry is None:
+                continue
+            if not isinstance(entry, dict) or entry.get("sha256") != stock:
+                raise PatchError(f"unexpected {OWNERSHIP} entry for {rel}")
+            entry["sha256"] = sha256(body)
+            touched = True
+        if touched:
+            own_bytes = ownership_dump(own).encode()
+            old_own = read_regular(own_path)[0]
+            hits = by_path.get(OWNERSHIP, [])
+            if len(hits) != 1 or hits[0].get("sha256") != sha256(old_own):
+                raise PatchError(f"unexpected content inventory entry for {OWNERSHIP}")
+            hits[0]["sha256"], hits[0]["size"] = sha256(own_bytes), len(own_bytes)
+            out.append((own_path, own_bytes, stat.S_IMODE(own_st.st_mode)))
+    out.append((inv_path, inventory_dump(inv).encode(), stat.S_IMODE(inv_st.st_mode)))
+    return out, inv
+
+
+def recheck_inventory(pkg, inv):
     bad = []
-    for e in data:
+    for e in inv:
         p = os.path.join(pkg, e["path"])
         try:
             body, est = read_regular(p)
@@ -202,7 +273,21 @@ def update_inventory(pkg, changed):
             bad.append(e["path"])
     if bad:
         raise PatchError("content inventory mismatch: " + ", ".join(bad[:10]))
-    return len(data)
+
+
+def node_check_all(staged):
+    """`node --check` of every patched file, from copies outside the package."""
+    tmp = tempfile.mkdtemp(prefix="oc-dist-patch-")
+    try:
+        for e, _path, new, _mode in staged:
+            p = os.path.join(tmp, os.path.basename(e["file"]))
+            with open(p, "wb") as f:
+                f.write(new)
+            r = subprocess.run(["node", "--check", p], capture_output=True, text=True)
+            if r.returncode != 0:
+                raise PatchError(f"{e['name']}: node --check failed: {(r.stderr or r.stdout).strip()[:300]}")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
 
 
 def apply_all(pkg, patch_dir, node_check=True, log=print):
@@ -224,21 +309,24 @@ def apply_all(pkg, patch_dir, node_check=True, log=print):
         data, st = read_regular(path)
         if sha256(data) != e["stock_sha256"]:
             raise PatchError(f"{e['name']}: {rel} is not the stock file (sha256 {sha256(data)})")
-        with open(os.path.join(patch_dir, e["diff"]), encoding="utf-8") as f:
+        with open(os.path.join(patch_dir, e["diff"]), encoding="utf-8", newline="") as f:
             hunks = parse_diff(f.read(), rel)
         new = apply_hunks(data, hunks, rel)
         if sha256(new) != e["patched_sha256"]:
             raise PatchError(f"{e['name']}: patched {rel} has sha256 {sha256(new)}, expected {e['patched_sha256']}")
         staged.append((e, path, new, stat.S_IMODE(st.st_mode)))
+    metadata, inv = stage_metadata(pkg, {e["file"]: (e["stock_sha256"], new) for e, _p, new, _m in staged})
+    if node_check and staged:
+        node_check_all(staged)
     for e, path, new, mode in staged:
         write_like(path, new, mode)
-        if node_check:
-            subprocess.run(["node", "--check", path], check=True)
         log(f"[oc-dist-patch] {e['name']}: {e['file']} patched")
-    n = update_inventory(pkg, {e["file"]: (e["stock_sha256"], e["patched_sha256"], len(new))
-                               for e, _p, new, _m in staged})
-    log(f"[oc-dist-patch] {len(staged)} file(s) patched for OpenClaw {version}; content inventory updated, "
-        f"{n} entries re-checked")
+    if staged:
+        for path, data, mode in metadata:
+            write_like(path, data, mode)
+    recheck_inventory(pkg, inv)
+    log(f"[oc-dist-patch] {len(staged)} file(s) patched for OpenClaw {version}; content inventory "
+        f"{'updated, ' if staged else ''}{len(inv)} entries re-checked")
 
 
 def main(argv):

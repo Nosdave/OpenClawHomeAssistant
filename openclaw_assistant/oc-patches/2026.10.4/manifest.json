@@ -37,7 +37,7 @@
     {
       "name": "telegram-fetch-fresh-audio",
       "file": "dist/fetch-DRGAKny1.mjs",
-      "note": "Telegram hotfix VOLT-TG-20261023 (3/3): sendVoice/sendAudio use a fresh connection and the strict safe-to-retry check like sendMessage, so an upload that Telegram may have accepted is not replayed.",
+      "note": "Telegram hotfix VOLT-TG-20261023 (3/3): sendVoice/sendAudio use a fresh connection like sendMessage, with the same rule that a request Telegram may have received is not replayed (isSafeToRetrySendError).",
       "stock_sha256": "a80535e5f42a89bd0daf6252c40c6ebc63471272781b59b4b71fc8694cb14bad",
       "patched_sha256": "1d525bd5e41960977a388460817671a3bbd3195fa40fe62a409c0aee11412958",
       "diff": "telegram-fetch-fresh-audio.patch"

@@ -1,0 +1,2 @@
+# Exact bytes: unified diffs of OpenClaw dist files (oc_dist_patch.py checks them line by line).
+openclaw_assistant/oc-patches/** -text -whitespace
