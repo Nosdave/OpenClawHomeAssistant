@@ -1,0 +1,11 @@
+--- a/dist/memory-search-BKCwFNk2.mjs
++++ b/dist/memory-search-BKCwFNk2.mjs
+@@ -58,7 +58,7 @@
+ 				},
+ 				temporalDecay: {
+ 					enabled: true,
+-					halfLifeDays: 30
++					halfLifeDays: 365
+ 				}
+ 			}
+ 		},

@@ -1018,8 +1018,8 @@ encrypted Home Assistant backup, and restoring it is the only rollback: the gate
 writes no archive of its own, and the add-on keeps no copy of the state outside the
 Home Assistant backup system.
 
-**Runbook** (from `0.5.93-full2` to `0.5.94-full3`; coming from `0.5.94-full1` or
-`0.5.94-full2`, see the note after the steps)
+**Runbook** (from `0.5.93-full2` to `0.5.94-full3` or later, currently `0.5.94-full4`;
+coming from `0.5.94-full1`, `0.5.94-full2` or `0.5.94-full3`, see the note after the steps)
 
 1. On `0.5.93-full2`: `oc-upgrade check` → exit code `0` or `4`, and
    `startup-migrations checkpoint: 2026.7.35`. Exit code `2` or `3`: do not update, ask first.
@@ -1041,7 +1041,7 @@ Home Assistant backup system.
    Cloud, Google Drive and similar) are not visible to the add-on. Without such a
    backup the gate holds with `ha-backup-missing` (see
    [Backup HOLD codes](#backup-hold-codes)). Plan 1–3 hours.
-4. Update to `0.5.94-full3` with the add-on still stopped. `glm_thinking_levels` is
+4. Update to the current version with the add-on still stopped. `glm_thinking_levels` is
    on by default: a GLM model with the `qwen-chat-template` thinking format then gets
    thinking levels (see [GLM thinking levels](#glm-thinking-levels-option-glm_thinking_levels);
    check your GLM server first). To keep on/off only, turn it off now in the add-on's
@@ -1064,7 +1064,7 @@ Home Assistant backup system.
    (see [Automatic deletion](#automatic-deletion-gate_cleanup_hours); `oc-upgrade cleanup`
    shows the times). The rollback needs neither.
 
-**Coming from `0.5.94-full1` or `0.5.94-full2`.** The OpenClaw version does not change
+**Coming from `0.5.94-full1`, `0.5.94-full2` or `0.5.94-full3`.** The OpenClaw version does not change
 (2026.10.4), so no gate runs on this update: nothing is checked now. Create the
 encrypted backup before updating anyway (step 3; a rollback to the earlier add-on
 version then only needs a restore). There is nothing to set: the archive options of
@@ -1334,10 +1334,8 @@ OpenClaw 2026.10.10-beta.1 applies `minScore` before the decay
 (openclaw/openclaw#168692).
 
 **What the add-on changes.** The image sets the half-life to 365 days in OpenClaw's
-memory-search resolver (`dist/memory-search-BKCwFNk2.mjs`). The build checks the
-file's sha256 before and after the change, updates the file's entry in OpenClaw's
-content inventory (so OpenClaw's own package integrity check still passes), and fails
-for any OpenClaw version other than 2026.10.4. There is no option for it.
+memory-search resolver (`dist/memory-search-BKCwFNk2.mjs`), as one of the add-on's
+patches to OpenClaw (see "Patches to OpenClaw's files" below). There is no option for it.
 
 **Effect.** A note keeps 84 % of its score after 90 days (12.5 % with 30 days) and
 half of it after one year; a perfect match stays above 0.35 for about 553 days. Among
@@ -1357,6 +1355,64 @@ undated files under `memory/` do not decay.
 `minScore` can stay at the default 0.35. If you lowered it as a workaround, you can
 remove that override again (`openclaw config unset memory.search.query.minScore`, and
 per agent where you set one).
+
+#### Telegram replies with voice (hotfix VOLT-TG-20261023)
+
+Volt (the add-on's OpenClaw agent) wrote this hotfix on 2026-10-23, after a Telegram
+outage on 21/22 October had swallowed voice replies together with their text. It ran
+in the container until 0.5.94-full4 put the same files into the image. It does not
+change timeouts, DNS, proxy or the Telegram API address, and it cannot prevent a
+Telegram outage; it makes replies more robust against one. Three changes:
+
+1. **Long voice replies send their text first** (OpenClaw's queued reply delivery,
+   which carries normal replies with media). A voice reply whose text is longer than a
+   Telegram caption (1024 characters) is sent as text first and then as audio without
+   caption. If the audio then fails on the network or is refused by the recipient's
+   voice-privacy setting, the text stays delivered, the add-on logs `telegram optional
+   voice failed after confirmed text; text retained, audio not replayed`, and the audio
+   is not retried. A short reply still travels as the caption of the voice message.
+   Without the hotfix the text followed the audio, so a hanging upload (30 s timeout)
+   lost both.
+2. **No false "couldn't confirm" notice during a delivery** (all reply deliveries).
+   OpenClaw sends "I couldn't confirm whether my previous reply reached this chat, so I
+   won't resend it automatically. Please ask for any missing remainder." before the next
+   answer when the outcome of a reply stayed unknown. Without the hotfix this could also
+   happen while the reply was still being sent (for example when you wrote again during
+   a voice upload). Now the notice waits until that delivery has ended; a reply whose
+   outcome really stayed unknown is still reported once. OpenClaw fixed this on its main
+   branch (openclaw/openclaw#154417), but no release contains it yet (2026.10.7 does not).
+3. **Voice and audio uploads use a fresh connection** (all Telegram requests), like text
+   messages already did, with the same rule: an upload that broke off after Telegram may
+   have received it is not sent again.
+
+**Known limits.** A lost reply is never resent automatically; ask Volt to repeat it.
+The notice can still appear although the text arrived: when Telegram definitively
+rejects the audio after the text (for example "file is too big"), when Volt already
+answered your next message before the upload of the previous one ended, or when the
+session was reset during the upload. Replies that do not go through the queued delivery
+(some fallback paths of the Telegram channel) still send the audio before the text. An
+upload that failed before the connection was made is not sent again successfully either
+(as before the hotfix). The
+regression tests are in `openclaw_assistant/tests/oc_patches/telegram_hotfix_2026.10.4.test.mjs`;
+they need the image's OpenClaw (run them in a container of the image with `node --test`;
+the two negative controls need the stock modules in `OC_STOCK_DIST`).
+
+#### Patches to OpenClaw's files
+
+The add-on changes a few of OpenClaw's own files in the image: the memory search
+half-life and the Telegram hotfix above. They are kept per OpenClaw version in
+`openclaw_assistant/oc-patches/<version>/`: one unified diff per file and a
+`manifest.json` with each file's sha256 before and after. `oc_dist_patch.py` applies
+them at build time and fails the build when the installed OpenClaw is another version,
+a file is not the stock file, a diff does not apply exactly at its stated lines, or the
+result differs from the expected sha256; all checks, including `node --check` of the
+patched files, run before the first file is replaced. It then updates OpenClaw's content
+inventory (`dist/postinstall-content-inventory.json`, so OpenClaw's own package
+integrity check still passes) and the chunk hashes in
+`dist/runtime-dependency-ownership.json`, and re-checks every inventory entry. Every
+OpenClaw bump needs the patches re-derived, or dropped where OpenClaw fixed the problem
+itself; a version that needs none has a manifest with an empty `patches` list. Derive
+diffs with `diff -u` (lines are split on newlines only).
 
 ### Backup
 

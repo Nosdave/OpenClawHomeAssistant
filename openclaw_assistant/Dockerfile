@@ -37,6 +37,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Install Node.js 24 LTS from NodeSource.
 # OpenClaw 2026.10.4 requires Node >=24.16.0 <25 || >=26.1.0 (package.json
 # engines); on an older Node it refuses to run or tries to install another Node.
+# The image requires >=24.22.1 <25 || >=26.12.1: the October 2026 Node security
+# releases, which reject TLS chains signed with the compromised certificate keys
+# (also the floor of OpenClaw 2026.10.6 and later).
 # Use explicit keyring + apt source instead of setup_24.x pipe script for deterministic builds.
 RUN mkdir -p /etc/apt/keyrings \
     && curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key \
@@ -48,7 +51,7 @@ RUN mkdir -p /etc/apt/keyrings \
     && apt-get install -y --no-install-recommends nodejs \
     && NODE_VERSION="$(node -v)" \
     && echo "$NODE_VERSION" \
-    && node -e 'const[a,b]=process.versions.node.split(".").map(Number);if(!((a===24&&b>=16)||(a===26&&b>=1)||a>26)){console.error("Node "+process.versions.node+" does not satisfy >=24.16.0 <25 || >=26.1.0");process.exit(1)}' \
+    && node -e 'const[a,b,c]=process.versions.node.split(".").map(Number);if(!((a===24&&(b>22||b===22&&c>=1))||(a===26&&(b>12||b===12&&c>=1))||a>26)){console.error("Node "+process.versions.node+" does not satisfy >=24.22.1 <25 || >=26.12.1");process.exit(1)}' \
     && rm -f /etc/apt/sources.list.d/nodesource.list /etc/apt/keyrings/nodesource.gpg \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
@@ -143,7 +146,7 @@ ARG BRAVE_PLUGIN_VERSION=2026.10.4
 ARG NPM_BEFORE=2026-10-16T00:30:00Z
 # Repeated here (cheap) so this part of the build also checks the Node range
 # when it is built on top of another base.
-RUN node -e 'const[a,b]=process.versions.node.split(".").map(Number);if(!((a===24&&b>=16)||(a===26&&b>=1)||a>26)){console.error("Node "+process.versions.node+" does not satisfy >=24.16.0 <25 || >=26.1.0");process.exit(1)}'
+RUN node -e 'const[a,b,c]=process.versions.node.split(".").map(Number);if(!((a===24&&(b>22||b===22&&c>=1))||(a===26&&(b>12||b===12&&c>=1))||a>26)){console.error("Node "+process.versions.node+" does not satisfy >=24.22.1 <25 || >=26.12.1");process.exit(1)}'
 # Never use --ignore-scripts: the package lifecycle marker would make the first
 # CLI run replay the install scripts (or exit 1). The checks below fail the build
 # when the installed package is not the pinned, fully installed version, when it
@@ -161,64 +164,27 @@ RUN npm config set fund false && npm config set audit false \
     && NODE_OPTIONS="--disable-sigusr1 --disable-warning=ExperimentalWarning" node -e 0 \
     && test "$(npm view "@openclaw/brave-plugin@${BRAVE_PLUGIN_VERSION}" version)" = "${BRAVE_PLUGIN_VERSION}"
 
-# Memory search recency: OpenClaw 2026.10.4 hard-codes the temporal-decay half-life of memory search at
-# 30 days (resolver literal in dist/memory-search-*.mjs, //#region src/agents/memory-search.ts; no config key,
-# doctor removes the old ones). With minScore 0.35 checked after the decay, dated memory notes older than
-# ~45 days can never be found. The add-on ships 365 days. Guarded by sha256 before and after, for exactly
-# this OpenClaw version: any other version or a re-packed file fails the build (re-derive both hashes and
-# the content-inventory entry on every OpenClaw bump). OpenClaw's own content inventory is updated to match.
-ARG MEMSEARCH_FILE=memory-search-BKCwFNk2.mjs
-ARG MEMSEARCH_STOCK_SHA256=08fa5e995ea9138df3278eb136a7139e9310132ae24dcef53143e790941af38a
-ARG MEMSEARCH_PATCHED_SHA256=be0f0ea95fcf0a6f0ed9c36a4f711e3e5b94141b98cbe67ab67e51a6908fa8e3
+# Patches to the installed OpenClaw dist (oc-patches/<OpenClaw version>/manifest.json, applied by
+# oc_dist_patch.py; DOCS: "Patches to OpenClaw's files"). Each patch is a unified diff for exactly one
+# dist file of exactly this OpenClaw version, guarded by sha256 before and after; another version, a
+# re-packed file or a diff that does not apply at its stated lines fails the build (re-derive every
+# patch on each OpenClaw bump). OpenClaw's content inventory and runtime-dependency ownership hashes
+# are updated to match; every inventory entry is re-checked.
+#  - memory search half-life 365 days: 2026.10.4 hard-codes the temporal-decay half-life of memory
+#    search at 30 days (dist/memory-search-*.mjs, //#region src/agents/memory-search.ts; no config
+#    key, doctor removes the old ones). With minScore 0.35 checked after the decay, dated memory
+#    notes older than ~45 days can never be found.
+#  - Telegram hotfix VOLT-TG-20261023 (send-, lifecycle-, execution-, fetch-*.mjs): long voice
+#    replies send their text first, no "couldn't confirm" notice while a reply is still being
+#    delivered, voice/audio uploads on a fresh connection without replay.
+COPY oc_dist_patch.py /usr/local/lib/oc-addon/oc_dist_patch.py
+COPY oc-patches/ /usr/local/lib/oc-addon/oc-patches/
 RUN set -eu; \
-    if [ "${OPENCLAW_VERSION}" != "2026.10.4" ]; then echo "memory half-life patch is for OpenClaw 2026.10.4 only (OPENCLAW_VERSION=${OPENCLAW_VERSION}): re-derive it" >&2; exit 1; fi; \
     pkg="$(npm root -g)/openclaw"; \
-    test "$(jq -r .version "$pkg/package.json")" = "2026.10.4"; \
-    f="$pkg/dist/${MEMSEARCH_FILE}"; \
-    test "$(grep -l -F '//#region src/agents/memory-search.ts' "$pkg"/dist/*.mjs)" = "$f"; \
-    echo "${MEMSEARCH_STOCK_SHA256}  $f" | sha256sum -c -; \
-    test "$(grep -c -E '^[[:space:]]+halfLifeDays: 30$' "$f")" = 1; \
-    sed -i '/^\t\t\t\ttemporalDecay: {$/,/^\t\t\t\t}$/ s/^\(\t\t\t\t\t\)halfLifeDays: 30$/\1halfLifeDays: 365/' "$f"; \
-    echo "${MEMSEARCH_PATCHED_SHA256}  $f" | sha256sum -c -; \
-    node --check "$f"; \
-    OC_PKG="$pkg" python3 - <<'PY'
-import hashlib, json, os, stat, sys
-pkg = os.environ["OC_PKG"]
-rel = "dist/" + os.environ["MEMSEARCH_FILE"]
-stock, patched = os.environ["MEMSEARCH_STOCK_SHA256"], os.environ["MEMSEARCH_PATCHED_SHA256"]
-inv = os.path.join(pkg, "dist", "postinstall-content-inventory.json")
-raw = open(inv, "rb").read()
-data = json.loads(raw)
-if (json.dumps(data, indent=2) + "\n").encode() != raw:
-    sys.exit("content inventory format changed")
-hits = [e for e in data if e.get("path") == rel]
-if len(hits) != 1 or hits[0].get("sha256") != stock:
-    sys.exit(f"unexpected content inventory entry for {rel}")
-body = open(os.path.join(pkg, rel), "rb").read()
-if hashlib.sha256(body).hexdigest() != patched:
-    sys.exit("patched resolver differs")
-hits[0]["sha256"], hits[0]["size"] = patched, len(body)
-mode = stat.S_IMODE(os.stat(inv).st_mode)
-tmp = inv + ".tmp"
-with open(tmp, "w", encoding="utf-8") as o:
-    o.write(json.dumps(data, indent=2) + "\n")
-os.chmod(tmp, mode)
-os.replace(tmp, inv)
-bad = []
-for e in data:  # OpenClaw's own comparison: path, sha256, size, exec bit
-    p = os.path.join(pkg, e["path"])
-    try:
-        b = open(p, "rb").read()
-        m = os.stat(p).st_mode
-    except OSError:
-        bad.append(e["path"])
-        continue
-    if hashlib.sha256(b).hexdigest() != e["sha256"] or len(b) != e["size"] or (m & 0o111) != (e["mode"] & 0o111):
-        bad.append(e["path"])
-if bad:
-    sys.exit("content inventory mismatch: " + ", ".join(bad[:10]))
-print(f"memory search half-life 365 days; content inventory updated, {len(data)} entries re-checked")
-PY
+    test -f "/usr/local/lib/oc-addon/oc-patches/${OPENCLAW_VERSION}/manifest.json" \
+      || { echo "no dist patches for OpenClaw ${OPENCLAW_VERSION}: re-derive oc-patches/" >&2; exit 1; }; \
+    python3 -I -B /usr/local/lib/oc-addon/oc_dist_patch.py \
+      "$pkg" "/usr/local/lib/oc-addon/oc-patches/${OPENCLAW_VERSION}"
 
 # ACP / ACPX harness: lets OpenClaw drive external coding agents (Codex, Claude Code)
 # via the Agent Client Protocol. Volt authenticates Anthropic + OpenAI via OAuth

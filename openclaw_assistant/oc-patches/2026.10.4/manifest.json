@@ -1,0 +1,46 @@
+{
+  "openclaw_version": "2026.10.4",
+  "patches": [
+    {
+      "name": "memory-search-half-life",
+      "file": "dist/memory-search-BKCwFNk2.mjs",
+      "region": "//#region src/agents/memory-search.ts",
+      "stock_sha256": "08fa5e995ea9138df3278eb136a7139e9310132ae24dcef53143e790941af38a",
+      "patched_sha256": "be0f0ea95fcf0a6f0ed9c36a4f711e3e5b94141b98cbe67ab67e51a6908fa8e3",
+      "diff": "memory-search-half-life.patch",
+      "note": "Memory search temporal-decay half-life 365 days instead of the hard-coded 30 (see DOCS.md, \"Memory search recency\")."
+    },
+    {
+      "name": "telegram-voice-text-first",
+      "file": "dist/send-wlidaQLJ.mjs",
+      "note": "Telegram hotfix VOLT-TG-20261023 (1/3): a single voice reply whose text exceeds the caption limit sends and confirms the text first, then the audio without caption; a network failure or voice-privacy rejection of the audio keeps the text and is not retried.",
+      "stock_sha256": "3348d71c5de17638efa32a8722f1df822477a84b08564b45f7cbc89d495ce680",
+      "patched_sha256": "597b9e3073f107360d73ab7e2117336ea6aa87bfb0325bfe7007c73f899f99e2",
+      "diff": "telegram-voice-text-first.patch"
+    },
+    {
+      "name": "telegram-delivery-live-custody",
+      "file": "dist/lifecycle-DUGwfths.mjs",
+      "note": "Telegram hotfix VOLT-TG-20261023 (2/3): a process-local refcount per sessionId/intentId is held from the start of a direct reply delivery until its canonical settlement (also across deferred finalization).",
+      "stock_sha256": "96923241ff46b99b18107cb5a6d9bd85dc39cddc62deda15ee8295fb5328f2d9",
+      "patched_sha256": "bc25de7a7eece7eb6c35113fc6f2067ed703cb6fd2ec51fb0aa60a6eac2cac63",
+      "diff": "telegram-delivery-live-custody.patch"
+    },
+    {
+      "name": "telegram-notice-live-guard",
+      "file": "dist/execution-C0yo88ck.mjs",
+      "note": "Telegram hotfix VOLT-TG-20261023 (2/3): the pending-delivery notice (\"I couldn\u2019t confirm whether my previous reply reached this chat ...\") skips an intent that is still being delivered; settled unknown outcomes and restart debts are still reported.",
+      "stock_sha256": "12854eac26f71203f7ee54c68ce0e0886f12402b8f83bbdffbc6a1a618cf1f33",
+      "patched_sha256": "283c07b6d9289844fb917fb2dd29a58ff5512ae1bec2102f3e5c0fca10505544",
+      "diff": "telegram-notice-live-guard.patch"
+    },
+    {
+      "name": "telegram-fetch-fresh-audio",
+      "file": "dist/fetch-DRGAKny1.mjs",
+      "note": "Telegram hotfix VOLT-TG-20261023 (3/3): sendVoice/sendAudio use a fresh connection like sendMessage, with the same rule that a request Telegram may have received is not replayed (isSafeToRetrySendError).",
+      "stock_sha256": "a80535e5f42a89bd0daf6252c40c6ebc63471272781b59b4b71fc8694cb14bad",
+      "patched_sha256": "1d525bd5e41960977a388460817671a3bbd3195fa40fe62a409c0aee11412958",
+      "diff": "telegram-fetch-fresh-audio.patch"
+    }
+  ]
+}

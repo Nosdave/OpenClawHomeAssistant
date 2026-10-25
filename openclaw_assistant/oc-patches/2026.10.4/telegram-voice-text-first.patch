@@ -1,0 +1,55 @@
+--- a/dist/send-wlidaQLJ.mjs
++++ b/dist/send-wlidaQLJ.mjs
+@@ -4891,11 +4891,21 @@
+ 			const { media, mediaPlan, mediaSender, documentSender } = first;
+ 			const batchReplyMarkup = first.index === 0 ? replyMarkup : void 0;
+ 			finalMediaBatch = first.index + batch.length === mediaUrls.length;
+-			const { htmlCaption, plainCaption, followUpText } = mediaPlan;
+-			const needsSeparateText = Boolean(followUpText);
++			let { htmlCaption, plainCaption, followUpText } = mediaPlan;
++            let needsSeparateText = Boolean(followUpText);
++            let voltTextFirstResult;
++            // VOLT-TG-20261023: long voice replies commit visible text before optional audio.
++            if (mediaSender.label === "voice" && needsSeparateText && mediaUrls.length === 1) {
++                const wasFinal = finalMediaBatch;
++                finalMediaBatch = false;
++                try { voltTextFirstResult = await sendChunkedText(followUpText, "voice text-first send"); }
++                finally { finalMediaBatch = wasFinal; }
++                followUpText = void 0;
++                needsSeparateText = false;
++            }
+ 			const baseMediaParams = {
+ 				...buildThreadParams(!singleUseReplyTo || sender.parts.length === 0),
+-				...!needsSeparateText && batchReplyMarkup ? { reply_markup: batchReplyMarkup } : {}
++				...!needsSeparateText && !voltTextFirstResult && batchReplyMarkup ? { reply_markup: batchReplyMarkup } : {}
+ 			};
+ 			const videoDimensions = mediaPlan.deliveryKind === "video" && !mediaPlan.isVideoNote ? await probeVideoDimensions(media.buffer) : void 0;
+ 			const mediaParams = {
+@@ -4941,6 +4951,13 @@
+ 					deliveryKind = delivery.sender.label;
+ 				}
+ 			} catch (error) {
++                if (voltTextFirstResult && !opts.signal?.aborted &&
++                    !findTelegramRequestAuthorityError(error) &&
++                    (isRecoverableTelegramNetworkError(error) || isTelegramVoiceMessagesForbiddenError(error))) {
++                    opts.promptContextProjectionPlan?.cursor.invalidate();
++                    sendLogger$1.warn("telegram optional voice failed after confirmed text; text retained, audio not replayed");
++                    return voltTextFirstResult;
++                }
+ 				if (mediaSender.label === "voice" && isTelegramVoiceMessagesForbiddenError(error) && first.index === 0 && text.trim()) {
+ 					logVerbose("telegram sendVoice forbidden by recipient privacy settings; falling back to text");
+ 					const textResult = await sendChunkedText(text, "voice fallback text send", { replyToAlreadyUsed: singleUseReplyTo && sender.parts.length > 0 });
+@@ -5073,6 +5090,13 @@
+ 					receipt
+ 				};
+ 			}
++            if (voltTextFirstResult) return {
++                ...voltTextFirstResult,
++                receipt: createMessageReceiptFromOutboundResults({
++                    results: [voltTextFirstResult, mediaDeliveryResult ?? { messageId: String(mediaMessageId), chatId: resolvedChatId }],
++                    kind: "text"
++                })
++            };
+ 			return mediaDeliveryResult?.meta?.telegramHasInlineKeyboard ? mediaDeliveryResult : {
+ 				messageId: String(mediaMessageId),
+ 				chatId: resolvedChatId,
