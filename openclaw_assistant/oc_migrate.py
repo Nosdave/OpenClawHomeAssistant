@@ -28,7 +28,7 @@ import os
 import re
 import sqlite3
 import stat
-from urllib.parse import quote as _urlquote
+from urllib.parse import quote as _urlquote, urlsplit as _urlsplit
 
 __all__ = [
     "EXPLICIT_DEFAULT_IDS", "PINS", "TRANSIENT_SQLITE_RE", "TELEGRAM_CACHE_RE", "EMPTY_BINDINGS_RES",
@@ -39,7 +39,8 @@ __all__ = [
     "legacy_key_context", "is_migrated_legacy_key",
     "check_legacy_refs", "check_codex_runtime", "check_runtime_pins", "apply_pins", "auth_order_adjust",
     "classify_state_files", "scan_sessions_files", "config_precheck", "flatten_paths",
-    "retired_config_keys", "retired_config_findings", "classify_retired_state", "retired_db_findings",
+    "retired_config_keys", "retired_config_rewrites", "retired_config_findings", "classify_retired_state",
+    "retired_db_findings",
     "retired_tuning_dropped", "RETIRED_QUARANTINE_KINDS",
 ]
 
@@ -249,6 +250,19 @@ def _get(obj, parts, default=_MISSING):
         else:
             return default
     return cur
+
+
+def _url_origin(v):
+    """scheme://host[:port] of a URL for the transform ledger (user info, path and query may carry a token)."""
+    try:
+        u = _urlsplit(v) if isinstance(v, str) else None
+        port = u.port if u is not None else None
+    except ValueError:
+        return "***"
+    if u is None or not u.scheme or not u.hostname:
+        return "***"
+    host = "[%s]" % u.hostname if ":" in u.hostname else u.hostname
+    return "%s://%s%s" % (u.scheme, host, ":%d" % port if port else "")
 
 
 def _ensure_dict_path(root, parts):
@@ -693,9 +707,12 @@ def _pin_entry(mmap, key, parts, ledger, step):
     return True
 
 
-def premigrate_config(cfg, removals=()):
+def premigrate_config(cfg, removals=(), rewrites=()):
     """R0 (retired keys from classify_retired_state), R1 (wildcards), R2 (openclaw runtime pins),
     R3 (modelPolicy {}) -- §7.4.2. R4: nothing.
+
+    rewrites: retired_config_rewrites() (OpenClaw 2026.10.5+ targets): R0 also sets each API id that still holds
+    the retired value and deletes each listed extension-profile cdpUrl; a value changed by hand is left alone.
 
     Pass the run's write-once config.pre-gate.json (critique B2): R3 and EXPLICIT are evaluated on the
     input, so the result is the same on every re-run. `meta` is never touched.
@@ -714,6 +731,21 @@ def premigrate_config(cfg, removals=()):
             ledger.append({"step": "R0", "file": CONFIG_FILE, "path": fmt_path(list(parts)),
                            "before": copy.deepcopy(parent[parts[-1]]), "after": None})
             del parent[parts[-1]]
+    # R0 rewrites: what 2026.10.4 doctor did for settings 2026.10.5+ refuses (API id rename, extension cdpUrl)
+    for e in rewrites:
+        parts = list(e["parts"])
+        parent = _get(new, parts[:-1], None)
+        if not isinstance(parent, dict) or parts[-1] not in parent:
+            continue
+        old = parent[parts[-1]]
+        if e.get("op") == "set" and old == e.get("from"):
+            parent[parts[-1]] = e["value"]
+            ledger.append({"step": "R0", "file": CONFIG_FILE, "path": fmt_path(parts), "before": old,
+                           "after": e["value"]})
+        elif e.get("op") == "delete":
+            del parent[parts[-1]]
+            ledger.append({"step": "R0", "file": CONFIG_FILE, "path": fmt_path(parts),
+                           "before": _url_origin(old), "after": None})
     refs = scan_legacy_refs(cfg)
     legacy_slots = [{k: copy.deepcopy(r[k]) for k in ("path", "value", "where", "id", "profile", "parts", "agent_id")}
                     for r in refs if r["id"] != "*"]
@@ -2235,7 +2267,25 @@ def classify_state_files(state_dir, cfg, *, from_checkpoint, accepted, mode, que
 RETIRED_FORMAT_BRIDGE = "2026.9.7"
 RETIRED_QUARANTINE_KINDS = ("cron-json", "cron-json-state", "cron-run-log", "delivery-queue-json",
                             "oauth-sidecar", "plugin-install-index", "device-pair-notify",
-                            "voice-call-log", "telegram-spool-invalid", "dreaming-json")
+                            "voice-call-log", "telegram-spool-invalid", "dreaming-json",
+                            # OpenClaw 2026.10.5+ (oc_common.runtime_caps runtime_files_retired /
+                            # sandbox_registry_retired): runtime files 2026.10.4 still imported
+                            "acp-replay-ledger", "voicewake-json", "conversation-bindings-json",
+                            "plugin-approvals-json", "restart-sentinel-json", "sandbox-registry")
+# Retired runtime files of OpenClaw 2026.10.5+ (#165402, #164669; 2026.10.10 state-migrations.retired-runtime-
+# files.ts, .restart-sentinel.ts, doctor-sandbox.ts). The proofs mirror the 2026.10.4 importers
+# (state-migrations.runtime-state.ts, .acp-replay.ts, .restart-sentinel*.ts, doctor-sandbox-legacy-registry.ts).
+_RESTART_SENTINEL_KIND = "legacy-restart-sentinel-json"
+_RESTART_DECISIONS = ("canonical-preserved", "canonical-advanced", "legacy-update-finalized",
+                      "invalid-canonical-repaired", "legacy-imported", "malformed-legacy-discarded",
+                      "receipt-authoritative")
+_RESTART_SENTINEL_MAX = 4 * 1024 * 1024  # MAX_LEGACY_RESTART_SENTINEL_BYTES
+_VOICEWAKE_DEFAULT_TRIGGERS = ["openclaw", "claude", "computer"]
+_CODEX_RESPONSES_API = "openai-codex-responses"  # renamed by 2026.10.4 doctor, refused from 2026.10.5
+_CHATGPT_RESPONSES_API = "openai-chatgpt-responses"
+# JavaScript String.prototype.trim(): WhiteSpace and LineTerminator (incl. U+FEFF)
+_JS_WS = ("\t\n\v\f\r              "
+          "    　﻿")
 # Memory Core dreaming JSON in <workspace>/memory/.dreams/ (label, file, plugin-state namespaces, meta key):
 # 2026.10 doctor stops on a file unless memory-core plugin state already holds that workspace's rows
 # (extensions/memory-core/doctor-contract-api.js:159-226; 7.35 uses the same keys, dreaming-state-DLMGVRgZ.js).
@@ -2265,6 +2315,15 @@ RETIRED_MEMORY_TUNING = (
 
 def _rec(v):
     return isinstance(v, dict)
+
+
+def _cap(caps, name):
+    """True when the bundled OpenClaw has capability `name` (oc_common.runtime_caps; None: 2026.10.4)."""
+    return bool(isinstance(caps, dict) and caps.get(name))
+
+
+def _js_trim(s):
+    return s.strip(_JS_WS)
 
 
 def _visit_agent_scopes(cfg, visitor):
@@ -2298,8 +2357,13 @@ def _visit_channel(cfg, channel_id, visitor):
                 visitor(acc, "channels.%s.accounts.%s" % (channel_id, acc_id))
 
 
-def retired_config_keys(cfg):
-    """Port of 10.2 findRetiredConfigUpgradeRequirement: ([paths], bridge version)."""
+def retired_config_keys(cfg, caps=None):
+    """Port of 10.2 findRetiredConfigUpgradeRequirement: ([paths], bridge version).
+
+    caps: oc_common.runtime_caps of the bundled OpenClaw (None: 2026.10.4). empty_installs_tolerated (2026.10.6+):
+    an empty plugins.installs object is not refused (doctor removes it); config_api_cdpurl_retired (2026.10.5+):
+    the "openai-codex-responses" API ids and the extension driver's cdpUrl are refused too (10.10
+    retired-config-formats.ts:34-70)."""
     if not _rec(cfg):
         return [], "2026.9.5"
     out = []
@@ -2321,7 +2385,11 @@ def retired_config_keys(cfg):
 
     check(cfg, "", ["heartbeat"])
     check(cfg.get("routing"), "routing", ["allowFrom", "groupChat"])
-    check(cfg.get("plugins"), "plugins", ["installs"])
+    installs = sub(cfg, "plugins", "installs")
+    if not (_cap(caps, "empty_installs_tolerated") and installs == {}):
+        check(cfg.get("plugins"), "plugins", ["installs"])
+    if _cap(caps, "config_api_cdpurl_retired"):
+        out.extend(fmt_path(e["parts"]) for e in _retired_api_cdpurl(cfg))
     check(cfg.get("browser"), "browser", ["relayBindHost"])
     check(sub(cfg, "browser", "ssrfPolicy"), "browser.ssrfPolicy", ["allowPrivateNetwork"])
     memory_store(cfg, "")
@@ -2394,6 +2462,42 @@ def retired_config_keys(cfg):
     check(sub(cfg, "session", "threadBindings"), "session.threadBindings", ["ttlHours"])
     check(sub(cfg, "agents", "defaults"), "agents.defaults", ["llm"])
     return out, bridge
+
+
+def _retired_api_cdpurl(cfg):
+    """The 2026.10.5+ refusals 2026.10.4 doctor still fixed itself, as rewrite entries (see retired_config_rewrites):
+    models.providers.<id>.api / .models[i].api exactly "openai-codex-responses", and a non-blank string cdpUrl on a
+    browser profile whose driver trims to "extension" (10.10 retired-config-formats.ts:38-70)."""
+    out = []
+    providers = _get(cfg, ["models", "providers"], None)
+    for pid, prov in (providers.items() if _rec(providers) else ()):
+        if not _rec(prov):
+            continue
+        if prov.get("api") == _CODEX_RESPONSES_API:
+            out.append({"parts": ["models", "providers", pid, "api"], "op": "set", "from": _CODEX_RESPONSES_API,
+                        "value": _CHATGPT_RESPONSES_API})
+        for i, model in enumerate(prov["models"] if isinstance(prov.get("models"), list) else ()):
+            if _rec(model) and model.get("api") == _CODEX_RESPONSES_API:
+                out.append({"parts": ["models", "providers", pid, "models", i, "api"], "op": "set",
+                            "from": _CODEX_RESPONSES_API, "value": _CHATGPT_RESPONSES_API})
+    profiles = _get(cfg, ["browser", "profiles"], None)
+    for name, prof in (profiles.items() if _rec(profiles) else ()):
+        if _rec(prof) and isinstance(prof.get("driver"), str) and _js_trim(prof["driver"]) == "extension" \
+                and isinstance(prof.get("cdpUrl"), str) and _js_trim(prof["cdpUrl"]):
+            out.append({"parts": ["browser", "profiles", name, "cdpUrl"], "op": "delete"})
+    return out
+
+
+def retired_config_rewrites(cfg, caps=None):
+    """Config fixes for the settings OpenClaw 2026.10.5+ refuses but 2026.10.4 doctor still migrated itself (pure).
+
+    [] unless caps has config_api_cdpurl_retired. Entries: {"parts", "op": "set", "from", "value"} (the API id
+    becomes "openai-chatgpt-responses") or {"parts", "op": "delete"} (the extension profile's cdpUrl), exactly
+    what 2026.10.4 doctor did (legacy-config-migrations.runtime.models.codex.ts:56-92, legacy-config-core-
+    normalizers.ts:35-70). The from-7x pre-migrate step applies them (premigrate_config rewrites=)."""
+    if not _cap(caps, "config_api_cdpurl_retired") or not _rec(cfg):
+        return []
+    return _retired_api_cdpurl(cfg)
 
 
 def _sql_str(s):
@@ -2558,14 +2662,416 @@ def _spool_entry_problem(path, file_id, failed):
     return None
 
 
+# --- retired runtime files of OpenClaw 2026.10.5+: proof that 2026.10.4 already imported them -------------------
+# Each proof returns (status, detail): "imported" (the content is in SQLite), "empty" (2026.10.4 would import
+# nothing) or "unproven". Read-only; a symlink is never followed and any query error means "unproven".
+_IMPORTED, _EMPTY, _UNPROVEN = "imported", "empty", "unproven"
+_NOTHING = "nothing to import"
+
+
+def _lstat_checked(path):
+    """(stat, None) when `path` exists (a broken link too), (None, None) when it does not, (None, error text) when
+    it cannot be inspected: 2026.10.10 refuses then ("Cannot inspect potentially retired state")."""
+    try:
+        return os.lstat(path), None
+    except FileNotFoundError:
+        return None, None
+    except OSError as exc:
+        return None, exc.strerror or type(exc).__name__
+
+
+def _read_regular_bytes(path, limit):
+    """Bytes of a regular file of at most `limit` bytes (O_NOFOLLOW, never a socket/FIFO); None otherwise."""
+    st = _lstat(path)
+    if st is None or not stat.S_ISREG(st.st_mode) or st.st_size > limit:
+        return None
+    try:
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0))
+    except OSError:
+        return None
+    try:
+        with os.fdopen(fd, "rb") as f:
+            data = f.read(limit + 1)
+    except OSError:
+        return None
+    return data if len(data) <= limit else None
+
+
+def _sha256_hex(data):
+    import hashlib
+    return hashlib.sha256(data).hexdigest()
+
+
+def _json_strict(data):
+    """JSON.parse of UTF-8 bytes (NaN/Infinity rejected like JavaScript); _MISSING when it does not parse."""
+    def no_const(name):
+        raise ValueError(name)
+    try:
+        return json.loads(data.decode("utf-8"), parse_constant=no_const)
+    except (UnicodeDecodeError, ValueError, RecursionError):
+        return _MISSING
+
+
+def _js_num(v):
+    import math
+    return isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
+
+
+def _js_int(v, minimum=None):
+    return _js_num(v) and float(v).is_integer() and (minimum is None or v >= minimum)
+
+
+def _same_json(a, b):
+    """node:util isDeepStrictEqual for JSON values (true is not 1, key order does not matter)."""
+    if isinstance(a, bool) or isinstance(b, bool):
+        return isinstance(a, bool) and isinstance(b, bool) and a == b
+    if _js_num(a) or _js_num(b):
+        return _js_num(a) and _js_num(b) and a == b
+    if isinstance(a, dict):
+        return isinstance(b, dict) and a.keys() == b.keys() and all(_same_json(a[k], b[k]) for k in a)
+    if isinstance(a, list):
+        return isinstance(b, list) and len(a) == len(b) and all(_same_json(x, y) for x, y in zip(a, b))
+    return type(a) is type(b) and a == b
+
+
+def _opt_str(v):
+    """normalizeOptionalString: a trimmed non-blank string, else None."""
+    if not isinstance(v, str):
+        return None
+    v = _js_trim(v)
+    return v or None
+
+
+def _archive_twin(path, sha, limit):
+    """Name of an identical `.migrated` copy 2026.10.4 left after importing `path` (it archives only after the SQLite
+    commit, and deletes a source whose twin is identical): .migrated, .migrated.2, ... until one is absent
+    (state-migrations.storage.ts:18-33)."""
+    for i in range(1, 1000):
+        twin = path + ".migrated" if i == 1 else "%s.migrated.%d" % (path, i)
+        if not os.path.exists(twin):
+            return None
+        data = _read_regular_bytes(twin, limit)
+        if data is not None and _sha256_hex(data) == sha:
+            return os.path.basename(twin)
+    return None
+
+
+def _openclaw_home(env, home):
+    """resolveRequiredHomeDir: OPENCLAW_HOME (a leading ~ is the OS home), else HOME/USERPROFILE, else `home`;
+    path.resolve semantics (absolute, normalized, symlinks not resolved)."""
+    def norm(v):
+        v = _js_trim(v) if isinstance(v, str) else ""
+        return v if v and v not in ("undefined", "null") else None
+    os_home = norm(env.get("HOME")) or norm(env.get("USERPROFILE")) or home
+    explicit = norm(env.get("OPENCLAW_HOME"))
+    if explicit and (explicit == "~" or explicit.startswith("~/")):
+        return os.path.abspath(os_home + explicit[1:])
+    return os.path.abspath(explicit or os_home)
+
+
+def _rows(q, db, sql):
+    """Rows of a read-only query, or None when it fails (no such table/column, unreadable database)."""
+    if _lstat(db) is None:
+        return None
+    try:
+        return list(q(db, sql))
+    except Exception:  # noqa: BLE001 - every failure leaves the file unproven
+        return None
+
+
+def _in_list(values):
+    return ", ".join(_sql_str(v) for v in values)
+
+
+def _acp_ledger_sessions(doc):
+    """The sessions of a version-1 ACP replay ledger by the 2026.10.4 parse rules (acp-replay.ts:40-146), or a
+    reason why 2026.10.4 could not import it."""
+    if not _rec(doc) or isinstance(doc.get("version"), bool) or doc.get("version") != 1 \
+            or not _rec(doc.get("sessions")):
+        return "not a version 1 ledger"
+    out = []
+    for sid, s in doc["sessions"].items():
+        if not _rec(s) or s.get("sessionId") != sid or not isinstance(s.get("sessionKey"), str) \
+                or not isinstance(s.get("cwd"), str) or not isinstance(s.get("complete"), bool) \
+                or not _js_num(s.get("createdAt")) or not _js_num(s.get("updatedAt")) \
+                or not _js_int(s.get("nextSeq"), 1) or not isinstance(s.get("events"), list):
+            return "invalid session"
+        events = []
+        for ev in s["events"]:
+            if not _rec(ev) or not _js_int(ev.get("seq"), 1) or not _js_num(ev.get("at")) \
+                    or ev.get("sessionId") != sid or not isinstance(ev.get("sessionKey"), str) \
+                    or not _rec(ev.get("update")) or not isinstance(ev["update"].get("sessionUpdate"), str):
+                return "invalid event"
+            if "runId" in ev and not (isinstance(ev["runId"], str) and ev["runId"]):
+                return "invalid run id"
+            events.append(ev)
+        seqs = [ev["seq"] for ev in events]
+        if len(set(seqs)) != len(seqs) or s["nextSeq"] <= max(seqs or [0]):
+            return "invalid sequencing"
+        out.append((sid, s, sorted(events, key=lambda e: e["seq"])))
+    return out
+
+
+def _acp_ledger_proof(path, state_db, q):
+    data = _read_regular_bytes(path, 64 * 1024 * 1024)
+    if data is None:
+        return _UNPROVEN, "not a regular file"
+    doc = _json_strict(data)
+    if doc is _MISSING:
+        return _UNPROVEN, "invalid JSON"
+    sessions = _acp_ledger_sessions(doc)
+    if isinstance(sessions, str):
+        return _UNPROVEN, sessions
+    if not sessions:
+        return _EMPTY, _NOTHING
+    by_id, evs = {}, {}
+    ids = [sid for sid, _s, _e in sessions]
+    for i in range(0, len(ids), 500):
+        chunk = _in_list(ids[i:i + 500])
+        srows = _rows(q, state_db, "SELECT session_id, session_key, cwd, complete, created_at, updated_at, next_seq "
+                                   "FROM acp_replay_sessions WHERE session_id IN (%s)" % chunk)
+        erows = _rows(q, state_db, "SELECT session_id, seq, at, session_key, run_id, update_json FROM "
+                                   "acp_replay_events WHERE session_id IN (%s) ORDER BY session_id, seq" % chunk)
+        if srows is None or erows is None:
+            return _UNPROVEN, "acp_replay_* tables not readable"
+        for r in srows:
+            by_id[_cell(r, 0)] = [_cell(r, k) for k in range(1, 7)]
+        for r in erows:
+            evs.setdefault(_cell(r, 0), []).append([_cell(r, k) for k in range(1, 6)])
+    def same_event(ev, stored):
+        seq, at, skey, run_id, upd = stored
+        upd = _json_strict(upd.encode("utf-8")) if isinstance(upd, str) else _MISSING
+        return _same_json(seq, ev["seq"]) and _same_json(at, ev["at"]) and skey == ev["sessionKey"] \
+            and run_id == ev.get("runId") and _same_json(upd, ev["update"])
+
+    missing, n_events = 0, 0
+    for sid, s, events in sessions:  # reconcileCanonicalSession (acp-replay.ts:158-216)
+        n_events += len(events)
+        row, stored = by_id.get(sid), evs.get(sid, [])
+        ok = row is not None and row[0] == s["sessionKey"] and row[1] == s["cwd"] \
+            and _same_json(row[2], 1 if s["complete"] else 0) and _same_json(row[3], s["createdAt"]) \
+            and _same_json(row[4], s["updatedAt"]) and _same_json(row[5], s["nextSeq"]) \
+            and len(stored) == len(events) and all(same_event(e, r) for e, r in zip(events, stored))
+        missing += not ok
+    if missing:
+        return _UNPROVEN, "%d of %d session(s) not in SQLite" % (missing, len(sessions))
+    return _IMPORTED, "%d session(s), %d event(s) in acp_replay_*" % (len(sessions), n_events)
+
+
+def _voicewake_proof(path, key, state_db, q):
+    data = _read_regular_bytes(path, 64 * 1024 * 1024)
+    if data is None:
+        return _UNPROVEN, "not a regular file"
+    twin = _archive_twin(path, _sha256_hex(data), 64 * 1024 * 1024)
+    if twin:
+        return _IMPORTED, "identical archived copy " + twin
+    doc = _json_strict(data)
+    if doc is _MISSING:
+        return _UNPROVEN, "invalid JSON"
+    rows = _rows(q, state_db, "SELECT value_json FROM config_machine_state WHERE state_key=%s" % _sql_str(key))
+    if rows is None:
+        return _UNPROVEN, "config_machine_state not readable"
+    stored = _json_strict(str(_cell(rows[0])).encode("utf-8")) if rows else _MISSING
+    if key == "voicewake.triggers":
+        # normalizeLegacyVoiceWakeTriggers: trimmed non-blank strings, else the defaults
+        raw = doc.get("triggers") if _rec(doc) else None
+        triggers = [_opt_str(t) for t in raw if _opt_str(t)] if isinstance(raw, list) else []
+        triggers = triggers or list(_VOICEWAKE_DEFAULT_TRIGGERS)
+        if stored is not _MISSING and _same_json(stored, triggers):
+            return _IMPORTED, "%s in SQLite" % key
+        if stored is _MISSING and triggers == _VOICEWAKE_DEFAULT_TRIGGERS:
+            return _EMPTY, _NOTHING + " (the default trigger words)"
+        return _UNPROVEN, "SQLite holds other trigger words" if stored is not _MISSING else "not in SQLite"
+    # voicewake.routing: compared with the raw file (stricter than 2026.10.4's normalized compare)
+    if _rec(stored) and _rec(doc) and _same_json(stored.get("defaultTarget"), doc.get("defaultTarget")) \
+            and _same_json(stored.get("routes"), doc.get("routes")):
+        return _IMPORTED, "%s in SQLite" % key
+    default = not _rec(doc) or (doc.get("defaultTarget") in (None, {"mode": "current"})
+                                and doc.get("routes") in (None, []))
+    if stored is _MISSING and default:
+        return _EMPTY, _NOTHING + " (the default routing)"
+    return _UNPROVEN, "SQLite holds other routing" if stored is not _MISSING else "not in SQLite"
+
+
+def _conversation_bindings_proof(path, state_db, q):
+    data = _read_regular_bytes(path, 64 * 1024 * 1024)
+    if data is None:
+        return _UNPROVEN, "not a regular file"
+    twin = _archive_twin(path, _sha256_hex(data), 64 * 1024 * 1024)
+    if twin:
+        return _IMPORTED, "identical archived copy " + twin
+    doc = _json_strict(data)
+    if doc is _MISSING:
+        return _UNPROVEN, "invalid JSON"
+    if not _rec(doc) or isinstance(doc.get("version"), bool) or doc.get("version") != 1 \
+            or not isinstance(doc.get("bindings"), list):
+        return _EMPTY, _NOTHING + " (no version 1 bindings)"
+    want = {}
+    for rec in doc["bindings"]:
+        conv = rec.get("conversation") if _rec(rec) else None
+        if not _rec(conv) or not conv.get("conversationId") or not _opt_str(rec.get("targetSessionKey")):
+            continue
+        acc = conv.get("accountId")
+        if acc is not None and not isinstance(acc, str):
+            return _UNPROVEN, "invalid account id"  # 2026.10.4 fails on it and leaves the file
+        cid = _opt_str(conv.get("conversationId")) or ""
+        parent = _opt_str(conv.get("parentConversationId"))
+        channel = (_opt_str(conv.get("channel")) or "").lower()
+        account = (_opt_str(acc) or "default").lower()  # approximates normalizeAccountId: a mismatch only HOLDs
+        k = (channel, account, parent if parent and parent != cid else "", cid)
+        want[k] = _opt_str(rec.get("targetSessionKey"))
+    if not want:
+        return _EMPTY, _NOTHING + " (no binding with a conversation and a target session)"
+    rows = _rows(q, state_db, "SELECT channel, account_id, COALESCE(parent_conversation_id, ''), conversation_id, "
+                              "target_session_key FROM current_conversation_bindings")
+    if rows is None:
+        return _UNPROVEN, "current_conversation_bindings not readable"
+    have = {tuple(_cell(r, k) for k in range(5)) for r in rows}
+    missing = sum(1 for k, target in want.items() if k + (target,) not in have)
+    if missing:
+        return _UNPROVEN, "%d of %d binding(s) not in SQLite" % (missing, len(want))
+    return _IMPORTED, "%d binding(s) in current_conversation_bindings" % len(want)
+
+
+def _plugin_approvals_proof(path, state_db, q):
+    data = _read_regular_bytes(path, 64 * 1024 * 1024)
+    if data is None:
+        return _UNPROVEN, "not a regular file"
+    twin = _archive_twin(path, _sha256_hex(data), 64 * 1024 * 1024)
+    if twin:
+        return _IMPORTED, "identical archived copy " + twin
+    doc = _json_strict(data)
+    if doc is _MISSING:
+        return _UNPROVEN, "invalid JSON"
+    if not _rec(doc) or isinstance(doc.get("version"), bool) or doc.get("version") != 1 \
+            or not isinstance(doc.get("approvals"), list):
+        return _EMPTY, _NOTHING + " (no version 1 approvals)"
+    want = {}
+    for item in doc["approvals"]:
+        e = item if _rec(item) else {}
+        root, pid = _opt_str(e.get("pluginRoot")), _opt_str(e.get("pluginId"))
+        channel = (_opt_str(e.get("channel")) or "").lower()
+        if root and pid and channel:
+            want[(root, channel, _opt_str(e.get("accountId")) or "default")] = pid
+    if not want:
+        return _EMPTY, _NOTHING + " (no complete approval)"
+    rows = _rows(q, state_db, "SELECT plugin_root, channel, account_id, plugin_id FROM plugin_binding_approvals")
+    if rows is None:
+        return _UNPROVEN, "plugin_binding_approvals not readable"
+    have = {tuple(_cell(r, k) for k in range(4)) for r in rows}
+    missing = sum(1 for k, pid in want.items() if k + (pid,) not in have)
+    if missing:
+        return _UNPROVEN, "%d of %d approval(s) not in SQLite" % (missing, len(want))
+    return _IMPORTED, "%d approval(s) in plugin_binding_approvals" % len(want)
+
+
+def _restart_receipt_decision(report_json, sha):
+    """The decision of a valid restart-sentinel migration report for exactly `sha` (readReceiptReport,
+    restart-sentinel-receipts.ts:29-50), else None."""
+    r = _json_strict(report_json.encode("utf-8")) if isinstance(report_json, str) else _MISSING
+    if not _rec(r) or r.get("source") != _RESTART_SENTINEL_KIND or r.get("target") != "gateway_restart_sentinel" \
+            or r.get("sourceSha256") != sha or not isinstance(r.get("sourceValid"), bool) \
+            or not all(_same_json(r.get(k), 0) or _same_json(r.get(k), 1)
+                       for k in ("importedRecordCount", "preservedSqliteRecordCount")) \
+            or r.get("decision") not in _RESTART_DECISIONS:
+        return None
+    return r["decision"]
+
+
+def _restart_sentinel_proof(path, state_db, q):
+    """Any recorded 2026.10.4 decision for exactly these bytes is proof (the receipt keys hash the absolute path;
+    matching on kind and sha256 alone also covers a copy of the state at another path)."""
+    data = _read_regular_bytes(path, _RESTART_SENTINEL_MAX)
+    if data is None:
+        st = _lstat(path)
+        return _UNPROVEN, ("larger than 4 MiB" if st is not None and stat.S_ISREG(st.st_mode)
+                           and st.st_size > _RESTART_SENTINEL_MAX else "not a regular file")
+    sha = _sha256_hex(data)
+    for sql in ("SELECT report_json FROM migration_sources WHERE migration_kind=%s AND source_sha256=%s"
+                % (_sql_str(_RESTART_SENTINEL_KIND), _sql_str(sha)),
+                "SELECT report_json FROM migration_runs WHERE id LIKE %s AND status='completed'"
+                % _sql_str("restart-sentinel-json:%:" + sha[:16])):
+        for r in _rows(q, state_db, sql) or ():
+            decision = _restart_receipt_decision(_cell(r), sha)
+            if decision:
+                return _IMPORTED, "receipt " + decision
+    return _UNPROVEN, "no receipt for sha256 %s..." % sha[:12]
+
+
+def _sandbox_registry_proof(path, registry_kind, sharded, state_db, q):
+    """Monolithic sandbox/<kind>s.json ({entries: [{containerName}]}) or sharded sandbox/<kind>s/*.json; strict:
+    an unreadable or invalid registry is unproven (2026.10.4 renamed it to .invalid-<time> without importing)."""
+    st = _lstat(path)
+    names = []
+    if not sharded:
+        if st is None or not stat.S_ISREG(st.st_mode):
+            return _UNPROVEN, "not a regular file"
+        data = _read_regular_bytes(path, 64 * 1024 * 1024)
+        doc = _json_strict(data) if data is not None else _MISSING
+        if not _rec(doc) or not isinstance(doc.get("entries"), list) \
+                or not all(_rec(e) and isinstance(e.get("containerName"), str) for e in doc["entries"]):
+            return _UNPROVEN, "not a valid registry file"
+        names = [e["containerName"] for e in doc["entries"]]
+    else:
+        if st is None or not stat.S_ISDIR(st.st_mode):
+            return _UNPROVEN, "not a directory"
+        try:
+            with os.scandir(path) as it:
+                shards = sorted(e.name for e in it if e.name.endswith(".json"))
+        except OSError:
+            return _UNPROVEN, "directory not readable"
+        for name in shards:
+            data = _read_regular_bytes(os.path.join(path, name), 64 * 1024 * 1024)
+            doc = _json_strict(data) if data is not None else _MISSING
+            if not _rec(doc) or not isinstance(doc.get("containerName"), str):
+                return _UNPROVEN, "invalid shard " + name
+            names.append(doc["containerName"])
+    if not names:
+        return _EMPTY, _NOTHING
+    rows = _rows(q, state_db, "SELECT container_name FROM sandbox_registry_entries WHERE registry_kind=%s"
+                 % _sql_str(registry_kind))
+    if rows is None:
+        return _UNPROVEN, "sandbox_registry_entries not readable"
+    have = {_cell(r) for r in rows}
+    missing = len({n for n in names if n not in have})
+    if missing:
+        return _UNPROVEN, "%d of %d entr(ies) not in SQLite" % (missing, len(set(names)))
+    return _IMPORTED, "%d entr(ies) in sandbox_registry_entries" % len(set(names))
+
+
+# (relative path(s), plan kind, HOLD code, label, proof(path, state_db, q)); fixed order, every 2026.10.5+ refusal
+_RUNTIME_FILE_FAMILIES = (
+    (("acp/event-ledger.json", "acp/event-ledger.json.doctor-import"), "acp-replay-ledger", "acp-ledger-unimported",
+     "ACP replay ledger", _acp_ledger_proof),
+    (("settings/voicewake.json",), "voicewake-json", "voicewake-unimported", "Voice Wake trigger words",
+     lambda p, db, q: _voicewake_proof(p, "voicewake.triggers", db, q)),
+    (("settings/voicewake-routing.json",), "voicewake-json", "voicewake-unimported", "Voice Wake routing",
+     lambda p, db, q: _voicewake_proof(p, "voicewake.routing", db, q)),
+    (("bindings/current-conversations.json",), "conversation-bindings-json", "conversation-bindings-unimported",
+     "conversation bindings", _conversation_bindings_proof),
+    (("plugin-binding-approvals.json",), "plugin-approvals-json", "plugin-approvals-unimported",
+     "plugin binding approvals", _plugin_approvals_proof),
+    (("restart-sentinel.json", "restart-sentinel.json.doctor-importing"), "restart-sentinel-json",
+     "restart-sentinel-unimported", "restart sentinel", _restart_sentinel_proof),
+)
+_SANDBOX_REGISTRIES = (("sandbox/containers.json", "container", False), ("sandbox/containers", "container", True),
+                       ("sandbox/browsers.json", "browser", False), ("sandbox/browsers", "browser", True))
+
+
 def classify_retired_state(state_dir, cfg, *, accepted, query=None, home="/config", env=None, mode="from-7x",
-                           workspaces=(), config_root=None):
+                           workspaces=(), config_root=None, caps=None):
     """Retired pre-July-2026 files and config keys that 10.2 doctor refuses (every gate mode).
 
     workspaces: absolute agent workspace dirs (dreaming JSON); config_root: the directory workspace files are
-    quarantined relative to (plan entries then carry "root": "config").
-    Returns {"plan": [{rel, kind, action, reason, size[, root]}], "findings": [...], "info": [...],
-    "config_removals": [path parts]} -- config_removals are applied by the from-7x pre-migrate step.
+    quarantined relative to (plan entries then carry "root": "config"). env: the environment OpenClaw runs with
+    (OPENCLAW_OAUTH_DIR; HOME/OPENCLAW_HOME for the default-home plugin-binding-approvals.json).
+    caps: oc_common.runtime_caps of the bundled OpenClaw (None: 2026.10.4). With runtime_files_retired /
+    sandbox_registry_retired (2026.10.5+) the runtime files 2026.10.4 still imported are checked too: quarantined
+    with proof that OpenClaw imported them (plan entry "proof") or when 2026.10.4 would import nothing, otherwise
+    an acceptable HOLD per file type.
+    Returns {"plan": [{rel, kind, action, reason, size[, root][, proof]}], "findings": [...], "info": [...],
+    "config_removals": [path parts], "config_rewrites": [...]} -- config_removals and config_rewrites
+    (retired_config_rewrites, from-7x only) are applied by the from-7x pre-migrate step.
     """
     q = query or _query_ro_local
     accepted = set(accepted or ())
@@ -2574,7 +3080,7 @@ def classify_retired_state(state_dir, cfg, *, accepted, query=None, home="/confi
     plan, info, removals = [], [], []
     by_code = {}
 
-    def add(abs_path, kind, action, reason, root="state"):
+    def add(abs_path, kind, action, reason, root="state", proof=None):
         rel = _within(config_root if root == "config" else state_dir, abs_path) \
             if root == "state" or config_root else None
         if rel is None:
@@ -2584,6 +3090,8 @@ def classify_retired_state(state_dir, cfg, *, accepted, query=None, home="/confi
         e = {"rel": rel, "kind": kind, "action": action, "reason": reason, "size": st.st_size if st is not None else 0}
         if root == "config":
             e["root"] = "config"
+        if proof:
+            e["proof"] = proof
         plan.append(e)
 
     def flag(code, item):
@@ -2720,7 +3228,10 @@ def classify_retired_state(state_dir, cfg, *, accepted, query=None, home="/confi
     if installs is not _MISSING:
         missing = sorted(str(x) for x in set(installs if _rec(installs) else ()) - index_ids)
         if mode != "from-7x":
-            pass  # reported by retired_config_findings as a hard config key
+            if installs == {} and _cap(caps, "empty_installs_tolerated"):
+                info.append("openclaw.json plugins.installs is an empty object; OpenClaw doctor removes it "
+                            "(install records stay in SQLite)")
+            # otherwise reported by retired_config_findings as a hard config key
         elif not missing or "plugins-installs-unindexed" in accepted:
             removals.append(["plugins", "installs"])
             if missing:
@@ -2798,6 +3309,36 @@ def classify_retired_state(state_dir, cfg, *, accepted, query=None, home="/confi
             info.append("telegram ingress spool: %d legacy Telegram update file(s); doctor imports them into the "
                         "SQLite ingress queue" % spool_ok)
 
+    # Runtime files OpenClaw 2026.10.5+ refuses (lstat existence like OpenClaw; 2026.10.4 still imported them):
+    # doctor's admission check (runtime JSON sidecars, restart sentinel) and its doctor:sandbox step.
+    families = list(_RUNTIME_FILE_FAMILIES) if _cap(caps, "runtime_files_retired") else []
+    # the retired approvals writer always used the default home (path.resolve compare, no symlink resolution)
+    if os.path.abspath(state_dir) != os.path.join(_openclaw_home(env, home), ".openclaw"):
+        families = [f for f in families if f[1] != "plugin-approvals-json"]
+    if _cap(caps, "sandbox_registry_retired"):
+        families += [((rel,), "sandbox-registry", "sandbox-registry-unimported", "sandbox registry",
+                      lambda p, db, qq, k=kind, s=sharded: _sandbox_registry_proof(p, k, s, db, qq))
+                     for rel, kind, sharded in _SANDBOX_REGISTRIES]
+    for rels, kind, code, label, proof in families:
+        for rel in rels:
+            path = os.path.join(state_dir, rel)
+            st, err = _lstat_checked(path)
+            if err:
+                flag("retired-state-uninspectable", "%s (%s)" % (path, err))
+                continue
+            if st is None:
+                continue
+            status, detail = proof(path, state_db, q)
+            if status == _IMPORTED:
+                add(path, kind, "quarantine", "retired pre-July-2026 %s; OpenClaw already imported it" % label,
+                    proof=detail)
+            elif status == _EMPTY:
+                add(path, kind, "quarantine", "retired pre-July-2026 %s with nothing OpenClaw 2026.10.4 would import"
+                    % label, proof=detail)
+            else:
+                acceptable(code, path, kind, "accepted: " + code, "retired pre-July-2026 %s (%s)" % (label, detail),
+                           "%s (%s)" % (rel, detail))
+
     messages = {
         "retired-state-outside": ("retired pre-July-2026 file(s) outside the state directory: %s; OpenClaw 2026.10 "
                                   "refuses them: move them away by hand (after a backup)"),
@@ -2827,20 +3368,60 @@ def classify_retired_state(state_dir, cfg, *, accepted, query=None, home="/confi
         "dreaming-json-unmigrated": ("pre-July-2026 dreaming file(s) whose state is not in SQLite: %s; OpenClaw 2026.10 "
                                      "stops on them. Accepting moves them to quarantine: dreaming starts its ingestion "
                                      "and short-term recall history afresh (MEMORY.md and memory notes are untouched)"),
+        # OpenClaw 2026.10.5+ (caps runtime_files_retired / sandbox_registry_retired)
+        "acp-ledger-unimported": ("pre-July-2026 ACP replay ledger(s) whose sessions are not in SQLite: %s; OpenClaw "
+                                  "2026.10.5 and later refuse them (doctor: \"Upgrade through OpenClaw 2026.9.7\"). "
+                                  "Accepting moves them to quarantine: ACP clients (IDE integrations) can no longer "
+                                  "replay those old sessions; nothing else uses the file"),
+        "voicewake-unimported": ("pre-July-2026 Voice Wake setting file(s) whose values are not in SQLite: %s; OpenClaw "
+                                 "2026.10.5 and later refuse them. Accepting moves them to quarantine: the Voice Wake "
+                                 "trigger words and routing of the macOS/iOS apps stay as SQLite holds them (default: "
+                                 "openclaw, claude, computer)"),
+        "conversation-bindings-unimported": ("pre-July-2026 bindings/current-conversations.json with bindings that are "
+                                             "not in SQLite: %s; OpenClaw 2026.10.5 and later refuse it. Accepting "
+                                             "moves it to quarantine: those chats lose their binding to a specific "
+                                             "session and use normal routing again"),
+        "plugin-approvals-unimported": ("pre-July-2026 plugin-binding-approvals.json with approvals that are not in "
+                                        "SQLite: %s; OpenClaw 2026.10.5 and later refuse it. Accepting moves it to "
+                                        "quarantine: those plugins ask again before binding a conversation"),
+        "restart-sentinel-unimported": ("pre-July-2026 restart-sentinel.json without an OpenClaw migration receipt for "
+                                        "its content: %s; OpenClaw 2026.10.5 and later refuse it. Accepting moves it "
+                                        "to quarantine: only the one-time restart/update notice of that old restart "
+                                        "is lost"),
+        "sandbox-registry-unimported": ("pre-July-2026 sandbox registry entries that are not in SQLite (or unreadable): "
+                                        "%s; OpenClaw 2026.10.5 and later refuse them (doctor reports its sandbox step "
+                                        "as failed on every run). Accepting moves them to quarantine: OpenClaw forgets "
+                                        "those Docker sandbox containers (they are recreated on demand; remove old "
+                                        "containers by hand if any exist)"),
     }
     hard = {"retired-state-outside", "retired-state-uninspectable", "telegram-spool-unsupported"}
     findings = [_finding(code, "hard" if code in hard else "acceptable", messages[code] % _brief(items), "precheck")
                 for code, items in by_code.items()]
-    return {"plan": plan, "findings": findings, "info": info, "config_removals": removals}
+    return {"plan": plan, "findings": findings, "info": info, "config_removals": removals,
+            "config_rewrites": retired_config_rewrites(cfg, caps) if mode == "from-7x" else []}
 
 
-def retired_config_findings(cfg, mode="from-7x"):
-    """Hard finding for retired config keys 10.2 doctor refuses (plugins.installs: see classify_retired_state)."""
-    paths, bridge = retired_config_keys(cfg)
+def retired_config_findings(cfg, mode="from-7x", caps=None, runtime=None):
+    """Hard finding for retired config keys 10.2 doctor refuses (plugins.installs: see classify_retired_state).
+
+    caps: oc_common.runtime_caps (None: 2026.10.4); runtime: the bundled OpenClaw version for the message. In from-7x
+    mode the keys the pre-migrate step rewrites (retired_config_rewrites) are left out; otherwise the message names
+    the exact fix for them."""
+    paths, bridge = retired_config_keys(cfg, caps)
+    fixes = {fmt_path(e["parts"]): e for e in retired_config_rewrites(cfg, caps)}
     if mode == "from-7x":
-        paths = [p for p in paths if p != "plugins.installs"]
+        paths = [p for p in paths if p != "plugins.installs" and p not in fixes]
     if not paths:
         return []
+    hints = [('set %s to "%s"' % (p, fixes[p]["value"])) if fixes[p]["op"] == "set" else
+             "delete %s (extension profiles find their relay themselves)" % p for p in paths if p in fixes]
+    if hints:  # bump/maintenance with a 2026.10.5+ runtime: name the exact fix
+        fix = "; ".join(hints[:10]) + (" (+%d more)" % (len(hints) - 10) if len(hints) > 10 else "")
+        if any(p not in fixes for p in paths):
+            fix += "; remove the others (or migrate them with OpenClaw %s)" % bridge
+        return [_finding("config-retired-keys", "hard",
+                         "openclaw.json contains settings OpenClaw %s refuses (retired before July 2026): %s. Fix: %s; "
+                         "then oc-upgrade retry" % (runtime or "2026.10", _brief(paths, 10), fix), "precheck")]
     return [_finding(
         "config-retired-keys", "hard",
         ("openclaw.json contains settings OpenClaw 2026.10 refuses (retired before July 2026): %s. OpenClaw "

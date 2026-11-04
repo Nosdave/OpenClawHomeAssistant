@@ -395,17 +395,23 @@ def cmd_check(_args):
     if M is not None:
         try:
             ccfg = cfg if isinstance(cfg, dict) else {}
-            keys, _bridge = M.retired_config_keys(ccfg)
+            try:  # the checks of the bundled OpenClaw (2026.10.5+: runtime files, API ids, cdpUrl)
+                caps = C.runtime_caps(C.runtime_package())
+            except Exception:  # noqa: BLE001 - unknown runtime: the 2026.10.4 checks
+                caps = None
+            keys, _bridge = M.retired_config_keys(ccfg, caps)
             for k in keys:
                 shown += 1
                 print(f"  openclaw.json {k}: retired setting"
                       + (" (removed by the gate when its records are in SQLite)" if k == "plugins.installs" else ""))
                 bump(RC_NOTES, info_only)
-            rs = M.classify_retired_state(str(state), ccfg, accepted=set(), home=str(p["CONFIG_ROOT"]))
+            rs = M.classify_retired_state(str(state), ccfg, accepted=set(), home=str(p["CONFIG_ROOT"]), caps=caps,
+                                          env=dict(os.environ, HOME=str(p["CONFIG_ROOT"])))
             for e in rs.get("plan", []):
                 shown += 1
                 print(f"  {e.get('rel')} ({e.get('size', 0)} B) {e.get('kind')}: {e.get('action')}"
-                      + (f" — {e['reason']}" if e.get("reason") else ""))
+                      + (f" — {e['reason']}" if e.get("reason") else "")
+                      + (f" (proof: {e['proof']})" if e.get("proof") else ""))
                 bump(RC_NOTES, info_only)
             for f in rs.get("findings", []):
                 shown += 1

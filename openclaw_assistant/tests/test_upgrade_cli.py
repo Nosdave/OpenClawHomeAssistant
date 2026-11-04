@@ -161,6 +161,31 @@ class StateGuardCheckTests(CliEnv):
             self.assertIn(s, self.stdout)
         self.assertNotIn("SECRET", self.stdout)
 
+    def test_check_c2_lists_retired_runtime_files_for_1010(self):
+        """full5: C2 shows the 2026.10.5+ retired runtime files (with the proof) only for such a runtime."""
+        T.make_1004_state(self.state)
+        self.write_cfg({"meta": {"lastTouchedVersion": "2026.10.4"},
+                        "models": {"providers": {"p": {"api": "openai-codex-responses"}}}})
+        (self.state / "acp").mkdir()
+        (self.state / "acp" / "event-ledger.json").write_text('{"version": 1, "sessions": {"s": {}}}')
+        (self.state / "sandbox" / "browsers").mkdir(parents=True)
+        self.set_runtime("2026.10.10", 22, 27)
+        rc = self.cli("check", env={"OPENCLAW_RUNTIME_VERSION": "2026.10.10"})
+        self.assertIn(rc, (0, 4), self.stdout + self.stderr)
+        c2 = self.stdout.split("== C2 ", 1)[1].split("\n== ", 1)[0]
+        self.assertIn("acp/event-ledger.json (", c2)
+        self.assertIn("acp-replay-ledger: leave", c2)
+        self.assertIn("ACCEPTABLE acp-ledger-unimported", c2)
+        self.assertIn("sandbox/browsers (", c2)
+        self.assertIn("sandbox-registry: quarantine", c2)
+        self.assertIn("(proof: nothing to import)", c2)
+        self.assertIn("openclaw.json models.providers.p.api: retired setting", c2)
+        self.set_runtime("2026.10.4", 20, 24)
+        self.cli("check", env={"OPENCLAW_RUNTIME_VERSION": "2026.10.4"})
+        c2 = self.stdout.split("== C2 ", 1)[1].split("\n== ", 1)[0]
+        for s in ("acp/event-ledger.json", "sandbox/browsers", "models.providers.p.api"):
+            self.assertNotIn(s, c2)
+
     def test_check_wildcard_note_only_for_legacy_codex_wildcards(self):
         # live box: canonical wildcards only -> no "expanded" note (they stay as they are)
         self.build_735()

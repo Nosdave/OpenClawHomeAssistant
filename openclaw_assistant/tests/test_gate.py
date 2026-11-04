@@ -1137,6 +1137,36 @@ class DoctorEvalTests(unittest.TestCase):
         ev = G.evaluate_doctor(0, cron, final=True)
         self.assertEqual((ev["code"], ev["cls"]), ("doctor-warnings", "acceptable"))
 
+    def test_optional_step_retired_refusal_is_its_own_code(self):
+        """2026.10.5+: doctor:sandbox refuses the retired sandbox registries after the database migration but only
+        prints a "Doctor warnings" line and exits 0. Own acceptable code, only when runtime_caps says the runtime
+        retires these files (2026.10.4: unchanged)."""
+        sandbox = ("◇  Doctor warnings ──╮\n│  doctor:sandbox run failed: Sandbox registries: retired files whose last "
+                   "writer predates July 1, 2026: /config/.openclaw/sandbox/containers.json. The files were left "
+                   "unchanged. │\nDoctor complete.\n")
+        self.assertIsNone(G.evaluate_doctor(0, sandbox)["code"])
+        ev = G.evaluate_doctor(0, sandbox, retired_warning=True)
+        self.assertEqual((ev["code"], ev["cls"]), ("doctor-retired-warning", "acceptable"))
+        self.assertIn("sandbox/containers.json", ev["message"])
+        uninspectable = ("doctor:sandbox run failed: Cannot inspect potentially retired state at /x/sandbox/browsers: "
+                         "EACCES\nDoctor complete.\n")
+        self.assertEqual(G.evaluate_doctor(0, uninspectable, retired_warning=True)["code"], "doctor-retired-warning")
+        # accepting one code never accepts the others in the same pass
+        both = "Preserved retired model ids.\n" + sandbox
+        self.assertEqual([e["code"] for e in G.acceptable_doctor(G.evaluate_doctor(0, both, retired_warning=True))],
+                         ["doctor-warnings", "doctor-retired-warning"])
+        self.assertEqual([e["code"] for e in G.acceptable_doctor(G.evaluate_doctor(0, both))], ["doctor-warnings"])
+        held = "1 store held back.\n" + both
+        self.assertEqual([e["code"] for e in G.acceptable_doctor(G.evaluate_doctor(0, held, retired_warning=True))],
+                         ["doctor-held-back", "doctor-warnings", "doctor-retired-warning"])
+        # rc != 0: the admission refusal stays doctor-retired-format
+        refusal = ("Runtime JSON sidecars: retired files whose last writer predates July 1, 2026: /y/restart-sentinel"
+                   ".json. The files were left unchanged. Upgrade through OpenClaw 2026.9.7")
+        for flag in (False, True):
+            self.assertEqual(G.evaluate_doctor(1, refusal, retired_warning=flag)["code"], "doctor-retired-format")
+        self.assertIn("doctor-retired-warning", G.ACCEPTABLE)
+        self.assertIn("doctor-retired-warning", G.ADVICE)
+
     def test_wrapped_clack_box(self):
         text = "│  Doctor stopped     │\n│  because the step refused │\n"
         self.assertEqual(G.evaluate_doctor(1, text)["code"], "doctor-migration-refused")

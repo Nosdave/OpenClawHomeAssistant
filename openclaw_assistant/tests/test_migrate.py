@@ -2035,6 +2035,453 @@ class TestRetiredFormats(unittest.TestCase):
         self.assertIn("installs", cfg["plugins"], "input must not be mutated")
 
 
+DDL_STATE_1004 = os.path.join(FIX, "openclaw-state-schema-2026.10.4.sql")  # verbatim OpenClaw v2026.10.4 DDL
+
+
+def _caps(version):
+    """oc_common.runtime_caps of a bundled OpenClaw `version` (no build-time features record)."""
+    from unittest import mock
+    import oc_common as C
+    with mock.patch.dict(os.environ, {"OC_ADDON_FEATURES_FILE": os.path.join(HERE, "no-such-features.json")}):
+        return C.runtime_caps(version)
+
+
+RUNTIME_FILES = ("acp/event-ledger.json", "acp/event-ledger.json.doctor-import", "settings/voicewake.json",
+                 "settings/voicewake-routing.json", "bindings/current-conversations.json",
+                 "plugin-binding-approvals.json", "restart-sentinel.json", "restart-sentinel.json.doctor-importing")
+SANDBOX_REGISTRIES = ("sandbox/containers.json", "sandbox/browsers.json")
+SANDBOX_DIRS = ("sandbox/containers", "sandbox/browsers")
+
+
+class TestRetiredRuntimeFiles(unittest.TestCase):
+    """OpenClaw 2026.10.5+ refuses pre-July runtime files 2026.10.4 still imported (#165402, #164669): quarantine
+    only with proof that OpenClaw imported them (or when 2026.10.4 would import nothing), otherwise an acceptable
+    HOLD per file type; retired config keys of 2026.10.5/10.6 (runtime_caps)."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.home = self.tmp.name
+        self.root = os.path.join(self.home, ".openclaw")  # the default home of HOME=self.home
+        self.db = os.path.join(self.root, "state", "openclaw.sqlite")
+        os.makedirs(os.path.dirname(self.db))
+        con = sqlite3.connect(self.db)
+        with open(DDL_STATE_1004, encoding="utf-8") as f:
+            con.executescript(f.read())
+        con.close()
+        self.c1010 = _caps("2026.10.10")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def sql(self, *statements, params=()):
+        con = sqlite3.connect(self.db)
+        try:
+            for s in statements:
+                con.execute(s, params) if params else con.execute(s)
+            con.commit()
+        finally:
+            con.close()
+
+    def run_cls(self, cfg=None, caps="1010", env=None, **kw):
+        before = _snapshot(self.home)
+        out = m.classify_retired_state(self.root, cfg or {}, accepted=kw.pop("accepted", set()), home="/config",
+                                       caps=self.c1010 if caps == "1010" else caps,
+                                       env={"HOME": self.home} if env is None else env, **kw)
+        self.assertEqual(_snapshot(self.home), before, "classification must not touch the state dir")
+        json.dumps(out)
+        return out
+
+    def plan(self, out):
+        return {p["rel"]: (p["kind"], p["action"]) for p in out["plan"]}
+
+    def proof(self, out, rel):
+        return next(p.get("proof") for p in out["plan"] if p["rel"] == rel)
+
+    def codes(self, out):
+        return {f["code"]: f["cls"] for f in out["findings"]}
+
+    def ledger(self, sessions):
+        return json.dumps({"version": 1, "sessions": sessions})
+
+    # ----- version gating -----
+    def test_runtime_files_left_to_doctor_for_10_4(self):
+        for rel in RUNTIME_FILES + SANDBOX_REGISTRIES:
+            _write(self.root, rel, "{}")
+        for rel in SANDBOX_DIRS:
+            os.makedirs(os.path.join(self.root, rel))
+        for caps in (None, _caps("2026.10.4"), _caps("2026.10.4-2")):
+            out = self.run_cls(caps=caps)
+            self.assertEqual(out["plan"], [], caps)
+            self.assertEqual(out["findings"], [], caps)
+        # 2026.10.5 and later: every path is checked
+        for v in ("2026.10.5", "2026.10.10", "2026.11.1"):
+            out = self.run_cls(caps=_caps(v))
+            self.assertEqual(set(self.plan(out)), set(RUNTIME_FILES + SANDBOX_REGISTRIES + SANDBOX_DIRS), v)
+        # "{}" is nothing 2026.10.4 would import for Voice Wake (defaults), bindings, approvals and the empty
+        # shard directories; the ledger, the sentinel and the registry files need proof
+        self.assertEqual(self.codes(out), {c: "acceptable" for c in (
+            "acp-ledger-unimported", "restart-sentinel-unimported", "sandbox-registry-unimported")})
+        for rel in ("settings/voicewake.json", "settings/voicewake-routing.json", "bindings/current-conversations.json",
+                    "plugin-binding-approvals.json") + SANDBOX_DIRS:
+            self.assertEqual(self.plan(out)[rel][1], "quarantine", rel)
+            self.assertTrue(self.proof(out, rel).startswith("nothing to import"), rel)
+
+    # ----- ACP replay ledger -----
+    def acp_rows(self, session_key="agent:main:acp", update2=None, run_id2="run-1"):
+        self.sql("INSERT INTO acp_replay_sessions (session_id, session_key, cwd, complete, created_at, updated_at, "
+                 "next_seq) VALUES ('s1', '%s', '/config/clawd', 1, 1000, 2000, 3)" % session_key)
+        self.sql("INSERT INTO acp_replay_events (session_id, seq, at, session_key, run_id, update_json) VALUES "
+                 "('s1', 1, 1100, 'agent:main:acp', NULL, ?)", params=(json.dumps({"sessionUpdate": "a", "n": 1}),))
+        self.sql("INSERT INTO acp_replay_events (session_id, seq, at, session_key, run_id, update_json) VALUES "
+                 "('s1', 2, 1200, 'agent:main:acp', ?, ?)",
+                 params=(run_id2, json.dumps(update2 or {"sessionUpdate": "b", "ok": True})))
+
+    def acp_file(self, rel="acp/event-ledger.json", **over):
+        s = {"sessionId": "s1", "sessionKey": "agent:main:acp", "cwd": "/config/clawd", "complete": True,
+             "createdAt": 1000, "updatedAt": 2000.0, "nextSeq": 3, "events": [
+                 {"seq": 2, "at": 1200, "sessionId": "s1", "sessionKey": "agent:main:acp", "runId": "run-1",
+                  "update": {"ok": True, "sessionUpdate": "b"}},
+                 {"seq": 1, "at": 1100, "sessionId": "s1", "sessionKey": "agent:main:acp",
+                  "update": {"sessionUpdate": "a", "n": 1}}]}
+        s.update(over)
+        _write(self.root, rel, self.ledger({"s1": s}))
+
+    def test_acp_ledger_proof(self):
+        self.acp_rows()
+        self.acp_file()
+        out = self.run_cls()
+        self.assertEqual(self.plan(out)["acp/event-ledger.json"], ("acp-replay-ledger", "quarantine"))
+        self.assertEqual(self.proof(out, "acp/event-ledger.json"), "1 session(s), 2 event(s) in acp_replay_*")
+        self.assertEqual(out["findings"], [])
+        # the doctor claim file is checked the same way
+        os.rename(os.path.join(self.root, "acp/event-ledger.json"),
+                  os.path.join(self.root, "acp/event-ledger.json.doctor-import"))
+        self.assertEqual(self.plan(self.run_cls())["acp/event-ledger.json.doctor-import"],
+                         ("acp-replay-ledger", "quarantine"))
+        os.remove(os.path.join(self.root, "acp/event-ledger.json.doctor-import"))
+        # nextSeq not above the last event, invalid JSON, a null run id: 2026.10.4 could not import it either
+        for bad in ({"nextSeq": 2}, {"complete": 1}):
+            self.acp_file(**bad)
+            out = self.run_cls()
+            self.assertEqual(self.plan(out)["acp/event-ledger.json"], ("acp-replay-ledger", "leave"), bad)
+            self.assertEqual(self.codes(out), {"acp-ledger-unimported": "acceptable"})
+        _write(self.root, "acp/event-ledger.json", "{not json")
+        self.assertIn("invalid JSON", self.run_cls()["findings"][0]["message"])
+        # nothing to import: no sessions
+        _write(self.root, "acp/event-ledger.json", self.ledger({}))
+        out = self.run_cls()
+        self.assertEqual((self.plan(out)["acp/event-ledger.json"], self.proof(out, "acp/event-ledger.json")),
+                         (("acp-replay-ledger", "quarantine"), "nothing to import"))
+        self.assertEqual(out["findings"], [])
+
+    def test_acp_ledger_proof_needs_exact_rows(self):
+        self.acp_rows(update2={"sessionUpdate": "b", "ok": 1})  # true is not 1 (isDeepStrictEqual)
+        self.acp_file()
+        out = self.run_cls()
+        self.assertEqual(self.plan(out)["acp/event-ledger.json"], ("acp-replay-ledger", "leave"))
+        self.assertIn("acp/event-ledger.json (1 of 1 session(s) not in SQLite)", out["findings"][0]["message"])
+        out = self.run_cls(accepted={"acp-ledger-unimported"})
+        self.assertEqual(self.plan(out)["acp/event-ledger.json"], ("acp-replay-ledger", "quarantine"))
+        self.assertIsNone(self.proof(out, "acp/event-ledger.json"))
+        self.sql("DELETE FROM acp_replay_events", "DELETE FROM acp_replay_sessions")
+        self.acp_rows(run_id2=None)  # NULL run_id against a recorded runId
+        self.assertEqual(self.codes(self.run_cls()), {"acp-ledger-unimported": "acceptable"})
+        self.sql("DELETE FROM acp_replay_events", "DELETE FROM acp_replay_sessions")
+        self.acp_rows(session_key="agent:main:other")
+        self.assertEqual(self.codes(self.run_cls()), {"acp-ledger-unimported": "acceptable"})
+        self.sql("DROP TABLE acp_replay_events")  # unreadable tables: never proof
+        self.assertEqual(self.codes(self.run_cls()), {"acp-ledger-unimported": "acceptable"})
+
+    # ----- Voice Wake -----
+    def test_voicewake_proof(self):
+        rel = "settings/voicewake.json"
+        _write(self.root, rel, json.dumps({"triggers": [" hey ", "computer", 7, "  "]}))
+        self.sql("INSERT INTO config_machine_state VALUES ('voicewake.triggers', '[\"hey\",\"computer\"]', 1)")
+        out = self.run_cls()
+        self.assertEqual((self.plan(out)[rel], self.proof(out, rel)),
+                         (("voicewake-json", "quarantine"), "voicewake.triggers in SQLite"))
+        self.sql("UPDATE config_machine_state SET value_json='[\"other\"]'")
+        out = self.run_cls()
+        self.assertEqual(self.plan(out)[rel], ("voicewake-json", "leave"))
+        self.assertEqual(self.codes(out), {"voicewake-unimported": "acceptable"})
+        # an identical archived copy (2026.10.4 archives only after the SQLite commit) is proof; .migrated.N too
+        self.sql("DELETE FROM config_machine_state")
+        _write(self.root, rel + ".migrated", "different")
+        self.assertEqual(self.plan(self.run_cls())[rel], ("voicewake-json", "leave"))
+        _write(self.root, rel + ".migrated.2", json.dumps({"triggers": [" hey ", "computer", 7, "  "]}))
+        out = self.run_cls()
+        self.assertEqual((self.plan(out)[rel], self.proof(out, rel)),
+                         (("voicewake-json", "quarantine"), "identical archived copy voicewake.json.migrated.2"))
+        # the default trigger words without a SQLite row: nothing to import (the runtime uses the defaults)
+        for n in (".migrated", ".migrated.2"):
+            os.remove(os.path.join(self.root, rel + n))
+        _write(self.root, rel, json.dumps({"triggers": []}))
+        out = self.run_cls()
+        self.assertEqual(self.plan(out)[rel], ("voicewake-json", "quarantine"))
+        self.assertTrue(self.proof(out, rel).startswith("nothing to import"))
+        os.remove(os.path.join(self.root, rel))
+        # routing: the stored defaultTarget and routes equal the file's
+        routing = {"version": 1, "defaultTarget": {"agentId": "main"},
+                   "routes": [{"trigger": "hey", "target": {"mode": "current"}}]}
+        _write(self.root, "settings/voicewake-routing.json", json.dumps(routing))
+        self.assertEqual(self.codes(self.run_cls()), {"voicewake-unimported": "acceptable"})
+        self.sql("INSERT INTO config_machine_state VALUES ('voicewake.routing', ?, 1)",
+                 params=(json.dumps(dict(routing, updatedAtMs=5)),))
+        out = self.run_cls()
+        self.assertEqual(self.plan(out)["settings/voicewake-routing.json"], ("voicewake-json", "quarantine"))
+        self.assertEqual(out["findings"], [])
+
+    # ----- current-conversation bindings -----
+    def binding_row(self, channel, account, parent, conv, target):
+        self.sql("INSERT INTO current_conversation_bindings (binding_key, binding_id, target_session_key, channel, "
+                 "account_id, conversation_kind, parent_conversation_id, conversation_id, target_kind, status, "
+                 "bound_at, record_json, updated_at) VALUES (?, 'b', ?, ?, ?, 'current', ?, ?, 'session', 'active', "
+                 "1, '{}', 1)", params=("%s|%s|%s|%s" % (channel, account, parent, conv), target, channel, account,
+                                         parent, conv))
+
+    def test_current_conversation_bindings_proof(self):
+        rel = "bindings/current-conversations.json"
+        _write(self.root, rel, json.dumps({"version": 1, "bindings": [
+            {"conversation": {"channel": " Telegram ", "accountId": "Main", "conversationId": " 42 ",
+                              "parentConversationId": "42"}, "targetSessionKey": " agent:main:x "},
+            {"conversation": {"channel": "discord", "accountId": "", "conversationId": "c1",
+                              "parentConversationId": "g1"}, "targetSessionKey": "agent:main:y"},
+            {"conversation": {"channel": "slack", "conversationId": "c9"}}]}))  # no target: ignored
+        self.binding_row("telegram", "main", None, "42", "agent:main:x")
+        out = self.run_cls()
+        self.assertEqual(self.plan(out)[rel], ("conversation-bindings-json", "leave"))
+        self.assertIn("1 of 2 binding(s) not in SQLite", out["findings"][0]["message"])
+        self.binding_row("discord", "default", "g1", "c1", "agent:main:other")  # another target session
+        self.assertEqual(self.codes(self.run_cls()), {"conversation-bindings-unimported": "acceptable"})
+        self.sql("UPDATE current_conversation_bindings SET target_session_key='agent:main:y' WHERE channel='discord'")
+        out = self.run_cls()
+        self.assertEqual((self.plan(out)[rel], self.proof(out, rel)),
+                         (("conversation-bindings-json", "quarantine"), "2 binding(s) in current_conversation_bindings"))
+        _write(self.root, rel, json.dumps({"version": 2, "bindings": [{"conversation": {"conversationId": "x"}}]}))
+        out = self.run_cls()
+        self.assertEqual(self.plan(out)[rel], ("conversation-bindings-json", "quarantine"))
+        self.assertTrue(self.proof(out, rel).startswith("nothing to import"))
+
+    # ----- plugin binding approvals (default home only) -----
+    def test_plugin_binding_approvals_default_home_only(self):
+        rel = "plugin-binding-approvals.json"
+        _write(self.root, rel, json.dumps({"version": 1, "approvals": [
+            {"pluginRoot": "/p/brave", "pluginId": "brave", "channel": " Telegram ", "approvedAt": 1},
+            {"pluginRoot": "/p/x", "pluginId": "x"}]}))  # no channel: ignored
+        out = self.run_cls()
+        self.assertEqual(self.plan(out)[rel], ("plugin-approvals-json", "leave"))
+        self.assertEqual(self.codes(out), {"plugin-approvals-unimported": "acceptable"})
+        self.sql("INSERT INTO plugin_binding_approvals VALUES ('/p/brave', 'telegram', 'default', 'brave', NULL, 1)")
+        out = self.run_cls()
+        self.assertEqual((self.plan(out)[rel], self.proof(out, rel)),
+                         (("plugin-approvals-json", "quarantine"), "1 approval(s) in plugin_binding_approvals"))
+        self.sql("DELETE FROM plugin_binding_approvals")
+        # only the default home's state dir: OPENCLAW_HOME wins over HOME; a leading ~ is the OS home
+        for env, checked in (({"HOME": "/elsewhere"}, False), ({"HOME": self.home}, True),
+                             ({"HOME": "/elsewhere", "OPENCLAW_HOME": self.home}, True),
+                             ({"HOME": self.home, "OPENCLAW_HOME": "/elsewhere"}, False),
+                             ({"HOME": self.home, "OPENCLAW_HOME": " ~ "}, True),
+                             ({"HOME": self.home + "/./"}, True), ({}, False)):
+            out = self.run_cls(env=env)
+            self.assertEqual(rel in self.plan(out), checked, env)
+            self.assertEqual("plugin-approvals-unimported" in self.codes(out), checked, env)
+        # path.resolve semantics: a symlinked home is not resolved (OpenClaw compares the paths as given)
+        link_home = os.path.join(self.home, "linked")
+        os.makedirs(link_home)
+        os.symlink(self.root, os.path.join(link_home, ".openclaw"))
+        self.assertNotIn(rel, self.plan(self.run_cls(env={"HOME": link_home})))
+
+    # ----- restart sentinel -----
+    def receipt(self, sha, decision="legacy-imported", status="completed", source_row=True, path="/old/x.json"):
+        import hashlib
+        key = "restart-sentinel-json:" + hashlib.sha256(path.encode()).hexdigest()
+        report = json.dumps({"source": "legacy-restart-sentinel-json", "target": "gateway_restart_sentinel",
+                             "decision": decision, "sourceSha256": sha, "sourceValid": True,
+                             "importedRecordCount": 1, "preservedSqliteRecordCount": 0})
+        run_id = "%s:%s" % (key, sha[:16])
+        self.sql("INSERT INTO migration_runs VALUES (?, 1, 1, ?, ?)", params=(run_id, status, report))
+        if source_row:
+            self.sql("INSERT INTO migration_sources (source_key, migration_kind, source_path, target_table, "
+                     "source_sha256, last_run_id, status, imported_at, report_json) VALUES (?, "
+                     "'legacy-restart-sentinel-json', ?, 'gateway_restart_sentinel', ?, ?, 'completed', 1, ?)",
+                     params=(key, path, sha, run_id, report))
+
+    def test_restart_sentinel_receipts(self):
+        import hashlib
+        body = '{"version":1,"payload":{"kind":"restart"}}'
+        sha = hashlib.sha256(body.encode()).hexdigest()
+        _write(self.root, "restart-sentinel.json", body)
+        out = self.run_cls()
+        self.assertEqual(self.plan(out)["restart-sentinel.json"], ("restart-sentinel-json", "leave"))
+        self.assertEqual(self.codes(out), {"restart-sentinel-unimported": "acceptable"})
+        self.receipt(hashlib.sha256(b"other bytes").hexdigest())  # a receipt for other content
+        self.assertEqual(self.codes(self.run_cls()), {"restart-sentinel-unimported": "acceptable"})
+        # any recorded decision for exactly these bytes, whatever path it was recorded for
+        self.receipt(sha, decision="canonical-preserved", path="/old/y.json")
+        out = self.run_cls()
+        self.assertEqual((self.plan(out)["restart-sentinel.json"], self.proof(out, "restart-sentinel.json")),
+                         (("restart-sentinel-json", "quarantine"), "receipt canonical-preserved"))
+        # the doctor claim with only a migration_runs row: completed counts, running or an unknown decision not
+        os.rename(os.path.join(self.root, "restart-sentinel.json"),
+                  os.path.join(self.root, "restart-sentinel.json.doctor-importing"))
+        self.sql("DELETE FROM migration_sources", "DELETE FROM migration_runs")
+        self.receipt(sha, status="running", source_row=False)
+        self.assertEqual(self.codes(self.run_cls()), {"restart-sentinel-unimported": "acceptable"})
+        self.sql("DELETE FROM migration_runs")
+        self.receipt(sha, decision="made-up", source_row=False)
+        self.assertEqual(self.codes(self.run_cls()), {"restart-sentinel-unimported": "acceptable"})
+        self.sql("DELETE FROM migration_runs")
+        self.receipt(sha, source_row=False)
+        out = self.run_cls()
+        self.assertEqual(self.plan(out)["restart-sentinel.json.doctor-importing"],
+                         ("restart-sentinel-json", "quarantine"))
+        self.assertEqual(out["findings"], [])
+
+    # ----- sandbox registries (strict) -----
+    def test_sandbox_registry_proof(self):
+        _write(self.root, "sandbox/containers.json", json.dumps({"entries": [{"containerName": "a", "x": 1}]}))
+        _write(self.root, "sandbox/browsers/x.json", json.dumps({"containerName": "b"}))
+        _write(self.root, "sandbox/browsers/notes.txt", "ignored")
+        os.makedirs(os.path.join(self.root, "sandbox/skills-workspaces/w"))  # live runtime path: never planned
+        out = self.run_cls()
+        plan = self.plan(out)
+        self.assertEqual(plan["sandbox/containers.json"], ("sandbox-registry", "leave"))
+        self.assertEqual(plan["sandbox/browsers"], ("sandbox-registry", "leave"))  # the directory is the entry
+        self.assertEqual(set(plan), {"sandbox/containers.json", "sandbox/browsers"})
+        self.assertEqual(self.codes(out), {"sandbox-registry-unimported": "acceptable"})
+        self.sql("INSERT INTO sandbox_registry_entries (registry_kind, container_name, entry_json, updated_at) "
+                 "VALUES ('container', 'a', '{}', 1)")
+        out = self.run_cls()
+        self.assertEqual((self.plan(out)["sandbox/containers.json"], self.proof(out, "sandbox/containers.json")),
+                         (("sandbox-registry", "quarantine"), "1 entr(ies) in sandbox_registry_entries"))
+        self.sql("INSERT INTO sandbox_registry_entries (registry_kind, container_name, entry_json, updated_at) "
+                 "VALUES ('container', 'b', '{}', 1)")  # a container row does not prove a browser entry
+        self.assertEqual(self.plan(self.run_cls())["sandbox/browsers"], ("sandbox-registry", "leave"))
+        self.sql("INSERT INTO sandbox_registry_entries (registry_kind, container_name, entry_json, updated_at) "
+                 "VALUES ('browser', 'b', '{}', 1)")
+        self.assertEqual(self.plan(self.run_cls())["sandbox/browsers"], ("sandbox-registry", "quarantine"))
+        # strict: an invalid shard or registry file holds even though 2026.10.4 would have set it aside
+        _write(self.root, "sandbox/browsers/y.json", "{not json")
+        self.assertEqual(self.plan(self.run_cls())["sandbox/browsers"], ("sandbox-registry", "leave"))
+        _write(self.root, "sandbox/containers.json", json.dumps({"entries": [{"name": "a"}]}))
+        self.assertEqual(self.plan(self.run_cls())["sandbox/containers.json"], ("sandbox-registry", "leave"))
+        # an empty registry directory or file: nothing to import
+        os.remove(os.path.join(self.root, "sandbox/containers.json"))
+        os.makedirs(os.path.join(self.root, "sandbox/containers"))
+        _write(self.root, "sandbox/browsers.json", json.dumps({"entries": []}))
+        out = self.run_cls()
+        for rel in ("sandbox/containers", "sandbox/browsers.json"):
+            self.assertEqual((self.plan(out)[rel], self.proof(out, rel)),
+                             (("sandbox-registry", "quarantine"), "nothing to import"))
+        # a regular file where the shard directory belongs
+        os.rmdir(os.path.join(self.root, "sandbox/containers"))
+        _write(self.root, "sandbox/containers", "x")
+        self.assertEqual(self.plan(self.run_cls())["sandbox/containers"], ("sandbox-registry", "leave"))
+
+    def test_runtime_files_uninspectable_and_symlinks(self):
+        _write(self.root, "settings", "a file where a directory belongs")
+        out = self.run_cls()
+        self.assertEqual(self.codes(out), {"retired-state-uninspectable": "hard"})
+        self.assertIn("settings/voicewake.json (", out["findings"][0]["message"])
+        os.remove(os.path.join(self.root, "settings"))
+        # a symlink is never followed (2026.10.10 refuses the link itself): accepting quarantines the link
+        self.acp_rows()
+        self.acp_file(rel="../ledger.json")  # a valid ledger OpenClaw imported, outside the state dir
+        os.makedirs(os.path.join(self.root, "acp"))
+        os.symlink(os.path.join(self.home, "ledger.json"), os.path.join(self.root, "acp", "event-ledger.json"))
+        out = self.run_cls()
+        self.assertEqual(self.plan(out)["acp/event-ledger.json"], ("acp-replay-ledger", "leave"))
+        self.assertIn("not a regular file", out["findings"][0]["message"])
+        out = self.run_cls(accepted={"acp-ledger-unimported"})
+        self.assertEqual(self.plan(out)["acp/event-ledger.json"], ("acp-replay-ledger", "quarantine"))
+        os.remove(os.path.join(self.home, "ledger.json"))  # a broken link still counts as present
+        self.assertEqual(self.plan(self.run_cls())["acp/event-ledger.json"], ("acp-replay-ledger", "leave"))
+
+    # ----- retired config keys -----
+    def test_config_keys_targets(self):
+        c104, c105, c106 = _caps("2026.10.4"), _caps("2026.10.5"), _caps("2026.10.6")
+        empty = {"plugins": {"installs": {}}}
+        self.assertEqual(m.retired_config_keys(empty)[0], ["plugins.installs"])
+        for caps, flagged in ((c104, True), (c105, True), (c106, False), (self.c1010, False)):
+            self.assertEqual("plugins.installs" in m.retired_config_keys(empty, caps)[0], flagged, caps)
+        for installs in (None, [], {"x": {}}):
+            for caps in (None, self.c1010):
+                self.assertIn("plugins.installs", m.retired_config_keys({"plugins": {"installs": installs}}, caps)[0])
+        cfg = {"models": {"providers": {
+                   "p": {"api": "openai-codex-responses",
+                         "models": [{"id": "a"}, {"id": "b", "api": "openai-codex-responses"}, "x"]},
+                   "q": {"api": "openai-chatgpt-responses"}, "r": {"api": " openai-codex-responses"}}},
+               "browser": {"profiles": {"e": {"driver": " extension ", "cdpUrl": "ws://x"},
+                                        "blank": {"driver": "extension", "cdpUrl": "  "},
+                                        "other": {"driver": "openclaw", "cdpUrl": "ws://y"},
+                                        "num": {"driver": "extension", "cdpUrl": 9222}}}}
+        want = ["models.providers.p.api", "models.providers.p.models[1].api", "browser.profiles.e.cdpUrl"]
+        for caps in (c105, self.c1010):
+            self.assertEqual(m.retired_config_keys(cfg, caps)[0], want)
+        for caps in (None, c104):
+            self.assertEqual(m.retired_config_keys(cfg, caps)[0], [])
+
+    def test_config_rewrites_and_findings_modes(self):
+        cfg = {"models": {"providers": {"openai": {"api": "openai-codex-responses",
+                                                   "models": [{"id": "gpt-5.5", "api": "openai-codex-responses"}]}}},
+               "browser": {"profiles": {"e": {"driver": "extension", "cdpUrl": "ws://x"}}}}
+        self.assertEqual(m.retired_config_rewrites(cfg, _caps("2026.10.4")), [])
+        self.assertEqual(m.retired_config_rewrites(cfg), [])
+        rw = m.retired_config_rewrites(cfg, self.c1010)
+        self.assertEqual([(e["parts"], e["op"], e.get("value")) for e in rw], [
+            (["models", "providers", "openai", "api"], "set", "openai-chatgpt-responses"),
+            (["models", "providers", "openai", "models", 0, "api"], "set", "openai-chatgpt-responses"),
+            (["browser", "profiles", "e", "cdpUrl"], "delete", None)])
+        # from-7x: the pre-migrate step fixes them; bump/maintenance: a hard HOLD naming the exact fix
+        self.assertEqual(m.retired_config_findings(cfg, "from-7x", self.c1010, "2026.10.10"), [])
+        f = m.retired_config_findings(cfg, "bump", self.c1010, "2026.10.10")
+        self.assertEqual([(x["code"], x["cls"]) for x in f], [("config-retired-keys", "hard")])
+        self.assertIn("OpenClaw 2026.10.10 refuses", f[0]["message"])
+        self.assertIn('set models.providers.openai.api to "openai-chatgpt-responses"', f[0]["message"])
+        self.assertIn("delete browser.profiles.e.cdpUrl", f[0]["message"])
+        self.assertNotIn("remove the others", f[0]["message"])
+        f = m.retired_config_findings(dict(cfg, heartbeat={}), "maintenance", self.c1010, "2026.10.10")
+        self.assertIn("; remove the others (or migrate them with OpenClaw 2026.9.5); then oc-upgrade retry",
+                      f[0]["message"])
+        self.assertEqual(m.retired_config_findings(cfg, "bump", _caps("2026.10.4")), [])
+        # the classify result carries the rewrites in from-7x mode only; an empty installs {} is an info on 10.6+
+        self.assertEqual(self.run_cls(cfg)["config_rewrites"], rw)
+        self.assertEqual(self.run_cls(cfg, mode="bump")["config_rewrites"], [])
+        out = self.run_cls({"plugins": {"installs": {}}}, mode="bump")
+        self.assertEqual(out["info"], ["openclaw.json plugins.installs is an empty object; OpenClaw doctor removes it "
+                                       "(install records stay in SQLite)"])
+        self.assertEqual(self.run_cls({"plugins": {"installs": {}}}, mode="bump", caps=None)["info"], [])
+        self.assertEqual(self.run_cls({"plugins": {"installs": {}}})["config_removals"], [["plugins", "installs"]])
+
+    def test_premigrate_r0_rewrites(self):
+        cfg = {"models": {"providers": {"openai": {"api": "openai-codex-responses",
+                                                   "models": [{"id": "gpt-5.5", "api": "openai-codex-responses"}]}}},
+               "browser": {"profiles": {"e": {"driver": "extension", "cdpUrl": "ws://user:pw@127.0.0.1:18792/x?t=1"},
+                                        "f": {"driver": "extension", "cdpUrl": "http://h"}}}}
+        snap = copy.deepcopy(cfg)
+        rw = m.retired_config_rewrites(cfg, self.c1010)
+        cfg["browser"]["profiles"]["f"]["cdpUrl"] = "http://h"  # unchanged
+        new, ledger, _s = m.premigrate_config(cfg, rewrites=rw)
+        self.assertEqual(cfg, snap, "input must not be mutated")
+        self.assertEqual(new["models"]["providers"]["openai"]["api"], "openai-chatgpt-responses")
+        self.assertEqual(new["models"]["providers"]["openai"]["models"][0]["api"], "openai-chatgpt-responses")
+        self.assertEqual(new["browser"]["profiles"], {"e": {"driver": "extension"}, "f": {"driver": "extension"}})
+        self.assertEqual([(e["step"], e["path"], e["before"], e["after"]) for e in ledger if e["step"] == "R0"], [
+            ("R0", "models.providers.openai.api", "openai-codex-responses", "openai-chatgpt-responses"),
+            ("R0", "models.providers.openai.models[0].api", "openai-codex-responses", "openai-chatgpt-responses"),
+            ("R0", "browser.profiles.e.cdpUrl", "ws://127.0.0.1:18792", None),  # no credentials in the ledger
+            ("R0", "browser.profiles.f.cdpUrl", "http://h", None)])
+        # idempotent; a value already changed by hand is left alone
+        again, ledger2, _s = m.premigrate_config(new, rewrites=rw)
+        self.assertEqual([e for e in ledger2 if e["step"] == "R0"], [])
+        self.assertEqual(again["models"], new["models"])
+        hand = copy.deepcopy(cfg)
+        hand["models"]["providers"]["openai"]["api"] = "openai-responses"
+        out, ledger3, _s = m.premigrate_config(hand, rewrites=rw)
+        self.assertEqual(out["models"]["providers"]["openai"]["api"], "openai-responses")
+        self.assertNotIn("models.providers.openai.api", [e["path"] for e in ledger3])
+
+
 class TestVllmUntouched(unittest.TestCase):
     """The live user's primary is vllm/qwen3.5-122b: no transform may touch vllm refs or the provider block."""
 

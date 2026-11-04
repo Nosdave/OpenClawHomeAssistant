@@ -79,6 +79,9 @@ ACCEPTABLE = frozenset({
     "acp-ledger-unimported", "voicewake-unimported", "conversation-bindings-unimported", "plugin-approvals-unimported",
     "restart-sentinel-unimported", "sandbox-registry-unimported",
     "skill-workshop-export-failed",
+    # doctor rc 0 that still reports retired pre-July-2026 files it left unchanged (2026.10.5+ only: the
+    # doctor:sandbox step only warns; runtime_caps)
+    "doctor-retired-warning",
 })
 NO_RETRY = frozenset({"newer-state", "runtime-integrity"})
 # HOLD codes of the gate archive of 0.5.94-full1/full2 (removed in full3): a journal may still hold one
@@ -158,8 +161,8 @@ ADVICE = {
                       "System > Backups), then oc-upgrade retry",
     "cleanup-failed": "check permissions under /config/.openclaw-upgrade, then oc-upgrade retry",
     "premigrate-failed": "check free space and permissions, then oc-upgrade retry",
-    "config-retired-keys": "remove the listed settings from openclaw.json on 0.5.93 (OpenClaw 2026.7.35 does not use "
-                           "them), then oc-upgrade retry",
+    "config-retired-keys": "change or remove the listed settings in openclaw.json as the reason says (every OpenClaw "
+                           "2026.10 refuses them; OpenClaw 2026.7.35 of 0.5.93 does not use them), then oc-upgrade retry",
     "retired-state-outside": "move the listed pre-July-2026 files away by hand (they are in your backup), then oc-upgrade retry",
     "retired-state-uninspectable": "fix or remove the listed paths (they must be directories or absent), then oc-upgrade retry",
     "retired-memory-index": "on 0.5.93 run `openclaw memory index --agent <id>` for each listed agent (2026.7.35 converts "
@@ -198,6 +201,9 @@ ADVICE = {
     "plugin-approvals-unimported": RETIRED_RUNTIME_ADVICE,
     "restart-sentinel-unimported": RETIRED_RUNTIME_ADVICE,
     "sandbox-registry-unimported": RETIRED_RUNTIME_ADVICE,
+    "doctor-retired-warning": "move the listed pre-July-2026 files out of /config/.openclaw, or fix the path doctor "
+                              "could not inspect (the files are in your encrypted Home Assistant backup; OpenClaw "
+                              "2026.10.4 was the last runtime that imported them), then oc-upgrade retry",
     "skill-workshop-export-failed": "free space or fix permissions under /config/.openclaw-upgrade/gate/runs/ (see the "
                                     "reason), then oc-upgrade retry (doctor has not run yet); to migrate without the "
                                     "export: oc-upgrade retry --accept skill-workshop-export-failed (OpenClaw doctor "
@@ -249,6 +255,11 @@ FATAL_MARKERS = (
     ("doctor-failed", ("Failing check ",), None),
 )
 SUSPICIOUS_MARKERS = ("Preserved retired", "may contain unmigrated data", "Pre-June OAuth credentials")
+# OpenClaw 2026.10.5+: an optional doctor step that refuses retired files (doctor:sandbox for the sandbox registries,
+# after the database migration) is only a "Doctor warnings" line with rc 0. Its own code (doctor-retired-warning),
+# so accepting it does not accept the other warnings; checked only when runtime_caps says the runtime retires
+# these files (evaluate_doctor retired_warning=True), so a 2026.10.4 run is unchanged.
+RETIRED_WARNING_MARKERS = ("predates July 1, 2026", "Cannot inspect potentially retired state")
 # Only in the last doctor pass: pass 1 reports plugins pinned to the 7.x package as unfinished until doctor
 # has updated them (deferred-plugin-migrations-DtqETF3J.mjs:220; gone in pass 2 in every rehearsal).
 # The same for auth profile renames: pass 1 always prints "Kept auth profile openai-codex:... unchanged" before
@@ -1266,10 +1277,11 @@ def _snippet(norm, idx, width=160):
     return C.redact_text(s)
 
 
-def evaluate_doctor(rc, text, *, timed_out=False, stopping=False, final=False):
+def evaluate_doctor(rc, text, *, timed_out=False, stopping=False, final=False, retired_warning=False):
     """Classify one doctor pass (B3: markers only when rc != 0, except held-back stores, which 2026.10
     reports with rc 0; B8: signals/OOM -> doctor-crashed). final: the pass that should leave nothing
-    pending (pass 2 or 3)."""
+    pending (pass 2 or 3). retired_warning: the runtime retires the pre-July runtime files (2026.10.5+), so a
+    RETIRED_WARNING_MARKERS hit with rc 0 is doctor-retired-warning."""
     norm = normalize_doctor_text(text)
     low = norm.lower()
     complete = "Doctor complete." in norm
@@ -1290,6 +1302,13 @@ def evaluate_doctor(rc, text, *, timed_out=False, stopping=False, final=False):
             idx = low.find(sus[0].lower())
             warn = {"code": "doctor-warnings", "cls": "acceptable", "markers": sus,
                     "message": f"doctor completed with warnings ({', '.join(sus)}): ...{_snippet(norm, idx)}..."}
+        retired = [m for m in RETIRED_WARNING_MARKERS if m.lower() in low] if retired_warning else []
+        extra = [warn] if warn else []
+        if retired:
+            idx = low.find(retired[0].lower())
+            extra.append({"code": "doctor-retired-warning", "cls": "acceptable", "markers": retired,
+                          "message": "doctor completed but reported pre-July-2026 files it left unchanged: "
+                                     f"...{_snippet(norm, idx)}..."})
         held = [(low.find(s.lower()), s) for s in HELD_BACK_MARKERS if s.lower() in low]
         m = _HELD_AGENT_RE.search(norm)
         if m:
@@ -1299,11 +1318,13 @@ def evaluate_doctor(rc, text, *, timed_out=False, stopping=False, final=False):
             res.update(code="doctor-held-back", cls="acceptable", markers=[s],
                        message=f"doctor completed but held back agent databases (they stay unmigrated): "
                                f"...{_snippet(norm, idx)}...")
-            if warn:  # accepting the held stores must not accept the warnings too
-                res["also"] = [warn]
+            if extra:  # accepting the held stores must not accept the warnings too
+                res["also"] = extra
             return res
-        if warn:
-            res.update(warn)
+        if extra:
+            res.update(extra[0])
+            if extra[1:]:
+                res["also"] = extra[1:]
         return res
     if rc < 0 or rc in (134, 137):
         sig = -rc if rc < 0 else rc - 128
@@ -2154,20 +2175,30 @@ class Gate:
     # ----- phase 2: cleanup -----
     def retired_state(self, mode, cfg=None):
         cfg = self.cfg if cfg is None else cfg
+        # env: what doctor sees (C.openclaw_env sets HOME to the config root; OPENCLAW_HOME/OAUTH_DIR pass through)
         return mig().classify_retired_state(str(self.gp["STATE"]), cfg, accepted=set(self.accepted), query=_mq,
                                             home=str(self.gp["CONFIG_ROOT"]), mode=mode,
                                             workspaces=[str(w) for w in workspaces(cfg)],
-                                            config_root=str(self.gp["CONFIG_ROOT"]))
+                                            config_root=str(self.gp["CONFIG_ROOT"]), caps=self.caps(),
+                                            env=dict(os.environ, HOME=str(self.gp["CONFIG_ROOT"])))
 
     def retired_format_findings(self, mode, cfg_ok):
         """Mirror of the 2026.10 refusals (oc_migrate.classify_retired_state / retired_*): HOLD before any write."""
         M = mig()
-        F = [dict(f) for f in M.retired_config_findings(self.cfg, mode)] if cfg_ok else []
+        F = [dict(f) for f in M.retired_config_findings(self.cfg, mode, caps=self.caps(),
+                                                        runtime=(self.pkg or {}).get("version"))] if cfg_ok else []
         rs = self.retired_state("from-7x" if mode == "from-7x" else "bump")
         self.facts["retired_state"] = rs
         F += [dict(f) for f in rs["findings"]]
         for i in rs["info"]:
             self.say(f"{self.pn('precheck')} info: {i}")
+        for e in rs["plan"]:  # OpenClaw 2026.10.5+ runtime files (classify_retired_state caps)
+            if e.get("proof") and e["proof"].startswith("nothing to import"):
+                self.say(f"{self.pn('precheck')} info: nothing for OpenClaw to import, goes to quarantine: "
+                         f"{e['rel']} ({e['proof']})")
+            elif e.get("proof"):
+                self.say(f"{self.pn('precheck')} info: already imported by OpenClaw, goes to quarantine: "
+                         f"{e['rel']} ({e['proof']})")
         n = sum(1 for e in rs["plan"] if e["action"] == "quarantine")
         if n:
             self.say(f"{self.pn('precheck')} info: {n} retired pre-July-2026 file(s) will be moved to quarantine "
@@ -2232,13 +2263,15 @@ class Gate:
                 man = C.load_json_or_none(mpath)
                 man = man if isinstance(man, list) else []
                 man.append({"src": relp, "dst": str(dst), "kind": kind, "size": st.st_size, "sha256": sha,
-                            "reason": e.get("reason", ""), "at": C.utc_iso(), **({"root": "config"} if in_cfg else {})})
+                            "reason": e.get("reason", ""), **({"proof": e["proof"]} if e.get("proof") else {}),
+                            "at": C.utc_iso(), **({"root": "config"} if in_cfg else {})})
                 C.atomic_write_json(mpath, man)
             except OSError as exc:
                 raise HoldError([finding("cleanup-failed", "hard", f"cannot quarantine {relp}: {exc}", "cleanup")],
                                 "cleanup")
             counts[kind] = counts.get(kind, 0) + 1
-            self.say(f"2/8 quarantine {kind}: {relp} ({C.human(st.st_size)})")
+            self.say(f"2/8 quarantine {kind}: {relp} ({C.human(st.st_size)}"
+                     + (f"; proof: {e['proof']})" if e.get("proof") else ")"))
         total = sum(counts.values())
         detail = ", ".join(f"{v} {k}" for k, v in sorted(counts.items())) or "nothing to move"
         self.say(f"2/8 cleanup: quarantined {total} files ({detail}) -> {qdir}/")
@@ -2254,8 +2287,10 @@ class Gate:
             self.mark_first_write()
             self.copy_once(p["CONFIG_PATH"], rd / "config.pre-gate.json")
             cfg_pre = C.read_json_strict(rd / "config.pre-gate.json")
-            removals = self.retired_state("from-7x", cfg_pre)["config_removals"]
-            new_cfg, ledger, summary = M.premigrate_config(cfg_pre, removals=removals)
+            rs = self.retired_state("from-7x", cfg_pre)
+            removals = rs["config_removals"]
+            new_cfg, ledger, summary = M.premigrate_config(cfg_pre, removals=removals,
+                                                           rewrites=rs.get("config_rewrites") or [])
             stores, _f = M.scan_sessions_files(str(p["STATE"]))
             sess_led, pinned, user_explicit, harness = [], [], [], []
             sess_writes = []
@@ -2292,9 +2327,15 @@ class Gate:
                  f"(scopes: {scopes}); runtime pinned to openclaw on {summary.get('pinned', 0)} entries; "
                  f"{len(pinned)} sessions pinned; modelPolicy {{}} written: "
                  f"{'yes' if summary.get('model_policy_written') else 'no'}")
-        r0 = [e["path"] for e in ledger if e.get("step") == "R0"]
+        removed_keys = {M.fmt_path(list(parts)) for parts in removals}
+        r0 = [e["path"] for e in ledger if e.get("step") == "R0" and e["path"] in removed_keys]
         if r0:
             self.say("3/8 pre-migrate: removed retired key(s) OpenClaw 2026.10 refuses: " + ", ".join(r0))
+        rw = [(f'{e["path"]} -> "{e["after"]}"' if e.get("after") is not None else f'removed {e["path"]}')
+              for e in ledger if e.get("step") == "R0" and e["path"] not in removed_keys]
+        if rw:  # OpenClaw 2026.10.5+ (retired_config_rewrites)
+            self.say(f"3/8 pre-migrate: rewrote retired setting(s) OpenClaw {(self.pkg or {}).get('version')} "
+                     "refuses: " + "; ".join(rw) + " (what OpenClaw 2026.10.4 doctor did)")
 
     # ----- doctor -----
     def run_doctor_pass(self, n, phase):
@@ -2330,7 +2371,9 @@ class Gate:
         with open(log, "rb") as f:
             f.seek(off)
             text = f.read().decode("utf-8", "replace")
-        ev = evaluate_doctor(res.rc, text, timed_out=res.timed_out, stopping=STOP.is_set(), final=n >= 2)
+        caps = self.caps()
+        ev = evaluate_doctor(res.rc, text, timed_out=res.timed_out, stopping=STOP.is_set(), final=n >= 2,
+                             retired_warning=caps["runtime_files_retired"] or caps["sandbox_registry_retired"])
         rec = {"pass": n, "started": started, "ended": C.utc_iso(), "rc": res.rc, "duration_s": round(res.duration),
                "complete": ev["complete"], "markers": ev["markers"], "code": ev["code"],
                "log": str(log.relative_to(self.gp["GATE"])) if str(log).startswith(str(self.gp["GATE"])) else str(log),
@@ -3644,7 +3687,8 @@ def readiness(g, mode):
     lines.append("[gate]   cleanup plan: " + (", ".join(f"{v} {k}" for k, v in sorted(counts.items())) or "nothing to move"))
     lines += _readiness_skills(g)  # full5
     if mode == "from-7x" and g.cfg:
-        _new, ledger, summary = M.premigrate_config(g.cfg, removals=rs.get("config_removals") or [])
+        _new, ledger, summary = M.premigrate_config(g.cfg, removals=rs.get("config_removals") or [],
+                                                    rewrites=rs.get("config_rewrites") or [])
         lines.append(f"[gate]   pre-migrate: explicit ids {', '.join(summary.get('explicit') or []) or 'none'}; "
                      f"{len(ledger)} config change(s); modelPolicy {{}}: "
                      f"{'yes' if summary.get('model_policy_written') else 'no'}")
