@@ -716,6 +716,37 @@ printf '2026.9.9\n' > "$T/rv-pinned"
 got="$(PATH="$T/rv-bin:$PATH" PINNED="$T/rv-pinned" bash "$T/runtime-version.sh" 2>&1)"
 check "startup: a working version probe was overridden by the pinned version: $got" [ "$got" = "RESULT 2026.10.4" ]
 
+# The Brave plugin version comes from the image record, else from the runtime version; never from a
+# hard-coded release (that would pin a plugin built for another OpenClaw), and a malformed record is ignored.
+{
+  echo 'set -euo pipefail'
+  sed -n '/^BRAVE_PLUGIN_VERSION="\$(head -n 1/,/^fi$/p' "$RUN_SH" |
+    sed "s#/usr/local/libexec/oc-addon/brave-plugin-version#\$BRAVE_REC#"
+  echo 'echo "RESULT ${BRAVE_PLUGIN_VERSION:-<empty>}"'
+} > "$T/brave-version.sh"
+printf '2026.10.10\n' > "$T/brave-rec"
+got="$(BRAVE_REC="$T/brave-rec" OPENCLAW_RUNTIME_VERSION=2026.10.4 bash "$T/brave-version.sh" 2>&1)"
+check "startup: the recorded Brave plugin version was not used: $got" [ "$got" = "RESULT 2026.10.10" ]
+got="$(BRAVE_REC="$T/brave-missing" OPENCLAW_RUNTIME_VERSION=2026.10.10 bash "$T/brave-version.sh" 2>&1)"
+check "startup: without a record the Brave version did not follow the runtime: $got" [ "$got" = "RESULT 2026.10.10" ]
+got="$(BRAVE_REC="$T/brave-missing" OPENCLAW_RUNTIME_VERSION= bash "$T/brave-version.sh" 2>&1)"
+check "startup: an unknown runtime got a hard-coded Brave version: $got" [ "$got" = "RESULT <empty>" ]
+printf '../../x\n' > "$T/brave-rec"
+got="$(BRAVE_REC="$T/brave-rec" OPENCLAW_RUNTIME_VERSION=2026.10.10 bash "$T/brave-version.sh" 2>&1)"
+check "startup: a malformed Brave record was used: $got" [ "$got" = "RESULT 2026.10.10" ]
+{
+  echo 'set -euo pipefail'
+  echo 'openclaw() { echo "UNEXPECTED openclaw $*"; }'
+  echo 'runtime_at_least() { return 0; }'
+  extract_function ensure_brave_plugin
+  echo 'BRAVE_PLUGIN_VERSION=""'
+  echo 'ensure_brave_plugin'
+  echo 'echo "RESULT rc=$?"'
+} > "$T/brave-skip.sh"
+got="$(bash "$T/brave-skip.sh" 2>&1)"
+check "startup: ensure_brave_plugin ran openclaw or failed without a version: $got" \
+  [ "$got" = "$(printf '%s\n%s' 'WARN: Brave web-search plugin not ensured: the OpenClaw version is unknown (non-fatal).' 'RESULT rc=0')" ]
+
 # known_bug DESCRIPTION COMMAND...: asserts the correct behaviour, but the
 # current run.sh is known to fail it. A failure is a KNOWN-BUG skip (not counted
 # as FAIL); a pass means the bug was fixed and the marker can be removed.

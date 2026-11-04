@@ -375,8 +375,64 @@ class MainTests(DistPatchCase):
             self.assertEqual(P.main(["--no-node-check", str(self.pkg), str(self.patches)]), 0)
 
 
+# The patches each shipped set carries, per OpenClaw version. A new set, or dropping a patch because
+# OpenClaw fixed it, is a deliberate edit here (with the reason in CHANGELOG.md).
+_HOTFIX_2026_10 = {"memory-search-half-life", "telegram-voice-text-first", "telegram-delivery-live-custody",
+                   "telegram-notice-live-guard", "telegram-fetch-fresh-audio"}
+EXPECTED_PATCHES = {
+    "2026.10.4": _HOTFIX_2026_10,
+    "2026.10.10": _HOTFIX_2026_10,  # rehearsal of the 2026.11.1 line (not the image default)
+}
+
+
+def dockerfile_arg(name):
+    for line in (ADDON / "Dockerfile").read_text().splitlines():
+        if line.startswith(f"ARG {name}="):
+            return line.split("=", 1)[1]
+    raise AssertionError(f"Dockerfile has no ARG {name}")
+
+
 class RepoPatchSetTests(unittest.TestCase):
     """The patch sets shipped in oc-patches/ are well-formed (no OpenClaw package needed)."""
+
+    def patch_sets(self):
+        root = ADDON / "oc-patches"
+        return [(d, P.load_manifest(str(d))) for d in sorted(d for d in root.iterdir() if d.is_dir())]
+
+    def test_every_set_carries_the_expected_patches_with_notes(self):
+        sets = self.patch_sets()
+        self.assertEqual({d.name for d, _man in sets}, set(EXPECTED_PATCHES),
+                         "oc-patches/ and EXPECTED_PATCHES name different OpenClaw versions")
+        for d, man in sets:
+            with self.subTest(version=d.name):
+                self.assertEqual({e["name"] for e in man["patches"]}, EXPECTED_PATCHES[d.name])
+                for e in man["patches"]:
+                    self.assertTrue(isinstance(e.get("note"), str) and e["note"].strip(), e["name"])
+
+    def test_hotfix_test_file_per_patch_set(self):
+        for d, man in self.patch_sets():
+            telegram = [e for e in man["patches"] if e["name"].startswith("telegram-")]
+            if not telegram:
+                continue
+            with self.subTest(version=d.name):
+                js = ADDON / "tests" / "oc_patches" / f"telegram_hotfix_{d.name}.test.mjs"
+                self.assertTrue(js.is_file(), f"{js.name} missing for oc-patches/{d.name}")
+                text = js.read_text()
+                for e in telegram:
+                    self.assertIn(f"'{os.path.basename(e['file'])}'", text, f"{js.name} does not name {e['file']}")
+
+    def test_dockerfile_default_pin_has_patch_set_and_lockstep_plugins(self):
+        version = dockerfile_arg("OPENCLAW_VERSION")
+        self.assertTrue((ADDON / "oc-patches" / version / "manifest.json").is_file(),
+                        f"Dockerfile pins OpenClaw {version} but oc-patches/{version}/ is missing")
+        self.assertEqual(dockerfile_arg("BRAVE_PLUGIN_VERSION"), "${OPENCLAW_VERSION}")
+        docker = (ADDON / "Dockerfile").read_text()
+        for plugin, ver in (("brave-plugin", "BRAVE_PLUGIN_VERSION"), ("codex", "OPENCLAW_VERSION"),
+                            ("acpx", "OPENCLAW_VERSION")):
+            self.assertIn(f'test "$(npm view "@openclaw/{plugin}@${{{ver}}}" version)" = "${{{ver}}}"', docker,
+                          f"the image build does not check @openclaw/{plugin} at the pinned version")
+        brave_block = (ADDON / "run.sh").read_text().split("ensure_brave_plugin() {", 1)[0][-1500:]
+        self.assertNotRegex(brave_block, r"OPENCLAW_RUNTIME_VERSION:-\d", "run.sh hard-codes a Brave fallback version")
 
     def test_manifests_and_diffs_parse(self):
         root = ADDON / "oc-patches"
@@ -397,12 +453,24 @@ class RepoPatchSetTests(unittest.TestCase):
     @unittest.skipUnless(os.environ.get("OC_DIST_PATCH_REAL_PKG"), "set OC_DIST_PATCH_REAL_PKG to an unpacked "
                          "openclaw package to apply the shipped patch set to a copy")
     def test_real_package(self):
+        # The patch set is chosen by the package's own version; OC_DIST_PATCH_NODE_CHECK=0 skips
+        # `node --check` where node is missing or must not be run.
         src = Path(os.environ["OC_DIST_PATCH_REAL_PKG"])
         version = json.loads((src / "package.json").read_text())["version"]
+        patch_dir = ADDON / "oc-patches" / version
+        self.assertTrue((patch_dir / "manifest.json").is_file(), f"no oc-patches/{version}/ for {src}")
+        man = P.load_manifest(str(patch_dir))
+        self.assertEqual({e["name"] for e in man["patches"]}, EXPECTED_PATCHES[version])
+        node_check = os.environ.get("OC_DIST_PATCH_NODE_CHECK", "1") != "0"
         tmp = Path(tempfile.mkdtemp(prefix="oc-dist-patch-real-"))
         try:
-            shutil.copytree(src, tmp / "pkg", symlinks=True)
-            P.apply_all(str(tmp / "pkg"), str(ADDON / "oc-patches" / version), node_check=True, log=lambda _m: None)
+            shutil.copytree(src, tmp / "pkg", symlinks=True,
+                            ignore=lambda d, names: ["node_modules"] if Path(d) == src else [])
+            P.apply_all(str(tmp / "pkg"), str(patch_dir), node_check=node_check, log=lambda _m: None)
+            for e in man["patches"]:
+                self.assertEqual(sha((tmp / "pkg" / e["file"]).read_bytes()), e["patched_sha256"], e["name"])
+            with self.assertRaisesRegex(P.PatchError, "is not the stock file"):
+                P.apply_all(str(tmp / "pkg"), str(patch_dir), node_check=False, log=lambda _m: None)
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 

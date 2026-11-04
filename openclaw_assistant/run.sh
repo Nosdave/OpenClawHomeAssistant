@@ -600,7 +600,8 @@ trap early_stop INT TERM
 # Upgrade-state backup (OpenClaw 2026.7.x runtimes only)
 #
 # OpenClaw 2026.8+ migrates the persistent databases one-way (2026.10.4: state
-# schema 20, agent schema 24); older OpenClaw builds cannot open them. For those
+# schema 20, agent schema 24; 2026.10.10 and 2026.11.1: 22/27); older OpenClaw
+# builds cannot open them. For those
 # runtimes the migration gate (`oc-upgrade gate`, below) requires a recent
 # encrypted Home Assistant backup with this add-on (the only rollback point; the
 # gate writes no archive) before it runs `openclaw doctor --fix`. The local archive below is kept for
@@ -1119,12 +1120,18 @@ heal_telegram_ingress_spool() {
 # Best-effort: never blocks startup (guarded, non-fatal). Runs after the
 # migration gate, so never against unmigrated state.
 # ------------------------------------------------------------------------------
-BRAVE_PLUGIN_VERSION="$(head -n 1 /usr/local/libexec/oc-addon/brave-plugin-version 2>/dev/null || true)"
+BRAVE_PLUGIN_VERSION="$(head -n 1 /usr/local/libexec/oc-addon/brave-plugin-version 2>/dev/null | grep -oE '^[0-9]{4}\.[0-9]+\.[0-9]+(-[0-9]+)?$' || true)"
 if [ -z "$BRAVE_PLUGIN_VERSION" ]; then
-  # Older image without the record: CalVer lockstep with the bundled runtime.
-  BRAVE_PLUGIN_VERSION="${OPENCLAW_RUNTIME_VERSION:-2026.10.4}"
+  # Image without a valid record: CalVer lockstep with the bundled runtime
+  # (OPENCLAW_RUNTIME_VERSION already falls back to the image's pinned version).
+  # No hard-coded version: it would pin a plugin built for another OpenClaw.
+  BRAVE_PLUGIN_VERSION="${OPENCLAW_RUNTIME_VERSION:-}"
 fi
 ensure_brave_plugin() {
+  if [ -z "$BRAVE_PLUGIN_VERSION" ]; then
+    echo "WARN: Brave web-search plugin not ensured: the OpenClaw version is unknown (non-fatal)."
+    return 0
+  fi
   local marker="/config/.openclaw/.brave_plugin_${BRAVE_PLUGIN_VERSION}"
   if [ -f "$marker" ]; then
     return 0

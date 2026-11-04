@@ -5,12 +5,32 @@ All notable changes to the OpenClaw Assistant Home Assistant Add-on will be docu
 > **Private fork** (`Nosdave/OpenClawHomeAssistant`): `-ghcrN` / `-fullN` suffixes are fork build iterations on top of the upstream `techartdev` base version. The image is pre-built on GitHub Actions (native `aarch64`) and pulled from GHCR. `-fullN` marks the un-stripped "full" build line (see `0.5.80-full1`).
 
 
+## [Unreleased] – preparation for OpenClaw 2026.11.1
+
+**Not released; the image still ships OpenClaw `2026.10.4`.** This prepares the move to the OpenClaw 2026.10.10 line. The target is `2026.11.1`: its release branch has the same database schemas as `2026.10.10` (state 22, agent 27) and the same code in every patched file, but it is not on npm yet. `2026.10.10` is only used to rehearse the move (image build argument), it is not shipped.
+
+### Added
+- **FFmpeg in the image** (Debian package `ffmpeg`, which provides `ffmpeg` and `ffprobe`; about 150–200 MB more image). From `2026.10.10` OpenClaw uses `ffprobe` to send the duration of Telegram voice and audio messages (without it Telegram can show 0:00, openclaw/openclaw#142552). OpenClaw `2026.10.4` already uses it for video dimensions, Control UI playback conversion and video understanding, which so far were skipped. OpenClaw only runs the copies in system directories, never one from Homebrew.
+- **Patches for OpenClaw `2026.10.10`** (`oc-patches/2026.10.10/`, for the rehearsal): the memory search half-life (365 days) and all three parts of the Telegram hotfix VOLT-TG-20261023, re-derived with the same behaviour as on `2026.10.4`. None of them is fixed upstream in `2026.10.10` or in the `2026.11.1` candidate. From `2026.10.10` memory search applies `minScore` before the decay (openclaw/openclaw#168692), so the half-life patch only changes the ranking there. The `2026.11.1` set will be derived from the published package; the `2026.10.4` set stays until the `2026.11.1` image replaces it.
+- Regression tests for the hotfix on `2026.10.10` (`tests/oc_patches/telegram_hotfix_2026.10.10.test.mjs`, 20 cases incl. two negative controls against the stock modules). The repository tests now check that every patch set carries the expected patches and has its hotfix tests, that the image's default OpenClaw version has a patch set, and that the plugin versions follow it.
+
+### Changed
+- Image build: `--build-arg OPENCLAW_VERSION=…` also sets the Brave plugin version (CalVer lockstep) unless `BRAVE_PLUGIN_VERSION` is given. Before, passing only the OpenClaw version kept Brave `2026.10.4`.
+- Image build: also checks that the official `@openclaw/codex` and `@openclaw/acpx` plugins exist on npm at the bundled OpenClaw version (like Brave already), so a bump to a release without them fails the build instead of the add-on start.
+- Start: without a valid recorded Brave plugin version the add-on uses the bundled OpenClaw's version; if that is unknown too it skips the Brave install with a warning instead of installing Brave `2026.10.4`.
+- The global `acpx` CLI in the image is `0.19.4` (was `0.19.3`), the version `@openclaw/acpx@2026.10.10` uses. OpenClaw's own ACP plugin loads its own pinned `acpx` library either way.
+
+### Corrections
+- `0.5.94-full4` said OpenClaw `2026.10.6` "and later" require Node.js `>=24.22.1 <25 || >=26.12.1`. That holds for `2026.10.6` to `2026.10.9`; `2026.10.10` (and the `2026.11.1` candidate) require `>=24.16.0 <25 || >=26.1.0` again and only recommend these releases (openclaw/openclaw#186589). The image keeps requiring them.
+- The agent database schema 25 (one-way) already comes with OpenClaw `2026.10.5` (`0.5.94-full4` only named `2026.10.6`/`2026.10.7`). The move from `2026.10.4` to the `2026.10.10` line changes state 20 → 22 and agent 24 → 27 in one update.
+
+
 ## [0.5.94-full4] - 2026-10-25
 
 **OpenClaw stays `2026.10.4`.** The Telegram hotfix VOLT-TG-20261023 that Volt applied in the running container on 2026-10-23 is now part of the image, byte-identical to the live files, so it survives add-on restarts and updates. The image requires the patched Node.js `24.22.1`.
 
 - **Coming from `0.5.94-full3`:** no action needed. No gate runs (same OpenClaw). The container hotfix is replaced by the same files from the image.
-- Why not OpenClaw `2026.10.6`/`2026.10.7` (upstream `0.5.96` ships `2026.10.6`): neither contains the hotfix, and since `2026.10.5` there are open upstream regressions that hit this setup: completion turns of background commands post into Telegram without the stay-silent guidance (openclaw/openclaw#182179) and the second message of a Control UI conversation fails (openclaw/openclaw#182744). As of 2026-10-24 their fixes were on OpenClaw's main branch only, not in a release. The agent databases would also move to schema 25 (one-way). The add-on follows with a stable OpenClaw release that carries those fixes.
+- Why not OpenClaw `2026.10.6`/`2026.10.7` (upstream `0.5.96` ships `2026.10.6`): neither contains the hotfix, and since `2026.10.5` there are open upstream regressions that hit this setup: completion turns of background commands post into Telegram without the stay-silent guidance (openclaw/openclaw#182179) and the second message of a Control UI conversation fails (openclaw/openclaw#182744). As of 2026-10-24 their fixes were on OpenClaw's main branch only, not in a release. The agent databases would also move to schema 25 (one-way, from `2026.10.5`). The add-on follows with a stable OpenClaw release that carries those fixes.
 
 ### Added
 - **Telegram hotfix VOLT-TG-20261023** (written by Volt, the add-on's OpenClaw agent; DOCS: "Telegram replies with voice"):
@@ -20,7 +40,7 @@ All notable changes to the OpenClaw Assistant Home Assistant Add-on will be docu
 
 ### Changed
 - **Patches to OpenClaw's files** are now kept per OpenClaw version in `oc-patches/<version>/` (one unified diff per file plus `manifest.json`) and applied by `oc_dist_patch.py` at build time. Each patch must match the stock file's sha256, apply exactly at its stated lines and produce the expected sha256; all checks, including `node --check`, run before the first file is replaced. OpenClaw's content inventory and runtime-dependency ownership hashes are updated, and every inventory entry is re-checked. Any other OpenClaw version fails the build until the patches are re-derived. The memory search half-life patch (365 days) moved there unchanged (same result, `be0f0ea9…`).
-- **Node.js:** the image requires `>=24.22.1 <25 || >=26.12.1`, the October 2026 Node security releases (TLS chains signed with compromised certificate keys are rejected). OpenClaw `2026.10.6` and later require the same.
+- **Node.js:** the image requires `>=24.22.1 <25 || >=26.12.1`, the October 2026 Node security releases (TLS chains signed with compromised certificate keys are rejected). OpenClaw `2026.10.6` to `2026.10.9` require the same (corrected; `2026.10.10` requires `>=24.16.0` again).
 - Merged upstream `techartdev` `0.5.95`/`0.5.96`: they only bump OpenClaw; this fork keeps its own pins.
 
 ### Known limits
