@@ -747,6 +747,61 @@ got="$(bash "$T/brave-skip.sh" 2>&1)"
 check "startup: ensure_brave_plugin ran openclaw or failed without a version: $got" \
   [ "$got" = "$(printf '%s\n%s' 'WARN: Brave web-search plugin not ensured: the OpenClaw version is unknown (non-fatal).' 'RESULT rc=0')" ]
 
+# full5: the enabled official plugins follow the OpenClaw version (oc-upgrade plugins-sync), after Brave, in the
+# branch that never runs during a HOLD, once per version (marker), with the same validated runtime version.
+mkdir -p "$T/cohort-bin" "$T/cohort-state"
+cat > "$T/cohort-bin/oc-upgrade" <<'EOF'
+#!/bin/sh
+echo "CALLED $*" >> "$COHORT_LOG"
+exit "${COHORT_RC:-0}"
+EOF
+chmod +x "$T/cohort-bin/oc-upgrade"
+{
+  echo 'set -euo pipefail'
+  extract_function runtime_at_least
+  extract_function ensure_official_plugin_cohort | sed "s#/config/.openclaw/.plugin_cohort_#\$COHORT_STATE/.plugin_cohort_#"
+  echo 'ensure_official_plugin_cohort'
+  echo 'echo "RESULT rc=$?"'
+} > "$T/cohort.sh"
+cohort() {  # $1 = runtime version, $2 = rc of the fake oc-upgrade; sets got and calls
+  : > "$T/cohort.log"
+  got="$(PATH="$T/cohort-bin:$PATH" COHORT_LOG="$T/cohort.log" COHORT_RC="$2" COHORT_STATE="$T/cohort-state" \
+           OPENCLAW_RUNTIME_VERSION="$1" bash "$T/cohort.sh" 2>&1)"
+  calls="$(cat "$T/cohort.log")"
+}
+cohort 2026.10.10 0
+check "startup: the official plugin step did not run plugins-sync once: $calls / $got" \
+  bash -c '[ "$1" = "CALLED plugins-sync" ] && [ "$2" = "RESULT rc=0" ]' _ "$calls" "$got"
+cohort 2026.10.10 1
+check "startup: a failed plugins-sync stopped startup or was silent: $got" \
+  bash -c '[ "$1" = "CALLED plugins-sync" ] && [[ "$2" == *"WARN: Official plugin update step failed"*"RESULT rc=0" ]]' \
+  _ "$calls" "$got"
+: > "$T/cohort-state/.plugin_cohort_2026.10.10"
+cohort 2026.10.10 0
+check "startup: the official plugin step ran again for a version it already did: $calls" \
+  bash -c '[ -z "$1" ] && [ "$2" = "RESULT rc=0" ]' _ "$calls" "$got"
+cohort 2026.11.1 0
+check "startup: a new OpenClaw version did not sync the plugins again: $calls" [ "$calls" = "CALLED plugins-sync" ]
+cohort "" 0
+check "startup: an unknown OpenClaw version ran plugins-sync or failed: $calls / $got" \
+  bash -c '[ -z "$1" ] && [ "$2" = "$(printf "%s\n%s" "WARN: Official plugins not updated: the OpenClaw version is unknown (non-fatal)." "RESULT rc=0")" ]' \
+  _ "$calls" "$got"
+cohort 2026.7.35 0
+check "startup: a 2026.7 runtime ran plugins-sync: $calls" bash -c '[ -z "$1" ] && [ "$2" = "RESULT rc=0" ]' _ "$calls" "$got"
+# placement: right after the Brave step, inside the branch STATE_HOLD skips
+cohort_lines="$(awk '
+  /^if \[ "\$STATE_HOLD" = "true" \]; then$/ && !branch { hold = NR }
+  /^elif \[ -f "\$OPENCLAW_CONFIG_PATH" \]; then$/ && hold { branch = NR }
+  /^  ensure_brave_plugin \|\| true$/ && branch { brave = NR }
+  /^  ensure_official_plugin_cohort \|\| true$/ && branch { cohort = NR }
+  END { print hold, branch, brave, cohort }' "$RUN_SH")"
+read -r c_hold c_branch c_brave c_cohort <<<"$cohort_lines"
+check "startup: ensure_official_plugin_cohort is not called right after ensure_brave_plugin in the non-HOLD branch ($cohort_lines)" \
+  bash -c '[ -n "$4" ] && [ "$1" -lt "$2" ] && [ "$2" -lt "$3" ] && [ "$3" -lt "$4" ] && [ $(( $4 - $3 )) -le 3 ]' \
+  _ "${c_hold:-0}" "${c_branch:-0}" "${c_brave:-0}" "${c_cohort:-}"
+check "startup: ensure_official_plugin_cohort is called more than once" \
+  [ "$(grep -c '^[[:space:]]*ensure_official_plugin_cohort || true$' "$RUN_SH")" -eq 1 ]
+
 # known_bug DESCRIPTION COMMAND...: asserts the correct behaviour, but the
 # current run.sh is known to fail it. A failure is a KNOWN-BUG skip (not counted
 # as FAIL); a pass means the bug was fixed and the marker can be removed.

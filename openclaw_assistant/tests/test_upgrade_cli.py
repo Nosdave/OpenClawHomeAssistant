@@ -667,5 +667,155 @@ class Full2CliTests(CliEnv):
         self.assertEqual(self.share_files(), [])
         self.assertFalse((self.upg / "gate" / "journal.json").exists())
 
+
+# --- full5: official plugins follow the OpenClaw version (oc-upgrade plugins-sync) ----------------------------------
+
+# Fake node for `plugins list --json` / `plugins update <pkg>@<ver>`: the plugin list lives in $FAKE_PLUGINS, every
+# call is logged to $FAKE_ARGV_LOG; FAKE_UPDATE_RC / FAKE_LIST_RC make the update / the list fail.
+PLUGINS_NODE = r'''#!/usr/bin/env python3
+import json, os, sys
+args = sys.argv[2:]
+with open(os.environ["FAKE_ARGV_LOG"], "a") as f:
+    f.write(json.dumps(args) + "\n")
+with open(os.environ["FAKE_PLUGINS"]) as f:
+    plugins = json.load(f)
+if args[:2] == ["plugins", "list"]:
+    if os.environ.get("FAKE_LIST_RC"):
+        sys.stderr.write("plugin registry unreadable\n")
+        sys.exit(int(os.environ["FAKE_LIST_RC"]))
+    print(json.dumps({"workspaceDir": "/x", "registry": {}, "plugins": plugins, "diagnostics": []}))
+    sys.exit(0)
+if args[:2] == ["plugins", "update"]:
+    if os.environ.get("FAKE_UPDATE_RC"):
+        sys.stderr.write("npm error 404 Not Found; npm_config_token=SECRET-NPM-TOKEN\n")
+        sys.exit(int(os.environ["FAKE_UPDATE_RC"]))
+    pkg, ver = args[2].rsplit("@", 1)
+    for p in plugins:
+        if p.get("packageName") == pkg:
+            p["version"] = ver
+    with open(os.environ["FAKE_PLUGINS"], "w") as f:
+        json.dump(plugins, f)
+    print("Updated " + pkg)
+    sys.exit(0)
+sys.exit(3)
+'''
+
+
+def plugin(pid, pkg, ver, enabled=True, origin="global"):
+    return {"id": pid, "packageName": pkg, "version": ver, "enabled": enabled, "origin": origin, "status": "loaded"}
+
+
+class PluginsSyncTests(CliEnv):
+    def setUp(self):
+        super().setUp()
+        (self.bin / "node").write_text(PLUGINS_NODE)
+        self.plugins = self.tmp / "plugins.json"
+        self.argv_log = self.tmp / "argv.log"
+        self.set_runtime("2026.10.10", 22, 27, doctor=False)
+        self.write_plugins([
+            plugin("codex", "@openclaw/codex", "2026.10.4"),
+            plugin("acpx", "@openclaw/acpx", "2026.10.4", enabled=False),
+            plugin("brave", "@openclaw/brave-plugin", "2026.10.4"),
+            plugin("thirdparty", "openclaw-plugin-x", "1.0.0"),
+            plugin("memory-core", "@openclaw/memory-core", "2026.10.10", origin="bundled")])
+
+    def write_plugins(self, plugins):
+        self.plugins.write_text(json.dumps(plugins))
+
+    def sync(self, **env):
+        if self.argv_log.exists():
+            self.argv_log.unlink()
+        rc = self.cli("plugins-sync", env={"FAKE_PLUGINS": str(self.plugins), "FAKE_ARGV_LOG": str(self.argv_log),
+                                           **env})
+        self.assertEqual(rc, 0, self.stdout + self.stderr)
+        return [json.loads(x) for x in self.argv_log.read_text().splitlines()] if self.argv_log.exists() else []
+
+    def marker(self, ver="2026.10.10"):
+        return self.state / f".plugin_cohort_{ver}"
+
+    def test_plugins_sync_updates_enabled_official_only(self):
+        calls = self.sync()
+        self.assertEqual([c for c in calls if c[:2] == ["plugins", "update"]],
+                         [["plugins", "update", "@openclaw/codex@2026.10.10"]])
+        self.assertEqual(calls[0], ["plugins", "list", "--json"])
+        self.assertEqual(calls[-1], ["plugins", "list", "--json"])  # checked after the update
+        self.assertEqual(self.stdout.splitlines(), [
+            "INFO: Official plugins: updating @openclaw/codex 2026.10.4 -> 2026.10.10 (OpenClaw 2026.10.10)...",
+            "INFO: Official plugins match OpenClaw 2026.10.10."])
+        self.assertTrue(self.marker().is_file())
+        self.assertEqual(self.sync(), [])  # once per OpenClaw version
+        self.assertEqual(self.stdout, "")
+
+    def test_plugins_sync_failure_keeps_no_marker(self):
+        calls = self.sync(FAKE_UPDATE_RC="1")
+        self.assertIn(["plugins", "update", "@openclaw/codex@2026.10.10"], calls)
+        self.assertIn("WARN: @openclaw/codex stays at 2026.10.4 (openclaw plugins update failed, rc 1: ", self.stdout)
+        self.assertIn("OpenClaw 2026.10.10 still loads it (minimum 2026.9.7). The add-on tries again at the next start; "
+                      "by hand: openclaw plugins update @openclaw/codex@2026.10.10", self.stdout)
+        self.assertNotIn("SECRET", self.stdout + self.stderr)
+        self.assertFalse(self.marker().exists())
+        self.assertIn(["plugins", "update", "@openclaw/codex@2026.10.10"], self.sync())  # retried at the next start
+        self.assertTrue(self.marker().is_file())
+        # the list itself fails: WARN, nothing updated, no marker
+        self.marker().unlink()
+        self.assertEqual(self.sync(FAKE_LIST_RC="1"), [["plugins", "list", "--json"]])
+        self.assertIn("WARN: Official plugins not updated: openclaw plugins list failed (rc 1", self.stdout)
+        self.assertFalse(self.marker().exists())
+
+    def test_plugins_sync_no_downgrade_and_noop_on_1004(self):
+        self.write_plugins([plugin("codex", "@openclaw/codex", "2026.10.4"),
+                            plugin("next", "@openclaw/next", "2026.11.5-beta.1")])
+        calls = self.sync()
+        self.assertEqual([c[2] for c in calls if c[:2] == ["plugins", "update"]], ["@openclaw/codex@2026.10.10"])
+        self.assertIn("WARN: @openclaw/next 2026.11.5-beta.1 is newer than OpenClaw 2026.10.10; left as is "
+                      "(no downgrade)", self.stdout)
+        self.assertTrue(self.marker().is_file())
+        # runtime 2026.10.4 with every plugin at 2026.10.4: nothing to update, the marker is written
+        self.set_runtime("2026.10.4", 20, 24, doctor=False)
+        self.write_plugins([plugin("codex", "@openclaw/codex", "2026.10.4"),
+                            plugin("acpx", "@openclaw/acpx", "2026.10.4")])
+        self.assertEqual(self.sync(), [["plugins", "list", "--json"]])
+        self.assertEqual(self.stdout.strip(), "INFO: Official plugins match OpenClaw 2026.10.4.")
+        self.assertTrue(self.marker("2026.10.4").is_file())
+        # run.sh's validated OPENCLAW_RUNTIME_VERSION names the version (and the marker)
+        self.assertEqual(self.sync(OPENCLAW_RUNTIME_VERSION="2026.10.4"), [])
+        self.marker().unlink()
+        self.sync(OPENCLAW_RUNTIME_VERSION="2026.10.10")  # the package still says 2026.10.4
+        self.assertIn("updating @openclaw/codex 2026.10.4 -> 2026.10.10", self.stdout)
+        # a HOLD: never touch the plugins
+        self.marker().unlink()
+        (self.upg / "hold.txt").write_text("OpenClaw is held\n")
+        self.assertEqual(self.sync(), [])
+        self.assertIn("OpenClaw is held", self.stdout)
+        self.assertFalse(self.marker().exists())
+
+
+class HeldStoreCheckTests(CliEnv):
+    def test_check_prints_new_orphan_and_held_lines(self):
+        self.set_runtime("2026.10.10", 22, 27, doctor=False)
+        T.make_1004_state(self.state)
+        self.write_cfg({"meta": {"lastTouchedVersion": "2026.10.4"}, "agents": {"list": [{"id": "main"}]}})
+        T.make_1004_agent_db(self.state, "ghost")
+        T.make_1004_agent_db(self.state, "old")
+        con = sqlite3.connect(str(self.state / "state" / "openclaw.sqlite"))
+        con.execute("INSERT INTO agent_databases VALUES ('old', 'agents/old/agent/openclaw-agent.sqlite', 24, 0, NULL)")
+        con.execute("INSERT INTO agent_deletion_journal (agent_id, agent_dir, workspace_dir, sessions_dir, created_at, "
+                    "cleanup_completed, delete_files) VALUES ('old', ?, '/w', '/s', 0, 1, 0)",
+                    (str(self.state / "agents" / "old" / "agent"),))
+        con.commit()
+        con.close()
+        self.cli("check", env={"OPENCLAW_RUNTIME_VERSION": "2026.10.10"})
+        self.assertIn("  agent databases of no configured or registered agent (doctor may migrate them one-way; the "
+                      "gateway does not open them): agents/ghost/agent/openclaw-agent.sqlite (schema 24)", self.stdout)
+        self.assertIn("  held agent databases (kept from deleted agents; not migrated, not opened): "
+                      "agents/old/agent/openclaw-agent.sqlite (agent old, schema 24: kept from a deleted agent "
+                      "(deletion journal))", self.stdout)
+        # readiness (section I) uses the same held stores
+        self.assertIn("[gate] 1/8 info: agents/old/agent/openclaw-agent.sqlite (agent old, schema 24) is kept from a "
+                      "deleted agent", self.stdout)
+        # state, main and the orphan doctor would migrate; not the held store
+        self.assertIn("quick_check ok (3/3); foreign keys ok (3/3)", self.stdout)
+
+
 if __name__ == "__main__":
     unittest.main()

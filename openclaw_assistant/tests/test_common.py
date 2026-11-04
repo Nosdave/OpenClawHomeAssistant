@@ -236,6 +236,14 @@ class RuntimePackageTests(TmpCase):
         self.assertEqual((p["version"], p["schema_state"], p["schema_agent"]), ("2026.9.9", 19, 24))
         self.assertTrue(p["entry"].endswith("openclaw.mjs"))
 
+    def test_runtime_package_1010_with_database_engines(self):
+        """full5: OpenClaw 2026.10.10 adds openclaw.databaseEngines next to the schema targets 22/27."""
+        entry = self._pkg({"version": "2026.10.10", "openclaw": {"schemaVersions": {"state": 22, "agent": 27},
+                                                                 "databaseEngines": ["sqlite", "postgres"]}})
+        with mock.patch.dict(os.environ, {"OC_ADDON_ENTRY_FILE": str(entry)}):
+            p = C.runtime_package()
+        self.assertEqual((p["version"], p["schema_state"], p["schema_agent"]), ("2026.10.10", 22, 27))
+
     def test_runtime_package_uses_the_recorded_image_node(self):
         """F8: a Homebrew node earlier on PATH must not run OpenClaw."""
         entry = self._pkg({"version": "2026.9.9", "openclaw": {"schemaVersions": {"state": 19, "agent": 24}}})

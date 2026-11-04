@@ -10,6 +10,8 @@ Run ids, timestamps, durations, sizes and the temporary root are replaced by pla
 The golden file was captured from the gate code before the full5 hooks existed. A change to it must be a
 deliberate, decided 10.4-visible change (named in the CHANGELOG), made in the same commit as the code:
     OC_GATE_GOLDEN_UPDATE=1 python3 -m pytest -q tests/test_gate_golden_1004.py
+Deliberate changes so far: the precheck line's "foreign keys ok (2/2)" part (read-only foreign-key check, which
+OpenClaw 2026.10.4 enforces too; CHANGELOG "Migration gate, foreign keys").
 """
 
 import json

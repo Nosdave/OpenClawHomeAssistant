@@ -188,7 +188,11 @@ ADVICE = {
     "doctor-invocation": "the doctor command line was refused (broken image?): reinstall the add-on, then oc-upgrade retry",
     "interrupted-twice": "the gate was interrupted twice: make sure nothing stops the add-on during the migration, then oc-upgrade retry",
     "fixups-invalid": "the post-doctor fixups produced an invalid config (restored): see oc-upgrade status, then oc-upgrade retry",
-    "pc-schema": "the databases are not at the target schema: oc-upgrade retry --doctor",
+    "pc-schema": "the databases are not at the target schema: oc-upgrade retry --doctor; if the reason names a store "
+                 "doctor held back, first remove that agent from openclaw.json (agents.list) if you no longer use "
+                 "it, or restore the encrypted Home Assistant backup of the previous add-on version",
+    "orphan-agent-db": "move agent folders you no longer need out of /config/.openclaw/agents (they are in your "
+                       "encrypted backup), then oc-upgrade retry",
     "pc-config": "fix the configuration (openclaw config validate), then oc-upgrade retry",
     "internal-error": "see the traceback in the gate events.log (oc-upgrade status), then oc-upgrade retry",
     "bump-repeat": "the gate already ran for this runtime but the state still needs migration: check oc-upgrade check, then oc-upgrade retry",
@@ -484,6 +488,26 @@ def workspaces(cfg):
 
 # --- classification (§6.2 + B4/B5) -----------------------------------------------------------
 
+def default_agent_id(cfg):
+    """The default agent (approximation of OpenClaw's resolveDefaultAgentId): the agents.list entry marked
+    default, else the only configured agent, else "main"."""
+    agents = cfg.get("agents") if isinstance(cfg, dict) else None
+    lst = agents.get("list") if isinstance(agents, dict) else None
+    ids = []
+    for e in lst if isinstance(lst, list) else []:
+        if isinstance(e, dict) and isinstance(e.get("id"), str) and e["id"].strip():
+            if e.get("default") is True:
+                return e["id"].strip()
+            ids.append(e["id"].strip())
+    ent = agents.get("entries") if isinstance(agents, dict) else None
+    for k, e in ent.items() if isinstance(ent, dict) else []:
+        if isinstance(k, str) and k.strip():
+            if isinstance(e, dict) and e.get("default") is True:
+                return k.strip()
+            ids.append(k.strip())
+    return ids[0] if len(ids) == 1 else "main"
+
+
 def configured_agent_ids(cfg):
     ids = []
     agents = cfg.get("agents") if isinstance(cfg, dict) else None
@@ -528,6 +552,105 @@ def agent_databases(state_dir, cfg, state_tables):
         if os.path.realpath(pth) not in targets:
             orphans.append((pth.parent.parent.name, pth))
     return sorted(targets.values(), key=lambda t: str(t[1])), orphans
+
+
+# --- agent stores OpenClaw holds back (full5) --------------------------------------------------
+HELD_RETAINED = "retained-by-deletion"
+HELD_PENDING = "deletion pending"
+
+
+def deletion_journal_held(state_dir, pending=False):
+    """{realpath: (agent_id, reason)} of the agent databases OpenClaw's deletion journal holds back. Read-only.
+
+    Mirrors agent-deletion-journal.read.ts (readRetainedAgentDeletionsFromDatabase): retained deletions
+    (cleanup_completed=1 AND delete_files=0) on every runtime; pending=True (OpenClaw 2026.10.10+, runtime_caps
+    held_store_skip) adds the pending ones (cleanup_completed=0) its maintenance read includes. Each row holds
+    <agent_dir>/openclaw-agent.sqlite plus every path of database_paths_json (relative paths resolve against
+    the state dir). A missing table or an unreadable DB gives {}, malformed JSON only the agent_dir path; never
+    raises (a stop request still does). Reconstruction holds (migration_sources) are only seen in doctor's
+    output (held_paths_from_doctor)."""
+    state_dir = Path(state_dir)
+    sdb = state_dir / "state" / "openclaw.sqlite"
+    try:
+        if not sdb.exists() or "agent_deletion_journal" not in table_names(sdb):
+            return {}
+        rows = q(sdb, "SELECT agent_id, agent_dir, database_paths_json, cleanup_completed, delete_files "
+                      "FROM agent_deletion_journal")
+    except (sqlite3.Error, C.NodeQueryError, C.SchemaUnknown, OSError):
+        return {}
+    held = {}
+    for aid, adir, paths_json, done, delete_files in rows:
+        if done == 1 and delete_files == 0:
+            reason = HELD_RETAINED
+        elif done == 0 and pending:
+            reason = HELD_PENDING
+        else:
+            continue
+        if not isinstance(aid, str) or not isinstance(adir, str) or not adir:
+            continue
+        cands = [Path(adir) / "openclaw-agent.sqlite"]
+        try:
+            extra = json.loads(paths_json) if isinstance(paths_json, str) else None
+        except ValueError:
+            extra = None
+        if isinstance(extra, list) and all(isinstance(x, str) for x in extra):
+            cands += [Path(x) for x in extra if x]
+        for c in cands:
+            c = c if c.is_absolute() else state_dir / c
+            held.setdefault(os.path.realpath(c), (aid, reason))
+    return held
+
+
+def marker_held(state_dir, marker, runtime):
+    """{realpath: (agent_id, reason)} of the held stores a migration marker for `runtime` recorded, as long as
+    each file is the same one (dev, ino) at the same schema; anything else reads as not held."""
+    if not isinstance(marker, dict) or marker.get("runtime") != runtime or not isinstance(marker.get("held"), list):
+        return {}
+    state_dir = Path(state_dir)
+    held = {}
+    for h in marker["held"]:
+        if not isinstance(h, dict) or not isinstance(h.get("path"), str) or not h["path"]:
+            continue
+        pth = Path(h["path"])
+        pth = pth if pth.is_absolute() else state_dir / pth
+        try:
+            st = os.stat(pth)
+            same = (st.st_dev, st.st_ino) == (h.get("dev"), h.get("ino")) and agent_db_version(pth) == h.get("uv")
+        except (OSError, sqlite3.Error, C.SchemaUnknown, C.NodeQueryError):
+            same = False
+        if same:
+            held.setdefault(os.path.realpath(pth), (str(h.get("id")), str(h.get("reason") or "held")))
+    return held
+
+
+def planning_held(state_dir, marker, pkg):
+    """Held stores known before doctor runs (plan, dry-run, precheck, oc-upgrade check): the deletion journal
+    plus the stores the marker of this runtime recorded as held back by doctor."""
+    held = deletion_journal_held(state_dir, pending=C.runtime_caps(pkg)["held_store_skip"])
+    for k, v in marker_held(state_dir, marker, (pkg or {}).get("version")).items():
+        held.setdefault(k, v)
+    return held
+
+
+def held_marker_entries(state_dir, cls):
+    """Marker 'held' entries [{id, path, uv, dev, ino, reason}] for classify()'s res['held']."""
+    out_ = []
+    for h in cls.get("held") or []:
+        try:
+            st = os.stat(Path(state_dir) / h["path"])
+        except OSError:
+            continue
+        out_.append({"id": h["id"], "path": h["path"], "uv": h["uv"], "dev": st.st_dev, "ino": st.st_ino,
+                     "reason": h["reason"]})
+    return out_
+
+
+def held_reason_text(reason):
+    if reason == HELD_RETAINED:
+        return "kept from a deleted agent (deletion journal)"
+    if reason == HELD_PENDING:
+        return "its agent is being deleted (deletion journal: pending)"
+    return f"held back by doctor: {reason}"
 
 
 def legacy_files(state_dir, cfg, state_tables):
@@ -578,13 +701,21 @@ def legacy_files(state_dir, cfg, state_tables):
     return found
 
 
-def classify(state_dir, cfg, s_target, a_target, runtime):
-    """Predicate (§6.2). Returns a JSON-able dict; verdict newer|gate|ok."""
+def classify(state_dir, cfg, s_target, a_target, runtime, held=None):
+    """Predicate (§6.2). Returns a JSON-able dict; verdict newer|gate|ok.
+
+    held (full5): {realpath: (agent_id, reason)} of agent stores OpenClaw holds back (deletion journal, doctor's
+    "Held agent" lines, the marker). Below the target such a store of a configured agent stays in the gate and
+    is listed in res['held_configured'] (precheck agent-db-held); one that is only registered leaves the
+    predicate into res['held'] when the runtime skips held stores of unconfigured agents (2026.10.10+,
+    runtime_caps held_store_skip). A held orphan gets 'held' and 'reason'. held=None is the 0.5.94-full4
+    predicate."""
     state_dir = Path(state_dir)
     cfg = cfg if isinstance(cfg, dict) else {}
+    held = held or {}
     res = {"verdict": "ok", "schema_verdict": "ok", "files_verdict": "ok", "newer": [], "gate": [], "files": [],
-           "state": None, "state_uv": None, "agents": {}, "agent_paths": {}, "orphans": [],
-           "targets": {"state": s_target, "agent": a_target}}
+           "state": None, "state_uv": None, "agents": {}, "agent_paths": {}, "agent_ids": {}, "orphans": [],
+           "held": [], "held_configured": [], "targets": {"state": s_target, "agent": a_target}}
     state_db = state_dir / "state" / "openclaw.sqlite"
     tables = set()
     if state_db.exists():
@@ -608,13 +739,27 @@ def classify(state_dir, cfg, s_target, a_target, runtime):
         if eff >= s_target and "cron_run_logs" in tables:
             res["gate"].append("legacy cron_run_logs table present")
     targets, orphans = agent_databases(state_dir, cfg, tables)
+    configured = set(configured_agent_ids(cfg)) if held else set()
+    skip_held = bool(held) and C.runtime_caps(runtime)["held_store_skip"]
     for aid, pth in targets:
         v = agent_db_version(pth)
         if v is None:
             continue
+        h = held.get(os.path.realpath(pth)) if v < a_target else None
+        if h is not None:
+            entry = {"id": aid, "path": C.rel(pth, state_dir), "uv": v, "reason": h[1]}
+            if aid in configured or aid.lower() in configured:
+                # a pending deletion is not held from doctor: 2026.10.10 prepares (migrates) its store for the
+                # deletion recovery (openclaw-agent-db-maintenance.ts preparePendingAgentDeletionDatabases...)
+                if h[1] != HELD_PENDING:
+                    res["held_configured"].append(entry)
+            elif skip_held:
+                res["held"].append(entry)
+                continue
         key = aid if aid not in res["agents"] else C.rel(pth, state_dir)
         res["agents"][key] = v
         res["agent_paths"][key] = C.rel(pth, state_dir)
+        res["agent_ids"][key] = aid
         if v > a_target:
             res["newer"].append(f"{C.rel(pth, state_dir)}: agent schema {v} > {a_target}")
         elif v < a_target:
@@ -629,7 +774,11 @@ def classify(state_dir, cfg, s_target, a_target, runtime):
             continue
         if v > a_target:
             res["newer"].append(f"{C.rel(pth, state_dir)} (unconfigured agent): agent schema {v} > {a_target}")
-        res["orphans"].append({"id": aid, "path": C.rel(pth, state_dir), "uv": v})
+        o = {"id": aid, "path": C.rel(pth, state_dir), "uv": v}
+        h = held.get(os.path.realpath(pth))
+        if h is not None:
+            o.update(held=True, reason=h[1])
+        res["orphans"].append(o)
     lt = _cfg_get(cfg, "meta", "lastTouchedVersion")
     if C.version_tuple(lt) and C.version_tuple(runtime) and C.version_tuple(lt) > C.version_tuple(runtime):
         res["newer"].append(f"openclaw.json was last written by OpenClaw {lt}, but this image ships {runtime}")
@@ -856,8 +1005,9 @@ def _read_cfg_lenient():
 def _summary_bits(pkg, cls):
     st = cls.get("state") or {}
     ags = ",".join(f"{k}:{v}" for k, v in sorted(cls.get("agents", {}).items())) or "none"
+    held = f" held={len(cls['held'])}" if cls.get("held") else ""
     return (f"runtime={pkg['version']} targets={pkg['schema_state']}/{pkg['schema_agent']} "
-            f"state={st.get('eff', 'none')} agents={ags} verdict={cls['verdict']}")
+            f"state={st.get('eff', 'none')} agents={ags}{held} verdict={cls['verdict']}")
 
 
 def plan(apply=False, emit=out):
@@ -885,7 +1035,9 @@ def plan(apply=False, emit=out):
         cfg = _read_cfg_lenient()
         journal = load_journal()
         retry = load_retry()
-        cls = classify(gp["STATE"], cfg, pkg["schema_state"], pkg["schema_agent"], pkg["version"])
+        # full5: stores OpenClaw holds back (deletion journal, the marker of this runtime) do not ask for a gate
+        cls = classify(gp["STATE"], cfg, pkg["schema_state"], pkg["schema_agent"], pkg["version"],
+                       held=planning_held(gp["STATE"], marker, pkg))
         binding = current_binding(gp["STATE"], cls)
         d = decide({"fresh": False, "runtime": pkg["version"], "cls": cls, "journal": journal, "marker": marker,
                     "retry": retry, "cfg": cfg, "binding": binding})
@@ -915,7 +1067,7 @@ def plan(apply=False, emit=out):
     try:
         if d.get("marker") == "adopt":
             write_marker(mode="adopted", run_id=None, binding=binding, runtime=pkg["version"],
-                         accepted=[], orphans=cls.get("orphans", []))
+                         accepted=[], orphans=cls.get("orphans", []), held=held_marker_entries(gp["STATE"], cls))
         elif d.get("marker") == "rebind":
             m = dict(marker)
             m["binding"] = binding
@@ -966,13 +1118,17 @@ def apply_bookkeeping(d):
             C.atomic_write_json(gp["JOURNAL"], j)
 
 
-def write_marker(*, mode, run_id, binding, runtime, accepted, orphans):
+def write_marker(*, mode, run_id, binding, runtime, accepted, orphans, held=None):
+    """held (full5): [{id, path, uv, dev, ino, reason}] of stores OpenClaw held back and the gate left out of the
+    schema check; written only when there are any (a marker without it reads as none: marker_held)."""
     gp = gpaths()
     ensure_dirs(gp)
-    C.atomic_write_json(gp["MARKER"], {
-        "schema": 1, "runtime": runtime, "mode": mode, "run_id": run_id, "completed_at": C.utc_iso(),
-        "binding": binding, "accepted": sorted(set(accepted or [])),
-        "orphans": orphans or [], "addon_version": addon_version()})
+    m = {"schema": 1, "runtime": runtime, "mode": mode, "run_id": run_id, "completed_at": C.utc_iso(),
+         "binding": binding, "accepted": sorted(set(accepted or [])),
+         "orphans": orphans or [], "addon_version": addon_version()}
+    if held:
+        m["held"] = held
+    C.atomic_write_json(gp["MARKER"], m)
 
 
 # --- hold.txt ---------------------------------------------------------------------------------
@@ -1454,6 +1610,28 @@ def doctor_retirements(text):
     return pairs, removed[:40]
 
 
+# Doctor's held-store lines (2026.10.4 and 2026.10.10): "Held agent <id> database <path> (<reason>); run openclaw
+# doctor --fix to inspect restoration." (state-migrations.media-persistence-targets.ts) and "Held agent <id>
+# database <path>; deletion history needs repair." (doctor-agent-deletion-journal.ts). A reworded line matches
+# nothing, which keeps the store in the hard schema check (the safe direction).
+_HELD_PATH_RE = re.compile(r"Held agent (\S{1,120}) database (/\S{1,512}?)(?: \((retained-by-deletion|deletion "
+                           r"journal reconstructed|deletion journal unavailable)\)|; deletion history needs repair)")
+
+
+def held_paths_from_doctor(text):
+    """[[agent_id, abs_path, reason]] of the stores one doctor log holds back (de-duplicated by path, max 200)."""
+    found, seen = [], set()
+    for m in _HELD_PATH_RE.finditer(normalize_doctor_text(text)):
+        path = m.group(2)
+        if path in seen:
+            continue
+        seen.add(path)
+        found.append([m.group(1), path, m.group(3) or "deletion history needs repair"])
+        if len(found) >= 200:
+            break
+    return found
+
+
 class LogMirror:
     """Mirror new lines of a growing log to stdout as `[doctor] <line>` (redacted, capped)."""
 
@@ -1733,6 +1911,17 @@ class Gate:
                       "max_db": max_db, "largest_agent": largest_agent, "s_mib": s_mib}
         return self.sizes
 
+    def held_map(self, include_doctor):
+        """{realpath: (agent_id, reason)} of the agent stores OpenClaw holds back: the deletion journal and the
+        marker of this runtime (planning_held), plus with include_doctor the "Held agent" lines of this run's
+        doctor passes (journal doctor_held)."""
+        held = planning_held(self.gp["STATE"], load_marker(), self.pkg)
+        if include_doctor:
+            for x in (self.j or {}).get("doctor_held") or []:
+                if isinstance(x, list) and len(x) == 3 and isinstance(x[1], str):
+                    held.setdefault(os.path.realpath(x[1]), (str(x[0]), str(x[2])))
+        return held
+
     def budget(self):
         s_mib = self.sizes.get("s_mib", 0)
         t = min(21600, 3600 + 2 * s_mib)
@@ -1784,16 +1973,12 @@ class Gate:
                 F.append(finding("legacy-state-dir", "hard",
                                  f"legacy state dir {legacy} exists next to {p['STATE']}; doctor would refuse "
                                  "('State dir migration skipped: target already exists')", "precheck"))
-        # 5 predicate
+        # 5 predicate (full5: with the stores OpenClaw holds back; doctor has not run yet)
         self.cls = classify(p["STATE"], self.cfg, self.pkg["schema_state"], self.pkg["schema_agent"],
-                            self.pkg["version"])
+                            self.pkg["version"], held=self.held_map(False))
         if self.cls["verdict"] == "newer":
             F.append(finding("newer-state", "hard", "; ".join(self.cls["newer"]), "precheck"))
-        if self.cls["orphans"]:
-            F.append(finding("orphan-agent-db", "acceptable",
-                             "agent databases of unconfigured, unregistered agents are not migrated by doctor and are "
-                             "excluded from the checks: " + ", ".join(f"{o['path']} (schema {o['uv']})"
-                                                                      for o in self.cls["orphans"]), "precheck"))
+        F += self.agent_store_findings()
         state_db = p["STATE"] / "state" / "openclaw.sqlite"
         checkpoint = startup_checkpoint(state_db)
         if self.j is not None and not self.j.get("first_write_at"):
@@ -1889,6 +2074,39 @@ class Gate:
         if NODE_FALLBACKS:
             self.warn(f"node:sqlite fallback used for {len(set(NODE_FALLBACKS))} database(s)")
         return F, parts
+
+    def agent_store_findings(self):
+        """Precheck 5 (full5): orphan stores doctor would migrate one-way (acceptable orphan-agent-db), stores the
+        deletion journal keeps (info), and configured agents whose store is held back (hard agent-db-held)."""
+        F = []
+        cls, a_target, ver = self.cls, self.pkg["schema_agent"], self.pkg["version"]
+        orphans = [o for o in cls["orphans"] if not o.get("held") and (o.get("uv") is None or o["uv"] < a_target)]
+        if orphans:
+            F.append(finding("orphan-agent-db", "acceptable",
+                             "agent database(s) of agents that are neither configured nor registered: "
+                             + ", ".join(f"{o['path']} (schema {o['uv'] if o.get('uv') is not None else 'unreadable'})"
+                                         for o in orphans)
+                             + f". Doctor of OpenClaw {ver} finds such a store under agents/ and migrates it one-way "
+                               f"to schema {a_target} unless its deletion history holds it back; the gateway does "
+                               "not open it. The gate checks that it is readable (quick_check, foreign keys) but not "
+                               "its schema afterwards", "precheck"))
+        for h in [o for o in cls["orphans"] if o.get("held")] + list(cls.get("held") or []):
+            if h.get("reason") == HELD_PENDING:
+                what = "belongs to an agent OpenClaw is deleting (deletion journal: pending)"
+            elif h.get("reason") == HELD_RETAINED:
+                what = "is kept from a deleted agent (OpenClaw deletion journal); OpenClaw does not migrate or open it"
+            else:
+                what = f"was held back by doctor ({h.get('reason')}); OpenClaw does not migrate or open it"
+            self.say(f"{self.pn('precheck')} info: {h['path']} (agent {h['id']}, schema {h['uv']}) {what}, and the "
+                     "gate leaves it out of the schema checks")
+        for h in cls.get("held_configured") or []:
+            why = "from a deletion (deletion journal)" if h.get("reason") == HELD_RETAINED else \
+                f"back ({held_reason_text(h.get('reason'))})"
+            F.append(finding("agent-db-held", "hard",
+                             f"agent {h['id']} is configured, but OpenClaw keeps its database {h['path']} (schema "
+                             f"{h['uv']}) {why}: doctor will not migrate it and OpenClaw {ver} refuses the agent "
+                             "(the default agent: the gateway does not start or stays not ready)", "precheck"))
+        return F
 
     def ha_backup_check(self, F, opt):
         """Precheck 10b (read-only): an encrypted full/partial Home Assistant backup that contains this add-on, is
@@ -2030,10 +2248,24 @@ class Gate:
 
     def quick_checks(self, F, state_db):
         dbs = []
+        cls = self.cls or {}
+        checked = []  # full5: the same databases for the foreign-key check (9b), with their schema position
         if state_db.exists():
             dbs.append(state_db)
-        for _aid, relp in sorted((self.cls or {}).get("agent_paths", {}).items()):
+            st = cls.get("state") or {}
+            checked.append({"path": state_db, "kind": "state", "uv": st.get("eff"),
+                            "target": (self.pkg or {}).get("schema_state")})
+        a_target = (self.pkg or {}).get("schema_agent")
+        for key, relp in sorted(cls.get("agent_paths", {}).items()):
             dbs.append(self.gp["STATE"] / relp)
+            checked.append({"path": dbs[-1], "kind": "agent", "uv": (cls.get("agents") or {}).get(key),
+                            "target": a_target})
+        # full5: doctor also migrates orphan stores below the target one-way (doctor-health.ts), unless held
+        for o in cls.get("orphans") or []:
+            if not o.get("held") and o.get("uv") is not None and a_target is not None and o["uv"] < a_target:
+                dbs.append(self.gp["STATE"] / o["path"])
+                checked.append({"path": dbs[-1], "kind": "orphan", "uv": o["uv"], "target": a_target})
+        self.facts["checked_dbs"] = checked
         results, ok, skipped = {}, 0, 0
         for db in dbs:
             r = quick_check(db)
@@ -2099,6 +2331,19 @@ class Gate:
         if n:
             self.warn(f"{n} cron job(s) use openai-codex models: doctor may install the @openclaw/codex plugin "
                       "for them (it stays installed); the fixups revert doctor's codex runtime pins to openclaw")
+        # full5: official npm plugins follow the OpenClaw version; doctor does not update them, the add-on does
+        # after the gate (run.sh -> oc-upgrade plugins-sync, enabled ones only)
+        official = official_plugin_installs(state, self.cfg)
+        if official:
+            rt = self.pkg["version"]
+            text = ", ".join(f"{x['package']} {x['version'] or '?'}"
+                             + {True: " (enabled)", False: " (disabled)"}.get(x["enabled"], "") for x in official)
+            if any(x["version"] != rt for x in official):
+                text += (f"; after the migration the add-on updates the enabled ones to {rt} (OpenClaw's doctor "
+                         "does not)")
+            self.say(f"{self.pn('precheck')} info: official plugins: {text}")
+            if self.j is not None and not self.j.get("first_write_at"):
+                self.j["plugins_official_before"] = official
         # telegram/ingress-spool-*: reported by retired_format_findings (2026.10 doctor imports the spool)
         for ws in workspaces(self.cfg):
             nested = ws / ".openclaw" / "workspace-state.json"
@@ -2128,8 +2373,69 @@ class Gate:
 
     def fk_checks(self, F, state_db):
         """Precheck 9b (schema): PRAGMA foreign_key_check of the databases quick_check checked; appends findings
-        to F and returns a summary part, or None for none."""
-        return None
+        to F and returns a summary part, or None for none.
+
+        Read-only, in every mode (also on resume, dry-run and oc-upgrade check). OpenClaw checks foreign keys at
+        the end of every agent schema migration (identity migration) and before it uses the state database
+        (assertSqliteIntegrity, 2026.10.4 and 2026.10.10); the gate never deletes rows, so a violation in a
+        database below its target is a hard HOLD before the first write. Only the task_delivery_state orphans
+        OpenClaw's doctor repairs itself are information; a database already at its target only warns."""
+        qc = self.facts.get("quick_check") or {}
+        results, n, ok, skipped, repairable, failed = {}, 0, 0, 0, 0, 0
+        for db in self.facts.get("checked_dbs") or []:
+            rel_ = C.rel(db["path"], self.gp["STATE"])
+            if qc.get(rel_) not in ("ok", "skipped"):
+                continue  # reported by quick_check
+            n += 1
+            r = fk_check(db["path"])
+            results[rel_] = r
+            if r == "ok":
+                ok += 1
+                continue
+            if r == "skipped":
+                skipped += 1
+                continue
+            if r == "timeout":
+                failed += 1
+                F.append(finding("sqlite-check-timeout", "acceptable",
+                                 f"foreign_key_check of {rel_} did not finish in time", "precheck"))
+                continue
+            if not isinstance(r, dict):
+                failed += 1
+                self.warn(f"foreign_key_check of {rel_} could not run: {r}")
+                continue
+            sample = "; ".join(f"{t} row {'?' if rid is None else rid} -> {par}" for t, rid, par, _fk in r["sample"]) \
+                + ("; …" if r["count"] > len(r["sample"]) else "")
+            if db["kind"] == "state" and r["repairable"]:
+                repairable += 1
+                self.say(f"{self.pn('precheck')} info: {rel_} has {r['count']} task_delivery_state row(s) whose "
+                         "task run is gone; doctor deletes them (OpenClaw's own repair for this case)")
+                continue
+            failed += 1
+            uv, target = db.get("uv"), db.get("target")
+            label = "state schema" if db["kind"] == "state" else "agent schema"
+            if uv is not None and target is not None and uv < target:
+                if db["kind"] == "state":
+                    msg = (f"{rel_} ({label} {uv}): {r['count']} foreign-key violation(s): {sample}. OpenClaw checks "
+                           "the shared state database's foreign keys before it migrates or opens it and refuses it")
+                else:
+                    msg = (f"{rel_} ({label} {uv}, OpenClaw {self.pkg['version']} migrates it to {target}): "
+                           f"{r['count']} foreign-key violation(s): {sample}. OpenClaw checks foreign keys at the end "
+                           "of this one-way migration and stops it ('Agent schema migration failed foreign key "
+                           "validation') while other databases are already migrated")
+                F.append(finding("sqlite-fk-violation", "hard", msg, "precheck"))
+            else:
+                self.warn(f"{rel_} (already at {label} {uv}): {r['count']} foreign-key violation(s) ({sample}); "
+                          "nothing migrates it now, but the next OpenClaw update will stop on them: restore that "
+                          "database from a backup before then")
+        self.facts["fk_check"] = {k: v if isinstance(v, str) else {"count": v["count"], "repairable": v["repairable"],
+                                                                     "sample": [list(x) for x in v["sample"]]}
+                                  for k, v in results.items()}
+        if failed:
+            return f"foreign keys FAILED ({failed} of {n})"
+        extra = [f"{skipped} skipped"] if skipped else []
+        extra += [f"{repairable} repaired by doctor"] if repairable else []
+        return f"foreign keys ok ({ok}/{n}" + (", " + ", ".join(extra) if extra else "") + ")"
 
     def skill_workshop_info(self, F):
         """Precheck 11b (Skill Workshop): info and WARN lines about the proposals doctor will retire."""
@@ -2389,6 +2695,12 @@ class Gate:
         if removed:
             rem = self.j.setdefault("doctor_retired_removed", [])
             rem += [r for r in removed if r not in rem]
+        held = held_paths_from_doctor(text)  # full5: the stores doctor held back (Gate.held_map)
+        if held:
+            dh = self.j.setdefault("doctor_held", [])
+            known = {x[1] for x in dh if isinstance(x, list) and len(x) == 3}
+            dh += [x for x in held if x[1] not in known]
+            del dh[200:]
         self.save()
         if ev["code"] == "interrupted":
             self.say(f"{label}: stop requested; doctor was asked to stop (rc {res.rc})")
@@ -2723,10 +3035,16 @@ class Gate:
                 else:
                     cfg = new_cfg
                     self.say("7/8 auth.order.openai written (subscription first, API key as fallback)")
-        # pc-schema (hard)
-        cls = classify(p["STATE"], cfg, self.pkg["schema_state"], self.pkg["schema_agent"], self.pkg["version"])
+        # pc-schema (hard; full5: stores doctor held back of agents that are not configured are listed, not
+        # required, on runtimes whose gateway skips them; classify)
+        cls = classify(p["STATE"], cfg, self.pkg["schema_state"], self.pkg["schema_agent"], self.pkg["version"],
+                       held=self.held_map(True))
         if cls["schema_verdict"] != "ok":
-            hard("pc-schema", "; ".join(cls["gate"] + cls["newer"]) or "schema verdict not ok")
+            hard("pc-schema", "; ".join(self.pc_schema_items(cls, cfg) + cls["newer"]) or "schema verdict not ok")
+        if cls["held"]:
+            self.say("7/8 info: held agent database(s) left at their schema, not checked: "
+                     + ", ".join(f"{h['path']} (agent {h['id']}, schema {h['uv']}: {held_reason_text(h['reason'])})"
+                                 for h in cls["held"]) + "; the gateway does not open them")
         summary.append(f"schema {self.pkg['schema_state']}/{self.pkg['schema_agent']}")
         # pc-schema-meta
         sm = schema_meta_problems(p["STATE"], cls, self.pkg)
@@ -2843,6 +3161,31 @@ class Gate:
             self.resolve(policy, "postconditions")
         self.say("7/8 postconditions OK: " + ", ".join(summary))
 
+    def pc_schema_items(self, cls, cfg):
+        """cls['gate'] for the pc-schema HOLD; on runtimes that refuse agents per agent (2026.10.10+, runtime_caps
+        held_store_skip) each configured agent store below the target says what OpenClaw does with it."""
+        if not self.caps()["held_store_skip"]:
+            return list(cls["gate"])
+        configured = set(configured_agent_ids(cfg))
+        default = default_agent_id(cfg)
+        held_cfg = {h["path"]: h["reason"] for h in cls.get("held_configured") or []}
+        notes = {}
+        for key, relp in (cls.get("agent_paths") or {}).items():
+            uv = (cls.get("agents") or {}).get(key)
+            if uv is None or uv >= cls["targets"]["agent"]:
+                continue
+            aid = (cls.get("agent_ids") or {}).get(key, key)
+            bits = []
+            if aid == default:
+                bits.append("configured default agent: the gateway refuses to start (exit 78) or stays not ready")
+            elif aid in configured or aid.lower() in configured:
+                bits.append("configured agent: OpenClaw refuses this agent")
+            if relp in held_cfg:
+                bits.append(f"held back by doctor: {held_cfg[relp]}")
+            if bits:
+                notes[f"{relp}: agent schema {uv} < {cls['targets']['agent']}"] = "; ".join(bits)
+        return [f"{g} ({notes[g]})" if g in notes else g for g in cls["gate"]]
+
     # ----- phase 8: pins -----
     def phase_pins(self):
         if "pins-invalid" in self.accepted:
@@ -2899,9 +3242,11 @@ class Gate:
     def phase_finalize(self):
         p = self.gp
         cfg = _read_cfg_lenient()
-        cls = classify(p["STATE"], cfg, self.pkg["schema_state"], self.pkg["schema_agent"], self.pkg["version"])
+        cls = classify(p["STATE"], cfg, self.pkg["schema_state"], self.pkg["schema_agent"], self.pkg["version"],
+                       held=self.held_map(True))
         write_marker(mode=self.j["mode"], run_id=self.j["run_id"], binding=current_binding(p["STATE"], cls),
-                     runtime=self.pkg["version"], accepted=sorted(self.accepted), orphans=self.j.get("orphans") or [])
+                     runtime=self.pkg["version"], accepted=sorted(self.accepted), orphans=self.j.get("orphans") or [],
+                     held=held_marker_entries(p["STATE"], cls))
         self.j["status"] = "done"
         self.j["hold"] = None
         self.j["finished_at"] = C.utc_iso()
@@ -3210,6 +3555,82 @@ def _node_quick_check(path, budget_s, exc):
     return [tuple(r.values()) for r in rows if isinstance(r, dict)]
 
 
+def fk_check(path, budget_s=None):
+    """PRAGMA foreign_key_check of one database, read-only (full5, precheck 9b).
+
+    'ok' | 'timeout' | 'skipped' (WAL without -shm index, too large for a private copy) | 'unreadable (...)' |
+    {'count': n, 'sample': [(table, rowid, parent, fkid)] (first 5), 'repairable': bool}. repairable: every row is
+    the task_delivery_state -> task_runs cascade relation doctor --fix repairs (sqlite-integrity.ts
+    runSqliteForeignKeyCheck / readTaskDeliveryCascadeForeignKeyId). Aborts via progress handler on timeout or
+    stop (GateStopped) like quick_check; never writes next to the database (query_ro)."""
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        size = 0
+    wal, shm = Path(f"{path}-wal"), Path(f"{path}-shm")
+    try:
+        wal_size = wal.stat().st_size if wal.exists() else 0
+    except OSError:
+        wal_size = 0
+    if wal_size > 0 and not shm.exists() and size + wal_size > QUICK_CHECK_COPY_LIMIT:
+        return "skipped"
+    budget_s = budget_s if budget_s is not None else 300 + math.ceil(1.25 * size / C.MIB)
+    deadline = time.monotonic() + budget_s
+    why = [None]
+
+    def handler():
+        if STOP.is_set():
+            why[0] = "stop"
+            return 1
+        if time.monotonic() > deadline:
+            why[0] = "timeout"
+            return 1
+        return 0
+
+    def run(sql):
+        try:
+            return C.query_ro(path, sql, progress_handler=handler)
+        except sqlite3.OperationalError as exc:
+            if why[0] == "stop":
+                raise GateStopped()
+            if why[0] == "timeout":
+                return "timeout"
+            return _node_fk_query(path, sql, budget_s, exc)
+        except sqlite3.DatabaseError as exc:
+            return _node_fk_query(path, sql, budget_s, exc)
+        except OSError as exc:
+            return f"unreadable ({exc})"
+    if STOP.is_set():
+        raise GateStopped()
+    if time.monotonic() > deadline:
+        return "timeout"
+    rows = run("PRAGMA foreign_key_check")
+    if isinstance(rows, str):
+        return rows
+    if not rows:
+        return "ok"
+    viol = [(str(r[0]), r[1], str(r[2]), r[3]) for r in rows]
+    repairable = False
+    if all(t == "task_delivery_state" and par == "task_runs" for t, _rid, par, _fk in viol):
+        fks = run("PRAGMA foreign_key_list(task_delivery_state)")
+        if isinstance(fks, list):
+            # columns: id, seq, table, from, to, on_update, on_delete, match
+            cand = [r for r in fks if r[2] == "task_runs" and r[3] == "task_id" and r[4] == "task_id"
+                    and str(r[6]).upper() == "CASCADE"]
+            if cand and sum(1 for r in fks if r[0] == cand[0][0]) == 1:
+                repairable = all(fk == cand[0][0] for _t, _rid, _par, fk in viol)
+    return {"count": len(viol), "sample": viol[:5], "repairable": repairable}
+
+
+def _node_fk_query(path, sql, budget_s, exc):
+    try:
+        rows = C.node_query(path, sql, timeout=budget_s, stop_event=STOP)
+    except C.NodeQueryError as nexc:
+        return f"unreadable ({type(exc).__name__}: {exc}; node fallback: {nexc})"
+    NODE_FALLBACKS.append(str(path))
+    return [tuple(r.values()) for r in rows if isinstance(r, dict)]
+
+
 def prejournal_problems(state_db):
     """Mirror of 9.9 hasPreJournalStateSchema + retained deletion journal status (§7.1 item 6.1)."""
     if not state_db.exists():
@@ -3338,9 +3759,82 @@ def plugin_snapshot(state_dir):
     return sorted(names)
 
 
+OFFICIAL_PLUGIN_SCOPE = "@openclaw/"
+BRAVE_PLUGIN_PACKAGE = "@openclaw/brave-plugin"  # run.sh ensure_brave_plugin owns it
+
+
+def _npm_name(spec):
+    """Package name of an npm spec ('@scope/name@1.2.3', 'npm:@scope/name', 'name@x') or None."""
+    if not isinstance(spec, str) or not spec.strip():
+        return None
+    s = spec.strip()
+    if s.startswith("npm:"):
+        s = s[4:]
+    if s.startswith("@"):
+        scope, _, rest = s.partition("/")
+        return f"{scope}/{rest.split('@', 1)[0]}" if rest else None
+    return s.split("@", 1)[0] or None
+
+
+def official_plugin_installs(state_dir, cfg):
+    """[{id, package, version, enabled}] of the official npm plugins (@openclaw/*) OpenClaw installed, sorted by id.
+
+    Read-only: the install records in config_machine_state 'plugins.installedIndex' (index.installRecords; the
+    7.x installed_plugin_index table as a fallback), the version from <installPath>/package.json when readable,
+    enabled from openclaw.json plugins.entries.<id>.enabled (None: OpenClaw's default). Never raises."""
+    state_dir = Path(state_dir)
+    sdb = state_dir / "state" / "openclaw.sqlite"
+    records = {}
+    try:
+        tables = table_names(sdb) if sdb.exists() else set()
+        if "config_machine_state" in tables:
+            rows = q(sdb, "SELECT value_json FROM config_machine_state WHERE state_key='plugins.installedIndex'")
+            val = json.loads(rows[0][0]) if rows and isinstance(rows[0][0], str) else None
+            idx = val.get("index") if isinstance(val, dict) else None
+            recs = idx.get("installRecords") if isinstance(idx, dict) else None
+            if isinstance(recs, dict):
+                records = recs
+        if not records and "installed_plugin_index" in tables:  # 7.x (oc_migrate._installed_plugin_index_ids)
+            rows = q(sdb, "SELECT install_records_json FROM installed_plugin_index "
+                          "WHERE index_key='installed-plugin-index'")
+            val = json.loads(rows[0][0]) if rows and isinstance(rows[0][0], str) else None
+            if isinstance(val, dict):
+                records = val
+    except (sqlite3.Error, C.NodeQueryError, C.SchemaUnknown, OSError, ValueError, IndexError):
+        return []
+    entries = _cfg_get(cfg if isinstance(cfg, dict) else {}, "plugins", "entries")
+    entries = entries if isinstance(entries, dict) else {}
+    out_ = []
+    for pid, rec in records.items():
+        if not isinstance(pid, str) or not isinstance(rec, dict) or rec.get("source") != "npm":
+            continue
+        pkg_name = rec.get("resolvedName") if isinstance(rec.get("resolvedName"), str) else None
+        pkg_name = pkg_name or _npm_name(rec.get("spec")) or _npm_name(rec.get("resolvedSpec"))
+        if not pkg_name or not pkg_name.startswith(OFFICIAL_PLUGIN_SCOPE):
+            continue
+        version = None
+        ip = rec.get("installPath")
+        if isinstance(ip, str) and ip:
+            ipp = Path(ip) if os.path.isabs(ip) else state_dir / ip
+            data = C.load_json_or_none(ipp / "package.json")
+            if isinstance(data, dict) and isinstance(data.get("version"), str):
+                version = data["version"]
+        if version is None:
+            for k in ("resolvedVersion", "version"):
+                if isinstance(rec.get(k), str) and rec[k]:
+                    version = rec[k]
+                    break
+        ent = entries.get(pid)
+        enabled = ent.get("enabled") if isinstance(ent, dict) and isinstance(ent.get("enabled"), bool) else None
+        out_.append({"id": pid, "package": pkg_name, "version": version, "enabled": enabled})
+    return sorted(out_, key=lambda x: x["id"])
+
+
 def schema_meta_problems(state_dir, cls, pkg):
     probs = []
     sdb = Path(state_dir) / "state" / "openclaw.sqlite"
+    # full5: registry rows of stores OpenClaw holds back (classify res['held']) are not migrated: not reported
+    held = {os.path.realpath(Path(state_dir) / h["path"]) for h in cls.get("held") or []}
 
     def app_ok(v):
         # Measured on real 2026.9.9 and 2026.10.2 migrations (doctor + gateway): the state DB's primary row keeps
@@ -3365,7 +3859,10 @@ def schema_meta_problems(state_dir, cls, pkg):
                     or not app_ok(ap.get("app_version")):
                 probs.append(f"{relp} schema_meta primary {ap}")
         if sdb.exists() and "agent_databases" in table_names(sdb):
-            for aid, sv in q(sdb, "SELECT agent_id, schema_version FROM agent_databases"):
+            for aid, rp, sv in q(sdb, "SELECT agent_id, path, schema_version FROM agent_databases"):
+                if held and isinstance(rp, str) and rp and os.path.realpath(
+                        rp if os.path.isabs(rp) else Path(state_dir) / rp) in held:
+                    continue
                 if sv != pkg["schema_agent"]:
                     probs.append(f"agent_databases[{aid}].schema_version {sv}")
     except (sqlite3.Error, C.NodeQueryError, C.SchemaUnknown, OSError) as exc:
@@ -3493,6 +3990,8 @@ def probe_ok(data, profile_id):
 
 
 def plugin_version_warnings(data, runtime):
+    """WARN lines for enabled official plugins whose version differs from the runtime (full5 wording: the add-on
+    updates older ones before the gateway starts, oc-upgrade plugins-sync; Brave is run.sh's own step)."""
     warns = []
     if data is None:
         return ["plugins list --json returned no parseable JSON"]
@@ -3511,8 +4010,14 @@ def plugin_version_warnings(data, runtime):
         ver = p.get("version")
         if p.get("enabled") is False or "@openclaw/" not in spec or not isinstance(ver, str):
             continue
-        if C.version_tuple(ver) and C.version_tuple(ver) != C.version_tuple(runtime):
-            warns.append(f"plugin {p['id']} is {ver}, runtime is {runtime}")
+        if BRAVE_PLUGIN_PACKAGE in spec:
+            continue
+        v, rt = C.version_tuple(ver), C.version_tuple(runtime)
+        if v and rt and v > rt:
+            warns.append(f"plugin {p['id']} {ver} is newer than OpenClaw {runtime}; left as is")
+        elif v and v != rt:
+            warns.append(f"plugin {p['id']} is {ver}, OpenClaw is {runtime}: the add-on updates it before the gateway "
+                         "starts (oc-upgrade plugins-sync)")
     return warns
 
 
@@ -3632,8 +4137,9 @@ def dry_run(network=False, emit=out):
         pkg = C.runtime_package()
         g.pkg = pkg
         cfg = _read_cfg_lenient()
-        cls = classify(g.gp["STATE"], cfg, pkg["schema_state"], pkg["schema_agent"], pkg["version"])
         marker = load_marker()
+        cls = classify(g.gp["STATE"], cfg, pkg["schema_state"], pkg["schema_agent"], pkg["version"],
+                       held=planning_held(g.gp["STATE"], marker, pkg))
         marker_rt = bool(marker and marker.get("runtime") == pkg["version"])
         gate_needed = cls["schema_verdict"] == "gate" or (cls["files_verdict"] == "gate" and not marker_rt)
         emit(f"[gate] dry-run: {_summary_bits(pkg, cls)}")
@@ -3726,7 +4232,8 @@ def hold_after_start(code, last_rc=None, emit=out):
         try:
             g.pkg = C.runtime_package()
             cfg = _read_cfg_lenient()
-            cls = classify(gp["STATE"], cfg, g.pkg["schema_state"], g.pkg["schema_agent"], g.pkg["version"])
+            cls = classify(gp["STATE"], cfg, g.pkg["schema_state"], g.pkg["schema_agent"], g.pkg["version"],
+                           held=planning_held(gp["STATE"], load_marker(), g.pkg))
             sub = cls["verdict"]
         except Exception as exc:  # noqa: BLE001
             cls, sub = None, "unknown"
@@ -4419,6 +4926,41 @@ def _status_skills(gp):
     return []
 
 
+def plugin_cohort_marker(state_dir, version):
+    """run.sh / oc-upgrade plugins-sync: the enabled official plugins were brought to OpenClaw `version`."""
+    return Path(state_dir) / f".plugin_cohort_{version}"
+
+
+def _status_held_and_plugins(gp, marker):
+    """Status lines (full5): held stores the marker recorded, and the official plugins against the runtime."""
+    L = []
+    held = (marker or {}).get("held") if isinstance(marker, dict) else None
+    if isinstance(held, list) and held:
+        L.append("  held agent databases (not migrated, not opened by the gateway; not checked): "
+                 + ", ".join(f"{printable(h.get('path'))} (agent {printable(h.get('id'))}, schema {h.get('uv')}: "
+                             f"{held_reason_text(h.get('reason'))})" for h in held if isinstance(h, dict)))
+    try:
+        official = official_plugin_installs(gp["STATE"], _read_cfg_lenient())
+    except Exception:  # noqa: BLE001 - status must never fail on this line
+        official = []
+    if official:
+        try:
+            rt = C.runtime_package()["version"]
+        except C.RuntimePackageError:
+            rt = None
+        text = ", ".join(f"{x['package']} {x['version'] or '?'}"
+                         + {True: " (enabled)", False: " (disabled)"}.get(x["enabled"], "") for x in official)
+        if rt and plugin_cohort_marker(gp["STATE"], rt).exists():
+            text += f"; enabled ones synced to OpenClaw {rt}"
+        elif rt:
+            behind = [x["package"] for x in official if x["enabled"] is not False and x["version"] != rt
+                      and x["package"] != BRAVE_PLUGIN_PACKAGE]
+            text += (f"; not yet at OpenClaw {rt}: {', '.join(behind)} (the add-on retries at the next start: "
+                     "oc-upgrade plugins-sync)" if behind else f"; enabled ones at OpenClaw {rt}")
+        L.append(f"Official plugins: {text}")
+    return L
+
+
 def status_lines():
     gp = gpaths()
     L = []
@@ -4472,6 +5014,7 @@ def status_lines():
     m = load_marker()
     L.append(f"Migrated marker: {m.get('runtime')} ({m.get('mode')}, run {m.get('run_id')}, {m.get('completed_at')})"
              if m else "Migrated marker: none")
+    L += _status_held_and_plugins(gp, m)  # full5
     r = load_retry()
     if r:
         L.append(f"Pending retry request: doctor={r.get('doctor')} accept={','.join(r.get('accept') or []) or '-'} "

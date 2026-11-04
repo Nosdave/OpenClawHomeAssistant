@@ -127,6 +127,7 @@ print("└  Doctor complete.")
 #   sql / agent_sql       SQL statements run on the state DB / on every agent DB after the migration
 #   write                 {state-relative path: text} files doctor writes (parents are created)
 #   canonicalize_codex    openai-codex/ -> openai/ in openclaw.json (default true)
+#   skip_agents           agent ids whose DB (and agent_databases row) the migration leaves alone (held stores)
 #   baks                  state-relative DBs doctor copies to <db>.pre-startup-migration-<stamp>.bak first
 #   box                   print the clack box ending in "Doctor complete." (default true)
 #   print                 extra lines (inside the box when box is true)        rc   exit code (default 0)
@@ -161,14 +162,19 @@ if os.path.exists(sdb):
     for q in step.get("sql") or []:
         c.execute(q)
     if a_uv is not None:
+        skip = [str(x) for x in step.get("skip_agents") or []]
         try:
-            c.execute("UPDATE agent_databases SET schema_version=?", (a_uv,))
+            c.execute("UPDATE agent_databases SET schema_version=? WHERE agent_id NOT IN (%s)"
+                      % ",".join("?" * len(skip)) if skip else "UPDATE agent_databases SET schema_version=?",
+                      (a_uv, *skip))
         except sqlite3.OperationalError:
             pass
     c.commit()
     c.close()
 if a_uv is not None:
     for a in glob.glob(os.path.join(state, "agents/*/agent/openclaw-agent.sqlite")):
+        if os.path.basename(os.path.dirname(os.path.dirname(a))) in (step.get("skip_agents") or []):
+            continue
         c = sqlite3.connect(a)
         c.execute("PRAGMA user_version=%d" % int(a_uv))
         c.execute("UPDATE schema_meta SET schema_version=? WHERE meta_key='primary'", (a_uv,))

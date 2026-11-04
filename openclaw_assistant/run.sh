@@ -1157,6 +1157,32 @@ ensure_brave_plugin() {
 }
 
 # ------------------------------------------------------------------------------
+# Bring the ENABLED official npm plugins (@openclaw/codex, @openclaw/acpx, ...)
+# to the bundled OpenClaw version (CalVer cohort; peer openclaw >=<version>).
+# OpenClaw's doctor never does this (only `openclaw update` would, which the
+# add-on disables). `oc-upgrade plugins-sync` runs `openclaw plugins update
+# <pkg>@<version>` for each enabled one that is older (never a downgrade,
+# disabled plugins and Brave untouched; Brave is ensure_brave_plugin's job),
+# prints one report line and writes the per-version marker only when every
+# plugin got there, so a failed update is retried at the next start. Shares
+# the validated OPENCLAW_RUNTIME_VERSION with the Brave step. Runs after the
+# migration gate with the gateway down; best-effort, never blocks startup.
+# ------------------------------------------------------------------------------
+ensure_official_plugin_cohort() {
+  if [ -z "${OPENCLAW_RUNTIME_VERSION:-}" ]; then
+    echo "WARN: Official plugins not updated: the OpenClaw version is unknown (non-fatal)."
+    return 0
+  fi
+  runtime_at_least 2026.8.0 || return 0
+  if [ -f "/config/.openclaw/.plugin_cohort_${OPENCLAW_RUNTIME_VERSION}" ]; then
+    return 0
+  fi
+  timeout --kill-after=30 1200 oc-upgrade plugins-sync || \
+    echo "WARN: Official plugin update step failed or timed out (non-fatal); it runs again at the next start."
+  return 0
+}
+
+# ------------------------------------------------------------------------------
 # Migration gate (OpenClaw 2026.8+, when `gate --plan` asked for it above).
 # `oc-upgrade gate` checks for an encrypted Home Assistant backup (the rollback
 # point), cleans up, pre-migrates the config, runs `openclaw doctor --fix --non-interactive` twice and checks the
@@ -1409,6 +1435,8 @@ elif [ -f "$OPENCLAW_CONFIG_PATH" ]; then
   # Ensure Brave is present BEFORE repair-known-invalid-settings, so a persisted
   # tools.web.search.provider=brave is not stripped as "unavailable".
   ensure_brave_plugin || true
+  # Then the other enabled official plugins, to the same OpenClaw version (gateway still down).
+  ensure_official_plugin_cohort || true
   if [ -f "$HELPER_PATH" ]; then
     # Snapshot BEFORE the first mutation of this boot so `oc-config restore`
     # can always undo whatever the repair/apply steps below decide to change.
