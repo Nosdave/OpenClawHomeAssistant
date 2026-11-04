@@ -153,7 +153,7 @@ configuration:
 
   gate_cleanup_hours:
     name: Excluir capturas do doctor após (horas)
-    description: Horas após uma execução concluída do gate de migração até o complemento excluir as capturas do doctor do OpenClaw dessa execução (/config/.openclaw.update-captures/doctor-*). As cópias deixadas por versões anteriores do complemento (arquivos do gate em /share/openclaw-upgrade, exportações de ensaio em /share/openclaw-rehearsal, os arquivos não criptografados de 2026.7 em /config/.openclaw/upgrade-backups) são excluídas o mesmo tempo após sua execução, exportação ou migração. 0 = nunca. Uma alteração vale a partir da próxima inicialização do complemento. Faixa 0-720, padrão 48.
+    description: Horas após uma execução concluída do gate de migração até o complemento excluir as capturas do doctor do OpenClaw dessa execução (/config/.openclaw.update-captures/doctor-*) e as cópias SQLite que o doctor salvou nela ao lado dos bancos de dados (*.pre-startup-migration-*.bak, .scoped.bak). As cópias deixadas por versões anteriores do complemento (arquivos do gate em /share/openclaw-upgrade, exportações de ensaio em /share/openclaw-rehearsal, os arquivos não criptografados de 2026.7 em /config/.openclaw/upgrade-backups) são excluídas o mesmo tempo após sua execução, exportação ou migração. 0 = nunca. Uma alteração vale a partir da próxima inicialização do complemento. Faixa 0-720, padrão 48.
 
   gate_backup_max_age_hours:
     name: Idade exigida do backup (horas)

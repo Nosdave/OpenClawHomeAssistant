@@ -147,7 +147,8 @@ PINS = [
     {"path": ["tools", "toolSearch"], "value": False, "cond": None},
     {"path": ["tools", "swarm"], "value": False, "cond": None},
     {"path": ["gateway", "cliAgents", "enabled"], "value": False, "cond": None},
-    {"path": ["skills", "workshop", "approvalPolicy"], "value": "pending", "cond": None},
+    # gone with the Skill Workshop proposals in OpenClaw 2026.10.10 (strict skills.workshop schema; doctor removes it)
+    {"path": ["skills", "workshop", "approvalPolicy"], "value": "pending", "cond": "workshop-proposals"},
     {"path": ["skills", "workshop", "autonomous", "mode"], "value": "off", "cond": None},  # never .enabled
     {"path": ["plugins", "entries", "memory-core", "config", "dreaming", "enabled"], "value": False,
      "cond": "memory-slot"},
@@ -1721,10 +1722,12 @@ def check_runtime_pins(cfg, legacy_slots, retired_map=None, *, skip_codex=False)
 # --- pins ---------------------------------------------------------------------------------
 
 
-def _pin_condition(cfg, cond):
+def _pin_condition(cfg, cond, retires_skill_proposals=False):
     """None if the condition holds, else a short reason text."""
     if cond is None:
         return None
+    if cond == "workshop-proposals":
+        return "Skill Workshop proposals were removed in this OpenClaw version" if retires_skill_proposals else None
     if cond == "memory-slot":
         slot = _get(cfg, ["plugins", "slots", "memory"], None)
         if slot is None or (isinstance(slot, str) and slot.strip() in ("", "memory-core")):
@@ -1769,9 +1772,11 @@ def _system_agent_id(cfg):
     return v.strip() if isinstance(v, str) and v.strip() else None
 
 
-def apply_pins(cfg, ledgered_paths):
+def apply_pins(cfg, ledgered_paths, retires_skill_proposals=False):
     """§7.9: write each pin only where its leaf key is absent; never re-apply a ledgered path.
 
+    retires_skill_proposals: the bundled OpenClaw has no Skill Workshop proposals any more (runtime_caps, 2026.10.10+),
+    so skills.workshop.approvalPolicy is not written (its strict schema refuses the key).
     Returns (new_cfg, written[{path, value}], skipped[{path, reason}]) with reasons
     "ledgered", "already-set", "parent-not-dict" or "condition:<text>".
     """
@@ -1786,7 +1791,7 @@ def apply_pins(cfg, ledgered_paths):
         if path in ledgered:
             skipped.append({"path": path, "reason": "ledgered"})
             continue
-        why = _pin_condition(new, pin["cond"])
+        why = _pin_condition(new, pin["cond"], retires_skill_proposals)
         if why is not None:
             skipped.append({"path": path, "reason": "condition:" + why})
             continue

@@ -78,7 +78,7 @@ WARN [gate] test hook doctor_cmd in use
 [doctor] │
 [doctor] ◇  Doctor changes ───╮
 [doctor] └  Doctor complete.
-[gate] 4/8 doctor pass 1 rc=0 in <DUR>: Doctor complete. (1 pre-migration SQLite backups, <SIZE>)
+[gate] 4/8 doctor pass 1 rc=0 in <DUR>: Doctor complete. (1 full pre-migration SQLite copy by doctor, <SIZE>; not the rollback point)
 [gate] 5/8 fixups: codex plugin entry restored: no (Codex was in use before the migration: doctor's setting kept)
 WARN [gate] test hook doctor_cmd in use
 [gate] 6/8 doctor pass 2 started (limit <DUR>; log <TMP>/config/.openclaw-upgrade/gate/runs/<RUN>/doctor-pass2.log)
@@ -90,6 +90,7 @@ WARN [gate] test hook doctor_cmd in use
 [gate] 7/8 postconditions OK: schema 20/24, config valid, lint 0 errors, no legacy state, no legacy refs, models status ok, sessions openclaw (0)
 [gate] done: MIGRATED 2026.10.4 (run <RUN>, mode bump, total <DUR>)
 [gate] info: the doctor captures of this run are deleted after <TS> (gate_cleanup_hours=48)
+[gate] info: this run's 1 full pre-migration SQLite copy by doctor, <SIZE> (plaintext, beside the databases; not the rollback point): deleted at the same time
 
 ### bump: events.log
 <TS> WARN [gate] test hooks active: doctor_cmd, skip_backup_check, skip_network_check, skip_space_check
@@ -100,7 +101,7 @@ WARN [gate] test hook doctor_cmd in use
 <TS> [gate] 2/8 cleanup: quarantined 0 files (nothing to move) -> <TMP>/config/.openclaw-upgrade/gate/quarantine/<RUN>/
 <TS> WARN [gate] test hook doctor_cmd in use
 <TS> [gate] 4/8 doctor pass 1 started (limit <DUR>; log <TMP>/config/.openclaw-upgrade/gate/runs/<RUN>/doctor-pass1.log)
-<TS> [gate] 4/8 doctor pass 1 rc=0 in <DUR>: Doctor complete. (1 pre-migration SQLite backups, <SIZE>)
+<TS> [gate] 4/8 doctor pass 1 rc=0 in <DUR>: Doctor complete. (1 full pre-migration SQLite copy by doctor, <SIZE>; not the rollback point)
 <TS> [gate] 5/8 fixups: codex plugin entry restored: no (Codex was in use before the migration: doctor's setting kept)
 <TS> WARN [gate] test hook doctor_cmd in use
 <TS> [gate] 6/8 doctor pass 2 started (limit <DUR>; log <TMP>/config/.openclaw-upgrade/gate/runs/<RUN>/doctor-pass2.log)
@@ -108,6 +109,7 @@ WARN [gate] test hook doctor_cmd in use
 <TS> [gate] 7/8 postconditions OK: schema 20/24, config valid, lint 0 errors, no legacy state, no legacy refs, models status ok, sessions openclaw (0)
 <TS> [gate] done: MIGRATED 2026.10.4 (run <RUN>, mode bump, total <DUR>)
 <TS> [gate] info: the doctor captures of this run are deleted after <TS> (gate_cleanup_hours=48)
+<TS> [gate] info: this run's 1 full pre-migration SQLite copy by doctor, <SIZE> (plaintext, beside the databases; not the rollback point): deleted at the same time
 
 ### bump: journal
 {
@@ -165,9 +167,11 @@ WARN [gate] test hook doctor_cmd in use
    "pre_migration_backups": [
     {
      "path": "state/openclaw.sqlite.pre-startup-migration-20261101T000000Z.bak",
-     "size": "<N>"
+     "size": "<N>",
+     "scope": "full"
     }
-   ]
+   ],
+   "pre_migration_backups_older": 0
   },
   {
    "pass": 2,
@@ -180,7 +184,9 @@ WARN [gate] test hook doctor_cmd in use
    "code": null,
    "log": "runs/<RUN>/doctor-pass2.log",
    "config_sha256_before": "6776cd14a4d0321dc0d450277b963ad4cc82ee6e31b8cec2b13796cc8de3d8fd",
-   "config_sha256_after": "6776cd14a4d0321dc0d450277b963ad4cc82ee6e31b8cec2b13796cc8de3d8fd"
+   "config_sha256_after": "6776cd14a4d0321dc0d450277b963ad4cc82ee6e31b8cec2b13796cc8de3d8fd",
+   "pre_migration_backups": [],
+   "pre_migration_backups_older": 1
   }
  ],
  "accepted": [],
@@ -254,6 +260,7 @@ WARN [gate] test hook doctor_cmd in use
  ],
  "cron_legacy_ids": [],
  "cron_openai_ids": [],
+ "doctor_copies_before": [],
  "doctor_notes": [],
  "finished_at": "<TS>"
 }
@@ -293,9 +300,9 @@ Gate run <RUN>: mode bump, status done, phase finalize, started <TS>, finished <
   doctor pass 1: rc 0 in <DUR>
   doctor pass 2: rc 0 in <DUR>
 Migrated marker: 2026.10.4 (bump, run <RUN>, <TS>)
-Gate options: delete doctor captures 48 h after a run (0 = never); backup max age 24 h
+Gate options: delete doctor captures and SQLite copies 48 h after a run (0 = never); backup max age 24 h
 Quarantine: <TMP>/config/.openclaw-upgrade/gate/quarantine (0 files)
-Doctor pre-migration backups: 1 (<SIZE>)
+Doctor pre-migration SQLite copies: 1 full (.bak), 0 table-scoped (.scoped.bak) (<SIZE>) beside the databases in <TMP>/config/.openclaw: plaintext, not the rollback point; those a gate run made: deleted automatically, see oc-upgrade cleanup
 
 ### check after the bump
 rc=0
@@ -357,7 +364,7 @@ WARN [gate] test hook doctor_cmd in use
 [doctor] │
 [doctor] ◇  Doctor changes ───╮
 [doctor] └  Doctor complete.
-[gate] 4/8 doctor pass 1 rc=0 in <DUR>: Doctor complete. (1 pre-migration SQLite backups, <SIZE>)
+[gate] 4/8 doctor pass 1 rc=0 in <DUR>: Doctor complete. (no new pre-migration SQLite copy by doctor)
 [gate] 5/8 fixups: codex plugin entry restored: no (Codex was in use before the migration: doctor's setting kept)
 WARN [gate] test hook doctor_cmd in use
 [gate] 6/8 doctor pass 2 started (limit <DUR>; log <TMP>/config/.openclaw-upgrade/gate/runs/<RUN>/doctor-pass2.log)
@@ -379,7 +386,7 @@ WARN [gate] test hook doctor_cmd in use
 <TS> [gate] 2/8 cleanup: quarantined 0 files (nothing to move) -> <TMP>/config/.openclaw-upgrade/gate/quarantine/<RUN>/
 <TS> WARN [gate] test hook doctor_cmd in use
 <TS> [gate] 4/8 doctor pass 1 started (limit <DUR>; log <TMP>/config/.openclaw-upgrade/gate/runs/<RUN>/doctor-pass1.log)
-<TS> [gate] 4/8 doctor pass 1 rc=0 in <DUR>: Doctor complete. (1 pre-migration SQLite backups, <SIZE>)
+<TS> [gate] 4/8 doctor pass 1 rc=0 in <DUR>: Doctor complete. (no new pre-migration SQLite copy by doctor)
 <TS> [gate] 5/8 fixups: codex plugin entry restored: no (Codex was in use before the migration: doctor's setting kept)
 <TS> WARN [gate] test hook doctor_cmd in use
 <TS> [gate] 6/8 doctor pass 2 started (limit <DUR>; log <TMP>/config/.openclaw-upgrade/gate/runs/<RUN>/doctor-pass2.log)
@@ -441,12 +448,8 @@ WARN [gate] test hook doctor_cmd in use
    "log": "runs/<RUN>/doctor-pass1.log",
    "config_sha256_before": "6776cd14a4d0321dc0d450277b963ad4cc82ee6e31b8cec2b13796cc8de3d8fd",
    "config_sha256_after": "6776cd14a4d0321dc0d450277b963ad4cc82ee6e31b8cec2b13796cc8de3d8fd",
-   "pre_migration_backups": [
-    {
-     "path": "state/openclaw.sqlite.pre-startup-migration-20261101T000000Z.bak",
-     "size": "<N>"
-    }
-   ]
+   "pre_migration_backups": [],
+   "pre_migration_backups_older": 1
   },
   {
    "pass": 2,
@@ -459,7 +462,9 @@ WARN [gate] test hook doctor_cmd in use
    "code": null,
    "log": "runs/<RUN>/doctor-pass2.log",
    "config_sha256_before": "6776cd14a4d0321dc0d450277b963ad4cc82ee6e31b8cec2b13796cc8de3d8fd",
-   "config_sha256_after": "6776cd14a4d0321dc0d450277b963ad4cc82ee6e31b8cec2b13796cc8de3d8fd"
+   "config_sha256_after": "6776cd14a4d0321dc0d450277b963ad4cc82ee6e31b8cec2b13796cc8de3d8fd",
+   "pre_migration_backups": [],
+   "pre_migration_backups_older": 1
   }
  ],
  "accepted": [],
@@ -569,6 +574,9 @@ WARN [gate] test hook doctor_cmd in use
  ],
  "cron_legacy_ids": [],
  "cron_openai_ids": [],
+ "doctor_copies_before": [
+  "state/openclaw.sqlite.pre-startup-migration-20261101T000000Z.bak"
+ ],
  "doctor_notes": [],
  "finished_at": "<TS>"
 }
@@ -608,6 +616,6 @@ Gate run <RUN>: mode maintenance, status done, phase finalize, started <TS>, fin
   doctor pass 1: rc 0 in <DUR>
   doctor pass 2: rc 0 in <DUR>
 Migrated marker: 2026.10.4 (maintenance, run <RUN>, <TS>)
-Gate options: delete doctor captures 48 h after a run (0 = never); backup max age 24 h
+Gate options: delete doctor captures and SQLite copies 48 h after a run (0 = never); backup max age 24 h
 Quarantine: <TMP>/config/.openclaw-upgrade/gate/quarantine (0 files)
-Doctor pre-migration backups: 1 (<SIZE>)
+Doctor pre-migration SQLite copies: 1 full (.bak), 0 table-scoped (.scoped.bak) (<SIZE>) beside the databases in <TMP>/config/.openclaw: plaintext, not the rollback point; those a gate run made: deleted automatically, see oc-upgrade cleanup

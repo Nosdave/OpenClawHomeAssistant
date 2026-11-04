@@ -11,7 +11,12 @@ The golden file was captured from the gate code before the full5 hooks existed. 
 deliberate, decided 10.4-visible change (named in the CHANGELOG), made in the same commit as the code:
     OC_GATE_GOLDEN_UPDATE=1 python3 -m pytest -q tests/test_gate_golden_1004.py
 Deliberate changes so far: the precheck line's "foreign keys ok (2/2)" part (read-only foreign-key check, which
-OpenClaw 2026.10.4 enforces too; CHANGELOG "Migration gate, foreign keys").
+OpenClaw 2026.10.4 enforces too; CHANGELOG "Migration gate, foreign keys"); doctor's SQLite copies (CHANGELOG
+"doctor's pre-migration SQLite copies"): the doctor pass 1 line counts only the copies of that pass ("1 full
+pre-migration SQLite copy by doctor ...; not the rollback point", none in the maintenance run), the journal records
+them per pass (scope, pre_migration_backups_older, doctor_copies_before), finalize says they are deleted with the
+doctor captures, and the status lines name them ("Doctor pre-migration SQLite copies", "Gate options: delete doctor
+captures and SQLite copies").
 """
 
 import json

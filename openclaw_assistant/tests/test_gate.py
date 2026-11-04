@@ -2433,7 +2433,8 @@ class NoGateArchiveTests(GateEnv):
                                    r"\(gate_cleanup_hours=48\)\n")
         self.assertNotIn("archive", (self.upg / "gate" / "runs" / j["run_id"] / "events.log").read_text())
         st = G.status_lines()
-        self.assertIn("Gate options: delete doctor captures 48 h after a run (0 = never); backup max age 24 h", st)
+        self.assertIn("Gate options: delete doctor captures and SQLite copies 48 h after a run "
+                      "(0 = never); backup max age 24 h", st)
         self.assertEqual([x for x in st if "archive" in x.lower()], [])
 
     def test_finalize_with_cleanup_off_keeps_the_doctor_captures(self):

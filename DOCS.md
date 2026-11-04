@@ -360,7 +360,7 @@ These options control what the [migration gate](#upgrading-to-openclaw-202610-05
 
 | Option | Type | Default | Description |
 |---|---|---|---|
-| `gate_cleanup_hours` | int | `48` | Hours after a gate run (from `[gate] done`, or from when a hold after the run was cleared, whichever is later) before the add-on deletes the doctor captures that run created in `/config/.openclaw.update-captures/`. Copies that earlier add-on versions left (gate archives in `/share/openclaw-upgrade/`, rehearsal exports in `/share/openclaw-rehearsal/`, the plaintext 2026.7 archives in `/config/.openclaw/upgrade-backups/`) are deleted after the same number of hours, counted from their own time. `0` = never delete. A changed value applies from the next add-on start. Range: 0-720. See [Automatic deletion](#automatic-deletion-gate_cleanup_hours) |
+| `gate_cleanup_hours` | int | `48` | Hours after a gate run (from `[gate] done`, or from when a hold after the run was cleared, whichever is later) before the add-on deletes the doctor captures that run created in `/config/.openclaw.update-captures/` and the SQLite copies its doctor passes saved beside the databases (`*.pre-startup-migration-*.bak`, `.scoped.bak`). Copies that earlier add-on versions left (gate archives in `/share/openclaw-upgrade/`, rehearsal exports in `/share/openclaw-rehearsal/`, the plaintext 2026.7 archives in `/config/.openclaw/upgrade-backups/`) are deleted after the same number of hours, counted from their own time. `0` = never delete. A changed value applies from the next add-on start. Range: 0-720. See [Automatic deletion](#automatic-deletion-gate_cleanup_hours) |
 | `gate_backup_max_age_hours` | int | `24` | Before it changes the state, the gate requires an encrypted Home Assistant backup that contains this add-on and is at most this many hours old (for an OpenClaw update: taken before the update). Otherwise it holds (`ha-backup-missing`, acceptable). There is no value that switches the check off; to go ahead without a backup, accept the HOLD for that run. Range: 1-168 |
 
 **Supervisor API access (accepted risk).** For the backup check the add-on has
@@ -981,12 +981,12 @@ oc-upgrade status           # hold reason, gate run, HA backup checked, gate opt
 oc-upgrade gate --dry-run   # read-only preview of what the migration gate would do
 oc-upgrade retry            # continue after fixing a HOLD (then restart the add-on)
 oc-upgrade log              # tail of the last gate run's doctor log (redacted)
-oc-upgrade cleanup          # what the add-on deletes when: doctor captures, leftovers of earlier versions (--apply: what is due now)
+oc-upgrade cleanup          # what the add-on deletes when: doctor captures and SQLite copies, leftovers of earlier versions (--apply: what is due now)
 ```
 
 `oc-upgrade status` also shows the gate options (cleanup hours, backup age), the
-backup the last gate run checked, the doctor captures, and copies that earlier add-on
-versions left: gate archives in `/share/openclaw-upgrade/` and rehearsal exports in
+backup the last gate run checked, the doctor captures, doctor's pre-migration SQLite
+copies, the gate's Skill Workshop exports, and copies that earlier add-on versions left: gate archives in `/share/openclaw-upgrade/` and rehearsal exports in
 `/share/openclaw-rehearsal/` (`encrypted`, or `PLAINTEXT` for unencrypted ones), and the
 2026.7 pre-upgrade archives in `/config/.openclaw/upgrade-backups/` (`PLAINTEXT`). The
 add-on deletes all of these by itself (see [Automatic deletion](#automatic-deletion-gate_cleanup_hours)).
@@ -1056,8 +1056,9 @@ coming from `0.5.94-full1`, `0.5.94-full2` or `0.5.94-full3`, see the note after
    then test Telegram, your models, MCP and cron jobs.
 6. Keep the encrypted Home Assistant backup until you are sure: restoring it is the
    rollback (see [Safe rollback](#safe-rollback-after-an-openclaw-database-upgrade)).
-   The add-on deletes this run's doctor captures by itself `gate_cleanup_hours` after
-   the run (`[gate] info: the doctor captures of this run are deleted after …`; after a
+   The add-on deletes this run's doctor captures and doctor's SQLite copies by itself
+   `gate_cleanup_hours` after the run (`[gate] info: the doctor captures of this run are
+   deleted after …`; after a
    hold that followed the run, gateway exit 78 or a crash loop, counted from when you
    clear it with `oc-upgrade retry`), and the plaintext 2026.7 archives in
    `/config/.openclaw/upgrade-backups/` the same time after the migration completed
@@ -1163,6 +1164,45 @@ Unencrypted backups that contain this add-on are named in a `WARN` during the
 precheck (up to three, the rest counted; they hold its secrets in plaintext): delete
 them.
 
+#### Skill Workshop proposals (OpenClaw 2026.10.10+)
+
+OpenClaw 2026.10.10 and later no longer have Skill Workshop proposals. Its doctor keeps
+only the current draft of each pending or quarantined proposal, as files in the owner
+agent's Workshop archive
+(`/config/.openclaw/agents/<agent>/agent/workshop-skills/.archive/.retired-proposals/<id>/`),
+and drops everything else: applied, rejected and stale proposals, older draft versions,
+the proposal history, undo records and collection reviews. It also removes
+`skills.workshop.approvalPolicy` and `maxPending` from `openclaw.json` (the add-on's
+behaviour pin for `approvalPolicy` is not written on these versions). With OpenClaw
+2026.10.4 nothing of this happens and the gate prints none of the lines below.
+
+- **Precheck.** `[gate] 1/8 info: Skill Workshop proposals: N (pending …, quarantined …,
+  applied …, rejected …, stale …; …)` counts them (read-only). `WARN [gate] skill workshop: …`
+  names proposals doctor will keep back (owner agent not configured, unreadable record,
+  missing draft, a draft folder without a record) and unfinished applies whose files
+  doctor puts back. `oc-upgrade gate --dry-run` (and the readiness section of
+  `oc-upgrade check` while a migration is pending) shows `skill workshop: N proposals …`.
+- **Export before doctor pass 1.** The gate writes every proposal of every state to
+  `/config/.openclaw-upgrade/gate/runs/<run>/skill-workshop/`: `proposals.json` (all
+  rows with history, undo records and collection reviews), `PROPOSALS.md` (a readable
+  index) and `files/` (the files of `/config/.openclaw/skill-workshop/`, every draft
+  version). Secrets are replaced by `***` with the add-on's log redaction rules; the
+  exact originals exist only in the encrypted Home Assistant backup. Links, binary files
+  and files over 16 MiB are listed with size and sha256, not copied. The directory is
+  `0700` (files `0600`), stays inside `/config` (so it is in your encrypted backups; do
+  not copy it out of Home Assistant), is written once per run, and is kept until you
+  delete it (`gate_cleanup_hours` does not apply). `oc-upgrade status` lists the
+  exports. To use a draft again, ask the agent to save it with `/learn`.
+- **Export failed.** HOLD `skill-workshop-export-failed` (acceptable) before doctor
+  has run: free space or fix permissions under `/config/.openclaw-upgrade/gate/runs/`,
+  then `oc-upgrade retry` and restart. `oc-upgrade retry --accept
+  skill-workshop-export-failed` migrates without the export: then only the pending and
+  quarantined drafts survive (in the agents' Workshop archive).
+- **Doctor kept the storage.** `WARN [gate] 7/8 doctor kept the Skill Workshop proposal
+  storage …`: the migration still finishes (OpenClaw ignores the old storage) and the
+  export holds every proposal. Follow doctor's warning (`oc-upgrade log`), then
+  `oc-upgrade retry --doctor` and restart to retire it.
+
 #### Automatic deletion (`gate_cleanup_hours`)
 
 OpenClaw 2026.10 doctor leaves a copy of the databases in
@@ -1177,6 +1217,24 @@ logs and deletes only `doctor-<uuid>` directories inside
 secrets takes precedence over OpenClaw's own retention. If the add-on held after the
 run (gateway exit 78 or a crash loop), the time counts from when that hold was cleared
 with `oc-upgrade retry`, since that is later.
+
+**Doctor's SQLite copies.** Before it migrates a database, doctor saves a plaintext copy
+beside it: `<database>.pre-startup-migration-<id>.bak` (a full copy), from OpenClaw
+2026.10.10 for a fully declared migration instead `<id>.scoped.bak` (only the migrated
+tables: not a database, and only `openclaw database restore-migration-backup` can
+restore it). The update from 2026.10.4 to 2026.10.10 or 2026.11.1 writes full copies
+of every database. OpenClaw keeps them; they are not the add-on's rollback point (the
+encrypted Home Assistant backup is). The add-on deletes the copies a gate run's doctor
+passes saved at the same time as that run's doctor captures: the copies the run
+recorded per pass (`[gate] 4/8 doctor pass 1 … (1 full pre-migration SQLite copy by
+doctor, …)`) and every copy of a backup group its doctor logs name (`Saved
+pre-migration SQLite backup: …`), which covers the runs of earlier add-on versions too
+(their copies go at the first check after this update). It deletes only regular files
+with doctor's name pattern below `/config/.openclaw`, through directory handles that
+never follow a link. Copies that no gate run made (for example from the 2026.7
+gateway's own startup migrations) are left alone; `oc-upgrade status` counts all of
+them (`Doctor pre-migration SQLite copies: …`), and you can delete those by hand. Never
+copy a `.bak` or `.scoped.bak` over a database.
 
 It also deletes the copies that earlier add-on versions left, each
 `gate_cleanup_hours` after its own time:
@@ -1195,8 +1253,9 @@ It also deletes the copies that earlier add-on versions left, each
   migration (the gate's migrated marker). Nothing is deleted there before such a
   migration.
 
-It leaves alone what belongs to a run that can still continue and doctor captures
-that no gate run created.
+It leaves alone what belongs to a run that can still continue, doctor captures and
+SQLite copies that no gate run created, and the gate's Skill Workshop exports
+(`/config/.openclaw-upgrade/gate/runs/<run>/skill-workshop/`, kept until you delete them).
 
 The deletion runs next to the gateway: once at start, then hourly. It pauses while a
 HOLD is active, a gate run is running, interrupted or held, or a retry is pending
@@ -1447,7 +1506,7 @@ The add-on tells the Supervisor to skip regenerable caches and tooling, so backu
 | `__pycache__/` | Python bytecode — regenerated automatically |
 | `*.jsonl.lock` | stale session locks — never useful to restore |
 
-Everything else is backed up: `openclaw.json`, config snapshots, skills, agent sessions, the `clawd` workspace, keys, secrets and TLS certificates. That includes OpenClaw 2026.10's doctor captures in `/config/.openclaw.update-captures/` (database copies from each doctor pass) until the add-on deletes them, `gate_cleanup_hours` after their gate run, and the plaintext 2026.7 archives in `/config/.openclaw/upgrade-backups/` until they are deleted after the 2026.10 migration (see [Automatic deletion](#automatic-deletion-gate_cleanup_hours)).
+Everything else is backed up: `openclaw.json`, config snapshots, skills, agent sessions, the `clawd` workspace, keys, secrets and TLS certificates. That includes OpenClaw 2026.10's doctor captures in `/config/.openclaw.update-captures/` (database copies from each doctor pass) and doctor's SQLite copies beside the databases (`*.pre-startup-migration-*.bak`, `.scoped.bak`) until the add-on deletes them, `gate_cleanup_hours` after their gate run, the gate's Skill Workshop exports in `/config/.openclaw-upgrade/gate/runs/<run>/skill-workshop/` (secrets redacted) until you delete them, and the plaintext 2026.7 archives in `/config/.openclaw/upgrade-backups/` until they are deleted after the 2026.10 migration (see [Automatic deletion](#automatic-deletion-gate_cleanup_hours)).
 
 > **Important**: restoring a backup replaces `/config` wholesale, so excluded directories are **removed** by a restore rather than left in place. After restoring, reinstall any brew or global npm tools you depend on. Caches rebuild themselves.
 

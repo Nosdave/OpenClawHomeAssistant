@@ -568,9 +568,9 @@ class Full2CliTests(CliEnv):
                 p.kill()
                 p.communicate()
         self.assertEqual(p.returncode, 143, out)
-        self.assertIn("[cleanup] doctor captures are deleted 48 h after their gate run; gate archives and rehearsal "
-                      "exports of earlier add-on versions and the 2026.7 plaintext archives the same time after "
-                      "their run, export or migration (checked hourly)\n", out)
+        self.assertIn("[cleanup] doctor captures and doctor's SQLite copies are deleted 48 h after their gate run; "
+                      "gate archives and rehearsal exports of earlier add-on versions and the 2026.7 plaintext "
+                      "archives the same time after their run, export or migration (checked hourly)\n", out)
         self.assertIn(f"[cleanup] run {rid}: deleted 2 item(s)", out)
         self.assertFalse(adir.exists())
         self.assertFalse(caps[0].exists())
@@ -594,22 +594,26 @@ class Full2CliTests(CliEnv):
         self.set_options({"gate_cleanup_hours": 12, "gate_backup_max_age_hours": 72})
         self.assertEqual(self.cli("status"), 0, self.stderr)
         self.assertEqual(self.gate_options_line(),
-                         "Gate options: delete doctor captures 12 h after a run (0 = never); backup max age 72 h")
+                         "Gate options: delete doctor captures and SQLite copies 12 h after a run "
+                         "(0 = never); backup max age 72 h")
 
         self.set_options({"gate_cleanup_hours": 0})
         self.assertEqual(self.cli("status"), 0)
         self.assertEqual(self.gate_options_line(),
-                         "Gate options: delete doctor captures 0 h after a run (0 = never); backup max age 24 h")
+                         "Gate options: delete doctor captures and SQLite copies 0 h after a run "
+                         "(0 = never); backup max age 24 h")
 
         (self.tmp / "options.json").unlink()
         self.assertEqual(self.cli("status"), 0)
         self.assertEqual(self.gate_options_line(),
-                         "Gate options: delete doctor captures 48 h after a run (0 = never); backup max age 24 h")
+                         "Gate options: delete doctor captures and SQLite copies 48 h after a run "
+                         "(0 = never); backup max age 24 h")
 
         self.set_options({"gate_cleanup_hours": "secret-ish-48", "gate_backup_max_age_hours": 9999})
         self.assertEqual(self.cli("status"), 0)
         self.assertEqual(self.gate_options_line(),
-                         "Gate options: delete doctor captures 48 h after a run (0 = never); backup max age 24 h")
+                         "Gate options: delete doctor captures and SQLite copies 48 h after a run "
+                         "(0 = never); backup max age 24 h")
         self.assertNotIn("secret-ish", self.stdout + self.stderr)
         self.assertNotIn("9999", self.stdout + self.stderr)
 
@@ -618,7 +622,8 @@ class Full2CliTests(CliEnv):
                           "gate_cleanup_hours": 12})
         self.assertEqual(self.cli("status"), 0)
         self.assertEqual(self.gate_options_line(),
-                         "Gate options: delete doctor captures 12 h after a run (0 = never); backup max age 24 h")
+                         "Gate options: delete doctor captures and SQLite copies 12 h after a run "
+                         "(0 = never); backup max age 24 h")
         self.assertNotIn("gate_archive", self.stdout)
         self.assertNotIn(FAKE_RECIPIENT[:9], self.stdout)
         self.assertNotIn("Export requested", self.stdout)
@@ -632,8 +637,8 @@ class Full2CliTests(CliEnv):
             with self.subTest(key=key.strip()[:18]):
                 self.set_options({"gate_archive": "encrypted", "gate_archive_age_recipient": key})
                 self.assertEqual(self.cli("status"), 0, self.stderr)
-                self.assertEqual(self.gate_options_line(), "Gate options: delete doctor captures 48 h after a run "
-                                                           "(0 = never); backup max age 24 h")
+                self.assertEqual(self.gate_options_line(), "Gate options: delete doctor captures and SQLite copies "
+                                                           "48 h after a run (0 = never); backup max age 24 h")
                 out = self.stdout + self.stderr
                 for args in (("cleanup",), ("cleanup", "--apply"), ("export",), ("help",)):
                     self.cli(*args)

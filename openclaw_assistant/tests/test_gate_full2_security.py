@@ -899,8 +899,8 @@ class RetentionBaseTests(SecEnv):
         self.assertEqual(G.run_due_base(r.j), cleared)
         due = cleared + H48
         self.assertEqual(self.cleanup(T0 + H48), 0)  # finished_at + 48 h is not enough any more
-        self.assertEqual(self.lines, [f"[cleanup] run {r.rid}: 1 item(s) (doctor captures / archive) will be deleted "
-                                      f"at {iso(due)}"])
+        self.assertEqual(self.lines, [f"[cleanup] run {r.rid}: 1 item(s) (doctor captures, doctor SQLite copies / "
+                                      f"archive) will be deleted at {iso(due)}"])
         self.assertEqual(self.cleanup(due - SEC), 0)
         self.assertTrue(r.adir.is_dir())
         self.assertEqual(self.cleanup(due), 1)

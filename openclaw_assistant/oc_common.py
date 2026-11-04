@@ -762,6 +762,17 @@ def redact_text(s):
     return s
 
 
+def redact_text_counted(s):
+    """(redact_text(s), number of replacements): the same rules, for exports that report what they hid."""
+    if not s:
+        return s, 0
+    total = 0
+    for rx, rep in _REDACT_RES:
+        s, n = rx.subn(rep, s)
+        total += n
+    return s, total
+
+
 # --- subprocess runner -------------------------------------------------------------------
 
 class RunResult(tuple):

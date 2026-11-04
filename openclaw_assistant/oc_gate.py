@@ -17,6 +17,7 @@ as "[doctor] ..." (redacted). Secrets are never printed.
 """
 
 import errno
+import hashlib
 import json
 import math
 import os
@@ -179,7 +180,11 @@ ADVICE = {
                                   "a different PID namespace, wait 90 s after the previous stop first",
     "doctor-plugin-load": "make sure the network is available, then oc-upgrade retry",
     "doctor-config-write": "oc-upgrade retry",
-    "doctor-backup-unverifiable": "data at risk: restoring the backup is recommended; oc-upgrade retry is allowed",
+    "doctor-backup-unverifiable": "data at risk: doctor could not verify its own pre-migration SQLite copies "
+                                  "(*.pre-startup-migration-*.bak / .scoped.bak beside the databases). Restore the "
+                                  "add-on from the encrypted Home Assistant backup (the rollback point; never copy a "
+                                  ".bak or .scoped.bak over a database by hand), or oc-upgrade retry to let doctor "
+                                  "try again",
     "doctor-incomplete": "oc-upgrade retry (doctor resumes from its last committed step)",
     "doctor-failed": "see oc-upgrade log, fix the reported check, then oc-upgrade retry",
     "doctor-timeout": "oc-upgrade retry (doctor resumes; it is not re-run automatically in the same start)",
@@ -273,6 +278,38 @@ RETIRED_WARNING_MARKERS = ("predates July 1, 2026", "Cannot inspect potentially 
 FINAL_PASS_SUSPICIOUS = ("data/settings upgrade is unfinished", "Deferred auth profile alias",
                          "Deferred stale auth profile alias", "Kept auth profile ",
                          "Dreaming cron inspection remains pending")
+
+# Skill Workshop proposals (full5; runtime_caps retires_skill_proposals, OpenClaw 2026.10.10+): doctor keeps only the
+# current drafts of pending/quarantined proposals (as files in the owner agent's workshop-skills/.archive/
+# .retired-proposals/) and drops the four tables plus <state>/skill-workshop/proposals and proposals.json
+# (doctor-skill-workshop-retire-proposals.ts). The gate exports everything first to runs/<id>/skill-workshop/.
+SW_TABLES = ("skill_workshop_proposals", "skill_workshop_proposal_events", "skill_workshop_proposal_rollbacks",
+             "skill_workshop_collection_reviews")
+SW_STATE_DIR = "skill-workshop"  # <state>/skill-workshop/ (proposals/<id>/..., proposals.json, recovery/)
+SW_EXPORT_DIR = "skill-workshop"  # runs/<id>/skill-workshop/ (never deleted by the cleanup)
+SW_EXPORT_SCHEMA = "oc-gate/skill-workshop-export/1"
+SW_FILE_CAP = 16 * C.MIB  # larger files are listed with size and sha256 only
+SW_ID_RE = re.compile(r"[a-z0-9][a-z0-9-]{5,120}")  # doctor's PROPOSAL_ID_PATTERN (fullmatch)
+SW_DRAFT_RE = re.compile(r"(?:generations/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/)?PROPOSAL\.md")
+SW_EXPORTED_STATUSES = ("pending", "quarantined")
+SW_STATUSES = ("pending", "quarantined", "applied", "rejected", "stale")
+# export redaction per JSON leaf: values under these keys are hidden whole; hashes and ids are kept as they are (the
+# bare "key$" of oc_migrate._SECRET_KEY_RE is left out on purpose: origin.sessionKey stays readable)
+SW_SECRET_KEY_RE = re.compile(r"(?i)token|secret|password|passwd|api_?key|private_?key|access_?key|credential|"
+                              r"authorization|cookie|^key$")
+SW_HASH_KEY_RE = re.compile(r"(?i)(?:hash|sha256|digest)$")
+SW_HASH_VALUE_RE = re.compile(r"(?:sha256:)?[0-9a-f]{32,128}")
+SW_ID_VALUE_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,200}")
+SW_JSON_COLUMNS = frozenset({"record_json", "actor_json", "payload_json", "support_files_json", "kept_names_json",
+                             "written_names_json", "dropped_json"})
+# doctor's own SQLite copies beside each database it migrates: <db>.pre-startup-migration-<id>.bak (full) and, from
+# OpenClaw 2026.10.10, <db>.pre-startup-migration-<id>.scoped.bak (only the tables of a declared migration)
+DOCTOR_COPY_GLOB = "*.pre-startup-migration-*.bak"
+DOCTOR_COPY_RE = re.compile(r"[^/]{1,240}\.pre-startup-migration-([A-Za-z0-9][A-Za-z0-9-]{0,63})(?:\.scoped)?\.bak")
+# "Saved/Reused pre-migration SQLite backup: <db>.pre-startup-migration-<group id>[.scoped].bak" in a doctor log, matched
+# with every blank and box character removed (a long path can wrap inside doctor's box): the id names the group
+SAVED_COPY_ID_RE = re.compile(r"(?:Saved|Reused)pre-migrationSQLitebackup:\S*?\.pre-startup-migration-"
+                              r"([A-Za-z0-9][A-Za-z0-9-]{0,63}?)(?:\.scoped)?\.bak")
 
 STOP = threading.Event()
 _STOP_SIG = [None]
@@ -1540,11 +1577,42 @@ _NOTE_RES = (
 )
 
 
-def doctor_notes(text):
+# OpenClaw 2026.10.10+ doctor retiring the Skill Workshop proposals (doctor-skill-workshop-retire-proposals.ts): only
+# counts and proposal ids are captured (a box can wrap a long path). Not doctor warnings for a HOLD: the holdback is
+# harmless (the runtime ignores the tables) and the postconditions report it from the real state.
+_SW_ID = r"([a-z0-9][a-z0-9-]{5,120})"
+_SW_NOTE_RES = (
+    ("info", re.compile(r"Exported (\d+) pending Skill Workshop proposal drafts?\b"),
+     lambda m: f"doctor archived {m.group(1)} pending/quarantined Skill Workshop draft(s) in the owner agent's "
+               "workshop-skills/.archive/.retired-proposals/"),
+    ("info", re.compile(r"Retired the Skill Workshop proposal tables"),
+     lambda m: "doctor retired the Skill Workshop proposal tables (OpenClaw no longer has the applied, rejected and "
+               "stale proposals, their history and undo records)"),
+    ("warn", re.compile(r"Restored \S+ from the unfinished apply of Skill Workshop proposal " + _SW_ID),
+     lambda m: f"doctor put back the pre-apply skill files of Skill Workshop proposal {m.group(1)} (its apply never "
+               "finished)"),
+    ("warn", re.compile(r"No configured agent owns Skill Workshop proposal " + _SW_ID),
+     lambda m: f"doctor kept Skill Workshop proposal {m.group(1)}: no configured agent owns it (doctor's warning in "
+               "oc-upgrade log says what to do)"),
+    ("warn", re.compile(r"Skill Workshop proposal " + _SW_ID + r" has no draft left to export"),
+     lambda m: f"doctor retired the record of Skill Workshop proposal {m.group(1)}: its draft was already gone"),
+    ("warn", re.compile(r"Skill Workshop proposal " + _SW_ID + r" has no (draft|record);"),
+     lambda m: f"doctor kept Skill Workshop proposal {m.group(1)}: it has no {m.group(2)} (doctor's warning in "
+               "oc-upgrade log says what to do)"),
+    ("warn", re.compile(r"Could not (export|read the unfinished apply of|undo the unfinished apply of|read) Skill "
+                        r"Workshop proposal " + _SW_ID),
+     lambda m: f"doctor could not {m.group(1)} Skill Workshop proposal {m.group(2)}; it kept the proposal storage "
+               "(see oc-upgrade log)"),
+    ("warn", re.compile(r"Skill Workshop proposals changed during export"),
+     lambda m: "doctor did not finish retiring the Skill Workshop proposals (they changed during its export)"),
+)
+
+
+def doctor_notes(text, patterns=None):
     """[[level, message]] for doctor messages worth surfacing after a migration (deduplicated)."""
     norm = normalize_doctor_text(text)
     notes = []
-    for level, rx, fmt in _NOTE_RES:
+    for level, rx, fmt in _NOTE_RES + _SW_NOTE_RES if patterns is None else patterns:
         for m in rx.finditer(norm):
             msg = C.redact_text(fmt(m))
             if [level, msg] not in notes:
@@ -2368,8 +2436,31 @@ class Gate:
 
     def skill_workshop_precheck(self):
         """Precheck 7 (Skill Workshop): inventory of the proposals; returns the bytes the export adds to the
-        /config space need."""
-        return 0
+        /config space need. Only on runtimes whose doctor retires the proposals (runtime_caps
+        retires_skill_proposals, 2026.10.10+); read-only, so also in dry-run and oc-upgrade check."""
+        self.facts.pop("sw_inventory", None)
+        if not self.caps()["retires_skill_proposals"]:
+            return 0
+        try:
+            inv = skill_workshop_inventory(self.gp["STATE"], self.cfg)
+        except (sqlite3.Error, C.NodeQueryError, OSError, ValueError) as exc:
+            self.warn(f"skill workshop: the proposals could not be counted ({type(exc).__name__}: "
+                      f"{C.redact_text(str(exc))[:200]}); the export before doctor pass 1 tries again")
+            return 0
+        self.facts["sw_inventory"] = inv
+        if sw_empty(inv) or self.sw_export_done():
+            return 0
+        return int(inv["bytes"]) + int(inv["file_bytes"])
+
+    def sw_export_dir(self):
+        return self.run_dir() / SW_EXPORT_DIR
+
+    def sw_export_done(self):
+        """This run's Skill Workshop export is complete (journal record and MANIFEST.json)."""
+        if self.dry_run or not self.j or not self.j.get("run_id"):
+            return False
+        rec = (self.j.get("skill_workshop") or {}).get("export") or {}
+        return bool(rec.get("complete")) and (self.sw_export_dir() / "MANIFEST.json").is_file()
 
     def fk_checks(self, F, state_db):
         """Precheck 9b (schema): PRAGMA foreign_key_check of the databases quick_check checked; appends findings
@@ -2438,7 +2529,29 @@ class Gate:
         return f"foreign keys ok ({ok}/{n}" + (", " + ", ".join(extra) if extra else "") + ")"
 
     def skill_workshop_info(self, F):
-        """Precheck 11b (Skill Workshop): info and WARN lines about the proposals doctor will retire."""
+        """Precheck 11b (Skill Workshop): info and WARN lines about the proposals doctor will retire (never a
+        finding: what doctor keeps back is harmless, the postconditions report it from the real state)."""
+        inv = self.facts.get("sw_inventory")
+        if not self.caps()["retires_skill_proposals"] or sw_empty(inv):
+            return None
+        bs = inv["by_status"]
+        keep = sum(bs.get(s, 0) for s in SW_EXPORTED_STATUSES)
+        legacy = f", {inv['legacy_bundles']} pre-SQLite draft folder(s)" if inv.get("legacy_bundles") else ""
+        tail = (f"this run's export (secrets redacted): {self.sw_export_dir()}/" if self.sw_export_done() else
+                "the gate exports all of them before doctor pass 1 (secrets redacted)")
+        self.say(f"{self.pn('precheck')} info: Skill Workshop proposals: {inv['proposals']} ({sw_status_text(bs)}; "
+                 f"{inv['events']} events, {inv['rollbacks']} rollback records, {inv['reviews']} collection reviews, "
+                 f"{inv['files']} files{legacy}). OpenClaw {self.pkg['version']} doctor keeps only the {keep} "
+                 "pending/quarantined drafts (as files in the owner agent's workshop-skills/.archive/"
+                 f".retired-proposals/) and drops the rest; {tail}")
+        warns = [f"doctor will keep the proposal storage (the migration continues; the gate reports it afterwards): "
+                 f"{h}" for h in inv["holdbacks"]] + list(inv["unfinished"])
+        for w in warns[:10]:
+            self.warn(f"skill workshop: {w}")
+        if len(warns) > 10:
+            self.warn(f"skill workshop: and {len(warns) - 10} more")
+        if self.j is not None and not self.j.get("first_write_at"):
+            self.j.setdefault("skill_workshop", {})["inventory"] = sw_counts(inv)
         return None
 
     def cron_binding_forecast(self, F, mode):
@@ -2448,7 +2561,56 @@ class Gate:
 
     def skill_workshop_export(self):
         """Doctor pass 1 pre-pass hook (Skill Workshop): export every proposal before doctor retires them; runs
-        before mark_first_write. May raise HoldError skill-workshop-export-failed (acceptable)."""
+        before mark_first_write. May raise HoldError skill-workshop-export-failed (acceptable).
+
+        Write-once per run (runs/<id>/skill-workshop/, MANIFEST.json last); kept until the user deletes it (the
+        cleanup never deletes runs/). It does not change the OpenClaw state, so it never counts as the first write.
+        Also on a resumed run whose doctor already started (a held run after an image update, retry --doctor):
+        whatever is still there is exported before the next pass."""
+        if not self.caps()["retires_skill_proposals"]:
+            return None
+        sw = self.j.get("skill_workshop") or {}
+        dest = self.sw_export_dir()
+        if (dest / "MANIFEST.json").is_file():
+            if not (sw.get("export") or {}).get("complete"):  # the journal save after the rename was lost
+                rec = sw_export_record(self.gp, self.j["run_id"]) or {}
+                self.j.setdefault("skill_workshop", {})["export"] = dict(rec, dir=C.rel(dest, self.gp["GATE"]),
+                                                                         complete=True)
+                self.save()
+            self.say(f"4/8 skill workshop: export of this run already written ({dest}/)")
+            return None
+        ver = self.pkg["version"]
+        try:
+            inv = skill_workshop_inventory(self.gp["STATE"], self.cfg)
+            if sw_empty(inv):
+                if (sw.get("inventory") or {}).get("proposals"):
+                    self.warn("skill workshop: the proposal storage the precheck counted is gone before doctor pass 1; "
+                              "nothing to export")
+                return None
+            src = schema_meta_primary(self.gp["STATE"] / "state" / "openclaw.sqlite") or {}
+            res = export_skill_workshop(self.gp["STATE"], dest, {"run_id": self.j["run_id"], "openclaw_to": ver,
+                                                                 "openclaw_from": src.get("app_version")}, stop=STOP)
+        except (GateStopped, C.Stopped):
+            raise GateStopped()
+        except Exception as exc:  # noqa: BLE001 - any failure: doctor must not run before the user decides
+            msg = (f"could not export the Skill Workshop proposals before OpenClaw {ver} doctor drops them: "
+                   f"{type(exc).__name__}: {C.redact_text(str(exc))[:240]}")
+            if "skill-workshop-export-failed" in self.accepted:
+                self.warn(f"accepted skill-workshop-export-failed: {msg}; no export: OpenClaw doctor keeps only the "
+                          "pending and quarantined drafts")
+                self.j.setdefault("skill_workshop", {})["export"] = {"accepted": True, "error": type(exc).__name__}
+                self.save()
+                return None
+            raise HoldError([finding("skill-workshop-export-failed", "acceptable", msg, "doctor1")], "doctor1")
+        self.j.setdefault("skill_workshop", {})["export"] = dict(res, dir=C.rel(dest, self.gp["GATE"]),
+                                                                 at=C.utc_iso(), complete=True)
+        self.save()
+        self.say(f"4/8 skill workshop: exported {res['proposals']} proposals (all states), {res['events']} events, "
+                 f"{res['rollbacks']} rollback records, {res['collection_reviews']} collection reviews and "
+                 f"{res['files']} files ({res['redactions']} secrets redacted) -> {dest}/")
+        for o in (res.get("omitted_paths") or [])[:5]:
+            self.warn(f"skill workshop: skill-workshop/{printable(o)} not exported (a link, binary or larger than "
+                      f"{C.human(SW_FILE_CAP)}); its size and sha256 are in proposals.json")
         return None
 
     def cron_binding_postcheck(self, cfg, summary):
@@ -2457,12 +2619,54 @@ class Gate:
         return None
 
     def skill_workshop_postcheck(self, summary):
-        """Postconditions before the plugin WARNs (Skill Workshop): WARN when doctor kept the proposal storage."""
+        """Postconditions before the plugin WARNs (Skill Workshop): WARN when doctor kept the proposal storage
+        (decided: WARN, no HOLD; the runtime ignores it and this run's export holds every proposal)."""
+        if not self.caps()["retires_skill_proposals"]:
+            return None
+        sw = self.j.get("skill_workshop") or {}
+        exp = sw.get("export") or {}
+        where = self.gp["GATE"] / exp["dir"] if exp.get("complete") and exp.get("dir") else None
+        try:
+            inv = skill_workshop_inventory(self.gp["STATE"], self.cfg)
+        except (sqlite3.Error, C.NodeQueryError, OSError, ValueError) as exc:
+            self.warn(f"7/8 the Skill Workshop proposal storage could not be checked ({type(exc).__name__}: "
+                      f"{C.redact_text(str(exc))[:200]})")
+            return None
+        if sw_empty(inv):
+            if where or (sw.get("inventory") or {}).get("proposals"):
+                summary.append("Skill Workshop proposals retired"
+                               + (f" (export {C.rel(where, self.gp['GATE'])})" if where else ""))
+            return None
+        self.j.setdefault("skill_workshop", {})["retained"] = sw_counts(inv)
+        self.warn(f"7/8 doctor kept the Skill Workshop proposal storage ({inv['proposals']} proposals, {inv['files']} "
+                  f"files): OpenClaw {self.pkg['version']} ignores it; follow doctor's warning (oc-upgrade log), then "
+                  "oc-upgrade retry --doctor to retire it."
+                  + (f" This run's export holds every proposal: {where}/" if where else ""))
         return None
 
     def _finalize_skill_lines(self):
         """Finalize, after the doctor notes (Skill Workshop): info line about this run's export."""
+        exp = (self.j.get("skill_workshop") or {}).get("export") or {}
+        if exp.get("complete") and exp.get("dir"):
+            self.say(f"info: Skill Workshop export of this run: {self.gp['GATE'] / exp['dir']}/ ({exp.get('proposals')} "
+                     "proposals, secrets redacted); it is kept until you delete it (gate_cleanup_hours does not apply)")
         return None
+
+    def record_doctor_copies(self, n):
+        """After doctor pass n: the SQLite copies this pass created (not in the run's baseline taken before its first
+        pass, not journaled by an earlier pass of the run), on the pass's journal record. They are deleted with the
+        run's doctor captures (run_doctor_copies)."""
+        cur = doctor_copies(self.gp["STATE"])
+        base = set(self.j.get("doctor_copies_before") or [])
+        known = {e.get("path") for d in self.j.get("doctor") or [] if isinstance(d, dict)
+                 for e in d.get("pre_migration_backups") or [] if isinstance(e, dict)}
+        new = [{"path": r, "size": size, "scope": scope} for r, (size, scope) in sorted(cur.items())
+               if r not in base and r not in known]
+        rec = self.j["doctor"][-1]
+        rec["pre_migration_backups"] = new
+        rec["pre_migration_backups_older"] = len(cur) - len(new)
+        self.save()
+        return new
 
     def _finalize_cron_lines(self):
         """Finalize, after the Skill Workshop lines (cron): info/WARN lines per affected job."""
@@ -2718,21 +2922,17 @@ class Gate:
         self.skill_workshop_export()  # full5: before the first write and before doctor_started
         self.mark_first_write()
         self.j["doctor_started"] = True
+        if "doctor_copies_before" not in self.j:  # doctor's SQLite copies that existed before this run's doctor
+            self.j["doctor_copies_before"] = sorted(doctor_copies(p["STATE"]))[:1000]
         self.save()
         self.copy_once(p["CONFIG_PATH"], rd / "config.pre-pass1.json")
         if self.j.get("plugins_before") is None:
             self.j["plugins_before"] = plugin_snapshot(p["STATE"])
             self.save()
         ev = self.run_doctor_pass(1, "doctor1")
+        baks = self.record_doctor_copies(1)  # only the copies of this pass (full .bak / table-scoped .scoped.bak)
         self.doctor_failure(ev, "doctor1", 1)
         self.j["doctor_notes"] = doctor_notes(ev["text"])
-        baks = []
-        for b in p["STATE"].rglob("*.pre-startup-migration-*.bak"):
-            try:
-                baks.append({"path": C.rel(b, p["STATE"]), "size": b.stat().st_size})
-            except OSError:
-                pass
-        self.j["doctor"][-1]["pre_migration_backups"] = baks
         for c in p["STATE"].rglob("*.capturing"):
             self.warn(f"leftover {C.rel(c, p['STATE'])} after doctor pass 1")
         try:
@@ -2751,9 +2951,8 @@ class Gate:
                           + ", ".join(tuning[:8]))
         except C.ConfigReadError as exc:
             self.warn(f"cannot compare config before/after pass 1: {exc}")
-        total = sum(x["size"] for x in baks)
         self.say(f"4/8 doctor pass 1 rc={ev['rc']} in {C.fmt_duration(ev['duration'])}: Doctor complete. "
-                 f"({len(baks)} pre-migration SQLite backups, {C.human(total)})")
+                 f"({copies_text(baks)}{'; not the rollback point' if baks else ''})")
         self.complete_phase("doctor1")
         F = [finding(e["code"], "acceptable", f"pass 1: {e['message']}", "doctor1") for e in acceptable_doctor(ev)]
         if F:  # doctor-warnings, doctor-held-back (2026.10: rc 0)
@@ -2931,10 +3130,9 @@ class Gate:
         p, rd = self.gp, self.run_dir()
         sha0 = _sha_or_none(p["CONFIG_PATH"])
         ev = self.run_doctor_pass(2, "doctor2")
+        self.after_later_pass(ev, 2)
         self.doctor_failure(ev, "doctor2", 2)
         warnings = acceptable_doctor(ev)
-        if "Saved pre-migration SQLite backup" in normalize_doctor_text(ev["text"]):
-            self.warn("doctor pass 2 saved another pre-migration SQLite backup")
         sha1 = _sha_or_none(p["CONFIG_PATH"])
         result = "config unchanged"
         hold = None
@@ -2945,6 +3143,7 @@ class Gate:
         if sha1 != sha0:
             sha1f = _sha_or_none(p["CONFIG_PATH"])
             ev3 = self.run_doctor_pass(3, "doctor2")
+            self.after_later_pass(ev3, 3)
             self.doctor_failure(ev3, "doctor2", 3)
             # pass 3 is the last pass now: pass-2 warnings that only rest on a final-pass marker are superseded
             warnings = [w for w in warnings if w["code"] != "doctor-warnings"
@@ -2980,6 +3179,19 @@ class Gate:
             F.append(hold)
         if F:
             self.resolve(F, "doctor2", resume_after=True)
+
+    def after_later_pass(self, ev, n):
+        """Doctor pass 2/3: its own SQLite copies, and the Skill Workshop notes of a retirement that only finishes in
+        a later pass (the other doctor notes come from pass 1 only)."""
+        new = self.record_doctor_copies(n)
+        if new or "Saved pre-migration SQLite backup" in normalize_doctor_text(ev["text"]):
+            self.warn(f"doctor pass {n} saved another pre-migration SQLite copy (doctor's own; not the rollback "
+                      "point)")
+        notes = self.j.setdefault("doctor_notes", [])
+        add = [x for x in doctor_notes(ev["text"], _SW_NOTE_RES) if x not in notes]
+        if add:
+            notes += add
+            self.save()
 
     def changed_paths(self, rd):
         try:
@@ -3212,7 +3424,8 @@ class Gate:
         except C.ConfigReadError as exc:
             raise HoldError([finding("pc-config", "hard", f"openclaw.json cannot be read before the pins: {exc}",
                                      "pins")], "pins")
-        new_cfg, written, skipped = M.apply_pins(base, set(ledgered))
+        new_cfg, written, skipped = M.apply_pins(base, set(ledgered),
+                                                 retires_skill_proposals=self.caps()["retires_skill_proposals"])
         try:
             self.write_config(new_cfg)
         except ValueError as exc:
@@ -3275,6 +3488,12 @@ class Gate:
             self.say(f"info: {what} of this run are deleted after {due} (gate_cleanup_hours={hours})")
         else:
             self.say(f"info: {what} of this run are kept (gate_cleanup_hours=0): delete them yourself")
+        copies = [e for d in self.j.get("doctor") or [] if isinstance(d, dict)
+                  for e in d.get("pre_migration_backups") or [] if isinstance(e, dict) and e.get("scope")]
+        if copies:  # owner rule: plaintext database copies go like the doctor captures
+            self.say(f"info: this run's {copies_text(copies)} (plaintext, beside the databases; not the rollback "
+                     "point): " + ("deleted at the same time" if hours else
+                                   "kept too (gate_cleanup_hours=0), delete them yourself"))
 
     # ----- holds -----
     def write_hold(self, findings, phase, resume_after=False, post_run=False, sub=None, next_line=None):
@@ -3743,6 +3962,458 @@ def codex_cron_ids(state_db, provider="openai-codex"):
             if m:
                 ids.add(m.group(1)[:120])
     return len(rows), sorted(ids)[:200]
+
+
+# --- Skill Workshop proposals (full5, OpenClaw 2026.10.10+) -------------------------------------
+
+def _sw_quote(name):
+    return '"' + str(name).replace('"', '""') + '"'
+
+
+def _sw_columns(state_db, table):
+    return [str(r[1]) for r in q(state_db, f"PRAGMA table_info({_sw_quote(table)})")]
+
+
+def _sw_json(text):
+    try:
+        return json.loads(text) if isinstance(text, str) else None
+    except ValueError:
+        return None
+
+
+def _sw_owner_from_session(key):
+    """The agent id of an "agent:<id>:..." session key (OpenClaw's parseAgentSessionKey), else None."""
+    if isinstance(key, str):
+        parts = key.strip().split(":")
+        if len(parts) >= 3 and parts[0].lower() == "agent" and parts[1].strip():
+            return parts[1].strip().lower()
+    return None
+
+
+def skill_workshop_inventory(state_dir, cfg):
+    """Read-only count of the Skill Workshop proposal storage OpenClaw 2026.10.10+ doctor retires: the four tables of
+    the shared state database and the files below <state>/skill-workshop/. None when there is no such storage (no
+    table, no proposals/ directory, no proposals.json). Predicts the cases in which doctor keeps the storage
+    (mirrors doctor-skill-workshop-retire-proposals.ts closely, not exactly: an owner found through the target skill
+    directory is not resolved here, so those are only warnings). Never writes (query_ro / node fallback)."""
+    state_dir = Path(state_dir)
+    state_db = state_dir / "state" / "openclaw.sqlite"
+    sw_dir = state_dir / SW_STATE_DIR
+    rows = {}
+    if state_db.is_file():
+        names = table_names(state_db)
+        rows = {t: int(q(state_db, f"SELECT COUNT(*) FROM {_sw_quote(t)}")[0][0]) for t in SW_TABLES if t in names}
+    props_dir = sw_dir / "proposals"
+    legacy_manifest = os.path.lexists(sw_dir / "proposals.json")
+    if not rows and not os.path.lexists(props_dir) and not legacy_manifest:
+        return None
+    inv = {"tables": rows, "by_status": {}, "proposals": rows.get("skill_workshop_proposals", 0),
+           "events": rows.get("skill_workshop_proposal_events", 0),
+           "rollbacks": rows.get("skill_workshop_proposal_rollbacks", 0),
+           "reviews": rows.get("skill_workshop_collection_reviews", 0), "bytes": 0, "files": 0, "file_bytes": 0,
+           "not_regular": 0, "legacy_bundles": 0, "holdbacks": [], "unfinished": [], "legacy_manifest": legacy_manifest,
+           "recovery": os.path.isdir(sw_dir / "recovery")}
+    for t in rows:
+        cols = _sw_columns(state_db, t)
+        if cols:
+            expr = "+".join(f"COALESCE(length(CAST({_sw_quote(c)} AS BLOB)),0)" for c in cols)
+            inv["bytes"] += int(q(state_db, f"SELECT COALESCE(SUM({expr}),0) FROM {_sw_quote(t)}")[0][0] or 0)
+    recorded = set()
+    configured = {i.lower() for i in configured_agent_ids(cfg)}
+    if "skill_workshop_proposals" in rows:
+        cols = set(_sw_columns(state_db, "skill_workshop_proposals"))
+        owner = "owner_agent_id" if "owner_agent_id" in cols else "NULL"
+        for pid, status, own, rec_text in q(state_db, f"SELECT proposal_id, status, {owner}, record_json FROM "
+                                                      "skill_workshop_proposals ORDER BY proposal_id"):
+            pid, status = str(pid), str(status)
+            recorded.add(pid)
+            inv["by_status"][status] = inv["by_status"].get(status, 0) + 1
+            if status not in SW_EXPORTED_STATUSES:
+                continue
+            rec = _sw_json(rec_text)
+            if not isinstance(rec, dict):
+                inv["holdbacks"].append(f"proposal {pid}: its record cannot be read")
+                continue
+            draft = rec.get("draftFile", "PROPOSAL.md")
+            if not isinstance(draft, str) or not SW_DRAFT_RE.fullmatch(draft):
+                inv["holdbacks"].append(f"proposal {pid}: its record has an invalid draft path")
+                continue
+            if isinstance(own, str) and own.strip():
+                if own.strip().lower() not in configured:
+                    inv["holdbacks"].append(f"proposal {pid} belongs to agent \"{printable(own.strip())}\", which is "
+                                            "not configured")
+                    continue
+            else:
+                origin = rec.get("origin") if isinstance(rec.get("origin"), dict) else {}
+                who = origin.get("agentId").strip().lower() if isinstance(origin.get("agentId"), str) and \
+                    origin.get("agentId").strip() else _sw_owner_from_session(origin.get("sessionKey"))
+                if who and who not in configured:
+                    inv["holdbacks"].append(f"proposal {pid} was made by agent \"{printable(who)}\", which is not "
+                                            "configured")
+                    continue
+                if not who and len(configured) > 1:
+                    inv["holdbacks"].append(f"proposal {pid}: its owner is unclear (doctor may still find it from the "
+                                            "target skill directory)")
+                    continue
+            bundle = props_dir / pid
+            if SW_ID_RE.fullmatch(pid) and os.path.isdir(bundle) and not os.path.lexists(bundle / draft):
+                inv["holdbacks"].append(f"proposal {pid} has no draft file {draft}")
+    if "skill_workshop_proposal_rollbacks" in rows and "skill_workshop_proposals" in rows:
+        for pid, skill_file in q(state_db, "SELECT r.proposal_id, r.target_skill_file FROM "
+                                           "skill_workshop_proposal_rollbacks r JOIN skill_workshop_proposals p "
+                                           "USING (proposal_id) WHERE p.status != 'applied' ORDER BY r.proposal_id"):
+            inv["unfinished"].append(f"proposal {pid} has an unfinished apply; doctor puts back the pre-apply files "
+                                     f"in {printable(os.path.dirname(str(skill_file or '')) or '?')}")
+    for pth, st in C.walk_lstat(sw_dir) if os.path.isdir(sw_dir) and not os.path.islink(sw_dir) else ():
+        if stat.S_ISREG(st.st_mode):
+            inv["files"] += 1
+            inv["file_bytes"] += st.st_size
+        elif not stat.S_ISDIR(st.st_mode):
+            inv["not_regular"] += 1
+    for d, st in C.safe_children(props_dir):
+        if not stat.S_ISDIR(st.st_mode) or not SW_ID_RE.fullmatch(d.name) or d.name in recorded:
+            continue
+        if os.path.lexists(d / "proposal.json"):
+            inv["legacy_bundles"] += 1
+        else:
+            inv["holdbacks"].append(f"skill-workshop/proposals/{printable(d.name)} has no record")
+    return inv
+
+
+def sw_empty(inv):
+    """True when there is nothing to keep: no rows in the proposal tables and no files."""
+    return not inv or (not any((inv.get("tables") or {}).values()) and not inv.get("files")
+                       and not inv.get("not_regular"))
+
+
+def sw_counts(inv):
+    keys = ("proposals", "events", "rollbacks", "reviews", "files", "legacy_bundles")
+    return dict({k: inv.get(k, 0) for k in keys}, by_status=dict(inv.get("by_status") or {}))
+
+
+def sw_status_text(by_status):
+    known = [f"{s} {by_status.get(s, 0)}" for s in SW_STATUSES]
+    other = [f"{printable(s)} {n}" for s, n in sorted(by_status.items()) if s not in SW_STATUSES]
+    return ", ".join(known + other)
+
+
+def _sw_write(path, data):
+    """A new export file: 0600, never through an existing entry or a link (O_EXCL, O_NOFOLLOW), fsynced."""
+    fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    with open(fd, "wb") as f:
+        f.write(data)
+        f.flush()
+        os.fsync(f.fileno())
+
+
+def _sw_mkdir(path, root=None):
+    """path (and every missing directory between root and path) with mode 0700."""
+    path = Path(path)
+    chain = [path]
+    if root is not None:
+        cur = path
+        while cur != Path(root) and Path(root) in cur.parents:
+            cur = cur.parent
+            chain.append(cur)
+    for d in reversed(chain):
+        try:
+            os.mkdir(str(d), 0o700)
+        except FileExistsError:
+            pass
+        os.chmod(str(d), 0o700)
+
+
+def _sw_redact(obj, key, counter):
+    """One JSON value of the export, redacted per leaf with the gate's log rules (oc_common.redact_text): a value
+    under a secret-looking key is hidden whole; hashes and ids under their keys are kept."""
+    if isinstance(obj, dict):
+        return {str(k): _sw_redact(v, str(k), counter) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_sw_redact(v, key, counter) for v in obj]
+    if isinstance(obj, bytes):
+        return {"omitted": "binary value", "size": len(obj), "sha256": hashlib.sha256(obj).hexdigest()}
+    if not isinstance(obj, str) or not obj:
+        return obj
+    if key and SW_SECRET_KEY_RE.search(key):
+        counter[0] += 1
+        return "***"
+    if key and SW_HASH_KEY_RE.search(key) and SW_HASH_VALUE_RE.fullmatch(obj):
+        return obj
+    if key and (key == "id" or key.endswith(("_id", "Id", "ID"))) and SW_ID_VALUE_RE.fullmatch(obj):
+        return obj
+    text, n = C.redact_text_counted(obj)
+    counter[0] += n
+    return text
+
+
+def _sw_row(cols, values, counter):
+    row = {}
+    for c, v in zip(cols, values):
+        parsed = _sw_json(v) if c in SW_JSON_COLUMNS else None
+        row[c] = _sw_redact(parsed if parsed is not None else v, c, counter)
+    return row
+
+
+def _sw_md(text, limit=160):
+    s = " ".join(str(text if text is not None else "").split())
+    s = s if len(s) <= limit else s[:limit - 1] + "…"
+    return s.replace("|", "\\|")
+
+
+def _sw_proposals_md(doc):
+    """PROPOSALS.md: a readable index of the export (the values are already redacted)."""
+    L = [f"# Skill Workshop proposals (export of gate run {doc['run_id']})", "",
+         f"Exported on {doc['exported_at']} before OpenClaw {doc['openclaw_to']} doctor retired the Skill Workshop "
+         "proposals. OpenClaw keeps only the current drafts of pending and quarantined proposals, as files in the owner "
+         "agent's `workshop-skills/.archive/.retired-proposals/`; everything else exists only in this export.", "",
+         "Secrets are replaced by `***` with the add-on's log redaction rules; the exact originals are only in the "
+         "encrypted Home Assistant backup taken before the update. All data is in `proposals.json`; the files of "
+         "`/config/.openclaw/skill-workshop/` are mirrored under `files/`. To bring a draft back, ask the agent to "
+         "save it with `/learn`. This export is kept until you delete it.", "",
+         "| id | status | kind | name | target skill | updated | reason |", "|---|---|---|---|---|---|---|"]
+    for p in doc["proposals"]:
+        rec = p.get("record_json") if isinstance(p.get("record_json"), dict) else {}
+        target = rec.get("target") if isinstance(rec.get("target"), dict) else {}
+        L.append("| " + " | ".join(_sw_md(x, 80) for x in (
+            p.get("proposal_id"), p.get("status"), p.get("kind"), rec.get("name") or rec.get("skillName"),
+            target.get("skillDir") or target.get("skillFile"), p.get("updated_at"), p.get("status_reason"))) + " |")
+    for p in doc["proposals"]:
+        rec = p.get("record_json") if isinstance(p.get("record_json"), dict) else {}
+        L += ["", f"## {_sw_md(p.get('proposal_id'))} ({_sw_md(p.get('status'))})", ""]
+        for k in ("name", "description", "goal", "evidence"):
+            if rec.get(k):
+                L.append(f"- {k}: {_sw_md(rec.get(k), 600)}")
+        L.append(f"- draft: `{p['draft_export']}`" if p.get("draft_export") else "- draft: not in the export")
+        L.append(f"- events: {len(p.get('events') or [])}; undo record: {'yes' if p.get('rollback') else 'no'}; "
+                 f"files: {len(p.get('files') or [])}")
+        L.append(f"- OpenClaw doctor: {p['openclaw_doctor']}")
+    if doc.get("bundles_without_record"):
+        L += ["", "## Draft folders without a database record", ""]
+        L += [f"- {_sw_md(b['proposal_id'])}: {len(b['files'])} file(s)" for b in doc["bundles_without_record"]]
+    if doc.get("omitted"):
+        L += ["", "## Not exported", ""]
+        L += [f"- `{_sw_md(o['path'])}`: {_sw_md(o['omitted'])} ({o.get('size', '?')} bytes)" for o in doc["omitted"]]
+    return "\n".join(L) + "\n"
+
+
+def export_skill_workshop(state_dir, dest, meta, stop=STOP):
+    """Export every Skill Workshop proposal (all states, events, undo records, collection reviews) and every file
+    below <state>/skill-workshop/ (all draft generations) to dest, redacted with the gate's log rules. Written to
+    <dest>.partial and renamed: dest exists only complete, with MANIFEST.json written last. Files are 0600 and
+    directories 0700; links are never followed (listed, not copied), and files that are not UTF-8 or larger than
+    SW_FILE_CAP are listed with size and sha256 only. Returns the summary. Raises OSError/sqlite3.Error/ValueError
+    (the caller HOLDs) or C.Stopped."""
+    state_dir, dest = Path(state_dir), Path(dest)
+    if (dest / "MANIFEST.json").is_file():  # write-once: a complete export is never replaced
+        raise OSError(errno.EEXIST, "a complete export already exists", str(dest))
+    part = dest.with_name(dest.name + ".partial")
+    if os.path.lexists(part):
+        if os.path.isdir(part) and not os.path.islink(part):
+            shutil.rmtree(part)
+        else:
+            os.unlink(part)
+    _sw_mkdir(part)
+    counter = [0]
+    state_db = state_dir / "state" / "openclaw.sqlite"
+    tables = {}
+    names = table_names(state_db) if state_db.is_file() else set()
+    for t in SW_TABLES:
+        if t not in names:
+            continue
+        cols = _sw_columns(state_db, t)
+        rows = q(state_db, f"SELECT {', '.join(_sw_quote(c) for c in cols)} FROM {_sw_quote(t)} ORDER BY rowid")
+        tables[t] = [_sw_row(cols, r, counter) for r in rows]
+        if stop is not None and stop.is_set():
+            raise C.Stopped("stop requested")
+    # files: a mirror of <state>/skill-workshop/
+    sw_dir = state_dir / SW_STATE_DIR
+    files, omitted, written = [], [], []
+    entries = sorted(C.walk_lstat(sw_dir, stop_event=stop), key=lambda x: str(x[0])) \
+        if os.path.isdir(sw_dir) and not os.path.islink(sw_dir) else []
+    for pth, st in entries:
+        relp = pth.relative_to(sw_dir).as_posix()
+        if stat.S_ISDIR(st.st_mode):
+            continue
+        if stop is not None and stop.is_set():
+            raise C.Stopped("stop requested")
+        if not stat.S_ISREG(st.st_mode):
+            omitted.append({"path": relp, "type": "symlink" if stat.S_ISLNK(st.st_mode) else "other",
+                            "size": st.st_size, "omitted": "not a regular file (not followed)"})
+            continue
+        fd = os.open(str(pth), os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        with open(fd, "rb") as f:
+            if not stat.S_ISREG(os.fstat(f.fileno()).st_mode):
+                raise OSError(errno.EINVAL, "not a regular file", str(pth))
+            h, data, size = hashlib.sha256(), bytearray(), 0
+            for chunk in iter(lambda: f.read(C.MIB), b""):
+                h.update(chunk)
+                size += len(chunk)
+                if size <= SW_FILE_CAP:
+                    data += chunk
+        if size > SW_FILE_CAP:
+            omitted.append({"path": relp, "type": "file", "size": size, "sha256": h.hexdigest(),
+                            "omitted": f"larger than {C.human(SW_FILE_CAP)}"})
+            continue
+        try:
+            text = bytes(data).decode("utf-8")
+        except UnicodeDecodeError:
+            omitted.append({"path": relp, "type": "file", "size": size, "sha256": h.hexdigest(),
+                            "omitted": "binary (not UTF-8 text)"})
+            continue
+        before = counter[0]
+        parsed = _sw_json(text) if relp.endswith(".json") else None
+        if parsed is not None:
+            out_text = C.json_dumps(_sw_redact(parsed, "", counter))
+        else:
+            out_text, n = C.redact_text_counted(text)
+            counter[0] += n
+        target = part / "files" / relp
+        _sw_mkdir(target.parent, part)
+        blob = out_text.encode("utf-8")
+        _sw_write(target, blob)
+        written.append({"path": f"files/{relp}", "sha256": hashlib.sha256(blob).hexdigest()})
+        files.append({"path": relp, "export": f"files/{relp}", "size": size, "sha256_source": h.hexdigest(),
+                      "redactions": counter[0] - before})
+    # proposals.json
+    events, rollbacks = {}, {}
+    for e in tables.get("skill_workshop_proposal_events", []):
+        events.setdefault(str(e.get("proposal_id")), []).append(e)
+    for r in tables.get("skill_workshop_proposal_rollbacks", []):
+        rollbacks[str(r.get("proposal_id"))] = r
+    by_prop, other = {}, []
+    for fe in files + omitted:
+        parts = fe["path"].split("/")
+        if len(parts) >= 3 and parts[0] == "proposals" and SW_ID_RE.fullmatch(parts[1]):
+            by_prop.setdefault(parts[1], []).append(fe)
+        else:
+            other.append(fe)
+    proposals, by_status = [], {}
+    for row in tables.get("skill_workshop_proposals", []):
+        pid, status = str(row.get("proposal_id")), str(row.get("status"))
+        by_status[status] = by_status.get(status, 0) + 1
+        rec = row.get("record_json") if isinstance(row.get("record_json"), dict) else {}
+        draft = rec.get("draftFile", "PROPOSAL.md")
+        draft_rel = f"proposals/{pid}/{draft}" if isinstance(draft, str) and SW_DRAFT_RE.fullmatch(draft) else None
+        pfiles = [dict(fe, current_draft=fe["path"] == draft_rel) for fe in by_prop.get(pid, [])]
+        exported = any(fe["current_draft"] and fe.get("export") for fe in pfiles)
+        proposals.append(dict(row, events=events.pop(pid, []), rollback=rollbacks.pop(pid, None), files=pfiles,
+                              draft_export=f"files/{draft_rel}" if exported else None,
+                              openclaw_doctor=("keeps the current draft in the owner agent's workshop-skills/.archive/"
+                                               f".retired-proposals/{pid}/" if status in SW_EXPORTED_STATUSES
+                                               else "drops this proposal")))
+    recorded = {p["proposal_id"] for p in proposals}
+    doc = {"schema": SW_EXPORT_SCHEMA, "run_id": meta.get("run_id"), "exported_at": C.utc_iso(),
+           "openclaw_from": meta.get("openclaw_from"), "openclaw_to": meta.get("openclaw_to"),
+           "note": "secrets are redacted (***) with the add-on's log redaction rules; the exact originals are only in "
+                   "the encrypted Home Assistant backup taken before the update",
+           "counts": {"proposals": len(proposals), "by_status": by_status,
+                      "events": len(tables.get("skill_workshop_proposal_events", [])),
+                      "rollbacks": len(tables.get("skill_workshop_proposal_rollbacks", [])),
+                      "collection_reviews": len(tables.get("skill_workshop_collection_reviews", [])),
+                      "files": len(files), "omitted": len(omitted)},
+           "proposals": proposals,
+           "bundles_without_record": [{"proposal_id": k, "files": v} for k, v in sorted(by_prop.items())
+                                      if k not in recorded],
+           "collection_reviews": tables.get("skill_workshop_collection_reviews", []),
+           "events_without_proposal": [e for v in events.values() for e in v],
+           "rollbacks_without_proposal": list(rollbacks.values()),
+           "other_files": other, "omitted": omitted, "redactions_total": counter[0]}
+    for name, blob in (("proposals.json", C.json_dumps(doc).encode("utf-8")),
+                       ("PROPOSALS.md", _sw_proposals_md(doc).encode("utf-8"))):
+        _sw_write(part / name, blob)
+        written.append({"path": name, "sha256": hashlib.sha256(blob).hexdigest()})
+    summary = dict(doc["counts"], redactions=counter[0], bytes=sum(f["size"] for f in files),
+                   omitted_paths=[o["path"] for o in omitted][:50])
+    _sw_write(part / "MANIFEST.json", C.json_dumps({"schema": SW_EXPORT_SCHEMA, "complete": True,
+                                                     "run_id": meta.get("run_id"), "summary": summary,
+                                                     "files": written}).encode("utf-8"))
+    for d, _st in [(part, None)] + [(p_, s_) for p_, s_ in C.walk_lstat(part) if stat.S_ISDIR(s_.st_mode)]:
+        _fsync_dir(d)
+    if os.path.lexists(dest):  # not written by this function (dest only ever exists complete): set aside
+        os.rename(dest, dest.with_name(f"{dest.name}.incomplete-{C.utc_now().strftime('%Y%m%dT%H%M%SZ')}"))
+    os.rename(part, dest)
+    _fsync_dir(dest.parent)
+    return summary
+
+
+def sw_export_record(gp, run_id):
+    """The MANIFEST summary of the complete Skill Workshop export of run `run_id`, or None."""
+    m = C.load_json_or_none(gp["RUNS"] / str(run_id) / SW_EXPORT_DIR / "MANIFEST.json")
+    return m.get("summary") if isinstance(m, dict) and m.get("complete") and isinstance(m.get("summary"), dict) \
+        else None
+
+
+# --- doctor's pre-migration SQLite copies (*.pre-startup-migration-*.bak / .scoped.bak) ---------
+
+def doctor_copies(state_dir):
+    """{state-relative path: (size, "full" | "scoped")} of doctor's SQLite copies below the state dir (regular files
+    only; links are not followed)."""
+    state_dir = Path(state_dir)
+    found = {}
+    if not state_dir.is_dir():
+        return found
+    for pth in state_dir.rglob(DOCTOR_COPY_GLOB):
+        try:
+            st = os.lstat(pth)
+        except OSError:
+            continue
+        if stat.S_ISREG(st.st_mode) and DOCTOR_COPY_RE.fullmatch(pth.name):
+            found[C.rel(pth, state_dir)] = (st.st_size, "scoped" if pth.name.endswith(".scoped.bak") else "full")
+    return found
+
+
+def copies_text(entries):
+    """'2 full and 1 table-scoped pre-migration SQLite copies by doctor, 1.2 GiB' for journal entries."""
+    nf = sum(1 for e in entries if e.get("scope") != "scoped")
+    ns = len(entries) - nf
+    if not entries:
+        return "no new pre-migration SQLite copy by doctor"
+    kinds = " and ".join(x for x in (f"{nf} full" if nf else "", f"{ns} table-scoped" if ns else "") if x)
+    return (f"{kinds} pre-migration SQLite cop{'y' if len(entries) == 1 else 'ies'} by doctor, "
+            f"{C.human(sum(int(e.get('size') or 0) for e in entries))}")
+
+
+def _doctor_copy_parts(state_real, path):
+    """The components of `path` below the (real) state dir when it names one of doctor's SQLite copies, else None."""
+    p = os.path.normpath(str(path))
+    root = str(state_real).rstrip("/") + "/"
+    if not os.path.isabs(p) or not p.startswith(root):
+        return None
+    parts = p[len(root):].split("/")
+    if any(x in ("", ".", "..") for x in parts) or not DOCTOR_COPY_RE.fullmatch(parts[-1]):
+        return None
+    return parts
+
+
+def doctor_copy_groups(text):
+    """The backup group ids of the copies one doctor log says it saved or reused."""
+    flat = re.sub(r"\s+", "", BOX_RE.sub("", ANSI_RE.sub("", text or "")))
+    return set(SAVED_COPY_ID_RE.findall(flat))
+
+
+def run_doctor_copies(gp, j, present=None):
+    """Doctor's pre-migration SQLite copies a gate run created: the copies the run journaled per doctor pass (this
+    version) and every copy of a backup group its doctor logs say they saved or reused ("Saved pre-migration SQLite
+    backup: …", also in the runs of earlier add-on versions). Like the doctor captures they are plaintext copies of the
+    databases, so the owner's rule applies: they go gate_cleanup_hours after the run (the encrypted Home Assistant
+    backup is the rollback point). Only regular files below the state dir with doctor's name pattern (doctor_copies,
+    `present` when the caller listed them already); copies already gone are skipped."""
+    present = doctor_copies(gp["STATE"]) if present is None else present
+    want = set()
+    for d in j.get("doctor") or [] if isinstance(j.get("doctor"), list) else []:
+        for e in (d.get("pre_migration_backups") or []) if isinstance(d, dict) else []:
+            if isinstance(e, dict) and e.get("scope") and isinstance(e.get("path"), str):
+                want.add(e["path"])
+    groups = set()
+    for log in sorted((gp["RUNS"] / str(j.get("run_id"))).glob("doctor-pass*.log")):
+        try:
+            groups |= doctor_copy_groups(log.read_bytes().decode("utf-8", "replace"))
+        except OSError:
+            continue
+    if groups:
+        want |= {r for r in present if DOCTOR_COPY_RE.fullmatch(Path(r).name).group(1) in groups}
+    state_real = Path(os.path.realpath(str(gp["STATE"])))
+    return [state_real / r for r in sorted(want) if r in present], []
 
 
 def plugin_snapshot(state_dir):
@@ -4216,7 +4887,13 @@ def readiness(g, mode):
 
 def _readiness_skills(g):
     """Readiness lines after the cleanup plan (Skill Workshop, full5): from g.facts of the precheck."""
-    return []
+    inv = g.facts.get("sw_inventory")
+    if not g.caps()["retires_skill_proposals"] or sw_empty(inv):
+        return []
+    keep = sum(inv["by_status"].get(s, 0) for s in SW_EXPORTED_STATUSES)
+    return [f"[gate]   skill workshop: {inv['proposals']} proposals ({sw_status_text(inv['by_status'])}); OpenClaw "
+            f"{g.pkg['version']} doctor keeps only the {keep} pending/quarantined drafts: the gate exports all "
+            f"{inv['proposals']} first (secrets redacted)"]
 
 
 def _readiness_cron(g):
@@ -4566,6 +5243,20 @@ def _delete_file(base, name):
         os.close(bfd)
 
 
+def _delete_doctor_copy(gp, parts):
+    """One of doctor's SQLite copies <state>/<parts...>: every directory below the state dir is opened without
+    following links, and only a regular file with doctor's name pattern is unlinked."""
+    dfd = open_dir_nofollow(gp["STATE"], *parts[:-1])
+    try:
+        st = os.stat(parts[-1], dir_fd=dfd, follow_symlinks=False)
+        if not stat.S_ISREG(st.st_mode):
+            raise OSError(errno.EPERM, "not a regular file", "/".join(parts))
+        os.unlink(parts[-1], dir_fd=dfd)
+        return st.st_size
+    finally:
+        os.close(dfd)
+
+
 def _safe_delete(gp, p):
     """Dispatch by the cleanup root a target belongs to; anything else is refused."""
     base, name = p.parent, p.name
@@ -4575,6 +5266,9 @@ def _safe_delete(gp, p):
         return _delete_file(base, name)
     if base in (gp["ARCHIVES"], captures_root(gp)):
         return _delete_entry(base, name)
+    parts = _doctor_copy_parts(os.path.realpath(str(gp["STATE"])), str(p))
+    if parts is not None:
+        return _delete_doctor_copy(gp, parts)
     raise OSError(errno.EPERM, "outside the cleanup roots", str(p))
 
 
@@ -4621,6 +5315,7 @@ def cleanup_targets(gp, now, hours):
     runs, cur = _run_journals(gp)
     out_ = []
     referenced = set()
+    copies = None  # doctor's SQLite copies below the state dir, listed once for every run
     for rid, j in sorted(runs.items()):
         adir = gp["ARCHIVES"] / rid
         referenced.add(rid)
@@ -4644,6 +5339,10 @@ def cleanup_targets(gp, now, hours):
         try:
             caps, refused = run_captures(gp, j)
             paths += caps
+            kept += refused
+            copies = doctor_copies(gp["STATE"]) if copies is None else copies
+            mine, refused = run_doctor_copies(gp, j, copies)  # full5: doctor's *.pre-startup-migration-*.bak
+            paths += mine
             kept += refused
         except OSError as exc:  # like an unusable journal: warn once per loop, record nothing
             out_.append((rid, f"run {rid}", now, None,
@@ -4803,8 +5502,8 @@ def _cleanup_target(gp, now, rid, label, due, paths, kept, emit, errors=None):
     if now < due:
         if rec_path and not rec.get("announced_at"):
             rec.update({"due_at": C.utc_iso(due), "announced_at": C.utc_iso(now)})
-            emit(f"[cleanup] {label}: {len(live)} item(s) (doctor captures / archive) will be deleted at "
-                 f"{C.utc_iso(due)}")
+            emit(f"[cleanup] {label}: {len(live)} item(s) (doctor captures, doctor SQLite copies / archive) will be "
+                 f"deleted at {C.utc_iso(due)}")
             dirty = True
         elif rec_path and rec.get("due_at") != C.utc_iso(due):
             rec["due_at"] = C.utc_iso(due)  # moved: a hold after the run was cleared later
@@ -4844,9 +5543,9 @@ def cleanup_loop(emit=out):
     STOP.clear()
     hours = C.gate_options()["cleanup_hours"]
     if hours:
-        emit(f"[cleanup] doctor captures are deleted {hours} h after their gate run; gate archives and rehearsal "
-             "exports of earlier add-on versions and the 2026.7 plaintext archives the same time after their run, "
-             "export or migration (checked hourly)")
+        emit(f"[cleanup] doctor captures and doctor's SQLite copies are deleted {hours} h after their gate run; gate "
+             "archives and rehearsal exports of earlier add-on versions and the 2026.7 plaintext archives the same "
+             "time after their run, export or migration (checked hourly)")
     else:
         emit("[cleanup] gate_cleanup_hours=0: automatic deletion is off (oc-upgrade cleanup lists what to delete)")
     state = {}
@@ -4923,7 +5622,17 @@ def _status_cron(j):
 
 def _status_skills(gp):
     """`oc-upgrade status` lines after the quarantine (Skill Workshop exports, full5)."""
-    return []
+    found = []
+    for m in sorted(gp["RUNS"].glob(f"*/{SW_EXPORT_DIR}/MANIFEST.json")):
+        rid = m.parent.parent.name
+        if RUN_ID_RE.match(rid) and sw_export_record(gp, rid) is not None:
+            found.append((rid, m.parent))
+    if not found:
+        return []
+    rid, d = found[-1]  # run ids sort by their start time
+    n = (sw_export_record(gp, rid) or {}).get("proposals")
+    return [f"Skill Workshop exports: {len(found)} (newest {d}/, {n} proposals; secrets redacted; kept until you "
+            "delete them)"]
 
 
 def plugin_cohort_marker(state_dir, version):
@@ -5020,7 +5729,7 @@ def status_lines():
         L.append(f"Pending retry request: doctor={r.get('doctor')} accept={','.join(r.get('accept') or []) or '-'} "
                  "(runs on the next add-on start)")
     o = C.gate_options()
-    L.append(f"Gate options: delete doctor captures {o['cleanup_hours']} h after a run (0 = never); "
+    L.append(f"Gate options: delete doctor captures and SQLite copies {o['cleanup_hours']} h after a run (0 = never); "
              f"backup max age {o['backup_max_age_hours']} h")
     archives = C.safe_files_below(gp["ARCHIVES"], lambda n: n.endswith((".tar.gz", ".tar.gz.age")))
     if archives:
@@ -5037,15 +5746,15 @@ def status_lines():
         n = sum(1 for _p, st in C.walk_lstat(qd) if not stat.S_ISDIR(st.st_mode) and _p.name != "MANIFEST.json")
         L.append(f"Quarantine: {qd} ({n} files)")
     L += _status_skills(gp)  # full5
-    baks = list(gp["STATE"].rglob("*.pre-startup-migration-*.bak")) if gp["STATE"].exists() else []
+    baks = doctor_copies(gp["STATE"])
     if baks:
-        total = 0
-        for b in baks:
-            try:
-                total += b.stat().st_size
-            except OSError:
-                pass
-        L.append(f"Doctor pre-migration backups: {len(baks)} ({C.human(total)})")
+        ns = sum(1 for _size, scope in baks.values() if scope == "scoped")
+        L.append(f"Doctor pre-migration SQLite copies: {len(baks) - ns} full (.bak), {ns} table-scoped (.scoped.bak) "
+                 f"({C.human(sum(size for size, _scope in baks.values()))}) beside the databases in {gp['STATE']}: "
+                 "plaintext, not the rollback point; those a gate run made: "
+                 + leftover_note(o["cleanup_hours"])
+                 + ("; restore a .scoped.bak only with openclaw database restore-migration-backup, never by copying"
+                    if ns else ""))
     led = C.load_json_or_none(gp["LEDGER"])
     if isinstance(led, dict):
         L.append(f"Pins ledger: {len(led.get('entries') or [])} written, {len(led.get('skipped') or [])} skipped")

@@ -270,8 +270,8 @@ class CleanupTests(CleanupEnv):
 
         # one second before: nothing deleted, announced once
         self.assertEqual(self.cleanup(due - SEC), 0)
-        self.assertEqual(self.lines, [f"[cleanup] run {rid}: 2 item(s) (doctor captures / archive) will be deleted "
-                                      f"at {iso(due)}"])
+        self.assertEqual(self.lines, [f"[cleanup] run {rid}: 2 item(s) (doctor captures, doctor SQLite copies / "
+                                      f"archive) will be deleted at {iso(due)}"])
         rec = self.record(rid)
         self.assertEqual((rec["due_at"], rec["announced_at"]), (iso(due), iso(due - SEC)))
         self.assertTrue(all(c.is_dir() for c in caps))
@@ -328,8 +328,8 @@ class CleanupTests(CleanupEnv):
                          [(f"run {r.rid}", due, sorted(r.caps), [])])
         lines = []
         self.assertEqual(G.cleanup_pass(now=due - SEC, emit=lines.append), 0)
-        self.assertEqual(lines, [f"[cleanup] run {r.rid}: 2 item(s) (doctor captures / archive) will be deleted at "
-                                 f"{iso(due)}"])
+        self.assertEqual(lines, [f"[cleanup] run {r.rid}: 2 item(s) (doctor captures, doctor SQLite copies / "
+                                 f"archive) will be deleted at {iso(due)}"])
         self.assertEqual(self.cmd(), 0)
         self.assertEqual(self.lines[0], "gate_cleanup_hours=6")
         self.assertIn(f"  run {r.rid}: " + ("due now" if C.utc_now() >= due else f"due {iso(due)}"), self.lines)
@@ -1047,9 +1047,10 @@ class CleanupTests(CleanupEnv):
             timer.join()
         self.assertLess(time.monotonic() - t, 10)
         self.assertEqual(rc, 143)
-        self.assertEqual(lines[0], "[cleanup] doctor captures are deleted 48 h after their gate run; gate archives "
-                                   "and rehearsal exports of earlier add-on versions and the 2026.7 plaintext "
-                                   "archives the same time after their run, export or migration (checked hourly)")
+        self.assertEqual(lines[0], "[cleanup] doctor captures and doctor's SQLite copies are deleted 48 h after their "
+                                   "gate run; gate archives and rehearsal exports of earlier add-on versions and the "
+                                   "2026.7 plaintext archives the same time after their run, export or migration "
+                                   "(checked hourly)")
         self.assertFalse(os.path.lexists(r.adir))  # the first pass runs at once
 
     def test_loop_exits_143_on_sigterm(self):
@@ -1200,7 +1201,8 @@ class CleanupTests(CleanupEnv):
 
 
 class StatusTests(CleanupEnv):
-    OPTIONS_LINE = "Gate options: delete doctor captures 48 h after a run (0 = never); backup max age 24 h"
+    OPTIONS_LINE = ("Gate options: delete doctor captures and SQLite copies 48 h after a run "
+                    "(0 = never); backup max age 24 h")
 
     def status(self):
         self.st = "\n".join(G.status_lines())
@@ -1329,7 +1331,8 @@ class StatusTests(CleanupEnv):
         self.options(gate_cleanup_hours=0, gate_backup_max_age_hours=72)
         self.status()
         self.assertEqual(self.line("Gate options: "),
-                         "Gate options: delete doctor captures 0 h after a run (0 = never); backup max age 72 h")
+                         "Gate options: delete doctor captures and SQLite copies 0 h after a run "
+                         "(0 = never); backup max age 72 h")
         # out of range / not an integer: the defaults (the precheck warns about it, never with the value)
         self.options(gate_cleanup_hours=721, gate_backup_max_age_hours="72")
         self.status()

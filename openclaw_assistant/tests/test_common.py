@@ -431,6 +431,22 @@ class RedactTests(unittest.TestCase):
         self.assertIn('"apiKey": "***"', r)
         self.assertEqual(C.redact_text("Doctor complete."), "Doctor complete.")
 
+    def test_redact_text_counted_and_scoped_bak_path(self):
+        """full5: the same rules with a count (Skill Workshop export); doctor's copy names are no tokens."""
+        s = ('key sk-abcdefghijklmnop "apiKey": "abc123" token=deadbeef '
+             '123456789:AAHbcdefghijklmnopqrstuvwxyz0123456 ' + "A" * 45 + ' Bearer abcdefghijkl')
+        text, n = C.redact_text_counted(s)
+        self.assertEqual(text, C.redact_text(s))
+        self.assertGreaterEqual(n, 6)  # every secret at least once (a value can be hit by more than one rule)
+        self.assertEqual(C.redact_text_counted("Doctor complete."), ("Doctor complete.", 0))
+        self.assertEqual(C.redact_text_counted(""), ("", 0))
+        self.assertEqual(C.redact_text_counted(None), (None, 0))
+        for path in ("/config/.openclaw/state/openclaw.sqlite.pre-startup-migration-"
+                     "3f2b8c1e-9a4d-8e6f-8b7a-1c2d3e4f5a6b.scoped.bak",
+                     "/config/.openclaw-upgrade/gate/runs/20261104T120000Z-abc123/skill-workshop/files/proposals/"
+                     "wx-pending/generations/0a1b2c3d-1111-4222-8333-444455556666/PROPOSAL.md"):
+            self.assertEqual(C.redact_text_counted(path), (path, 0))
+
 
 class RunProcessTests(TmpCase):
     def test_success_appends_to_log_never_pipe(self):
@@ -753,7 +769,8 @@ class Full2RedactTests(unittest.TestCase):
     def test_plain_words_untouched(self):
         for line in ("gate_archive_age_recipient holds an age PRIVATE key (AGE-SECRET-KEY-…): remove it",
                      "never the AGE-SECRET-KEY private key",
-                     "Gate options: delete doctor captures 48 h after a run (0 = never); backup max age 24 h"):
+                     "Gate options: delete doctor captures and SQLite copies 48 h after a run "
+                     "(0 = never); backup max age 24 h"):
             with self.subTest(line=line[:30]):
                 self.assertEqual(C.redact_text(line), line)
 

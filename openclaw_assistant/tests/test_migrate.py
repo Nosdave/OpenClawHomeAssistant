@@ -1284,6 +1284,20 @@ class TestPins(unittest.TestCase):
         ours = {m.fmt_path(p["path"]) for p in m.PINS if p["cond"]}
         self.assertTrue(conditional <= ours, conditional - ours)
 
+    def test_approval_policy_pin_skipped_when_proposals_retired(self):
+        """full5: OpenClaw 2026.10.10+ has no Skill Workshop proposals (strict skills.workshop schema, doctor removes
+        approvalPolicy); the pin is skipped there and written as before on 2026.10.4."""
+        cfg = {"skills": {"workshop": {}}}
+        new, written, skipped = m.apply_pins(cfg, set(), retires_skill_proposals=True)
+        self.assertNotIn("approvalPolicy", new["skills"]["workshop"])
+        self.assertEqual(self.skipped(skipped)["skills.workshop.approvalPolicy"],
+                         "condition:Skill Workshop proposals were removed in this OpenClaw version")
+        self.assertEqual(new["skills"]["workshop"]["autonomous"]["mode"], "off")
+        self.assertEqual(len(written) + len(skipped), 31)
+        new, written, skipped = self.apply(cfg)
+        self.assertEqual(new["skills"]["workshop"]["approvalPolicy"], "pending")
+        self.assertNotIn("skills.workshop.approvalPolicy", self.skipped(skipped))
+
     def apply(self, cfg, ledgered=()):
         snap = copy.deepcopy(cfg)
         out = m.apply_pins(cfg, set(ledgered))
