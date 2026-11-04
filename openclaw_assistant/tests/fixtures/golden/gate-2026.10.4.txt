@@ -1,0 +1,613 @@
+### dry-run
+rc=0
+[gate] dry-run: runtime=2026.10.4 targets=20/24 state=19 agents=main:24 verdict=gate
+[gate] dry-run: a gate would run in mode bump
+[gate] 1/8 auth profile main/anthropic:default provider=anthropic type=token expires=-
+[gate] 1/8 auth profile main/openai:default provider=openai type=oauth expires=<TS>
+[gate]   precheck: node 24.16.0 sqlite 3.50.4 ok; space check skipped (test hook); quick_check ok (2/2); network not checked; HA backup not checked (test hook); doctor budget <DUR>/pass (S=<N> MiB)
+[gate]   rollback point: the encrypted Home Assistant backup (no archive of the gate's own)
+[gate]   cleanup plan: nothing to move
+[gate]   doctor budget <DUR>/pass (S=<N> MiB)
+[gate] dry-run: the precheck would pass
+
+### check before the bump
+rc=0
+oc-upgrade check — <TIME> (read-only)
+
+== A Versions
+  bundled OpenClaw:      2026.10.4
+  bundled OpenClaw schema targets: state 20, agent 24
+  openclaw.json written by: 2026.9.9
+  schema state/openclaw.sqlite: 19
+  schema agents/main/agent/openclaw-agent.sqlite: 24
+  startup-migrations checkpoint: none
+  predicate: gate (state schema 19 < 20)
+  migrated: 2026.9.9 (from-7x)
+
+== B Legacy databases (pre-June 2026)
+  none
+
+== C Legacy Telegram / Active Memory files (2026.9+ rules)
+  none
+
+== C2 Pre-July-2026 files and settings (OpenClaw 2026.10 refuses them)
+  none
+
+== D credentials/oauth.json (provider names only)
+  none
+
+== E Agent database directories
+  agents/main/agent/openclaw-agent.sqlite (<SIZE>)
+
+== F Model wildcards and model preflight
+  wildcards: none
+  INFO canonical-openai-refs: 2 canonical openai/* refs keep their runtime (Codex app-server by default, as on 7.35): agents.defaults.model.fallbacks[0]=openai/gpt-5.5, agents.defaults.models["openai/gpt-5.5"]=openai/gpt-5.5
+
+== G Already imported legacy files
+  0
+
+== H Space
+  /config: <SIZE> free of <SIZE>
+  /share: <SIZE> free of <SIZE>
+  state <TMP>/config/.openclaw: <SIZE>; workspace <TMP>/config/clawd: <SIZE>
+
+== I Migration gate readiness (dry run, no network check)
+  mode: bump
+[gate] 1/8 auth profile main/anthropic:default provider=anthropic type=token expires=-
+[gate] 1/8 auth profile main/openai:default provider=openai type=oauth expires=<TS>
+  precheck: node 24.16.0 sqlite 3.50.4 ok; space check skipped (test hook); quick_check ok (2/2); network not checked; HA backup not checked (test hook); doctor budget <DUR>/pass (S=<N> MiB)
+  rollback point: the encrypted Home Assistant backup (no archive of the gate's own)
+  cleanup plan: nothing to move
+  doctor budget <DUR>/pass (S=<N> MiB)
+  the gate precheck would pass
+
+== Result
+  rc=0: OK — nothing to note.
+
+### bump: gate output
+[gate] plan: runtime=2026.10.4 targets=20/24 state=19 agents=main:24 verdict=gate -> gate run mode=bump run=new (migration needed: state schema 19 < 20)
+WARN [gate] test hooks active: doctor_cmd, skip_backup_check, skip_network_check, skip_space_check
+[gate] start: run=<RUN> mode=bump runtime=2026.10.4
+[gate] 1/8 auth profile main/anthropic:default provider=anthropic type=token expires=-
+[gate] 1/8 auth profile main/openai:default provider=openai type=oauth expires=<TS>
+[gate] 1/8 precheck: node 24.16.0 sqlite 3.50.4 ok; mode bump; space check skipped (test hook); quick_check ok (2/2); network not checked; HA backup not checked (test hook); doctor budget <DUR>/pass (S=<N> MiB)
+[gate] 2/8 cleanup: quarantined 0 files (nothing to move) -> <TMP>/config/.openclaw-upgrade/gate/quarantine/<RUN>/
+WARN [gate] test hook doctor_cmd in use
+[gate] 4/8 doctor pass 1 started (limit <DUR>; log <TMP>/config/.openclaw-upgrade/gate/runs/<RUN>/doctor-pass1.log)
+[doctor] ┌  OpenClaw doctor
+[doctor] │
+[doctor] ◇  Doctor changes ───╮
+[doctor] └  Doctor complete.
+[gate] 4/8 doctor pass 1 rc=0 in <DUR>: Doctor complete. (1 pre-migration SQLite backups, <SIZE>)
+[gate] 5/8 fixups: codex plugin entry restored: no (Codex was in use before the migration: doctor's setting kept)
+WARN [gate] test hook doctor_cmd in use
+[gate] 6/8 doctor pass 2 started (limit <DUR>; log <TMP>/config/.openclaw-upgrade/gate/runs/<RUN>/doctor-pass2.log)
+[doctor] ┌  OpenClaw doctor
+[doctor] │
+[doctor] ◇  Doctor changes ───╮
+[doctor] └  Doctor complete.
+[gate] 6/8 doctor pass 2 rc=0 in <DUR>: Doctor complete.; config unchanged
+[gate] 7/8 postconditions OK: schema 20/24, config valid, lint 0 errors, no legacy state, no legacy refs, models status ok, sessions openclaw (0)
+[gate] done: MIGRATED 2026.10.4 (run <RUN>, mode bump, total <DUR>)
+[gate] info: the doctor captures of this run are deleted after <TS> (gate_cleanup_hours=48)
+
+### bump: events.log
+<TS> WARN [gate] test hooks active: doctor_cmd, skip_backup_check, skip_network_check, skip_space_check
+<TS> [gate] start: run=<RUN> mode=bump runtime=2026.10.4
+<TS> [gate] 1/8 auth profile main/anthropic:default provider=anthropic type=token expires=-
+<TS> [gate] 1/8 auth profile main/openai:default provider=openai type=oauth expires=<TS>
+<TS> [gate] 1/8 precheck: node 24.16.0 sqlite 3.50.4 ok; mode bump; space check skipped (test hook); quick_check ok (2/2); network not checked; HA backup not checked (test hook); doctor budget <DUR>/pass (S=<N> MiB)
+<TS> [gate] 2/8 cleanup: quarantined 0 files (nothing to move) -> <TMP>/config/.openclaw-upgrade/gate/quarantine/<RUN>/
+<TS> WARN [gate] test hook doctor_cmd in use
+<TS> [gate] 4/8 doctor pass 1 started (limit <DUR>; log <TMP>/config/.openclaw-upgrade/gate/runs/<RUN>/doctor-pass1.log)
+<TS> [gate] 4/8 doctor pass 1 rc=0 in <DUR>: Doctor complete. (1 pre-migration SQLite backups, <SIZE>)
+<TS> [gate] 5/8 fixups: codex plugin entry restored: no (Codex was in use before the migration: doctor's setting kept)
+<TS> WARN [gate] test hook doctor_cmd in use
+<TS> [gate] 6/8 doctor pass 2 started (limit <DUR>; log <TMP>/config/.openclaw-upgrade/gate/runs/<RUN>/doctor-pass2.log)
+<TS> [gate] 6/8 doctor pass 2 rc=0 in <DUR>: Doctor complete.; config unchanged
+<TS> [gate] 7/8 postconditions OK: schema 20/24, config valid, lint 0 errors, no legacy state, no legacy refs, models status ok, sessions openclaw (0)
+<TS> [gate] done: MIGRATED 2026.10.4 (run <RUN>, mode bump, total <DUR>)
+<TS> [gate] info: the doctor captures of this run are deleted after <TS> (gate_cleanup_hours=48)
+
+### bump: journal
+{
+ "schema": 1,
+ "run_id": "<RUN>",
+ "mode": "bump",
+ "runtime": "2026.10.4",
+ "addon_version": "0.5.94-test",
+ "status": "done",
+ "phase": "finalize",
+ "phases_done": [
+  "precheck",
+  "cleanup",
+  "doctor1",
+  "fixups",
+  "doctor2",
+  "postconditions",
+  "finalize"
+ ],
+ "first_write_at": "<TS>",
+ "doctor_started": true,
+ "auto_resumes": 0,
+ "started_at": "<TS>",
+ "source": {
+  "from_checkpoint": null,
+  "config_last_touched": "2026.9.9",
+  "state_user_version": 19,
+  "agents": {
+   "main": 24
+  }
+ },
+ "targets": {
+  "state": 20,
+  "agent": 24
+ },
+ "budget": {
+  "s_mib": "<N>",
+  "doctor_pass_seconds": "<N>",
+  "kill_after_seconds": 600
+ },
+ "transform": {},
+ "doctor": [
+  {
+   "pass": 1,
+   "started": "<TS>",
+   "ended": "<TS>",
+   "rc": 0,
+   "duration_s": "<N>",
+   "complete": true,
+   "markers": [],
+   "code": null,
+   "log": "runs/<RUN>/doctor-pass1.log",
+   "config_sha256_before": "7bef414bff450b86e123595f24ab84ccca309ba8687ced4739169abad2c13d7e",
+   "config_sha256_after": "6776cd14a4d0321dc0d450277b963ad4cc82ee6e31b8cec2b13796cc8de3d8fd",
+   "pre_migration_backups": [
+    {
+     "path": "state/openclaw.sqlite.pre-startup-migration-20261101T000000Z.bak",
+     "size": "<N>"
+    }
+   ]
+  },
+  {
+   "pass": 2,
+   "started": "<TS>",
+   "ended": "<TS>",
+   "rc": 0,
+   "duration_s": "<N>",
+   "complete": true,
+   "markers": [],
+   "code": null,
+   "log": "runs/<RUN>/doctor-pass2.log",
+   "config_sha256_before": "6776cd14a4d0321dc0d450277b963ad4cc82ee6e31b8cec2b13796cc8de3d8fd",
+   "config_sha256_after": "6776cd14a4d0321dc0d450277b963ad4cc82ee6e31b8cec2b13796cc8de3d8fd"
+  }
+ ],
+ "accepted": [],
+ "hold": null,
+ "orphans": [],
+ "plugins_before": [],
+ "fixups": {
+  "codex_pins": 0,
+  "refs_rewritten": 0,
+  "compaction_restored": false,
+  "codex_plugin_restored": false,
+  "codex_needed": true,
+  "policy_failures": []
+ },
+ "pins": {},
+ "history": [
+  {
+   "at": "<TS>",
+   "event": "run <RUN> started (mode bump): migration needed: state schema 19 < 20"
+  },
+  {
+   "at": "<TS>",
+   "event": "phase precheck done"
+  },
+  {
+   "at": "<TS>",
+   "event": "phase cleanup done"
+  },
+  {
+   "at": "<TS>",
+   "event": "first write"
+  },
+  {
+   "at": "<TS>",
+   "event": "phase doctor1 done"
+  },
+  {
+   "at": "<TS>",
+   "event": "phase fixups done"
+  },
+  {
+   "at": "<TS>",
+   "event": "phase doctor2 done"
+  },
+  {
+   "at": "<TS>",
+   "event": "phase postconditions done"
+  },
+  {
+   "at": "<TS>",
+   "event": "phase finalize done"
+  }
+ ],
+ "auth_profiles": [
+  {
+   "agent": "main",
+   "id": "anthropic:default",
+   "provider": "anthropic",
+   "type": "token",
+   "expires_utc": null,
+   "expires_ms": null
+  },
+  {
+   "agent": "main",
+   "id": "openai:default",
+   "provider": "openai",
+   "type": "oauth",
+   "expires_utc": "<TS>",
+   "expires_ms": 4102444800000
+  }
+ ],
+ "cron_legacy_ids": [],
+ "cron_openai_ids": [],
+ "doctor_notes": [],
+ "finished_at": "<TS>"
+}
+
+### bump: marker
+{
+ "schema": 1,
+ "runtime": "2026.10.4",
+ "mode": "bump",
+ "run_id": "<RUN>",
+ "completed_at": "<TS>",
+ "binding": {
+  "state_db": {
+   "path": "state/openclaw.sqlite",
+   "dev": "<N>",
+   "ino": "<N>",
+   "user_version": 20,
+   "app_version": "2026.10.4"
+  },
+  "agents": [
+   {
+    "path": "agents/main/agent/openclaw-agent.sqlite",
+    "dev": "<N>",
+    "ino": "<N>",
+    "user_version": 24
+   }
+  ]
+ },
+ "accepted": [],
+ "orphans": [],
+ "addon_version": "0.5.94-test"
+}
+
+### bump: status
+Gate run <RUN>: mode bump, status done, phase finalize, started <TS>, finished <TS>
+  phases done: precheck, cleanup, doctor1, fixups, doctor2, postconditions, finalize; first write: <TS>; auto-resumes 0/1
+  doctor pass 1: rc 0 in <DUR>
+  doctor pass 2: rc 0 in <DUR>
+Migrated marker: 2026.10.4 (bump, run <RUN>, <TS>)
+Gate options: delete doctor captures 48 h after a run (0 = never); backup max age 24 h
+Quarantine: <TMP>/config/.openclaw-upgrade/gate/quarantine (0 files)
+Doctor pre-migration backups: 1 (<SIZE>)
+
+### check after the bump
+rc=0
+oc-upgrade check — <TIME> (read-only)
+
+== A Versions
+  bundled OpenClaw:      2026.10.4
+  bundled OpenClaw schema targets: state 20, agent 24
+  openclaw.json written by: 2026.10.4
+  schema state/openclaw.sqlite: 20
+  schema agents/main/agent/openclaw-agent.sqlite: 24
+  startup-migrations checkpoint: none
+  predicate: ok
+  gate: run <RUN> status done phase finalize
+  migrated: 2026.10.4 (bump)
+
+== B Legacy databases (pre-June 2026)  [informational: migrated]
+  none
+
+== C Legacy Telegram / Active Memory files (2026.9+ rules)  [informational: migrated]
+  none
+
+== C2 Pre-July-2026 files and settings (OpenClaw 2026.10 refuses them)  [informational: migrated]
+  none
+
+== D credentials/oauth.json (provider names only)
+  none
+
+== E Agent database directories
+  agents/main/agent/openclaw-agent.sqlite (<SIZE>)
+
+== F Model wildcards and model preflight
+  wildcards: none
+  INFO canonical-openai-refs: 2 canonical openai/* refs keep their runtime (Codex app-server by default, as on 7.35): agents.defaults.model.fallbacks[0]=openai/gpt-5.5, agents.defaults.models["openai/gpt-5.5"]=openai/gpt-5.5
+
+== G Already imported legacy files
+  0
+  quarantined by the migration gate: 0 file(s) in <TMP>/config/.openclaw-upgrade/gate/quarantine (informational)
+
+== H Space
+  /config: <SIZE> free of <SIZE>
+  /share: <SIZE> free of <SIZE>
+  state <TMP>/config/.openclaw: <SIZE>; workspace <TMP>/config/clawd: <SIZE>
+
+== Result
+  rc=0: OK — nothing to note.
+
+### maintenance: gate output
+[gate] plan: runtime=2026.10.4 targets=20/24 state=20 agents=main:24 verdict=ok -> gate run mode=maintenance run=new (maintenance doctor run requested (oc-upgrade retry --doctor))
+WARN [gate] test hooks active: doctor_cmd, skip_backup_check, skip_network_check, skip_space_check
+[gate] start: run=<RUN> mode=maintenance runtime=2026.10.4
+[gate] 1/8 auth profile main/anthropic:default provider=anthropic type=token expires=-
+[gate] 1/8 auth profile main/openai:default provider=openai type=oauth expires=<TS>
+[gate] 1/8 precheck: node 24.16.0 sqlite 3.50.4 ok; mode maintenance; space check skipped (test hook); quick_check ok (2/2); network not checked; HA backup not checked (test hook); doctor budget <DUR>/pass (S=<N> MiB)
+[gate] 2/8 cleanup: quarantined 0 files (nothing to move) -> <TMP>/config/.openclaw-upgrade/gate/quarantine/<RUN>/
+WARN [gate] test hook doctor_cmd in use
+[gate] 4/8 doctor pass 1 started (limit <DUR>; log <TMP>/config/.openclaw-upgrade/gate/runs/<RUN>/doctor-pass1.log)
+[doctor] ┌  OpenClaw doctor
+[doctor] │
+[doctor] ◇  Doctor changes ───╮
+[doctor] └  Doctor complete.
+[gate] 4/8 doctor pass 1 rc=0 in <DUR>: Doctor complete. (1 pre-migration SQLite backups, <SIZE>)
+[gate] 5/8 fixups: codex plugin entry restored: no (Codex was in use before the migration: doctor's setting kept)
+WARN [gate] test hook doctor_cmd in use
+[gate] 6/8 doctor pass 2 started (limit <DUR>; log <TMP>/config/.openclaw-upgrade/gate/runs/<RUN>/doctor-pass2.log)
+[doctor] ┌  OpenClaw doctor
+[doctor] │
+[doctor] ◇  Doctor changes ───╮
+[doctor] └  Doctor complete.
+[gate] 6/8 doctor pass 2 rc=0 in <DUR>: Doctor complete.; config unchanged
+[gate] 7/8 postconditions OK: schema 20/24, config valid, lint 0 errors, no legacy state, no legacy refs, models status ok, sessions openclaw (0)
+[gate] done: MIGRATED 2026.10.4 (run <RUN>, mode maintenance, total <DUR>)
+[gate] info: the doctor captures of this run are deleted after <TS> (gate_cleanup_hours=48)
+
+### maintenance: events.log
+<TS> WARN [gate] test hooks active: doctor_cmd, skip_backup_check, skip_network_check, skip_space_check
+<TS> [gate] start: run=<RUN> mode=maintenance runtime=2026.10.4
+<TS> [gate] 1/8 auth profile main/anthropic:default provider=anthropic type=token expires=-
+<TS> [gate] 1/8 auth profile main/openai:default provider=openai type=oauth expires=<TS>
+<TS> [gate] 1/8 precheck: node 24.16.0 sqlite 3.50.4 ok; mode maintenance; space check skipped (test hook); quick_check ok (2/2); network not checked; HA backup not checked (test hook); doctor budget <DUR>/pass (S=<N> MiB)
+<TS> [gate] 2/8 cleanup: quarantined 0 files (nothing to move) -> <TMP>/config/.openclaw-upgrade/gate/quarantine/<RUN>/
+<TS> WARN [gate] test hook doctor_cmd in use
+<TS> [gate] 4/8 doctor pass 1 started (limit <DUR>; log <TMP>/config/.openclaw-upgrade/gate/runs/<RUN>/doctor-pass1.log)
+<TS> [gate] 4/8 doctor pass 1 rc=0 in <DUR>: Doctor complete. (1 pre-migration SQLite backups, <SIZE>)
+<TS> [gate] 5/8 fixups: codex plugin entry restored: no (Codex was in use before the migration: doctor's setting kept)
+<TS> WARN [gate] test hook doctor_cmd in use
+<TS> [gate] 6/8 doctor pass 2 started (limit <DUR>; log <TMP>/config/.openclaw-upgrade/gate/runs/<RUN>/doctor-pass2.log)
+<TS> [gate] 6/8 doctor pass 2 rc=0 in <DUR>: Doctor complete.; config unchanged
+<TS> [gate] 7/8 postconditions OK: schema 20/24, config valid, lint 0 errors, no legacy state, no legacy refs, models status ok, sessions openclaw (0)
+<TS> [gate] done: MIGRATED 2026.10.4 (run <RUN>, mode maintenance, total <DUR>)
+<TS> [gate] info: the doctor captures of this run are deleted after <TS> (gate_cleanup_hours=48)
+
+### maintenance: journal
+{
+ "schema": 1,
+ "run_id": "<RUN>",
+ "mode": "maintenance",
+ "runtime": "2026.10.4",
+ "addon_version": "0.5.94-test",
+ "status": "done",
+ "phase": "finalize",
+ "phases_done": [
+  "precheck",
+  "cleanup",
+  "doctor1",
+  "fixups",
+  "doctor2",
+  "postconditions",
+  "finalize"
+ ],
+ "first_write_at": "<TS>",
+ "doctor_started": true,
+ "auto_resumes": 0,
+ "started_at": "<TS>",
+ "source": {
+  "from_checkpoint": null,
+  "config_last_touched": "2026.10.4",
+  "state_user_version": 20,
+  "agents": {
+   "main": 24
+  }
+ },
+ "targets": {
+  "state": 20,
+  "agent": 24
+ },
+ "budget": {
+  "s_mib": "<N>",
+  "doctor_pass_seconds": "<N>",
+  "kill_after_seconds": 600
+ },
+ "transform": {},
+ "doctor": [
+  {
+   "pass": 1,
+   "started": "<TS>",
+   "ended": "<TS>",
+   "rc": 0,
+   "duration_s": "<N>",
+   "complete": true,
+   "markers": [],
+   "code": null,
+   "log": "runs/<RUN>/doctor-pass1.log",
+   "config_sha256_before": "6776cd14a4d0321dc0d450277b963ad4cc82ee6e31b8cec2b13796cc8de3d8fd",
+   "config_sha256_after": "6776cd14a4d0321dc0d450277b963ad4cc82ee6e31b8cec2b13796cc8de3d8fd",
+   "pre_migration_backups": [
+    {
+     "path": "state/openclaw.sqlite.pre-startup-migration-20261101T000000Z.bak",
+     "size": "<N>"
+    }
+   ]
+  },
+  {
+   "pass": 2,
+   "started": "<TS>",
+   "ended": "<TS>",
+   "rc": 0,
+   "duration_s": "<N>",
+   "complete": true,
+   "markers": [],
+   "code": null,
+   "log": "runs/<RUN>/doctor-pass2.log",
+   "config_sha256_before": "6776cd14a4d0321dc0d450277b963ad4cc82ee6e31b8cec2b13796cc8de3d8fd",
+   "config_sha256_after": "6776cd14a4d0321dc0d450277b963ad4cc82ee6e31b8cec2b13796cc8de3d8fd"
+  }
+ ],
+ "accepted": [],
+ "hold": null,
+ "orphans": [],
+ "plugins_before": [],
+ "fixups": {
+  "codex_pins": 0,
+  "refs_rewritten": 0,
+  "compaction_restored": false,
+  "codex_plugin_restored": false,
+  "codex_needed": true,
+  "policy_failures": []
+ },
+ "pins": {},
+ "history": [
+  {
+   "at": "<TS>",
+   "event": "run <RUN> started (mode bump): migration needed: state schema 19 < 20"
+  },
+  {
+   "at": "<TS>",
+   "event": "phase precheck done"
+  },
+  {
+   "at": "<TS>",
+   "event": "phase cleanup done"
+  },
+  {
+   "at": "<TS>",
+   "event": "first write"
+  },
+  {
+   "at": "<TS>",
+   "event": "phase doctor1 done"
+  },
+  {
+   "at": "<TS>",
+   "event": "phase fixups done"
+  },
+  {
+   "at": "<TS>",
+   "event": "phase doctor2 done"
+  },
+  {
+   "at": "<TS>",
+   "event": "phase postconditions done"
+  },
+  {
+   "at": "<TS>",
+   "event": "phase finalize done"
+  },
+  {
+   "at": "<TS>",
+   "event": "run <RUN> started (mode maintenance): maintenance doctor run requested (oc-upgrade retry --doctor)"
+  },
+  {
+   "at": "<TS>",
+   "event": "phase precheck done"
+  },
+  {
+   "at": "<TS>",
+   "event": "phase cleanup done"
+  },
+  {
+   "at": "<TS>",
+   "event": "first write"
+  },
+  {
+   "at": "<TS>",
+   "event": "phase doctor1 done"
+  },
+  {
+   "at": "<TS>",
+   "event": "phase fixups done"
+  },
+  {
+   "at": "<TS>",
+   "event": "phase doctor2 done"
+  },
+  {
+   "at": "<TS>",
+   "event": "phase postconditions done"
+  },
+  {
+   "at": "<TS>",
+   "event": "phase finalize done"
+  }
+ ],
+ "auth_profiles": [
+  {
+   "agent": "main",
+   "id": "anthropic:default",
+   "provider": "anthropic",
+   "type": "token",
+   "expires_utc": null,
+   "expires_ms": null
+  },
+  {
+   "agent": "main",
+   "id": "openai:default",
+   "provider": "openai",
+   "type": "oauth",
+   "expires_utc": "<TS>",
+   "expires_ms": 4102444800000
+  }
+ ],
+ "cron_legacy_ids": [],
+ "cron_openai_ids": [],
+ "doctor_notes": [],
+ "finished_at": "<TS>"
+}
+
+### maintenance: marker
+{
+ "schema": 1,
+ "runtime": "2026.10.4",
+ "mode": "maintenance",
+ "run_id": "<RUN>",
+ "completed_at": "<TS>",
+ "binding": {
+  "state_db": {
+   "path": "state/openclaw.sqlite",
+   "dev": "<N>",
+   "ino": "<N>",
+   "user_version": 20,
+   "app_version": "2026.10.4"
+  },
+  "agents": [
+   {
+    "path": "agents/main/agent/openclaw-agent.sqlite",
+    "dev": "<N>",
+    "ino": "<N>",
+    "user_version": 24
+   }
+  ]
+ },
+ "accepted": [],
+ "orphans": [],
+ "addon_version": "0.5.94-test"
+}
+
+### maintenance: status
+Gate run <RUN>: mode maintenance, status done, phase finalize, started <TS>, finished <TS>
+  phases done: precheck, cleanup, doctor1, fixups, doctor2, postconditions, finalize; first write: <TS>; auto-resumes 0/1
+  doctor pass 1: rc 0 in <DUR>
+  doctor pass 2: rc 0 in <DUR>
+Migrated marker: 2026.10.4 (maintenance, run <RUN>, <TS>)
+Gate options: delete doctor captures 48 h after a run (0 = never); backup max age 24 h
+Quarantine: <TMP>/config/.openclaw-upgrade/gate/quarantine (0 files)
+Doctor pre-migration backups: 1 (<SIZE>)

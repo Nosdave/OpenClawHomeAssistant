@@ -74,6 +74,11 @@ ACCEPTABLE = frozenset({
     # no recent encrypted Home Assistant backup with this add-on / the backup list could not be read
     "ha-backup-missing", "ha-backup-unverified",
     "data-outside-config",  # acceptable once the encrypted backup also holds that folder (a full backup)
+    # full5 prep (OpenClaw 2026.10.5+, runtime_caps): retired runtime files OpenClaw has not imported (accepting
+    # moves them to quarantine) and a failed Skill Workshop export before doctor retires the proposals
+    "acp-ledger-unimported", "voicewake-unimported", "conversation-bindings-unimported", "plugin-approvals-unimported",
+    "restart-sentinel-unimported", "sandbox-registry-unimported",
+    "skill-workshop-export-failed",
 })
 NO_RETRY = frozenset({"newer-state", "runtime-integrity"})
 # HOLD codes of the gate archive of 0.5.94-full1/full2 (removed in full3): a journal may still hold one
@@ -110,6 +115,12 @@ NODE_CAPABILITY_JS = (
     "if(f){console.error(f);process.exit(1)}"
     "console.log(process.versions.node+' '+p.version)"
 )
+
+# full5 prep: shared by the *-unimported codes (advice_for appends the accept hint)
+RETIRED_RUNTIME_ADVICE = ("OpenClaw 2026.10.4 (0.5.94-full4) is the last runtime of this add-on that imports this file; "
+                          "if its doctor left the file behind, it could not import it either (see its warning in the "
+                          "previous gate log). To keep the data, restore the encrypted backup of 0.5.94-full4 and "
+                          "stay on it")
 
 ADVICE = {
     "runtime-schema-unknown": "the add-on image is broken (OpenClaw package lacks schema targets): reinstall or rebuild the add-on",
@@ -180,6 +191,24 @@ ADVICE = {
     "bump-repeat": "the gate already ran for this runtime but the state still needs migration: check oc-upgrade check, then oc-upgrade retry",
     "exit78": "see the reason above, fix it, then oc-upgrade retry",
     "crash-loop": "see the gateway log, fix the cause, then oc-upgrade retry",
+    # full5 prep (OpenClaw 2026.10.5+; the checks are gated on oc_common.runtime_caps)
+    "acp-ledger-unimported": RETIRED_RUNTIME_ADVICE,
+    "voicewake-unimported": RETIRED_RUNTIME_ADVICE,
+    "conversation-bindings-unimported": RETIRED_RUNTIME_ADVICE,
+    "plugin-approvals-unimported": RETIRED_RUNTIME_ADVICE,
+    "restart-sentinel-unimported": RETIRED_RUNTIME_ADVICE,
+    "sandbox-registry-unimported": RETIRED_RUNTIME_ADVICE,
+    "skill-workshop-export-failed": "free space or fix permissions under /config/.openclaw-upgrade/gate/runs/ (see the "
+                                    "reason), then oc-upgrade retry (doctor has not run yet); to migrate without the "
+                                    "export: oc-upgrade retry --accept skill-workshop-export-failed (OpenClaw doctor "
+                                    "then keeps only the pending and quarantined drafts and drops the other proposals)",
+    "sqlite-fk-violation": "restore the listed database from an encrypted Home Assistant backup taken before the "
+                           "damage, or move an agent folder you no longer use out of /config/.openclaw/agents (it is "
+                           "in your backup); the gate never deletes rows. Then oc-upgrade retry",
+    "agent-db-held": "remove the agent from openclaw.json (agents.list) if you no longer use it, then oc-upgrade retry; "
+                     "to keep it, restore the encrypted Home Assistant backup of the previous add-on version, run "
+                     "openclaw agents add <id> --workspace <ws> --agent-dir <dir> --non-interactive there, then "
+                     "update again",
 }
 
 # Doctor output classification (spec §7.5 with critique B3/B8)
@@ -1469,6 +1498,7 @@ class Gate:
         self.phase = "precheck"
         self._tmp = None
         self.facts = {}
+        self._caps = None
 
     # ----- output / journal -----
     def _event(self, line):
@@ -1791,6 +1821,7 @@ class Gate:
                              "agent database(s) or workspace(s) outside /config are changed by the migration, but a "
                              "backup of the add-on alone does not contain them: " + ", ".join(outside[:4]), "precheck"))
         sizes = self.measure()
+        sw_bytes = self.skill_workshop_precheck()  # 7 (full5): Skill Workshop inventory, export size
         opt = C.gate_options()
         for prob in opt["problems"]:
             self.warn(f"add-on option {prob}")
@@ -1803,7 +1834,8 @@ class Gate:
             parts.append("space check skipped (test hook)")
         else:
             needs = [("/config", p["CONFIG_ROOT"],
-                      2 * sizes["sqlite_total"] + 2 * sizes["transcripts_total"] + 2 * C.GIB, "low-disk-config"),
+                      2 * sizes["sqlite_total"] + 2 * sizes["transcripts_total"] + 2 * C.GIB + sw_bytes,
+                      "low-disk-config"),
                      ("sqlite-tmp", sqlite_tmpdir(),
                       max(sizes["largest_agent"], sizes["max_db"]) + C.GIB, "low-disk-tmp")]
             sf_, summary = space_check(needs)
@@ -1811,6 +1843,10 @@ class Gate:
             parts.append(f"space {'ok' if not sf_ else 'LOW'} ({summary})")
         # 9 quick_check
         parts.append(self.quick_checks(F, state_db))
+        # 9b foreign keys (full5)
+        fk = self.fk_checks(F, state_db)
+        if fk:
+            parts.append(fk)
         # 10 network
         if self.hooks.get("skip_network_check") or (self.dry_run and not self.network):
             parts.append("network not checked")
@@ -1820,6 +1856,9 @@ class Gate:
         parts.append(self.ha_backup_check(F, opt))
         # 11 info
         self.info_items(mode, generic_only)
+        # 11b Skill Workshop, 11c cron inference accounts (full5; information only)
+        self.skill_workshop_info(F)
+        self.cron_binding_forecast(F, mode)
         b = self.budget()
         if self.j is not None:
             self.j["budget"] = b
@@ -2047,6 +2086,61 @@ class Gate:
                           "ignores (2026.7.35 copies it to openclaw-workspace-state.json when the workspace is "
                           "used); the agent may offer its first-run setup again")
 
+    # ----- full5 hooks (OpenClaw 2026.10.5+) -----
+    # Call sites in a fixed order (critic, implementation order step 2); each area fills only its own body.
+    # precheck: 5 classify -> 6b retired -> 7 sizes + skill_workshop_precheck -> 8 space -> 9 quick_check ->
+    # 9b fk_checks -> 10 network -> 10b HA backup -> 11 info_items -> 11b skill_workshop_info ->
+    # 11c cron_binding_forecast. The precheck also runs read-only for `gate --dry-run` and `oc-upgrade check`
+    # (self.dry_run, self.j may be None): these hooks never write there. On 2026.10.4 (runtime_caps all off)
+    # every hook keeps the 0.5.94-full4 output (tests/test_gate_golden_1004.py).
+    def caps(self):
+        """oc_common.runtime_caps of the bundled runtime (all off while the package is unknown)."""
+        ver = (self.pkg or {}).get("version")
+        if self._caps is None or self._caps[0] != ver:
+            self._caps = (ver, C.runtime_caps(self.pkg))
+        return self._caps[1]
+
+    def skill_workshop_precheck(self):
+        """Precheck 7 (Skill Workshop): inventory of the proposals; returns the bytes the export adds to the
+        /config space need."""
+        return 0
+
+    def fk_checks(self, F, state_db):
+        """Precheck 9b (schema): PRAGMA foreign_key_check of the databases quick_check checked; appends findings
+        to F and returns a summary part, or None for none."""
+        return None
+
+    def skill_workshop_info(self, F):
+        """Precheck 11b (Skill Workshop): info and WARN lines about the proposals doctor will retire."""
+        return None
+
+    def cron_binding_forecast(self, F, mode):
+        """Precheck 11c (cron, report only): enabled agentTurn jobs whose models would use a stored auth profile
+        without a recorded inference account (runtime_caps cron_refusal). WARN/info only, never a HOLD."""
+        return None
+
+    def skill_workshop_export(self):
+        """Doctor pass 1 pre-pass hook (Skill Workshop): export every proposal before doctor retires them; runs
+        before mark_first_write. May raise HoldError skill-workshop-export-failed (acceptable)."""
+        return None
+
+    def cron_binding_postcheck(self, cfg, summary):
+        """Postconditions after pc-config (cron, report only): re-read the jobs of the migrated state; never
+        writes, never HOLDs."""
+        return None
+
+    def skill_workshop_postcheck(self, summary):
+        """Postconditions before the plugin WARNs (Skill Workshop): WARN when doctor kept the proposal storage."""
+        return None
+
+    def _finalize_skill_lines(self):
+        """Finalize, after the doctor notes (Skill Workshop): info line about this run's export."""
+        return None
+
+    def _finalize_cron_lines(self):
+        """Finalize, after the Skill Workshop lines (cron): info/WARN lines per affected job."""
+        return None
+
     def phase_precheck(self):
         mode = self.j["mode"]
         generic = bool(self.j.get("first_write_at")) or mode != "from-7x"
@@ -2266,6 +2360,7 @@ class Gate:
 
     def phase_doctor1(self):
         rd, p = self.run_dir(), self.gp
+        self.skill_workshop_export()  # full5: before the first write and before doctor_started
         self.mark_first_write()
         self.j["doctor_started"] = True
         self.save()
@@ -2602,6 +2697,8 @@ class Gate:
         if not ok:
             hard("pc-config", f"openclaw config validate failed ({detail})")
         summary.append("config valid")
+        # cron inference accounts (full5, report only)
+        self.cron_binding_postcheck(cfg, summary)
         # lint (one run)
         lint_t = min(7200, 900 + self.sizes.get("s_mib", self.budget()["s_mib"]))
         res, data = self.oc_json(["doctor", "--lint", "--json", "--all", "--severity-min", "info"], lint_t, "pc-lint")
@@ -2692,6 +2789,8 @@ class Gate:
                     pol("pc-probe", f"live probe of OpenAI profile {o_ids[0]} did not return ok (rc {res.rc})")
                 else:
                     summary.append("probe ok")
+        # Skill Workshop storage (full5, WARN only)
+        self.skill_workshop_postcheck(summary)
         # plugins (WARN only)
         res, data = self.oc_json(["plugins", "list", "--json"], 180, "pc-plugins")
         for w in plugin_version_warnings(data, self.pkg["version"]):
@@ -2774,6 +2873,8 @@ class Gate:
         for path, old in self.j.get("doctor_retired_removed") or []:
             self.say(C.redact_text(f"info: doctor removed retired model {old} from {path} (it inherits the default "
                                    "model)"))
+        self._finalize_skill_lines()  # full5: doctor notes -> Skill Workshop -> cron -> done
+        self._finalize_cron_lines()
         total = _elapsed_since(self.j.get("started_at"))
         self.say(f"done: MIGRATED {self.pkg['version']} (run {self.j['run_id']}, mode {self.j['mode']}, "
                  f"total {C.fmt_duration(total)})")
@@ -3541,6 +3642,7 @@ def readiness(g, mode):
         if e.get("action") == "quarantine":
             counts[e.get("kind")] = counts.get(e.get("kind"), 0) + 1
     lines.append("[gate]   cleanup plan: " + (", ".join(f"{v} {k}" for k, v in sorted(counts.items())) or "nothing to move"))
+    lines += _readiness_skills(g)  # full5
     if mode == "from-7x" and g.cfg:
         _new, ledger, summary = M.premigrate_config(g.cfg, removals=rs.get("config_removals") or [])
         lines.append(f"[gate]   pre-migrate: explicit ids {', '.join(summary.get('explicit') or []) or 'none'}; "
@@ -3556,9 +3658,20 @@ def readiness(g, mode):
         lines.append(f"[gate]   sessions: {n} runtime pin(s) would be written")
     if g.cfg:
         lines += ["[gate]   " + ln for ln in M.glm_thinking_preview(g.cfg, C.glm_thinking_option())]
+    lines += _readiness_cron(g)  # full5
     b = g.budget()
     lines.append(f"[gate]   doctor budget {C.fmt_duration(b['doctor_pass_seconds'])}/pass (S={b['s_mib']} MiB)")
     return lines, F
+
+
+def _readiness_skills(g):
+    """Readiness lines after the cleanup plan (Skill Workshop, full5): from g.facts of the precheck."""
+    return []
+
+
+def _readiness_cron(g):
+    """Readiness lines before the doctor budget (cron, full5, report only): from g.facts of the precheck."""
+    return []
 
 
 def hold_after_start(code, last_rc=None, emit=out):
@@ -4252,6 +4365,16 @@ def leftover_note(hours):
             "kept: gate_cleanup_hours=0, delete them yourself")
 
 
+def _status_cron(j):
+    """`oc-upgrade status` lines of the gate run `j` (cron inference accounts, full5, report only)."""
+    return []
+
+
+def _status_skills(gp):
+    """`oc-upgrade status` lines after the quarantine (Skill Workshop exports, full5)."""
+    return []
+
+
 def status_lines():
     gp = gpaths()
     L = []
@@ -4299,6 +4422,7 @@ def status_lines():
                 L.append(f"  GLM thinking levels (G1): interrupted for {refs}; undone and repeated on the next run")
             else:
                 L.append(f"  GLM thinking levels (G1): not applied to {refs} ({g1.get('reason')})")
+        L += _status_cron(j)  # full5
     else:
         L.append("Gate: no run recorded.")
     m = load_marker()
@@ -4325,6 +4449,7 @@ def status_lines():
     if qd.exists():
         n = sum(1 for _p, st in C.walk_lstat(qd) if not stat.S_ISDIR(st.st_mode) and _p.name != "MANIFEST.json")
         L.append(f"Quarantine: {qd} ({n} files)")
+    L += _status_skills(gp)  # full5
     baks = list(gp["STATE"].rglob("*.pre-startup-migration-*.bak")) if gp["STATE"].exists() else []
     if baks:
         total = 0

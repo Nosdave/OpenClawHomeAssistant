@@ -217,6 +217,27 @@ RUN set -eu; \
     python3 -I -B /usr/local/lib/oc-addon/oc_dist_patch.py \
       "$pkg" "/usr/local/lib/oc-addon/oc-patches/${OPENCLAW_VERSION}"
 
+# Build-time record of what this OpenClaw dist does (oc_common.runtime_caps; read only for exactly this
+# OpenClaw version). The migration gate decides by the version table in oc_common.RUNTIME_CAPS; this record
+# can only switch a capability on, e.g. a doctor step backported to a release the table does not know.
+# grep/find only: no OpenClaw code runs here.
+#  - cron_refusal: cron agent turns without a recorded inference account stop at a stored-profile fallback
+#    (openclaw/openclaw#192195, 2026.10.10)
+#  - cron_doctor_migration: doctor records those accounts itself (#172792, 2026.11.5-beta.1)
+#  - retires_skill_proposals: doctor retires the Skill Workshop proposal tables (2026.10.10)
+RUN set -eu; \
+    pkg="$(npm root -g)/openclaw"; \
+    has() { if grep -rqF -- "$1" "$pkg/dist"; then echo true; else echo false; fi; }; \
+    sw=false; \
+    if find "$pkg/dist" -maxdepth 1 -type f -name 'doctor-skill-workshop-retire-proposals-*.mjs' | grep -q .; then sw=true; fi; \
+    jq -n --arg v "$(jq -r .version "$pkg/package.json")" \
+      --argjson r "$(has 'Automation has no recorded inference account')" \
+      --argjson m "$(has 'Inference account migration requires offline Doctor maintenance')" \
+      --argjson s "$sw" \
+      '{openclaw_version: $v, cron_refusal: $r, cron_doctor_migration: $m, retires_skill_proposals: $s}' \
+      > /usr/local/lib/oc-addon/openclaw-features.json; \
+    cat /usr/local/lib/oc-addon/openclaw-features.json
+
 # ACP / ACPX harness: lets OpenClaw drive external coding agents (Codex, Claude Code)
 # via the Agent Client Protocol. Volt authenticates Anthropic + OpenAI via OAuth
 # (not API keys), so the harness must ship in the image. Codex is NOT bundled in

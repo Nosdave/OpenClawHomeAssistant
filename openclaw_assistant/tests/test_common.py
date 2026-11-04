@@ -2,6 +2,7 @@
 
 import json
 import os
+import re
 import shutil
 import sqlite3
 import stat
@@ -262,6 +263,94 @@ class RuntimePackageTests(TmpCase):
         with mock.patch.dict(os.environ, {"OC_ADDON_ENTRY_FILE": str(self.tmp / "nope")}):
             with self.assertRaises(C.RuntimePackageError):
                 C.runtime_package()
+
+
+class RuntimeCapsTests(TmpCase):
+    """full5 prep: oc_common.runtime_caps, the one place that maps the bundled OpenClaw to gate behaviour."""
+
+    ALL_OFF = dict.fromkeys(C.CAP_NAMES, False)
+    AT_1005 = dict(ALL_OFF, runtime_files_retired=True, sandbox_registry_retired=True, config_api_cdpurl_retired=True)
+    AT_1006 = dict(AT_1005, empty_installs_tolerated=True)
+    AT_1010 = dict(AT_1006, retires_skill_proposals=True, cron_refusal=True, held_store_skip=True)
+
+    def setUp(self):
+        super().setUp()
+        self.ff = self.tmp / "openclaw-features.json"
+        self.envp = mock.patch.dict(os.environ, {"OC_ADDON_FEATURES_FILE": str(self.ff)})
+        self.envp.start()
+
+    def tearDown(self):
+        self.envp.stop()
+        super().tearDown()
+
+    def test_version_boundaries(self):
+        table = [("2026.9.9", self.ALL_OFF), ("2026.10.4", self.ALL_OFF), ("2026.10.5", self.AT_1005),
+                 ("2026.10.5-beta.1", self.AT_1005), ("2026.10.6", self.AT_1006), ("2026.10.9", self.AT_1006),
+                 ("2026.10.10", self.AT_1010), ("2026.11.1", self.AT_1010),
+                 ("2026.11.5-beta.1", dict(self.AT_1010, cron_doctor_migration=True)),
+                 ("2026.12.1", dict(self.AT_1010, cron_doctor_migration=True))]
+        for version, want in table:
+            with self.subTest(version=version):
+                self.assertEqual(C.runtime_caps(version), want)
+                self.assertEqual(C.runtime_caps({"version": version, "schema_state": 22}), want)
+
+    def test_unknown_runtime_is_all_off_and_never_raises(self):
+        for pkg in (None, "", "garbage", {}, {"version": None}, {"version": 2026}, ["2026.10.10"]):
+            with self.subTest(pkg=pkg):
+                self.assertEqual(C.runtime_caps(pkg), self.ALL_OFF)
+        self.ff.write_text("{not json")
+        self.assertEqual(C.runtime_caps("2026.10.4"), self.ALL_OFF)
+        self.ff.unlink()
+        self.ff.mkdir()  # a directory where the file should be
+        self.assertEqual(C.runtime_caps("2026.10.10"), self.AT_1010)
+
+    def test_table_names_are_unique_and_ordered_by_version(self):
+        self.assertEqual(len(set(C.CAP_NAMES)), len(C.CAP_NAMES))
+        versions = [v for _n, v in C.RUNTIME_CAPS]
+        self.assertEqual(versions, sorted(versions))
+        self.assertEqual(C.FEATURES_FILE, "/usr/local/lib/oc-addon/openclaw-features.json")
+
+    def test_image_record_switches_on_for_its_own_version_only(self):
+        # a doctor migration backported to 2026.11.1: only the image's dist grep can know it
+        self.ff.write_text(json.dumps({"openclaw_version": "2026.11.1", "cron_refusal": True,
+                                       "cron_doctor_migration": True, "retires_skill_proposals": True}))
+        self.assertEqual(C.runtime_caps("2026.11.1"), dict(self.AT_1010, cron_doctor_migration=True))
+        self.assertEqual(C.runtime_features("2026.11.1"),
+                         {"cron_refusal": True, "cron_doctor_migration": True, "retires_skill_proposals": True})
+        # a record of another version (an image rebuilt with another pin, a stale file) is ignored
+        self.assertEqual(C.runtime_caps("2026.11.2"), self.AT_1010)
+        self.assertEqual(C.runtime_caps("2026.11.1-1"), self.AT_1010)
+        self.assertEqual(C.runtime_features("2026.11.2"), {})
+
+    def test_image_record_never_switches_a_capability_off(self):
+        # a reworded dist string must not turn a check off: the version table is the floor
+        self.ff.write_text(json.dumps({"openclaw_version": "2026.10.10", "cron_refusal": False,
+                                       "retires_skill_proposals": False, "cron_doctor_migration": False}))
+        self.assertEqual(C.runtime_caps("2026.10.10"), self.AT_1010)
+        # 2026.10.4 image: everything off, as written by the Dockerfile
+        self.ff.write_text(json.dumps({"openclaw_version": "2026.10.4", "cron_refusal": False,
+                                       "cron_doctor_migration": False, "retires_skill_proposals": False}))
+        self.assertEqual(C.runtime_caps("2026.10.4"), self.ALL_OFF)
+
+    def test_image_record_ignores_unknown_keys_and_non_booleans(self):
+        self.ff.write_text(json.dumps({"openclaw_version": "2026.10.4", "cron_refusal": "true",
+                                       "held_store_skip": 1, "something_else": True, "retires_skill_proposals": True}))
+        self.assertEqual(C.runtime_features("2026.10.4"), {"retires_skill_proposals": True})
+        self.assertEqual(C.runtime_caps("2026.10.4"), dict(self.ALL_OFF, retires_skill_proposals=True))
+        self.ff.write_text(json.dumps(["2026.10.4"]))
+        self.assertEqual(C.runtime_features("2026.10.4"), {})
+
+    def test_dockerfile_writes_the_record_with_known_capabilities_only(self):
+        text = (Path(__file__).resolve().parent.parent / "Dockerfile").read_text(encoding="utf-8")
+        self.assertIn(f"> {C.FEATURES_FILE};", text)
+        m = re.search(r"'\{openclaw_version: \$v, ([^}]*)\}'", text)
+        self.assertIsNotNone(m, "jq object of the features RUN")
+        keys = [k.split(":")[0].strip() for k in m.group(1).split(",")]
+        self.assertTrue(keys and set(keys) <= set(C.CAP_NAMES), keys)
+        # grep/find only: the RUN executes no OpenClaw code
+        run = text[text.index("has() {"):text.index(f"> {C.FEATURES_FILE};")]
+        self.assertNotIn("node ", run)
+        self.assertNotIn("openclaw ", run)
 
 
 class EnvTests(TmpCase):

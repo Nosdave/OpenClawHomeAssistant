@@ -637,6 +637,55 @@ def runtime_package():
             "schema_state": s, "schema_agent": a}
 
 
+# What the bundled OpenClaw does, by the first release with that behaviour. Every gate check for OpenClaw
+# 2026.10.5 and later asks runtime_caps() instead of comparing versions itself; on 2026.10.4 every capability is
+# off and the gate behaves as in 0.5.94-full4. Entries: (name, first runtime with the behaviour above it).
+RUNTIME_CAPS = (
+    # doctor refuses retired runtime JSON files it has not imported (openclaw/openclaw#165402)
+    ("runtime_files_retired", (2026, 10, 5, 0)),
+    # the sandbox container/browser registries are retired files too (#164669)
+    ("sandbox_registry_retired", (2026, 10, 5, 0)),
+    # config validation refuses api "openai-codex-responses" and the extension driver's cdpUrl (d7f9ebd8de66)
+    ("config_api_cdpurl_retired", (2026, 10, 5, 0)),
+    # an empty plugins.installs {} is no longer refused; doctor removes it (#173851, 10.6-10.9; main line 10.10)
+    ("empty_installs_tolerated", (2026, 10, 6, 0)),
+    # doctor retires the Skill Workshop proposal tables (keeps only pending/quarantined drafts as files)
+    ("retires_skill_proposals", (2026, 10, 10, 0)),
+    # a cron agent turn without a recorded inference account stops at a stored-profile fallback (#192195)
+    ("cron_refusal", (2026, 10, 10, 0)),
+    # the gateway skips held stores of agents that are not configured instead of failing on them
+    ("held_store_skip", (2026, 10, 10, 0)),
+    # doctor records the cron inference accounts itself (#172792; 2026.11.5-beta.1 parses as 2026.11.5)
+    ("cron_doctor_migration", (2026, 11, 5, 0)),
+)
+CAP_NAMES = tuple(n for n, _v in RUNTIME_CAPS)
+# Build-time record (Dockerfile): {"openclaw_version": ..., <cap>: true|false} for capabilities the image can
+# prove by a dist grep (e.g. a backported doctor step the version table cannot know).
+FEATURES_FILE = "/usr/local/lib/oc-addon/openclaw-features.json"
+
+
+def runtime_features(version):
+    """The build-time capability record, only when it was written for exactly this OpenClaw `version`."""
+    data = load_json_or_none(os.environ.get("OC_ADDON_FEATURES_FILE") or FEATURES_FILE)
+    if not isinstance(data, dict) or not isinstance(version, str) or data.get("openclaw_version") != version:
+        return {}
+    return {k: v for k, v in data.items() if k in CAP_NAMES and isinstance(v, bool)}
+
+
+def runtime_caps(pkg):
+    """{capability: bool} of the bundled OpenClaw (`pkg`: runtime_package() or a version string).
+
+    The version table RUNTIME_CAPS is the floor; the image's record (runtime_features) can only switch a
+    capability on, so a reworded dist string never turns a check off. Unknown versions give all False.
+    Never raises."""
+    version = pkg.get("version") if isinstance(pkg, dict) else pkg
+    v = version_tuple(version)
+    caps = {name: bool(v and v >= since) for name, since in RUNTIME_CAPS}
+    for name, on in runtime_features(version).items():
+        caps[name] = caps[name] or on
+    return caps
+
+
 ENV_REMOVE = {
     "OPENCLAW_COMPATIBILITY_HOST_VERSION", "OPENCLAW_CONTAINER", "INVOCATION_ID", "JOURNAL_STREAM",
     "SYSTEMD_EXEC_PID", "OPENCLAW_SYSTEMD_UNIT", "OPENCLAW_SERVICE_MARKER", "OPENCLAW_SERVICE_KIND",
