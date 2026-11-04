@@ -2673,6 +2673,118 @@ class TestGlmThinkingLevels(unittest.TestCase):
         self.assertEqual(m.glm_thinking_preview(m.glm_thinking_levels(glm_cfg())[0], True), [])
 
 
+class TestCronAccountForecast(unittest.TestCase):
+    """full5 (report only): which cron jobs OpenClaw 2026.10.10/2026.11.1 refuses or stops at a fallback because
+    they have no recorded inference account (openclaw/openclaw#192195). Synthetic jobs and profiles only."""
+
+    CFG = {"agents": {"defaults": {"model": {"primary": "vllm/qwen", "fallbacks": ["openai/gpt-5.5", "google/g"]},
+                                   "models": {"openai/gpt-5.5": {"alias": "GPT"}}},
+                      "list": [{"id": "main", "default": True},
+                               {"id": "mail", "model": "vllm/small"},
+                               {"id": "ops", "model": {"primary": "vllm/small", "fallbacks": ["anthropic/c"]}},
+                               {"id": "lab", "model": {"primary": "vllm/small"}}, {"id": "dev", "model": {}}]},
+           "models": {"providers": {"vllm": {"baseUrl": "http://127.0.0.1:8000/v1"}}}}
+    PROFILES = [{"id": "openai:default", "provider": "openai"}, {"id": "anthropic:default", "provider": "anthropic"}]
+
+    def job(self, jid="j1", enabled=True, **kw):
+        payload = {"kind": "agentTurn", "message": "synthetic prompt"}
+        payload.update(kw.pop("payload", {}))
+        return {"id": jid, "name": f"Job {jid}", "enabled": enabled, "runtime_authority": kw.pop("authority", False),
+                "job": dict({"agentId": "main", "sessionTarget": "isolated", "payload": payload}, **kw)}
+
+    def forecast(self, *jobs, cfg=None, profiles=None):
+        return m.cron_account_forecast(list(jobs), self.CFG if cfg is None else cfg,
+                                       lambda aid: self.PROFILES if profiles is None else profiles, "main")
+
+    def test_split_trailing_auth_profile_matches_openclaw(self):
+        # agents/model-ref-profile.ts (identical in 2026.10.4 and 2026.10.10)
+        for raw, want in [("openai/gpt-5.5@openai:a", ("openai/gpt-5.5", "openai:a")),
+                          ("p/m@20250101", ("p/m@20250101", None)), ("p/m@q4_k_m@work", ("p/m@q4_k_m", "work")),
+                          ("p/m@20250101@Q4_K_M@w", ("p/m@20250101@Q4_K_M", "w")), ("p/m@8bit", ("p/m@8bit", None)),
+                          ("@x", ("@x", None)), ("p/m@ ", ("p/m@", None)), ("", ("", None)), (None, ("", None)),
+                          ("a@b/c@d", ("a@b/c", "d")), (" openai/gpt-5.5 ", ("openai/gpt-5.5", None)),
+                          ("p/m@١٢٣٤٥٦٧٨", ("p/m", "١٢٣٤"
+                                                                                   "٥٦٧٨"))]:
+            with self.subTest(raw=raw):
+                self.assertEqual(m.split_trailing_auth_profile(raw), want)
+
+    def test_model_chain_follows_the_cron_fallback_policy(self):
+        chain = lambda job, aid="main": m.cron_model_chain(job, self.CFG, aid)  # noqa: E731
+        # no job model: the defaults' primary and fallbacks
+        self.assertEqual(chain({"payload": {}}), ("vllm/qwen", ["openai/gpt-5.5", "google/g"], "defaults"))
+        # job model without job fallbacks: the agent's override, else the defaults' fallbacks
+        self.assertEqual(chain({"payload": {"model": "anthropic/c"}}),
+                         ("anthropic/c", ["openai/gpt-5.5", "google/g"], "defaults"))
+        # job fallbacks (also []) replace everything
+        self.assertEqual(chain({"payload": {"fallbacks": []}}), ("vllm/qwen", [], "job"))
+        self.assertEqual(chain({"payload": {"fallbacks": ["x/y", 3, " "]}}), ("vllm/qwen", ["x/y"], "job"))
+        # an agent with a primary of its own and no fallbacks has none; an explicit list replaces the defaults
+        self.assertEqual(chain({"payload": {}}, "mail"), ("vllm/small", [], "agent"))
+        self.assertEqual(chain({"payload": {}}, "OPS"), ("vllm/small", ["anthropic/c"], "agent"))
+        self.assertEqual(chain({"payload": {}}, "lab"), ("vllm/small", [], "agent"))
+        self.assertEqual(chain({"payload": {}}, "dev"), ("vllm/qwen", ["openai/gpt-5.5", "google/g"], "defaults"))
+        self.assertEqual(m.cron_model_chain({"payload": {}}, {}, "main"), (None, [], "defaults"))
+
+    def test_job_agent(self):
+        self.assertEqual(m.cron_job_agent({"agentId": " Mail "}), "mail")
+        self.assertEqual(m.cron_job_agent({"sessionKey": "agent:ops:telegram:dm:1"}), "ops")
+        self.assertEqual(m.cron_job_agent({"sessionKey": "main"}, "Main"), "main")
+
+    def test_model_ref_alias_and_profile(self):
+        self.assertEqual(m.cron_model_ref(self.CFG, "OpenAI/gpt-5.5@openai:b"), ("openai", "gpt-5.5", "openai:b"))
+        self.assertEqual(m.cron_model_ref(self.CFG, "gpt"), ("openai", "gpt-5.5", None))
+        self.assertIsNone(m.cron_model_ref(self.CFG, "unknown-alias"))
+        self.assertIsNone(m.cron_model_ref(self.CFG, "openai/"))
+
+    def test_stored_profile_rules(self):
+        uses = lambda cfg, prov="openai", explicit=None, profiles=self.PROFILES: \
+            m.cron_ref_uses_stored_profile(cfg, prov, explicit, profiles)  # noqa: E731
+        prov = lambda **p: {"models": {"providers": {"OpenAI": p}}}  # noqa: E731
+        self.assertTrue(uses({}))
+        self.assertFalse(uses({}, "vllm"))  # local route, no stored account
+        self.assertFalse(uses({}, "google"))  # environment / configured key
+        self.assertTrue(uses({}, "vllm", explicit="vllm:x"))  # model@profile names a stored account
+        # a configured key suppresses the profiles (prepare-auth.ts providerBindingSuppressesProfiles)
+        self.assertFalse(uses(prov(apiKey={"source": "env", "provider": "default", "id": "OPENAI_API_KEY"})))
+        self.assertFalse(uses(prov(apiKey="${OPENAI_API_KEY}")))
+        self.assertFalse(uses(prov(apiKey="OPENAI_API_KEY")))
+        self.assertFalse(uses(prov(apiKey="sk-synthetic", auth="api-key")))
+        # a literal key without explicit api-key auth: the stored profiles still come first
+        self.assertTrue(uses(prov(apiKey="sk-synthetic")))
+        # apiKey naming a stored profile pins it
+        self.assertTrue(uses(prov(apiKey="anthropic:default")))
+        self.assertFalse(uses(prov(auth="aws-sdk")))  # ambient credentials are not modelled
+
+    def test_forecast_primary_and_fallbacks(self):
+        res = self.forecast(self.job("a", payload={"model": "openai/gpt-5.5@openai:default",
+                                                   "fallbacks": ["anthropic/c", "vllm/qwen", "openai/gpt-5.5"]}),
+                            self.job("b"), self.job("c", agentId="mail"), self.job("d", payload={"model": "gpt"}))
+        self.assertEqual((res["checked"], res["bound"]), (4, 0))
+        self.assertEqual(res["affected"], [
+            {"id": "a", "name": "Job a", "agent": "main", "primary": "openai/gpt-5.5", "primary_affected": True,
+             "refs": ["openai/gpt-5.5", "anthropic/c"]},
+            {"id": "b", "name": "Job b", "agent": "main", "primary": "vllm/qwen", "primary_affected": False,
+             "refs": ["openai/gpt-5.5"]},
+            {"id": "d", "name": "Job d", "agent": "main", "primary": "openai/gpt-5.5", "primary_affected": True,
+             "refs": ["openai/gpt-5.5"]}])
+        # without any stored profile nothing is affected (configured keys, local models)
+        self.assertEqual(self.forecast(self.job("a", payload={"model": "openai/gpt-5.5"}), profiles=[])["affected"], [])
+
+    def test_forecast_skips_what_openclaw_does_not_refuse(self):
+        jobs = [self.job("off", enabled=False), self.job("ev", payload={"kind": "systemEvent"}),
+                self.job("main", sessionTarget="main"), self.job("auth", authority=True),
+                self.job("bound", inferenceBinding={"version": 1, "provider": "openai"}),
+                {"id": "bad", "name": "Bad", "enabled": True, "runtime_authority": False, "job": None}]
+        res = self.forecast(*jobs)
+        self.assertEqual((res["checked"], res["bound"], res["affected"]), (0, 1, []))
+
+    def test_forecast_leaves_its_inputs_alone(self):
+        jobs = [self.job("a", payload={"model": "gpt"})]
+        snap, cfg_snap = copy.deepcopy(jobs), copy.deepcopy(self.CFG)
+        self.forecast(*jobs)
+        self.assertEqual((jobs, self.CFG), (snap, cfg_snap))
+
+
 class TestPurity(unittest.TestCase):
     def test_all_transforms_leave_inputs_alone(self):
         before = spec_example()

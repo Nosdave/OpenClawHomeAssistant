@@ -38,6 +38,8 @@ __all__ = [
     "retired_chain", "apply_retired",
     "legacy_key_context", "is_migrated_legacy_key",
     "check_legacy_refs", "check_codex_runtime", "check_runtime_pins", "apply_pins", "auth_order_adjust",
+    "split_trailing_auth_profile", "cron_job_agent", "cron_model_chain", "cron_model_ref",
+    "cron_ref_uses_stored_profile", "cron_account_forecast",
     "classify_state_files", "scan_sessions_files", "config_precheck", "flatten_paths",
     "retired_config_keys", "retired_config_rewrites", "retired_config_findings", "classify_retired_state",
     "retired_db_findings",
@@ -1960,6 +1962,221 @@ def auth_order_adjust(cfg, profiles, store_order):
     ledger = [{"step": "auth-order", "file": CONFIG_FILE, "path": "auth.order.openai", "before": None,
                "after": list(value)}]
     return new, None, ledger
+
+
+# --- cron inference accounts (openclaw/openclaw#192195; report only) ---------------------------------
+# OpenClaw 2026.10.10 and the 2026.11.1 candidate refuse a cron agent turn that has no recorded inference
+# account (job_json inferenceBinding, #172590) as soon as a prepared candidate would run on a stored auth
+# profile or a direct credential that is not a configured key (embedded-agent-runner/run/auth-plan.ts), and
+# the refusal stops the fallback chain (recordModelFallbackStop). OpenClaw's own doctor migration (#172792)
+# ships with 2026.11.5. The gate only forecasts which jobs are affected; it writes nothing.
+
+_PROFILE_SUFFIX_NOT_PROFILE = (re.compile(r"[0-9]{8}(?:@|\Z)", re.A),
+                               re.compile(r"(?:i?q[0-9]+(?:_[a-z0-9]+)*|[0-9]+bit)(?:@|\Z)", re.A | re.I))
+# models.providers.<p>.apiKey values that are no literal key: ${ENV} references and env-var names (OpenClaw
+# treats its known env markers as configured keys, provider-model-auth-source-plan.ts)
+_ENV_KEY_REF_RE = re.compile(r"\A\$\{[A-Za-z_][A-Za-z0-9_]*\}\Z")
+_ENV_KEY_NAME_RE = re.compile(r"\A[A-Z][A-Z0-9_]*\Z")
+
+
+def split_trailing_auth_profile(raw):
+    """(model, profile or None) of a "provider/model@profile" ref: port of OpenClaw's splitTrailingAuthProfile
+    (agents/model-ref-profile.ts, identical in 2026.10.4 and 2026.10.10). An 8-digit version or a quantization
+    suffix after "@" is part of the model."""
+    trimmed = raw.strip() if isinstance(raw, str) else ""
+    if not trimmed:
+        return "", None
+    d = trimmed.find("@", trimmed.rfind("/") + 1)
+    if d <= 0:
+        return trimmed, None
+    for suffix in _PROFILE_SUFFIX_NOT_PROFILE:
+        if not suffix.match(trimmed, d + 1):
+            continue
+        nxt = trimmed.find("@", d + 1)
+        if nxt < 0:
+            return trimmed, None
+        d = nxt
+    model, profile = trimmed[:d].strip(), trimmed[d + 1:].strip()
+    if not model or not profile:
+        return trimmed, None
+    return model, profile
+
+
+def _agent_cfg_entry(cfg, agent_id):
+    """The agents.list / agents.entries object of `agent_id` (ids compared lower-cased), or None."""
+    agents = cfg.get("agents") if isinstance(cfg, dict) else None
+    if not isinstance(agents, dict) or not isinstance(agent_id, str):
+        return None
+    want = agent_id.strip().lower()
+    for e in agents.get("list") if isinstance(agents.get("list"), list) else []:
+        if isinstance(e, dict) and isinstance(e.get("id"), str) and e["id"].strip().lower() == want:
+            return e
+    ent = agents.get("entries")
+    for k, e in ent.items() if isinstance(ent, dict) else []:
+        if isinstance(k, str) and k.strip().lower() == want and isinstance(e, dict):
+            return e
+    return None
+
+
+def _model_primary(v):
+    if isinstance(v, dict):
+        v = v.get("primary")
+    return v.strip() if isinstance(v, str) and v.strip() else None
+
+
+def _agent_fallbacks_override(v):
+    """OpenClaw's resolveSelectedModelFallbacksOverride (agents/agent-scope.ts): a primary of its own without
+    fallbacks means none; an explicit list (also []) replaces the defaults; otherwise None (inherit)."""
+    if isinstance(v, str):
+        return [] if v.strip() else None
+    if not isinstance(v, dict):
+        return None
+    if "fallbacks" not in v:
+        return [] if _model_primary(v) else None
+    return v["fallbacks"] if isinstance(v["fallbacks"], list) else None
+
+
+def cron_job_agent(job, default_agent="main"):
+    """The agent a cron job runs as: agentId, else the agent of its sessionKey ("agent:<id>:..."), else the
+    default agent."""
+    aid = job.get("agentId")
+    if isinstance(aid, str) and aid.strip():
+        return aid.strip().lower()
+    sk = job.get("sessionKey")
+    if isinstance(sk, str):
+        parts = sk.strip().split(":")
+        if len(parts) >= 3 and parts[0].lower() == "agent" and parts[1].strip():
+            return parts[1].strip().lower()
+    return (default_agent or "main").strip().lower()
+
+
+def cron_model_chain(job, cfg, agent_id):
+    """(primary ref or None, [fallback refs], source) of a cron agent turn, as OpenClaw 2026.10.10 resolves it
+    (cron/isolated-agent/run-fallback-policy.ts): payload.model, else the agent's, else the defaults' primary;
+    payload.fallbacks when it is a list (also []), else the agent's fallback override, else the defaults'."""
+    payload = job.get("payload") if isinstance(job.get("payload"), dict) else {}
+    defaults = _get(cfg, ["agents", "defaults", "model"], None)
+    entry = _agent_cfg_entry(cfg, agent_id)
+    amodel = entry.get("model") if entry else None
+    pm = payload.get("model")
+    primary = (pm.strip() if isinstance(pm, str) and pm.strip() else None) or _model_primary(amodel) \
+        or _model_primary(defaults)
+    if isinstance(payload.get("fallbacks"), list):
+        fbs, src = payload["fallbacks"], "job"
+    else:
+        ov = _agent_fallbacks_override(amodel)
+        if ov is not None:
+            fbs, src = ov, "agent"
+        else:
+            fbs = defaults.get("fallbacks") if isinstance(defaults, dict) else None
+            fbs, src = (fbs if isinstance(fbs, list) else []), "defaults"
+    return primary, [f.strip() for f in fbs if isinstance(f, str) and f.strip()], src
+
+
+def _model_alias_target(cfg, alias):
+    models = _get(cfg, ["agents", "defaults", "models"], None)
+    want = alias.strip().casefold()
+    for ref, v in models.items() if isinstance(models, dict) else []:
+        if isinstance(ref, str) and isinstance(v, dict) and isinstance(v.get("alias"), str) \
+                and v["alias"].strip().casefold() == want:
+            return ref
+    return None
+
+
+def cron_model_ref(cfg, raw):
+    """(provider lower-cased, model id, explicit profile or None) of a cron candidate ref; a bare id is looked
+    up as an alias of agents.defaults.models. None when it cannot be resolved."""
+    model, profile = split_trailing_auth_profile(raw)
+    if not model:
+        return None
+    prov, mid = _split_ref(model)
+    if prov is None:
+        target = _model_alias_target(cfg, model)
+        if target is None:
+            return None
+        target, tprof = split_trailing_auth_profile(target)
+        prov, mid = _split_ref(target)
+        profile = profile or tprof
+    if not prov or not mid:
+        return None
+    return prov, mid, profile
+
+
+def _provider_cfg(cfg, provider):
+    provs = _get(cfg, ["models", "providers"], None)
+    for k, v in provs.items() if isinstance(provs, dict) else []:
+        if isinstance(k, str) and k.strip().lower() == provider and isinstance(v, dict):
+            return v
+    return None
+
+
+def cron_ref_uses_stored_profile(cfg, provider, explicit_profile, profiles):
+    """True when OpenClaw 2026.10.10 would prepare this candidate on a stored auth profile (prepare-auth.ts),
+    so a cron job without a recorded inference account is refused there.
+
+    profiles: [{"id", "provider"}] the job's agent can use (its own store, the shared store, auth.profiles of
+    openclaw.json). A model@profile ref names a stored account. models.providers.<p>.apiKey: a SecretRef or an
+    env reference is a configured key that suppresses the profiles; a value that names a stored profile pins
+    it; a literal key suppresses them only with auth "api-key", otherwise the profiles come first. A provider
+    without stored profiles (configured key, environment, local or synthetic route) is not affected."""
+    if explicit_profile:
+        return True
+    pcfg = _provider_cfg(cfg, provider) or {}
+    key = pcfg.get("apiKey")
+    if isinstance(key, dict):
+        return False
+    if isinstance(key, str) and key.strip():
+        k = key.strip()
+        if any(p.get("id") == k for p in profiles):
+            return True
+        if _ENV_KEY_REF_RE.match(k) or _ENV_KEY_NAME_RE.match(k) or pcfg.get("auth") == "api-key":
+            return False
+    if pcfg.get("auth") == "aws-sdk":  # ambient AWS credentials: not modelled
+        return False
+    return any(str(p.get("provider") or "").strip().lower() == provider for p in profiles)
+
+
+def cron_account_forecast(jobs, cfg, profiles_for, default_agent="main"):
+    """Report-only forecast for openclaw/openclaw#192195 (no I/O).
+
+    jobs: [{"id", "name", "enabled", "runtime_authority", "job"}] in store order, "job" the parsed job_json
+    without its prompt (None when unparsable); profiles_for(agent_id) -> [{"id", "provider"}] (no secrets).
+    Covers enabled agentTurn jobs with no recorded inference account (inferenceBinding), no scheduled runtime
+    authority and a session target other than "main". A job is affected when its primary or any fallback would
+    run on a stored auth profile. Returns {"checked": n, "bound": n, "affected": [{"id", "name", "agent",
+    "primary", "primary_affected", "refs"}]}; refs are the affected "provider/model" refs in chain order
+    (without @profile)."""
+    cfg = cfg if isinstance(cfg, dict) else {}
+    res = {"checked": 0, "bound": 0, "affected": []}
+    for row in jobs or []:
+        job = row.get("job")
+        if not row.get("enabled") or not isinstance(job, dict) or row.get("runtime_authority"):
+            continue
+        payload = job.get("payload") if isinstance(job.get("payload"), dict) else {}
+        if payload.get("kind") != "agentTurn" or job.get("sessionTarget") == "main":
+            continue
+        if job.get("inferenceBinding") or job.get("authProfileBinding"):
+            res["bound"] += 1
+            continue
+        res["checked"] += 1
+        agent = cron_job_agent(job, default_agent)
+        primary, fallbacks, _src = cron_model_chain(job, cfg, agent)
+        profiles = profiles_for(agent)
+        refs, primary_affected = [], False
+        for i, raw in enumerate([primary] + fallbacks):
+            r = cron_model_ref(cfg, raw) if raw else None
+            if r is None or not cron_ref_uses_stored_profile(cfg, r[0], r[2], profiles):
+                continue
+            ref = f"{r[0]}/{r[1]}"
+            primary_affected = primary_affected or i == 0
+            if ref not in refs:
+                refs.append(ref)
+        if refs:
+            p = cron_model_ref(cfg, primary) if primary else None
+            res["affected"].append({"id": row.get("id"), "name": row.get("name"), "agent": agent,
+                                    "primary": f"{p[0]}/{p[1]}" if p else primary,
+                                    "primary_affected": primary_affected, "refs": refs})
+    return res
 
 
 # --- state files (§7.1 item 6.3, §7.3) --------------------------------------------------------

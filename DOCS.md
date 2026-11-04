@@ -1203,6 +1203,39 @@ behaviour pin for `approvalPolicy` is not written on these versions). With OpenC
   export holds every proposal. Follow doctor's warning (`oc-upgrade log`), then
   `oc-upgrade retry --doctor` and restart to retire it.
 
+#### Cron jobs without a recorded inference account (OpenClaw 2026.10.10+)
+
+Since OpenClaw 2026.10.10 a cron job records the account (auth profile) it runs on.
+Jobs from before have none. OpenClaw 2026.10.10 and 2026.11.1 refuse such a job's run
+as soon as the model it is about to use would run on a stored login (a subscription
+login, a token or an API key in OpenClaw's auth store), with "Automation has no recorded
+inference account" in the run history (openclaw/openclaw#192195). The refusal also ends
+the fallback chain: no further model is tried. A model on a key from the environment or
+the provider config, or a local model (vLLM), needs no account and keeps working.
+OpenClaw's doctor records the accounts itself only from 2026.11.5
+(openclaw/openclaw#172792).
+
+The gate only reports this: it changes no cron job and no auth store and never holds.
+With OpenClaw 2026.10.4 it prints nothing.
+
+- **Precheck** (also `oc-upgrade gate --dry-run`, and `oc-upgrade check` while a
+  migration is pending): one `WARN [gate] cron job '<name>' (<id>): …` per enabled
+  agent-turn job without a recorded account whose model or a fallback (the job's own
+  fallbacks, else the agent's or the defaults' in `openclaw.json`) would use a stored
+  login. It names the affected models and says either that every run is refused (the
+  job's own model uses a stored login) or that the job keeps working on its own model
+  and stops at the first such fallback when that model fails. Only the job id, its name
+  and model names are shown, no prompt and no account.
+- **After the migration** the gate reads the migrated jobs again: the `7/8
+  postconditions` line counts them, the end of the run repeats the warnings, and
+  `oc-upgrade status` lists them.
+- **What to do.** Nothing, if the job's own model needs no account and you can do
+  without that fallback until OpenClaw 2026.11.5. To run a job on a stored login now:
+  after the start, `openclaw automations edit <id> --model <provider/model>@<profileId>`
+  records the account (and makes that model the job's model). The job then runs only on
+  that account's provider: fallbacks to other providers are refused
+  (openclaw/openclaw#192463).
+
 #### Automatic deletion (`gate_cleanup_hours`)
 
 OpenClaw 2026.10 doctor leaves a copy of the databases in

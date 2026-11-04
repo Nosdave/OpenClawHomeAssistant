@@ -2133,6 +2133,8 @@ class Gate:
         # 11b Skill Workshop, 11c cron inference accounts (full5; information only)
         self.skill_workshop_info(F)
         self.cron_binding_forecast(F, mode)
+        # 11d session sizes (full5, openclaw/openclaw#191847; information only)
+        self.large_session_info()
         b = self.budget()
         if self.j is not None:
             self.j["budget"] = b
@@ -2424,9 +2426,9 @@ class Gate:
     # Call sites in a fixed order (critic, implementation order step 2); each area fills only its own body.
     # precheck: 5 classify -> 6b retired -> 7 sizes + skill_workshop_precheck -> 8 space -> 9 quick_check ->
     # 9b fk_checks -> 10 network -> 10b HA backup -> 11 info_items -> 11b skill_workshop_info ->
-    # 11c cron_binding_forecast. The precheck also runs read-only for `gate --dry-run` and `oc-upgrade check`
-    # (self.dry_run, self.j may be None): these hooks never write there. On 2026.10.4 (runtime_caps all off)
-    # every hook keeps the 0.5.94-full4 output (tests/test_gate_golden_1004.py).
+    # 11c cron_binding_forecast -> 11d large_session_info. The precheck also runs read-only for `gate --dry-run`
+    # and `oc-upgrade check` (self.dry_run, self.j may be None): these hooks never write there. On 2026.10.4
+    # (runtime_caps all off) every hook keeps the 0.5.94-full4 output (tests/test_gate_golden_1004.py).
     def caps(self):
         """oc_common.runtime_caps of the bundled runtime (all off while the package is unknown)."""
         ver = (self.pkg or {}).get("version")
@@ -2556,7 +2558,31 @@ class Gate:
 
     def cron_binding_forecast(self, F, mode):
         """Precheck 11c (cron, report only): enabled agentTurn jobs whose models would use a stored auth profile
-        without a recorded inference account (runtime_caps cron_refusal). WARN/info only, never a HOLD."""
+        without a recorded inference account (runtime_caps cron_refusal). WARN/info only, never a HOLD.
+
+        Before the first write only (a resumed run reports after doctor, cron_binding_postcheck). On a runtime
+        whose doctor records the accounts itself (cron_doctor_migration) one info line; the jobs doctor leaves
+        are reported after the migration."""
+        caps = self.caps()
+        if not caps["cron_refusal"] or (self.j or {}).get("first_write_at"):
+            return None
+        try:
+            rec = cron_account_report(self.gp["STATE"], self.cfg, self.pkg["version"], caps["cron_doctor_migration"])
+        except (sqlite3.Error, C.NodeQueryError, OSError, ValueError, TypeError) as exc:
+            self.warn(f"could not check the cron jobs for their inference account ({type(exc).__name__}: "
+                      f"{C.redact_text(str(exc))[:200]})")
+            return None
+        self.facts["cron_binding_plan"] = rec
+        if self.j is not None:
+            self.j["cron_binding_forecast"] = rec
+        n = len(rec["affected"])
+        if n and caps["cron_doctor_migration"]:
+            self.say(f"{self.pn('precheck')} info: {n} enabled cron job(s) without a recorded inference account use "
+                     f"a stored login; OpenClaw {self.pkg['version']} doctor records the account "
+                     "(openclaw/openclaw#172792); the gate reports the jobs it leaves after the migration")
+        elif n:
+            for line in cron_job_lines(rec):
+                self.warn(line)
         return None
 
     def skill_workshop_export(self):
@@ -2614,8 +2640,21 @@ class Gate:
         return None
 
     def cron_binding_postcheck(self, cfg, summary):
-        """Postconditions after pc-config (cron, report only): re-read the jobs of the migrated state; never
-        writes, never HOLDs."""
+        """Postconditions after pc-config (cron, report only): re-read the jobs of the migrated state (doctor may
+        have changed them) into journal cron_binding for the finalize and status lines; never writes into
+        OpenClaw's databases, never HOLDs."""
+        caps = self.caps()
+        if not caps["cron_refusal"]:
+            return None
+        try:
+            rec = cron_account_report(self.gp["STATE"], cfg, self.pkg["version"], caps["cron_doctor_migration"])
+        except (sqlite3.Error, C.NodeQueryError, OSError, ValueError, TypeError) as exc:
+            self.warn(f"7/8 could not check the cron jobs for their inference account ({type(exc).__name__}: "
+                      f"{C.redact_text(str(exc))[:200]})")
+            return None
+        self.j["cron_binding"] = dict(rec, checked_at=C.utc_iso())
+        if rec["affected"]:
+            summary.append(f"{len(rec['affected'])} cron job(s) without a recorded inference account (report below)")
         return None
 
     def skill_workshop_postcheck(self, summary):
@@ -2669,7 +2708,35 @@ class Gate:
         return new
 
     def _finalize_cron_lines(self):
-        """Finalize, after the Skill Workshop lines (cron): info/WARN lines per affected job."""
+        """Finalize, after the Skill Workshop lines (cron): WARN lines per affected job of the postconditions'
+        report (journal cron_binding)."""
+        for line in cron_job_lines(self.j.get("cron_binding")):
+            self.warn(line)
+        return None
+
+    def large_session_info(self):
+        """Precheck 11d (openclaw/openclaw#191847, information only): the largest agent database and the event
+        count of the biggest session's transcript, so the exposure to the reported out-of-memory of the 512 MB
+        SQLite worker on large sessions can be judged. Read-only; runtime_caps large_session_oom_issue."""
+        if not self.caps()["large_session_oom_issue"]:
+            return None
+        try:
+            ls = largest_sessions(self.gp["STATE"], self.cfg)
+        except (sqlite3.Error, C.NodeQueryError, OSError, ValueError) as exc:
+            self.say(f"{self.pn('precheck')} info: session sizes not measured ({type(exc).__name__})")
+            return None
+        if not ls:
+            return None
+        self.facts["large_session"] = ls
+        db, se = ls["db"], ls["session"]
+        text = f"largest agent database {printable(db['path'])} ({C.human(db['bytes'])} with WAL)"
+        if se:
+            where = ", ".join(printable(x) for x in (se["channel"], se["chat_type"]) if x)
+            text += (f"; biggest session: {se['events']} transcript events (agent {printable(se['agent'])}"
+                     + (f", {where}" if where else "") + ")")
+        self.say(f"{self.pn('precheck')} info: {text}. An open OpenClaw issue reports the 512 MB SQLite worker of "
+                 f"OpenClaw {self.pkg['version']} running out of memory on large Telegram direct-chat sessions "
+                 "(openclaw/openclaw#191847)")
         return None
 
     def phase_precheck(self):
@@ -3964,6 +4031,189 @@ def codex_cron_ids(state_db, provider="openai-codex"):
     return len(rows), sorted(ids)[:200]
 
 
+# --- cron inference accounts (full5, openclaw/openclaw#192195; report only) ----------------------
+# Read-only. codex_cron_ids (F15) keeps its own 7.x column reader: a 10.x job on an openai/ model must not
+# mark Codex as in use (critic). Nothing here writes into OpenClaw's databases or auth stores.
+CRON_REPORT_MAX = 20
+CRON_MANUAL = ("Manual alternative after the start: openclaw automations edit <id> --model "
+               "<provider/model>@<profileId>; it records the account, but the job then runs only on that "
+               "account's provider and its fallbacks to other providers are refused (openclaw/openclaw#192463)")
+
+
+def cron_jobs_inventory(state_db):
+    """Cron jobs of the 2026.10 layout (state DB cron_jobs.job_json) in store order:
+    [{store_key, id, name, enabled, runtime_authority, job}], where job keeps only what the forecast reads
+    (agentId, sessionKey, sessionTarget, binding fields, payload kind/model/fallbacks; never the prompt) and
+    is None when job_json is not a JSON object. [] without the table or for the 7.x wide-row layout
+    (payload_model columns; reported after the migration)."""
+    state_db = Path(state_db)
+    if not state_db.exists():
+        return []
+    tables = table_names(state_db)
+    cols = {r[1] for r in q(state_db, "PRAGMA table_info(cron_jobs)")} if "cron_jobs" in tables else set()
+    if "job_json" not in cols or "payload_model" in cols:
+        return []
+    authority = set()
+    if "cron_job_runtime_authorities" in tables:  # a scheduled runtime authority is not refused (auth-plan.ts)
+        authority = {(r[0], r[1]) for r in q(state_db, "SELECT store_key, job_id FROM cron_job_runtime_authorities "
+                                                      "WHERE recovery_required=0")}
+    out = []
+    for sk, jid, name, enabled, text in q(state_db, "SELECT store_key, job_id, name, enabled, job_json FROM cron_jobs "
+                                                   "ORDER BY store_key, sort_order, job_id"):
+        try:
+            raw = json.loads(text) if isinstance(text, str) else None
+        except ValueError:
+            raw = None
+        job = None
+        if isinstance(raw, dict):
+            pl = raw.get("payload") if isinstance(raw.get("payload"), dict) else {}
+            job = {k: raw[k] for k in ("agentId", "sessionKey", "sessionTarget", "inferenceBinding",
+                                       "authProfileBinding") if k in raw}
+            job["payload"] = {k: pl[k] for k in ("kind", "model", "fallbacks") if k in pl}
+        out.append({"store_key": sk, "id": str(jid), "name": str(name or ""), "enabled": bool(enabled),
+                    "runtime_authority": (sk, jid) in authority, "job": job})
+    return out
+
+
+def _store_profiles(text):
+    """[{id, provider}] of an auth profile store JSON (ids and providers only, never credentials)."""
+    try:
+        store = json.loads(text) if isinstance(text, str) else None
+    except ValueError:
+        return []
+    profiles = store.get("profiles") if isinstance(store, dict) else None
+    return [{"id": str(pid), "provider": str(p.get("provider") or "")}
+            for pid, p in sorted(profiles.items()) if isinstance(p, dict)] if isinstance(profiles, dict) else []
+
+
+def auth_profile_index(state_dir, targets, state_db, tables):
+    """{"agents": {agent id: [{id, provider}]}, "shared": [...]} of the auth stores: each agent database's
+    auth_profile_store, and the shared store every agent inherits (the state DB's config_machine_state
+    'authProfiles.store' when 'auth.sharedStore' says state-db, else the main agent's store)."""
+    agents = {}
+    for aid, pth in targets:
+        try:
+            if "auth_profile_store" not in table_names(pth):
+                continue
+            rows = q(pth, "SELECT store_json FROM auth_profile_store WHERE store_key='primary'")
+        except (sqlite3.Error, C.NodeQueryError, OSError):
+            continue
+        if rows:
+            agents.setdefault(str(aid).lower(), []).extend(_store_profiles(rows[0][0]))
+    shared = agents.get("main", [])
+    if "config_machine_state" in tables:
+        own = q(state_db, "SELECT value_json FROM config_machine_state WHERE state_key='auth.sharedStore'")
+        try:
+            loc = json.loads(own[0][0]).get("location") if own else None
+        except (ValueError, AttributeError, TypeError):
+            loc = None
+        if loc == "state-db":
+            rows = q(state_db, "SELECT value_json FROM config_machine_state WHERE state_key='authProfiles.store'")
+            shared = _store_profiles(rows[0][0]) if rows else []
+    return {"agents": agents, "shared": shared}
+
+
+def cron_account_report(state_dir, cfg, runtime=None, doctor_migration=False):
+    """Forecast for openclaw/openclaw#192195 on the current state (read-only): oc_migrate.cron_account_forecast
+    with the auth profiles of the stores and of auth.profiles in openclaw.json. Names and ids are cut for the
+    journal; no prompt, profile id or credential is kept."""
+    state_dir = Path(state_dir)
+    cfg = cfg if isinstance(cfg, dict) else {}
+    state_db = state_dir / "state" / "openclaw.sqlite"
+    rec = {"runtime": runtime, "doctor_migration": bool(doctor_migration), "checked": 0, "bound": 0, "affected": []}
+    jobs = cron_jobs_inventory(state_db)
+    if not jobs:
+        return rec
+    tables = table_names(state_db)
+    targets, _orphans = agent_databases(state_dir, cfg, tables)
+    index = auth_profile_index(state_dir, targets, state_db, tables)
+    cfg_profiles = _cfg_get(cfg, "auth", "profiles")
+    declared = [{"id": str(pid), "provider": str(p.get("provider") or "")}
+                for pid, p in sorted(cfg_profiles.items()) if isinstance(p, dict)] \
+        if isinstance(cfg_profiles, dict) else []
+
+    def profiles_for(aid):
+        return index["agents"].get(aid, []) + index["shared"] + declared
+    fc = mig().cron_account_forecast(jobs, cfg, profiles_for, default_agent_id(cfg))
+    rec.update(checked=fc["checked"], bound=fc["bound"],
+               affected=[dict(a, id=str(a["id"])[:120], name=str(a["name"])[:120]) for a in fc["affected"]])
+    return rec
+
+
+def cron_job_lines(rec):
+    """Per-job WARN texts of a cron_account_report record, then the closing note (empty when none)."""
+    aff = (rec or {}).get("affected") or []
+    if not aff:
+        return []
+    rt = rec.get("runtime") or "2026.10.10+"
+    lines = []
+    for a in aff[:CRON_REPORT_MAX]:
+        refs = [printable(r) for r in a.get("refs") or []]
+        head = f"cron job '{printable(a.get('name'))[:80]}' ({printable(a.get('id'))[:80]}): "
+        more = f"; also on a stored login: {', '.join(refs[1:])}" if refs[1:] else ""
+        if a.get("primary_affected"):
+            lines.append(head + f"OpenClaw {rt} refuses every run and tries no fallback: its model {refs[0]} would "
+                         "use a stored login (auth profile) and the job has no recorded inference account "
+                         "(openclaw/openclaw#192195)" + more)
+        else:
+            primary = f"its model {printable(a['primary'])}" if a.get("primary") else "its primary model"
+            lines.append(head + f"{primary} needs no stored login and keeps working, but when it fails OpenClaw "
+                         f"{rt} stops at the fallback {refs[0]} (stored login, no recorded inference account; "
+                         "openclaw/openclaw#192195) instead of trying further models" + more)
+    if len(aff) > CRON_REPORT_MAX:
+        lines.append(f"and {len(aff) - CRON_REPORT_MAX} more cron job(s) (oc-upgrade status)")
+    if rec.get("doctor_migration"):
+        lines.append(f"{len(aff)} cron job(s) above still have no recorded inference account after the migration: "
+                     f"OpenClaw {rt} doctor left them (its warnings are in oc-upgrade log). {CRON_MANUAL}")
+    else:
+        lines.append(f"{len(aff)} cron job(s) above: the add-on changes nothing; OpenClaw records the inference "
+                     "account of such jobs itself from 2026.11.5 (doctor migration, openclaw/openclaw#172792). "
+                     + CRON_MANUAL)
+    return lines
+
+
+def _db_bytes(pth):
+    n = 0
+    for p_ in (str(pth), f"{pth}-wal"):
+        try:
+            st = os.lstat(p_)
+        except OSError:
+            continue
+        if stat.S_ISREG(st.st_mode):
+            n += st.st_size
+    return n
+
+
+def largest_sessions(state_dir, cfg):
+    """openclaw/openclaw#191847 exposure (read-only): {"db": {agent, path, bytes}, "session": {agent, events,
+    channel, chat_type} or None} for the configured and registered agent databases; None without any."""
+    state_dir = Path(state_dir)
+    state_db = state_dir / "state" / "openclaw.sqlite"
+    tables = table_names(state_db) if state_db.exists() else set()
+    targets, _orphans = agent_databases(state_dir, cfg if isinstance(cfg, dict) else {}, tables)
+    db = sess = None
+    for aid, pth in targets:
+        size = _db_bytes(pth)
+        if db is None or size > db["bytes"]:
+            db = {"agent": aid, "path": C.rel(pth, state_dir), "bytes": size}
+        try:
+            at = table_names(pth)
+            if "transcript_events" not in at:
+                continue
+            rows = q(pth, "SELECT session_id, count(*) AS n FROM transcript_events GROUP BY session_id "
+                          "ORDER BY n DESC LIMIT 1")
+            if not rows or (sess is not None and rows[0][1] <= sess["events"]):
+                continue
+            win = q(pth, "SELECT channel, chat_type FROM session_windows WHERE session_id=?", (rows[0][0],)) \
+                if "session_windows" in at else []
+        except (sqlite3.Error, C.NodeQueryError, OSError):
+            continue
+        ch, ct = win[0] if win else (None, None)
+        sess = {"agent": aid, "events": int(rows[0][1]), "channel": str(ch)[:40] if ch else None,
+                "chat_type": str(ct)[:20] if ct else None}
+    return {"db": db, "session": sess} if db else None
+
+
 # --- Skill Workshop proposals (full5, OpenClaw 2026.10.10+) -------------------------------------
 
 def _sw_quote(name):
@@ -4898,7 +5148,15 @@ def _readiness_skills(g):
 
 def _readiness_cron(g):
     """Readiness lines before the doctor budget (cron, full5, report only): from g.facts of the precheck."""
-    return []
+    rec = g.facts.get("cron_binding_plan")
+    if not g.caps()["cron_refusal"] or not isinstance(rec, dict) or not rec.get("affected"):
+        return []
+    n, rt = len(rec["affected"]), g.pkg["version"]
+    if rec.get("doctor_migration"):
+        return [f"[gate]   cron inference accounts: {n} enabled cron job(s) use a stored login without a recorded "
+                f"account; OpenClaw {rt} doctor records it (openclaw/openclaw#172792)"]
+    return [f"[gate]   cron inference accounts: {n} enabled cron job(s) stop at a stored login on OpenClaw {rt} "
+            "(the WARN lines above, openclaw/openclaw#192195); report only, the gate changes nothing"]
 
 
 def hold_after_start(code, last_rc=None, emit=out):
@@ -5616,8 +5874,27 @@ def leftover_note(hours):
 
 
 def _status_cron(j):
-    """`oc-upgrade status` lines of the gate run `j` (cron inference accounts, full5, report only)."""
-    return []
+    """`oc-upgrade status` lines of the gate run `j` (cron inference accounts, full5, report only): the
+    postconditions' report, else the precheck forecast of a run that stopped before."""
+    rec, when = j.get("cron_binding"), "after the migration"
+    if not isinstance(rec, dict):
+        rec, when = j.get("cron_binding_forecast"), "precheck forecast"
+    if not isinstance(rec, dict):
+        return []
+    aff = [a for a in rec.get("affected") or [] if isinstance(a, dict)]
+    head = (f"  cron jobs without a recorded inference account (openclaw/openclaw#192195, OpenClaw "
+            f"{printable(rec.get('runtime'))}, {when}): ")
+    if not aff:
+        return [head + f"none affected ({rec['checked']} checked)"] if rec.get("checked") else []
+    L = [head + f"{len(aff)} affected of {rec.get('checked', 0)} checked"]
+    for a in aff[:CRON_REPORT_MAX]:
+        refs = [printable(r) for r in a.get("refs") or []]
+        what = "every run refused" if a.get("primary_affected") else f"stops at the fallback {refs[0] if refs else '?'}"
+        L.append(f"    '{printable(a.get('name'))[:80]}' ({printable(a.get('id'))[:80]}): {what}; {', '.join(refs)}")
+    if len(aff) > CRON_REPORT_MAX:
+        L.append(f"    and {len(aff) - CRON_REPORT_MAX} more")
+    L.append("    OpenClaw records the account itself from 2026.11.5 (openclaw/openclaw#172792). " + CRON_MANUAL)
+    return L
 
 
 def _status_skills(gp):

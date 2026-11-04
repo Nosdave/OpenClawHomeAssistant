@@ -655,6 +655,9 @@ RUNTIME_CAPS = (
     ("cron_refusal", (2026, 10, 10, 0)),
     # the gateway skips held stores of agents that are not configured instead of failing on them
     ("held_store_skip", (2026, 10, 10, 0)),
+    # open issue openclaw/openclaw#191847: the 512 MB SQLite worker runs out of memory on large sessions
+    # (precheck information only: largest agent database, biggest session)
+    ("large_session_oom_issue", (2026, 10, 10, 0)),
     # doctor records the cron inference accounts itself (#172792; 2026.11.5-beta.1 parses as 2026.11.5)
     ("cron_doctor_migration", (2026, 11, 5, 0)),
 )

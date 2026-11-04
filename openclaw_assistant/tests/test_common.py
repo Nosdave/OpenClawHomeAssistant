@@ -279,7 +279,8 @@ class RuntimeCapsTests(TmpCase):
     ALL_OFF = dict.fromkeys(C.CAP_NAMES, False)
     AT_1005 = dict(ALL_OFF, runtime_files_retired=True, sandbox_registry_retired=True, config_api_cdpurl_retired=True)
     AT_1006 = dict(AT_1005, empty_installs_tolerated=True)
-    AT_1010 = dict(AT_1006, retires_skill_proposals=True, cron_refusal=True, held_store_skip=True)
+    AT_1010 = dict(AT_1006, retires_skill_proposals=True, cron_refusal=True, held_store_skip=True,
+                   large_session_oom_issue=True)
 
     def setUp(self):
         super().setUp()
