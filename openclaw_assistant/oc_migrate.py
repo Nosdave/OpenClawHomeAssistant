@@ -1973,10 +1973,24 @@ def auth_order_adjust(cfg, profiles, store_order):
 
 _PROFILE_SUFFIX_NOT_PROFILE = (re.compile(r"[0-9]{8}(?:@|\Z)", re.A),
                                re.compile(r"(?:i?q[0-9]+(?:_[a-z0-9]+)*|[0-9]+bit)(?:@|\Z)", re.A | re.I))
-# models.providers.<p>.apiKey values that are no literal key: ${ENV} references and env-var names (OpenClaw
-# treats its known env markers as configured keys, provider-model-auth-source-plan.ts)
+# models.providers.<p>.apiKey values that are no literal key: ${ENV} references, and the env-var names OpenClaw
+# knows as markers (agents/model-auth-markers.ts: its core and legacy names and those of the bundled provider
+# manifests of 2026.10.10; any other ALL_CAPS value is a literal key there). A marker of a plugin that is not
+# bundled counts as a literal key here, so the forecast can only over-report it.
 _ENV_KEY_REF_RE = re.compile(r"\A\$\{[A-Za-z_][A-Za-z0-9_]*\}\Z")
-_ENV_KEY_NAME_RE = re.compile(r"\A[A-Z][A-Z0-9_]*\Z")
+_KNOWN_ENV_KEY_MARKERS = frozenset((
+    "ANTHROPIC_ADMIN_API_KEY", "ANTHROPIC_ADMIN_KEY", "ANTHROPIC_API_KEY", "ANTHROPIC_OAUTH_TOKEN", "AZURE_API_KEY",
+    "AZURE_OPENAI_API_KEY", "AZURE_SPEECH_API_KEY", "AZURE_SPEECH_KEY", "AZURE_SPEECH_REGION", "CEREBRAS_API_KEY",
+    "CLAWROUTER_API_KEY", "CODEX_API_KEY", "COPILOT_GITHUB_TOKEN", "DASHSCOPE_API_KEY", "DEEPGRAM_API_KEY",
+    "DEEPSEEK_API_KEY", "ELEVENLABS_API_KEY", "FAL_API_KEY", "FAL_KEY", "FIREWORKS_API_KEY", "GEMINI_API_KEY",
+    "GOOGLE_API_KEY", "GOOGLE_CLOUD_API_KEY", "HF_TOKEN", "HUGGINGFACE_HUB_TOKEN", "KIE_API_KEY", "LITELLM_API_KEY",
+    "LM_API_TOKEN", "MINIMAX_API_KEY", "MINIMAX_CODE_PLAN_KEY", "MINIMAX_CODING_API_KEY", "MINIMAX_OAUTH_TOKEN",
+    "MODELSTUDIO_API_KEY", "NOVITA_API_KEY", "NVIDIA_API_KEY", "OLLAMA_API_KEY", "OPENAI_ADMIN_KEY", "OPENAI_API_KEY",
+    "OPENCODE_API_KEY", "OPENCODE_ZEN_API_KEY", "OPENROUTER_API_KEY", "PERPLEXITY_API_KEY", "QWEN_API_KEY",
+    "RUNWAYML_API_SECRET", "RUNWAY_API_KEY", "SENSEAUDIO_API_KEY", "SGLANG_API_KEY", "SPEECH_KEY", "SPEECH_REGION",
+    "TOGETHER_API_KEY", "VLLM_API_KEY", "VOYAGE_API_KEY", "XAI_API_KEY", "XI_API_KEY"))
+# AWS SDK markers are markers, but never a usable key: the stored profiles still come first
+_AWS_SDK_KEY_MARKERS = frozenset(("AWS_BEARER_TOKEN_BEDROCK", "AWS_ACCESS_KEY_ID", "AWS_PROFILE"))
 
 
 def split_trailing_auth_profile(raw):
@@ -2050,26 +2064,69 @@ def cron_job_agent(job, default_agent="main"):
     return (default_agent or "main").strip().lower()
 
 
+def _subagent_model_selection(cfg, entry):
+    """OpenClaw's resolveSubagentModelConfigSelectionResult (agents/agent-scope.ts): (model config, source) of the
+    first of the agent's subagents.model ("subagent"), agents.defaults.subagents.model ("default-subagent") and
+    the agent's model ("agent") that has a primary; None without one."""
+    sub = entry.get("subagents") if entry else None
+    for raw, src in ((sub.get("model") if isinstance(sub, dict) else None, "subagent"),
+                     (_get(cfg, ["agents", "defaults", "subagents", "model"], None), "default-subagent"),
+                     (entry.get("model") if entry else None, "agent")):
+        if _model_primary(raw):
+            return raw, src
+    return None
+
+
+def _subagent_fallbacks_override(cfg, entry):
+    """OpenClaw's resolveSubagentModelFallbacksOverride (agents/agent-scope.ts): the override of the agent's
+    subagents.model, else that of a selected default-subagent or agent model; None (inherit) otherwise."""
+    sub = entry.get("subagents") if entry else None
+    ov = _agent_fallbacks_override(sub.get("model") if isinstance(sub, dict) else None)
+    if ov is not None:
+        return ov
+    sel = _subagent_model_selection(cfg, entry)
+    return _agent_fallbacks_override(sel[0]) if sel and sel[1] in ("agent", "default-subagent") else None
+
+
 def cron_model_chain(job, cfg, agent_id):
-    """(primary ref or None, [fallback refs], source) of a cron agent turn, as OpenClaw 2026.10.10 resolves it
-    (cron/isolated-agent/run-fallback-policy.ts): payload.model, else the agent's, else the defaults' primary;
-    payload.fallbacks when it is a list (also []), else the agent's fallback override, else the defaults'."""
+    """(primary ref or None, [fallback refs], fallbacks source) of a cron agent turn, as OpenClaw 2026.10.10 and
+    2026.11.1 resolve it (cron/isolated-agent/model-selection.ts, run-fallback-policy.ts).
+
+    Primary: payload.model, else the agent's subagents.model, else agents.defaults.subagents.model, else the
+    agent's model, else the defaults' primary (cron follows the sub-agent spawn rules). Fallbacks: payload.fallbacks
+    when it is a list (also []) -> "job"; for a subagents.model primary its override -> "subagent"; for an agent
+    whose model is a string equal to the defaults' primary, the defaults' fallbacks when there are any ->
+    "defaults"; else the agent's override -> "agent", else the defaults' -> "defaults". Not modelled: the model
+    allowlist, hooks.gmail.model and a session's model override (a "session:<key>" target), an ACP agent runtime."""
     payload = job.get("payload") if isinstance(job.get("payload"), dict) else {}
     defaults = _get(cfg, ["agents", "defaults", "model"], None)
+    dfbs = defaults.get("fallbacks") if isinstance(defaults, dict) else None
+    dfbs = dfbs if isinstance(dfbs, list) else []
     entry = _agent_cfg_entry(cfg, agent_id)
     amodel = entry.get("model") if entry else None
     pm = payload.get("model")
-    primary = (pm.strip() if isinstance(pm, str) and pm.strip() else None) or _model_primary(amodel) \
-        or _model_primary(defaults)
+    pm = pm.strip() if isinstance(pm, str) and pm.strip() else None
+    sel = None if pm else _subagent_model_selection(cfg, entry)
+    if pm:
+        primary, msrc = pm, "payload"
+    elif sel:
+        primary, msrc = _model_primary(sel[0]), "agent" if sel[1] == "agent" else "subagent"
+    else:
+        primary, msrc = _model_primary(defaults), "default"
+    fbs = None
     if isinstance(payload.get("fallbacks"), list):
         fbs, src = payload["fallbacks"], "job"
-    else:
-        ov = _agent_fallbacks_override(amodel)
-        if ov is not None:
-            fbs, src = ov, "agent"
-        else:
-            fbs = defaults.get("fallbacks") if isinstance(defaults, dict) else None
-            fbs, src = (fbs if isinstance(fbs, list) else []), "defaults"
+    if fbs is None and msrc == "subagent":
+        fbs, src = _subagent_fallbacks_override(cfg, entry), "subagent"
+    # run-prepare.ts inheritDefaultFallbacksForAgentStringModel: an agent model "provider/model" that repeats the
+    # defaults' primary keeps the defaults' fallbacks (resolveSelectedModelFallbacksOverride would give none)
+    if fbs is None and msrc in ("agent", "default") and dfbs and isinstance(amodel, str) \
+            and _model_primary(amodel) == _model_primary(defaults):
+        fbs, src = dfbs, "defaults"
+    if fbs is None:
+        fbs, src = _agent_fallbacks_override(amodel), "agent"
+    if fbs is None:
+        fbs, src = dfbs, "defaults"
     return primary, [f.strip() for f in fbs if isinstance(f, str) and f.strip()], src
 
 
@@ -2115,24 +2172,29 @@ def cron_ref_uses_stored_profile(cfg, provider, explicit_profile, profiles):
     so a cron job without a recorded inference account is refused there.
 
     profiles: [{"id", "provider"}] the job's agent can use (its own store, the shared store, auth.profiles of
-    openclaw.json). A model@profile ref names a stored account. models.providers.<p>.apiKey: a SecretRef or an
-    env reference is a configured key that suppresses the profiles; a value that names a stored profile pins
-    it; a literal key suppresses them only with auth "api-key", otherwise the profiles come first. A provider
-    without stored profiles (configured key, environment, local or synthetic route) is not affected."""
+    openclaw.json). A model@profile ref names a stored account. models.providers.<p>.auth "aws-sdk" runs on AWS
+    credentials, which are no configured key: refused. models.providers.<p>.apiKey: a SecretRef, an env reference
+    or a known env-var marker is a configured key that suppresses the profiles (a marker only while its variable
+    is set, which is assumed here); a value that names a stored profile pins it; a literal key (also an ALL_CAPS
+    value OpenClaw does not know as a marker, such as "EMPTY") suppresses them only with auth "api-key",
+    otherwise the profiles come first. A provider without stored profiles (configured key, environment, local or
+    synthetic route) is not affected."""
     if explicit_profile:
         return True
     pcfg = _provider_cfg(cfg, provider) or {}
+    if pcfg.get("auth") == "aws-sdk":  # prepare-auth.ts: direct source with evidence "aws-sdk"
+        return True
     key = pcfg.get("apiKey")
     if isinstance(key, dict):
         return False
     if isinstance(key, str) and key.strip():
         k = key.strip()
+        if _ENV_KEY_REF_RE.match(k) or k in _KNOWN_ENV_KEY_MARKERS:
+            return False
         if any(p.get("id") == k for p in profiles):
             return True
-        if _ENV_KEY_REF_RE.match(k) or _ENV_KEY_NAME_RE.match(k) or pcfg.get("auth") == "api-key":
+        if pcfg.get("auth") == "api-key" and k not in _AWS_SDK_KEY_MARKERS:
             return False
-    if pcfg.get("auth") == "aws-sdk":  # ambient AWS credentials: not modelled
-        return False
     return any(str(p.get("provider") or "").strip().lower() == provider for p in profiles)
 
 

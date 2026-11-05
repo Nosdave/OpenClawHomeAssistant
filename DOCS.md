@@ -1034,7 +1034,9 @@ information line in the precheck, a line in `oc-upgrade status` and the
 [update after the gate](#official-plugins-follow-openclaws-version)), agent databases
 outside the configured agents (a store that OpenClaw keeps from a deleted agent is only
 listed instead of holding with `orphan-agent-db`, a configured agent whose store is kept
-that way holds with `agent-db-held`, the `orphan-agent-db` reason is reworded; see
+that way holds with `agent-db-held`, the `orphan-agent-db` reason is reworded, and an
+orphan store below the target is part of `quick_check` and the foreign-key check, so a
+damaged one holds with `sqlite-corrupt` or `sqlite-fk-violation`; see
 [HOLD codes added for the OpenClaw 2026.10.10 line](#hold-codes-added-for-the-openclaw-20261010-line))
 and a few reworded messages.
 
@@ -1292,33 +1294,45 @@ behaviour pin for `approvalPolicy` is not written on these versions). With OpenC
 Since OpenClaw 2026.10.10 a cron job records the account (auth profile) it runs on.
 Jobs from before have none. OpenClaw 2026.10.10 and 2026.11.1 refuse such a job's run
 as soon as the model it is about to use would run on a stored login (a subscription
-login, a token or an API key in OpenClaw's auth store), with "Automation has no recorded
-inference account" in the run history (openclaw/openclaw#192195). The refusal also ends
-the fallback chain: no further model is tried. A model on a key from the environment or
-the provider config, or a local model (vLLM), needs no account and keeps working.
-OpenClaw's doctor records the accounts itself only from 2026.11.5
-(openclaw/openclaw#172792).
+login, a token or an API key in OpenClaw's auth store) or on AWS SDK credentials
+(`auth: "aws-sdk"`), with "Automation has no recorded inference account" in the run
+history (openclaw/openclaw#192195). The refusal also ends the fallback chain: no further
+model is tried. A model needs no account and keeps working when its provider has no
+stored login (a local model such as vLLM, or a key only in the environment or the
+provider config). If the provider also has a stored login, OpenClaw tries that login
+first, unless the key in `models.providers.<provider>.apiKey` is a SecretRef, a `${VAR}`
+reference or the name of a known provider variable (such as `OPENAI_API_KEY`) that is
+set, or a literal key with `models.providers.<provider>.auth: "api-key"`. Another
+upper-case value (`EMPTY`, `NONE`) counts as a literal key. OpenClaw's doctor records
+the accounts itself only from 2026.11.5 (openclaw/openclaw#172792).
 
 The gate only reports this: it changes no cron job and no auth store and never holds.
 With OpenClaw 2026.10.4 it prints nothing.
 
 - **Precheck** (also `oc-upgrade gate --dry-run`, and `oc-upgrade check` while a
   migration is pending): one `WARN [gate] cron job '<name>' (<id>): …` per enabled
-  agent-turn job without a recorded account whose model or a fallback (the job's own
-  fallbacks, else the agent's or the defaults' in `openclaw.json`) would use a stored
-  login. It names the affected models and says either that every run is refused (the
-  job's own model uses a stored login) or that the job keeps working on its own model
-  and stops at the first such fallback when that model fails. Only the job id, its name
-  and model names are shown, no prompt and no account.
+  agent-turn job without a recorded account whose model or a fallback would use a stored
+  login. The models are chosen as OpenClaw does: the job's own model, else a
+  `subagents.model` (the agent's, then `agents.defaults.subagents.model`), else the
+  agent's model, else the default; the job's own fallbacks, else those of that
+  `subagents.model`, of the agent or of the defaults (an agent whose model is the same
+  `provider/model` string as the default keeps the default fallbacks). It names the
+  affected models and says either that every run is refused (the job's own model uses a
+  stored login) or that the job keeps working on its own model and stops at the first
+  such fallback when that model fails. Only the job id, its name and model names are
+  shown, no prompt and no account.
 - **After the migration** the gate reads the migrated jobs again: the `7/8
   postconditions` line counts them, the end of the run repeats the warnings, and
   `oc-upgrade status` lists them.
 - **What to do.** Nothing, if the job's own model needs no account and you can do
-  without that fallback until OpenClaw 2026.11.5. To run a job on a stored login now:
-  after the start, `openclaw automations edit <id> --model <provider/model>@<profileId>`
-  records the account (and makes that model the job's model). The job then runs only on
-  that account's provider: fallbacks to other providers are refused
-  (openclaw/openclaw#192463).
+  without that fallback until OpenClaw 2026.11.5. If the reported model's provider has
+  an API key in `models.providers.<provider>.apiKey` besides its stored login, set
+  `models.providers.<provider>.auth: "api-key"` (or give the key as a SecretRef or
+  `${VAR}`): OpenClaw then runs that model on the key, not on the stored login. To run a
+  job on a stored login now: after the start, `openclaw automations edit <id> --model
+  <provider/model>@<profileId>` records the account (and makes that model the job's
+  model). The job then runs only on that account's provider: fallbacks to other
+  providers are refused (openclaw/openclaw#192463).
 
 #### Official plugins follow OpenClaw's version
 

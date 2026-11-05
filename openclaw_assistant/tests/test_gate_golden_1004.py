@@ -23,8 +23,10 @@ agent that a retained deletion keeps (CHANGELOG "agent databases outside the con
 reads retained deletions too): an "info: ... is kept from a deleted agent" line instead of the acceptable HOLD
 orphan-agent-db, `oc-upgrade check` lists it under "held agent databases", the journal's orphans entry has
 held/reason.
-Not in the fixture because each one is a HOLD (DOCS "Upgrading to OpenClaw 2026.10"): the reworded orphan-agent-db
-text and the hard code agent-db-held for a configured agent whose store a retained deletion keeps.
+Not in the fixture because each one is a HOLD (DOCS "Upgrading to OpenClaw 2026.10"); Holds1004Tests pins them
+instead: the reworded orphan-agent-db text, quick_check and the foreign-key check on such a store below the target
+(its counts, and a hard sqlite-fk-violation for a damaged one), and the hard code agent-db-held for a configured
+agent whose store a retained deletion keeps.
 """
 
 import json
@@ -188,6 +190,87 @@ class Golden1004Tests(T.GateEnv):
         for name, text in got.items():
             with self.subTest(section=name):
                 self.assertEqual(text, want[name])
+
+
+class Holds1004Tests(T.GateEnv):
+    """The 10.4-visible HOLDs of the full5 agent store handling (review gate1010), pinned word for word: a 2026.9.9
+    state (19/24) under the 2026.10.4 runtime (20/24) with a store below the target that is neither configured nor
+    registered, or a configured agent whose store a retained deletion keeps."""
+    maxDiff = None
+    CFG = {"meta": {"lastTouchedVersion": "2026.9.9"}, "gateway": {"mode": "local"},
+           "agents": {"list": [{"id": "main", "default": True}]}}
+    GHOST = "agents/ghost/agent/openclaw-agent.sqlite"
+    ORPHAN = ("agent database(s) of agents that are neither configured nor registered: " + GHOST + " (schema 20). "
+              "Doctor of OpenClaw 2026.10.4 finds such a store under agents/ and migrates it one-way to schema 24 "
+              "unless its deletion history holds it back; the gateway does not open it. The gate checks that it is "
+              "readable (quick_check, foreign keys) but not its schema afterwards")
+
+    def setUp(self):
+        super().setUp()
+        self.set_runtime("2026.10.4", 20, 24)
+        self.features(cron_refusal=False, cron_doctor_migration=False, retires_skill_proposals=False)
+        T.make_1004_state(self.state, s=19, a=24, app="2026.9.9")
+        self.write_cfg(self.CFG)
+        (self.upg / "gate").mkdir(parents=True)
+        (self.upg / "gate" / "migrated.json").write_text(json.dumps({"runtime": "2026.9.9", "mode": "from-7x"}))
+        self.hooks()
+
+    def hold(self):
+        """(codes, acceptable, reason/next lines of hold.txt) of a precheck HOLD before the first write."""
+        self.assertEqual(self.run_gate(), 20, self.out)
+        j = self.journal()
+        self.assertEqual((j["phase"], j.get("first_write_at")), ("precheck", None))
+        text = (self.upg / "hold.txt").read_text(encoding="utf-8")
+        return (j["hold"]["codes"], j["hold"]["acceptable"],
+                [ln for ln in text.splitlines() if ln.startswith(("Reason ", "Next: ", "Accept "))])
+
+    def test_orphan_store_below_the_target(self):
+        T.make_1004_agent_db(self.state, "ghost", uv=20, app="2026.9.9")
+        lines = []
+        self.assertEqual(self.quiet(G.dry_run, emit=lines.append), 20)
+        self.assertIn("quick_check ok (3/3); foreign keys ok (3/3)", "\n".join(lines))  # the orphan is checked too
+        self.assertEqual(self.hold(), (["orphan-agent-db"], True, [
+            "Reason [orphan-agent-db]: " + self.ORPHAN,
+            "Next: move agent folders you no longer need out of /config/.openclaw/agents (they are in your encrypted "
+            "backup), then oc-upgrade retry, or accept: oc-upgrade retry --accept orphan-agent-db (then restart the "
+            "add-on)",
+            "Accept (only if you understand the consequence): oc-upgrade retry --accept orphan-agent-db"]))
+
+    def test_damaged_orphan_store_is_hard(self):
+        T.make_1004_agent_db(self.state, "ghost", uv=20, app="2026.9.9")
+        con = sqlite3.connect(str(self.state / self.GHOST))  # a row that breaks a foreign key (foreign keys off)
+        con.execute("INSERT INTO board_tabs (session_key, tab_id, title, position, created_by, revision) "
+                    "VALUES ('agent:main:gone', 't1', 'Tab', 0, 'user', 0)")
+        con.commit()
+        con.close()
+        codes, acceptable, lines = self.hold()
+        self.assertEqual((codes, acceptable), (["sqlite-fk-violation", "orphan-agent-db"], False))
+        self.assertEqual(lines[:2], [
+            "Reason [sqlite-fk-violation]: " + self.GHOST + " (agent schema 20, OpenClaw 2026.10.4 migrates it to "
+            "24): 1 foreign-key violation(s): board_tabs row 1 -> session_nodes. OpenClaw checks foreign keys at the "
+            "end of this one-way migration and stops it ('Agent schema migration failed foreign key validation') "
+            "while other databases are already migrated",
+            "Reason [orphan-agent-db]: " + self.ORPHAN])
+
+    def test_configured_agent_whose_store_a_retained_deletion_keeps(self):
+        T.make_1004_agent_db(self.state, "old", uv=20, app="2026.9.9")
+        con = sqlite3.connect(str(self.state / "state" / "openclaw.sqlite"))
+        con.execute("INSERT INTO agent_databases VALUES ('old', 'agents/old/agent/openclaw-agent.sqlite', 20, 0, NULL)")
+        con.execute("INSERT INTO agent_deletion_journal (agent_id, agent_dir, workspace_dir, sessions_dir, created_at, "
+                    "cleanup_completed, delete_files) VALUES ('old', ?, '/w', '/s', 0, 1, 0)",
+                    (str(self.state / "agents" / "old" / "agent"),))
+        con.commit()
+        con.close()
+        self.write_cfg(dict(self.CFG, agents={"list": [{"id": "main", "default": True}, {"id": "old"}]}))
+        self.assertEqual(self.hold(), (["agent-db-held"], False, [
+            "Reason [agent-db-held]: agent old is configured, but OpenClaw keeps its database "
+            "agents/old/agent/openclaw-agent.sqlite (schema 20) from a deletion (deletion journal): doctor will not "
+            "migrate it and OpenClaw 2026.10.4 refuses the agent (the default agent: the gateway does not start or "
+            "stays not ready)",
+            "Next: remove the agent from openclaw.json (agents.list) if you no longer use it, then oc-upgrade retry; "
+            "to keep it, restore the encrypted Home Assistant backup of the previous add-on version, run openclaw "
+            "agents add <id> --workspace <ws> --agent-dir <dir> --non-interactive there, then update again (then "
+            "restart the add-on)"]))
 
 
 if __name__ == "__main__":

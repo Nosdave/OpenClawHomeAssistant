@@ -2725,6 +2725,70 @@ class TestCronAccountForecast(unittest.TestCase):
         self.assertEqual(chain({"payload": {}}, "dev"), ("vllm/qwen", ["openai/gpt-5.5", "google/g"], "defaults"))
         self.assertEqual(m.cron_model_chain({"payload": {}}, {}, "main"), (None, [], "defaults"))
 
+    def test_model_chain_agent_string_model_repeating_the_default_primary(self):
+        """Review (gate1010): an agent model "provider/model" equal to the defaults' primary keeps the defaults'
+        fallbacks for a job without its own model (run-prepare.ts inheritDefaultFallbacksForAgentStringModel,
+        run-fallback-policy.ts), although a string agent model otherwise means no fallbacks."""
+        cfg = copy.deepcopy(self.CFG)
+        cfg["agents"]["list"] = [{"id": "main", "default": True, "model": " vllm/qwen "}, {"id": "obj",
+                                 "model": {"primary": "vllm/qwen"}}, {"id": "mail", "model": "vllm/small"}]
+        chain = lambda job, aid="main", c=cfg: m.cron_model_chain(job, c, aid)  # noqa: E731
+        self.assertEqual(chain({"payload": {}}), ("vllm/qwen", ["openai/gpt-5.5", "google/g"], "defaults"))
+        # only a string: an object with that primary and no fallbacks still has none
+        self.assertEqual(chain({"payload": {}}, "obj"), ("vllm/qwen", [], "agent"))
+        self.assertEqual(chain({"payload": {}}, "mail"), ("vllm/small", [], "agent"))
+        # a job model owns its chain: the agent's override (none) applies; job fallbacks replace everything
+        self.assertEqual(chain({"payload": {"model": "vllm/qwen"}}), ("vllm/qwen", [], "agent"))
+        self.assertEqual(chain({"payload": {"fallbacks": ["anthropic/c"]}}), ("vllm/qwen", ["anthropic/c"], "job"))
+        # without default fallbacks the agent's override (none) applies
+        cfg2 = copy.deepcopy(cfg)
+        cfg2["agents"]["defaults"]["model"] = {"primary": "vllm/qwen", "fallbacks": []}
+        self.assertEqual(chain({"payload": {}}, c=cfg2), ("vllm/qwen", [], "agent"))
+        # the S1 shape: every enabled job is reported for the fallbacks on a stored login (was: nothing)
+        res = self.forecast(self.job("s1"), cfg=cfg)
+        self.assertEqual(res["affected"], [{"id": "s1", "name": "Job s1", "agent": "main", "primary": "vllm/qwen",
+                                            "primary_affected": False, "refs": ["openai/gpt-5.5"]}])
+
+    def test_model_chain_follows_the_subagent_model_rules(self):
+        """Review (gate1010): without a job model, cron selects the model as a sub-agent spawn does
+        (model-selection.ts, agents/agent-scope.ts resolveSubagentModelConfigSelectionResult): the agent's
+        subagents.model, then agents.defaults.subagents.model, then the agent's model, then the defaults; the
+        fallbacks of a subagents.model come from resolveSubagentModelFallbacksOverride."""
+        def cfg_with(defaults_sub=None, **agents):
+            c = copy.deepcopy(self.CFG)
+            if defaults_sub is not None:
+                c["agents"]["defaults"]["subagents"] = {"model": defaults_sub}
+            for e in c["agents"]["list"]:
+                if e["id"] in agents:
+                    e["subagents"] = {"model": agents[e["id"]]}
+            return c
+        chain = lambda c, job=None, aid="main": m.cron_model_chain(job or {"payload": {}}, c, aid)  # noqa: E731
+        # a string sub-agent model has no fallbacks: the job runs on it alone
+        c = cfg_with("openai/gpt-5.5")
+        self.assertEqual(chain(c), ("openai/gpt-5.5", [], "subagent"))
+        self.assertEqual(chain(c, aid="ops"), ("openai/gpt-5.5", [], "subagent"))  # before the agent's model too
+        self.assertEqual(chain(c, {"payload": {"model": "vllm/qwen"}}),  # a job model wins
+                         ("vllm/qwen", ["openai/gpt-5.5", "google/g"], "defaults"))
+        self.assertEqual(chain(c, {"payload": {"fallbacks": ["google/g"]}}), ("openai/gpt-5.5", ["google/g"], "job"))
+        # the agent's own subagents.model wins over the defaults'; its fallback list is used
+        c = cfg_with("openai/gpt-5.5", main={"primary": "vllm/sub", "fallbacks": ["anthropic/c"]})
+        self.assertEqual(chain(c), ("vllm/sub", ["anthropic/c"], "subagent"))
+        c = cfg_with({"primary": "vllm/sub", "fallbacks": ["google/g"]})
+        self.assertEqual(chain(c), ("vllm/sub", ["google/g"], "subagent"))
+        # an agent subagents.model without a primary is not selected but its list is the override
+        c = cfg_with("vllm/d", mail={"fallbacks": ["anthropic/c"]})
+        self.assertEqual(chain(c, aid="mail"), ("vllm/d", ["anthropic/c"], "subagent"))
+        c = cfg_with(None, mail={"fallbacks": ["anthropic/c"]})
+        self.assertEqual(chain(c, aid="mail"), ("vllm/small", [], "agent"))
+        # forecast in both directions: a default sub-agent model on a stored login is refused every run; a local
+        # one with an openai default primary runs without fallbacks and is not reported
+        res = self.forecast(self.job("a"), cfg=cfg_with("openai/gpt-5.5"))
+        self.assertEqual(res["affected"], [{"id": "a", "name": "Job a", "agent": "main", "primary": "openai/gpt-5.5",
+                                           "primary_affected": True, "refs": ["openai/gpt-5.5"]}])
+        c = cfg_with("vllm/local")
+        c["agents"]["defaults"]["model"] = {"primary": "openai/gpt-5.5"}
+        self.assertEqual(self.forecast(self.job("b"), cfg=c)["affected"], [])
+
     def test_job_agent(self):
         self.assertEqual(m.cron_job_agent({"agentId": " Mail "}), "mail")
         self.assertEqual(m.cron_job_agent({"sessionKey": "agent:ops:telegram:dm:1"}), "ops")
@@ -2753,7 +2817,28 @@ class TestCronAccountForecast(unittest.TestCase):
         self.assertTrue(uses(prov(apiKey="sk-synthetic")))
         # apiKey naming a stored profile pins it
         self.assertTrue(uses(prov(apiKey="anthropic:default")))
-        self.assertFalse(uses(prov(auth="aws-sdk")))  # ambient credentials are not modelled
+
+    def test_stored_profile_rules_aws_sdk_and_unknown_markers(self):
+        """Review (gate1010): auth "aws-sdk" is a direct source OpenClaw does not count as a configured key
+        (refused without a recorded account, profiles or not); only the env-var names OpenClaw knows are markers
+        (model-auth-markers.ts), any other ALL_CAPS value is a literal key."""
+        vllm = [{"id": "vllm:default", "provider": "vllm"}]
+        uses = lambda pcfg, prov="vllm", profiles=vllm: m.cron_ref_uses_stored_profile(  # noqa: E731
+            {"models": {"providers": {prov: pcfg}}}, prov, None, profiles)
+        self.assertTrue(uses({"auth": "aws-sdk"}, "amazon-bedrock", []))
+        self.assertTrue(uses({"auth": "aws-sdk", "apiKey": "${AWS_KEY}"}, "amazon-bedrock", []))
+        for literal in ("EMPTY", "NONE", "LOCAL", "MY_LOCAL_KEY", "AWS_PROFILE"):
+            with self.subTest(literal=literal):
+                self.assertTrue(uses({"apiKey": literal}))  # the stored vllm profile comes first
+                self.assertFalse(uses({"apiKey": literal}, profiles=[]))  # nothing stored: not affected
+        self.assertFalse(uses({"apiKey": "EMPTY", "auth": "api-key"}))
+        self.assertTrue(uses({"apiKey": "AWS_PROFILE", "auth": "api-key"}))  # a marker, never a usable key
+        for marker in ("VLLM_API_KEY", "OPENAI_API_KEY", "GEMINI_API_KEY", "DEEPSEEK_API_KEY", "${EMPTY}"):
+            with self.subTest(marker=marker):
+                self.assertFalse(uses({"apiKey": marker}))
+        res = self.forecast(self.job("e", payload={"model": "vllm/qwen", "fallbacks": []}), profiles=vllm,
+                            cfg={"models": {"providers": {"vllm": {"apiKey": "EMPTY"}}}})
+        self.assertEqual([a["refs"] for a in res["affected"]], [["vllm/qwen"]])
 
     def test_forecast_primary_and_fallbacks(self):
         res = self.forecast(self.job("a", payload={"model": "openai/gpt-5.5@openai:default",
