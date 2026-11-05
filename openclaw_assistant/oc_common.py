@@ -734,10 +734,27 @@ def openclaw_env():
 # --- redaction --------------------------------------------------------------------------
 
 _SECRET_KEY = r"[A-Za-z0-9_.-]*(?:token|secret|password|apikey|api_key|bottoken)[A-Za-z0-9_.-]*|[A-Za-z0-9_.-]*key"
-# a key that names a secret (token, botToken, apiKey, x-api-key, password ...), for "key: value" forms
-_SECRET_WORD = r"[A-Za-z0-9_.-]*?(?:token|secret|password|passwd|api[_-]?key)"
+# a key that names a secret (token, botToken, apiKey, x-api-key, "API key", password ...), for "key: value" forms
+_SECRET_WORD = r"[A-Za-z0-9_.-]*?(?:token|secret|password|passwd|api[ _-]?key)"
+
+
+def _pem_redact(m):
+    return f"-----BEGIN {m.group(1)}-----***" + (f"-----END {m.group(1)}-----" if m.group(2) else "")
+
+
+# Long standalone tokens. A run next to "/" or "." (path segment, file name such as
+# openclaw.sqlite.<uuid>.bak or npm/projects/<hash>/) is not a token; a sentence-final "." is.
+_LONG_TOKEN_RULE = (re.compile(r"(?<![A-Za-z0-9_/.-])[A-Za-z0-9_-]{40,}(?![A-Za-z0-9_/-])(?!\.[A-Za-z0-9_-])"), "***")
 _REDACT_RES = [
     (re.compile(r"AGE-SECRET-KEY-1[0-9A-Za-z]{20,}"), "AGE-SECRET-KEY-***"),
+    # the formats of OpenClaw's own literal-secret check (LITERAL_SECRET_PATTERN, skills/security/scan-evidence.ts),
+    # before the rules below cut them apart: PEM private keys (the whole body, also of a block without its END
+    # line; "+" and "/" split the base64 into runs too short for the long-token rule), Google API keys, Slack and
+    # GitHub tokens
+    (re.compile(r"-----BEGIN ([A-Z0-9 ]*PRIVATE KEY(?: BLOCK)?)-----(?:.*?(-----END \1-----)|[A-Za-z0-9+/=\s\\]*)",
+                re.S), _pem_redact),
+    (re.compile(r"\b(?:AIza[0-9A-Za-z_-]{35}|xox[baprs]-[A-Za-z0-9-]{10,}|gh[pousr]_[A-Za-z0-9]{20,}"
+                r"|github_pat_[A-Za-z0-9_]{20,})(?![A-Za-z0-9_-])"), "***"),
     (re.compile(r'("(?:' + _SECRET_KEY + r')"\s*:\s*)"(?:[^"\\]|\\.)*"', re.I), r'\1"***"'),
     (re.compile(r"\b((?:" + _SECRET_KEY + r")=)[^\s&\"']+", re.I), r"\1***"),
     # token: value / apiKey: 'value' / x-api-key: value (YAML, JS object inspection, HTTP headers)
@@ -751,9 +768,7 @@ _REDACT_RES = [
     (re.compile(r"(?i)\bbot\d{6,12}:[A-Za-z0-9_-]{30,}"), "bot***"),  # Telegram Bot API URL form
     (re.compile(r"\b\d{6,12}:[A-Za-z0-9_-]{30,}\b"), "***"),
     (re.compile(r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}"), "***"),  # JWT
-    # Long standalone tokens. A run next to "/" or "." (path segment, file name such as
-    # openclaw.sqlite.<uuid>.bak or npm/projects/<hash>/) is not a token; a sentence-final "." is.
-    (re.compile(r"(?<![A-Za-z0-9_/.-])[A-Za-z0-9_-]{40,}(?![A-Za-z0-9_/-])(?!\.[A-Za-z0-9_-])"), "***"),
+    _LONG_TOKEN_RULE,
 ]
 
 
@@ -765,13 +780,17 @@ def redact_text(s):
     return s
 
 
-def redact_text_counted(s):
-    """(redact_text(s), number of replacements): the same rules, for exports that report what they hid."""
+def redact_text_counted(s, long_tokens=True):
+    """(redact_text(s), number of replacements): the same rules, for exports that report what they hid.
+    long_tokens=False leaves out the rule for long standalone tokens (an identifier such as a 121-character
+    Skill Workshop proposal id); every other rule still applies."""
     if not s:
         return s, 0
     total = 0
-    for rx, rep in _REDACT_RES:
-        s, n = rx.subn(rep, s)
+    for rule in _REDACT_RES:
+        if not long_tokens and rule is _LONG_TOKEN_RULE:
+            continue
+        s, n = rule[0].subn(rule[1], s)
         total += n
     return s, total
 

@@ -293,10 +293,14 @@ SW_ID_RE = re.compile(r"[a-z0-9][a-z0-9-]{5,120}")  # doctor's PROPOSAL_ID_PATTE
 SW_DRAFT_RE = re.compile(r"(?:generations/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/)?PROPOSAL\.md")
 SW_EXPORTED_STATUSES = ("pending", "quarantined")
 SW_STATUSES = ("pending", "quarantined", "applied", "rejected", "stale")
-# export redaction per JSON leaf: values under these keys are hidden whole; hashes and ids are kept as they are (the
-# bare "key$" of oc_migrate._SECRET_KEY_RE is left out on purpose: origin.sessionKey stays readable)
-SW_SECRET_KEY_RE = re.compile(r"(?i)token|secret|password|passwd|api_?key|private_?key|access_?key|credential|"
-                              r"authorization|cookie|^key$")
+# export redaction per JSON value: a value under one of these keys is hidden whole, whatever its type (the keys the
+# log rules of oc_common hide too, *key, api-key and x-api-key included), except the identifiers OpenClaw itself
+# writes under such keys (SW_KEY_KEEP, compared lower-cased: origin.sessionKey, origin_session_key, target.skillKey);
+# hashes under their keys are kept unless a value beside them was redacted; ids get every log rule except the
+# long-token one (a proposal id has up to 121 characters)
+SW_SECRET_KEY_RE = re.compile(r"(?i)token|secret|password|passwd|api[_-]?key|private_?key|access_?key|credential|"
+                              r"authorization|cookie|key$")
+SW_KEY_KEEP = frozenset({"sessionkey", "origin_session_key", "skillkey", "skill_key"})
 SW_HASH_KEY_RE = re.compile(r"(?i)(?:hash|sha256|digest)$")
 SW_HASH_VALUE_RE = re.compile(r"(?:sha256:)?[0-9a-f]{32,128}")
 SW_ID_VALUE_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,200}")
@@ -1558,8 +1562,8 @@ _NOTE_RES = (
     # (doctor-memory-search-CPASCeub.mjs:370/379; the agent prefix only appears with several agents)
     ("warn", re.compile(r'Agent "([^"]{1,80})": Memory search provider is set to "([^"]{1,40})" but '
                         r'(?:no API key|the API key was not found)'),
-     lambda m: f"memory search of agent {m.group(1)} uses provider {m.group(2)} without an API key: semantic "
-               "recall does not work until one is configured"),
+     lambda m: f"memory search of agent {m.group(1)} uses provider {m.group(2)} without an API key, so "
+               "semantic recall does not work until one is configured"),
     ("warn", re.compile(r'Agent "([^"]{1,80})": (\d+) allowed skills? (?:is|are) not usable in this environment'),
      lambda m: f"{m.group(2)} skill(s) of agent {m.group(1)} are not usable in this environment and were disabled "
                "(openclaw skills check)"),
@@ -2703,7 +2707,18 @@ class Gate:
         rec = self.j["doctor"][-1]
         rec["pre_migration_backups"] = new
         rec["pre_migration_backups_older"] = len(cur) - len(new)
+        # beside agent databases outside the state dir: journaled and reported, never deleted by the add-on
+        out_base = set(self.j.get("doctor_copies_outside_before") or [])
+        out_known = {e.get("path") for d in self.j.get("doctor") or [] if isinstance(d, dict)
+                     for e in d.get("pre_migration_backups_outside") or [] if isinstance(e, dict)}
+        outside = [{"path": x, "size": size, "scope": scope} for x, (size, scope) in
+                   sorted(outside_doctor_copies(outside_agent_dirs(self.gp["STATE"], self.cfg)).items())
+                   if x not in out_base and x not in out_known]
+        if outside:
+            rec["pre_migration_backups_outside"] = outside
         self.save()
+        if outside:
+            self.warn(f"doctor pass {n}: " + outside_copies_text([e["path"] for e in outside], self.gp["STATE"]))
         return new
 
     def _finalize_cron_lines(self):
@@ -2990,6 +3005,9 @@ class Gate:
         self.j["doctor_started"] = True
         if "doctor_copies_before" not in self.j:  # doctor's SQLite copies that existed before this run's doctor
             self.j["doctor_copies_before"] = sorted(doctor_copies(p["STATE"]))[:1000]
+            outside = sorted(outside_doctor_copies(outside_agent_dirs(p["STATE"], self.cfg)))
+            if outside:  # beside agent databases outside the state dir (only journaled when there are any)
+                self.j["doctor_copies_outside_before"] = outside[:1000]
         self.save()
         self.copy_once(p["CONFIG_PATH"], rd / "config.pre-pass1.json")
         if self.j.get("plugins_before") is None:
@@ -3560,6 +3578,9 @@ class Gate:
             self.say(f"info: this run's {copies_text(copies)} (plaintext, beside the databases; not the rollback "
                      "point): " + ("deleted at the same time" if hours else
                                    "kept too (gate_cleanup_hours=0), delete them yourself"))
+        outside = run_outside_copies(self.j)
+        if outside:
+            self.warn(outside_copies_text(outside, self.gp["STATE"]))
 
     # ----- holds -----
     def write_hold(self, findings, phase, resume_after=False, post_run=False, sub=None, next_line=None):
@@ -4372,35 +4393,74 @@ def _sw_mkdir(path, root=None):
         os.chmod(str(d), 0o700)
 
 
+def _sw_secret_key(key):
+    return bool(key) and SW_SECRET_KEY_RE.search(key) is not None and key.lower() not in SW_KEY_KEEP
+
+
+def _sw_kept_hash(key, obj):
+    """True for a hash the export keeps as it is: a hex digest under a hash key (draftHash, revision_hash, ...)."""
+    return (isinstance(obj, str) and bool(key) and SW_HASH_KEY_RE.search(key) is not None
+            and not _sw_secret_key(key) and SW_HASH_VALUE_RE.fullmatch(obj) is not None)
+
+
 def _sw_redact(obj, key, counter):
-    """One JSON value of the export, redacted per leaf with the gate's log rules (oc_common.redact_text): a value
-    under a secret-looking key is hidden whole; hashes and ids under their keys are kept."""
+    """One JSON value of the export, redacted with the gate's log rules (oc_common.redact_text_counted): a value under
+    a secret-looking key is hidden whole (a string, number, list or object); every string is redacted, an id under
+    its key without the long-token rule; hashes are kept unless a value beside them was redacted (_sw_redact_items).
+    It hides at least what the log rules hide in the JSON text of the same value."""
+    if (_sw_secret_key(key) and obj is not None and not isinstance(obj, bool)
+            and not (isinstance(obj, (str, bytes, dict, list)) and not obj)):
+        counter[0] += 1
+        return "***"
     if isinstance(obj, dict):
-        return {str(k): _sw_redact(v, str(k), counter) for k, v in obj.items()}
+        return _sw_redact_items(((str(k), v) for k, v in obj.items()), counter)
     if isinstance(obj, list):
         return [_sw_redact(v, key, counter) for v in obj]
     if isinstance(obj, bytes):
         return {"omitted": "binary value", "size": len(obj), "sha256": hashlib.sha256(obj).hexdigest()}
-    if not isinstance(obj, str) or not obj:
+    if not isinstance(obj, str) or not obj or _sw_kept_hash(key, obj):
         return obj
-    if key and SW_SECRET_KEY_RE.search(key):
-        counter[0] += 1
-        return "***"
-    if key and SW_HASH_KEY_RE.search(key) and SW_HASH_VALUE_RE.fullmatch(obj):
-        return obj
-    if key and (key == "id" or key.endswith(("_id", "Id", "ID"))) and SW_ID_VALUE_RE.fullmatch(obj):
-        return obj
-    text, n = C.redact_text_counted(obj)
+    is_id = bool(key) and (key == "id" or key.endswith(("_id", "Id", "ID"))) and SW_ID_VALUE_RE.fullmatch(obj)
+    text, n = C.redact_text_counted(obj, long_tokens=not is_id)
     counter[0] += n
     return text
 
 
+def _sw_redact_items(items, counter):
+    """A JSON object or a table row of the export, redacted value by value. When anything in it was redacted, the
+    hashes kept beside (previous_content_hash next to previous_content, ...) are hidden too: the sha256 of a
+    redacted text confirms a guess of the hidden part offline."""
+    before, out, hashes = counter[0], {}, []
+    for k, v in items:
+        if _sw_kept_hash(k, v):
+            hashes.append(k)
+            out[k] = v
+        else:
+            out[k] = _sw_redact(v, k, counter)
+    if hashes and counter[0] > before:
+        for k in hashes:
+            out[k] = "***"
+            counter[0] += 1
+    return out
+
+
+def _sw_hide_hashes(obj, counter, key=""):
+    """obj (already redacted) with every hash it kept replaced by "***"."""
+    if isinstance(obj, dict):
+        return {k: _sw_hide_hashes(v, counter, k) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_sw_hide_hashes(v, counter, key) for v in obj]
+    if _sw_kept_hash(key, obj):
+        counter[0] += 1
+        return "***"
+    return obj
+
+
 def _sw_row(cols, values, counter):
-    row = {}
-    for c, v in zip(cols, values):
+    def value(c, v):
         parsed = _sw_json(v) if c in SW_JSON_COLUMNS else None
-        row[c] = _sw_redact(parsed if parsed is not None else v, c, counter)
-    return row
+        return parsed if parsed is not None else v
+    return _sw_redact_items(((c, value(c, v)) for c, v in zip(cols, values)), counter)
 
 
 def _sw_md(text, limit=160):
@@ -4415,7 +4475,8 @@ def _sw_proposals_md(doc):
          f"Exported on {doc['exported_at']} before OpenClaw {doc['openclaw_to']} doctor retired the Skill Workshop "
          "proposals. OpenClaw keeps only the current drafts of pending and quarantined proposals, as files in the owner "
          "agent's `workshop-skills/.archive/.retired-proposals/`; everything else exists only in this export.", "",
-         "Secrets are replaced by `***` with the add-on's log redaction rules; the exact originals are only in the "
+         "Secrets are replaced by `***` with the add-on's log redaction rules, and so are the hashes that could "
+         "confirm a guess of a redacted value; the exact originals are only in the "
          "encrypted Home Assistant backup taken before the update. All data is in `proposals.json`; the files of "
          "`/config/.openclaw/skill-workshop/` are mirrored under `files/`. To bring a draft back, ask the agent to "
          "save it with `/learn`. This export is kept until you delete it.", "",
@@ -4521,8 +4582,10 @@ def export_skill_workshop(state_dir, dest, meta, stop=STOP):
         blob = out_text.encode("utf-8")
         _sw_write(target, blob)
         written.append({"path": f"files/{relp}", "sha256": hashlib.sha256(blob).hexdigest()})
-        files.append({"path": relp, "export": f"files/{relp}", "size": size, "sha256_source": h.hexdigest(),
-                      "redactions": counter[0] - before})
+        fe = {"path": relp, "export": f"files/{relp}", "size": size, "redactions": counter[0] - before}
+        if not fe["redactions"]:  # the source hash of a redacted file would confirm a guess of what was hidden
+            fe["sha256_source"] = h.hexdigest()
+        files.append(fe)
     # proposals.json
     events, rollbacks = {}, {}
     for e in tables.get("skill_workshop_proposal_events", []):
@@ -4545,7 +4608,10 @@ def export_skill_workshop(state_dir, dest, meta, stop=STOP):
         draft_rel = f"proposals/{pid}/{draft}" if isinstance(draft, str) and SW_DRAFT_RE.fullmatch(draft) else None
         pfiles = [dict(fe, current_draft=fe["path"] == draft_rel) for fe in by_prop.get(pid, [])]
         exported = any(fe["current_draft"] and fe.get("export") for fe in pfiles)
-        proposals.append(dict(row, events=events.pop(pid, []), rollback=rollbacks.pop(pid, None), files=pfiles,
+        evs = events.pop(pid, [])
+        if any(fe.get("redactions") for fe in pfiles):  # draft/support file hashes, the revision hashes built on them
+            row, evs = _sw_hide_hashes(row, counter), [_sw_hide_hashes(e, counter) for e in evs]
+        proposals.append(dict(row, events=evs, rollback=rollbacks.pop(pid, None), files=pfiles,
                               draft_export=f"files/{draft_rel}" if exported else None,
                               openclaw_doctor=("keeps the current draft in the owner agent's workshop-skills/.archive/"
                                                f".retired-proposals/{pid}/" if status in SW_EXPORTED_STATUSES
@@ -4617,6 +4683,66 @@ def doctor_copies(state_dir):
     return found
 
 
+def outside_agent_dirs(state_dir, cfg):
+    """The real directories of the agent databases (configured or registered) that lie outside the real state dir.
+    Doctor saves its SQLite copies beside these databases too, where the add-on does not delete them. Read-only;
+    [] when the state database cannot be read."""
+    state_dir = Path(state_dir)
+    root = os.path.realpath(str(state_dir)).rstrip("/") + "/"
+    sdb = state_dir / "state" / "openclaw.sqlite"
+    try:
+        targets, _orphans = agent_databases(state_dir, cfg if isinstance(cfg, dict) else {},
+                                            table_names(sdb) if sdb.exists() else set())
+    except (sqlite3.Error, C.NodeQueryError, C.SchemaUnknown, OSError, ValueError):
+        return []
+    dirs = {os.path.dirname(os.path.realpath(str(pth))) for _aid, pth in targets}
+    return sorted(d for d in dirs if not (d + "/").startswith(root))
+
+
+def outside_doctor_copies(dirs):
+    """{absolute path: (size, "full" | "scoped")} of doctor's SQLite copies directly in `dirs` (no recursion; regular
+    files only, links are not followed)."""
+    found = {}
+    for d in dirs:
+        try:
+            with os.scandir(d) as it:
+                entries = [(e.name, e.path) for e in it]
+        except OSError:
+            continue
+        for name, pth in entries:
+            if not DOCTOR_COPY_RE.fullmatch(name):
+                continue
+            try:
+                st = os.lstat(pth)
+            except OSError:
+                continue
+            if stat.S_ISREG(st.st_mode):
+                found[pth] = (st.st_size, "scoped" if name.endswith(".scoped.bak") else "full")
+    return found
+
+
+def run_outside_copies(j):
+    """The paths of the doctor SQLite copies a gate run journaled beside agent databases outside the state dir that
+    still exist (lstat; a link is listed as it is)."""
+    out = []
+    for d in j.get("doctor") or [] if isinstance(j.get("doctor"), list) else []:
+        for e in (d.get("pre_migration_backups_outside") or []) if isinstance(d, dict) else []:
+            pth = e.get("path") if isinstance(e, dict) else None
+            if isinstance(pth, str) and os.path.isabs(pth) and pth not in out and os.path.lexists(pth):
+                out.append(pth)
+    return out
+
+
+def outside_copies_text(paths, state_dir):
+    """The WARN text for doctor's SQLite copies beside agent databases outside the state dir: the add-on never
+    deletes them (its deletes stay below the state dir)."""
+    it = "it" if len(paths) == 1 else "them"
+    return (f"{len(paths)} pre-migration SQLite cop{'y' if len(paths) == 1 else 'ies'} by doctor beside agent "
+            f"databases outside {state_dir} (plaintext, not the rollback point; the add-on does not delete {it}): "
+            f"delete {it} yourself once the update is confirmed: " + ", ".join(printable(x) for x in paths[:4])
+            + (" …" if len(paths) > 4 else ""))
+
+
 def copies_text(entries):
     """'2 full and 1 table-scoped pre-migration SQLite copies by doctor, 1.2 GiB' for journal entries."""
     nf = sum(1 for e in entries if e.get("scope") != "scoped")
@@ -4652,7 +4778,8 @@ def run_doctor_copies(gp, j, present=None):
     backup: …", also in the runs of earlier add-on versions). Like the doctor captures they are plaintext copies of the
     databases, so the owner's rule applies: they go gate_cleanup_hours after the run (the encrypted Home Assistant
     backup is the rollback point). Only regular files below the state dir with doctor's name pattern (doctor_copies,
-    `present` when the caller listed them already); copies already gone are skipped."""
+    `present` when the caller listed them already); copies already gone are skipped. Returns (paths, kept): kept
+    lists the copies the run journaled beside agent databases outside the state dir, which are reported only."""
     present = doctor_copies(gp["STATE"]) if present is None else present
     want = set()
     for d in j.get("doctor") or [] if isinstance(j.get("doctor"), list) else []:
@@ -4668,7 +4795,9 @@ def run_doctor_copies(gp, j, present=None):
     if groups:
         want |= {r for r in present if DOCTOR_COPY_RE.fullmatch(Path(r).name).group(1) in groups}
     state_real = Path(os.path.realpath(str(gp["STATE"])))
-    return [state_real / r for r in sorted(want) if r in present], []
+    kept = [(x, f"beside an agent database outside {gp['STATE']}: not deleted by the add-on, delete it yourself")
+            for x in run_outside_copies(j)]
+    return [state_real / r for r in sorted(want) if r in present], kept
 
 
 def plugin_snapshot(state_dir):
@@ -6037,6 +6166,14 @@ def status_lines():
                  + leftover_note(o["cleanup_hours"])
                  + ("; restore a .scoped.bak only with openclaw database restore-migration-backup, never by copying"
                     if ns else ""))
+    outside = []
+    for _rid, rj in sorted(_run_journals(gp)[0].items()):
+        outside += [x for x in run_outside_copies(rj) if x not in outside]
+    if outside:
+        L.append("Doctor pre-migration SQLite copies beside agent databases outside "
+                 f"{gp['STATE']}: {len(outside)}, plaintext, not the rollback point; the add-on does not delete them, "
+                 "delete them yourself: " + ", ".join(printable(x) for x in outside[:8])
+                 + (" …" if len(outside) > 8 else ""))
     led = C.load_json_or_none(gp["LEDGER"])
     if isinstance(led, dict):
         L.append(f"Pins ledger: {len(led.get('entries') or [])} written, {len(led.get('skipped') or [])} skipped")

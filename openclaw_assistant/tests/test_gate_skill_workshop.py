@@ -13,6 +13,7 @@ and the scriptable fake doctor; this module's SW_DOCTOR wrapper adds what doctor
 import hashlib
 import json
 import os
+import re
 import sqlite3
 import stat
 import sys
@@ -305,17 +306,31 @@ class ExportUnitTests(Base):
         md = (self.dest / "PROPOSALS.md").read_text()
         self.assertIn("| wx-rejected | rejected | create | lights-off |", md)
         self.assertIn("/learn", md)
-        # redaction: no secret anywhere in the export; hashes, ids and session keys kept exactly
+        # redaction: no secret anywhere in the export; ids and session keys kept exactly
         blob = all_bytes(self.dest)
         for secret in (SK_SECRET, BOT_SECRET, "plain-api-key-value", "abcdefgh12345678secret", "SECRET-EVENT-TOKEN"):
             self.assertNotIn(secret.encode(), blob, secret)
         self.assertGreaterEqual(res["redactions"], 4)
         self.assertEqual(doc["redactions_total"], res["redactions"])
-        self.assertEqual(pend["record_json"]["draftHash"], DRAFT_HASH)
-        self.assertEqual(pend["draft_hash"], "sha256:" + DRAFT_HASH)
         self.assertEqual(pend["record_json"]["origin"]["sessionKey"], "agent:main:telegram:direct:42")
+        self.assertEqual(pend["origin_session_key"], "agent:main:telegram:direct:42")
         self.assertEqual(pend["record_json"]["apiKey"], "***")
         self.assertIn("botToken: ***", doc["proposals"][2]["rollback"]["previous_content"])
+        # hashes stay where nothing they could cover was redacted (wx-quarantined), and are hidden where they would
+        # confirm a guess of a redacted text: wx-pending's draft (sk- key) and record (apiKey), wx-applied's undo
+        # record (bot token), every event (a token in its payload)
+        quar = doc["proposals"][1]
+        self.assertEqual((quar["draft_hash"], quar["record_json"]["draftHash"]), ("sha256:" + DRAFT_HASH, DRAFT_HASH))
+        self.assertEqual((pend["draft_hash"], pend["record_json"]["draftHash"],
+                          pend["record_json"]["supportFiles"][0]["hash"]), ("***", "***", "***"))
+        self.assertEqual(doc["proposals"][2]["rollback"]["previous_content_hash"], "***")
+        self.assertEqual({e["revision_hash"] for p in doc["proposals"] for e in p["events"]}, {"***"})
+        fl = {f["path"]: f for f in pend["files"]}
+        self.assertNotIn("sha256_source", fl[f"proposals/wx-pending/generations/{GEN1}/PROPOSAL.md"])
+        self.assertEqual(fl[f"proposals/wx-pending/generations/{GEN1}/PROPOSAL.md"]["redactions"], 1)
+        gen2 = self.state / f"skill-workshop/proposals/wx-pending/generations/{GEN2}/PROPOSAL.md"
+        self.assertEqual(fl[f"proposals/wx-pending/generations/{GEN2}/PROPOSAL.md"]["sha256_source"],
+                         hashlib.sha256(gen2.read_bytes()).hexdigest())
         # modes, manifest
         for p, st in C.walk_lstat(self.dest):
             self.assertEqual(stat.S_IMODE(st.st_mode), 0o700 if stat.S_ISDIR(st.st_mode) else 0o600, p)
@@ -326,6 +341,89 @@ class ExportUnitTests(Base):
             self.assertEqual(hashlib.sha256((self.dest / f["path"]).read_bytes()).hexdigest(), f["sha256"])
         self.assertEqual(G.sw_export_record({"RUNS": self.tmp}, "out")["proposals"], 5)
         self.assertFalse(os.path.lexists(str(self.dest) + ".partial"))
+
+    def test_no_hash_confirms_a_guess_of_a_redacted_value(self):
+        """Security review: a short secret that the rules redact cannot be recovered by trying candidates against a
+        hash the export keeps: the source hash of a redacted file, the draft hash in the row and the record, the
+        revision hash of the events built on it, and the content hashes beside a redacted undo record."""
+        draft = b"# alarm\nUse the panel.\npassword: 4711\n"
+        dh = hashlib.sha256(draft).hexdigest()
+        rev = hashlib.sha256(b"revision over " + dh.encode()).hexdigest()
+        prev = "password: 1234\n"
+        ph = hashlib.sha256(prev.encode()).hexdigest()
+        (self.state / "skill-workshop" / "proposals" / "wx-quarantined" / "PROPOSAL.md").write_bytes(draft)
+        c = sqlite3.connect(str(self.sdb))
+        c.execute("UPDATE skill_workshop_proposals SET draft_hash=?, record_json=json_set(record_json, '$.draftHash', "
+                  "?, '$.evaluation', json_object('revisionHash', ?)) WHERE proposal_id='wx-quarantined'",
+                  ("sha256:" + dh, dh, rev))
+        c.execute("INSERT INTO skill_workshop_proposal_events (event_id, proposal_id, proposed_version, revision_hash, "
+                  "event_type, occurred_at, actor_json, payload_json) VALUES ('wx-q-rev', 'wx-quarantined', '2', ?, "
+                  "'revised', '2026-10-03T00:00:00Z', '{}', '{}')", (rev,))
+        c.execute("UPDATE skill_workshop_proposal_rollbacks SET previous_content=NULL, previous_content_hash=NULL, "
+                  "support_files_json=? WHERE proposal_id='wx-applied'",
+                  (json.dumps([{"path": "notes.md", "previousContentHash": ph, "previousContent": prev}]),))
+        c.commit()
+        c.close()
+        self.export()
+        blob = all_bytes(self.dest)
+        for value in (b"4711", b"1234\n", dh.encode(), rev.encode(), ph.encode()):
+            self.assertNotIn(value, blob, value)
+        doc = json.loads((self.dest / "proposals.json").read_text())
+        quar = doc["proposals"][1]
+        self.assertEqual((quar["draft_hash"], quar["record_json"]["draftHash"],
+                          quar["record_json"]["evaluation"]["revisionHash"]), ("***", "***", "***"))
+        self.assertEqual({e["event_id"]: e["revision_hash"] for e in quar["events"]}["wx-q-rev"], "***")
+        self.assertEqual(doc["proposals"][2]["rollback"]["support_files_json"],
+                         [{"path": "notes.md", "previousContentHash": "***", "previousContent": "password: ***\n"}])
+        f = next(x for x in quar["files"] if x["path"] == "proposals/wx-quarantined/PROPOSAL.md")
+        self.assertNotIn("sha256_source", f)
+        self.assertEqual((self.dest / "files" / "proposals" / "wx-quarantined" / "PROPOSAL.md").read_text(),
+                         "# alarm\nUse the panel.\npassword: ***\n")
+
+    def test_redaction_hides_whatever_the_log_rules_hide(self):
+        """Security review: per JSON value the export hides at least what the log rules (oc_common.redact_text) hide
+        in the JSON text of the same object: *key names (x-api-key, signingKey, hmacKey), a number under a secret
+        key, a token under an id key, the formats OpenClaw's literal-secret check knows. Beyond that, an object or
+        list under a secret key is hidden whole. Deliberate exceptions: hashes under hash keys with nothing redacted
+        beside them, ids under id keys and OpenClaw's own identifiers (sessionKey, origin_session_key, skillKey)."""
+        bot = "123456789:" + "AAH" + "x" * 32
+        cases = [
+            {"headers": {"x-api-key": "hv-0001"}}, {"api-key": "hv-0002"}, {"signingKey": "hv-0003"},
+            {"webhook": {"hmacKey": "hv-0004"}}, {"encryptionKey": "hv-0005"}, {"secret": 31415926},
+            {"id": bot}, {"chat_id": bot}, {"requestId": "sk-hv0011abcdefghij"}, {"note": "use API key: hv-0012 here"},
+            {"evidence": "key AIza" + "B" * 35}, {"slack": "xoxb-1234567890-hv0014abcd"},
+            {"evidence": "-----BEGIN PRIVATE KEY-----\nMIIEhv0013+abc/def\nZZ09==\n-----END PRIVATE KEY-----"},
+            {"url": "https://user:hv-0015@example.com/x"}, {"password": "hv-0016", "previous_content_hash": "ab" * 32}]
+        for x in cases:
+            with self.subTest(x=json.dumps(x)[:50]):
+                logged = C.redact_text(json.dumps(x))
+                out = json.dumps(G._sw_redact(x, "", [0]))
+                values, stack = [], [x]
+                while stack:
+                    v = stack.pop()
+                    if isinstance(v, dict):
+                        stack += list(v.values())
+                    else:
+                        values.append(json.dumps(v))
+                # every word of a value that the log rules hide is hidden in the export too
+                hidden = {w for v in values for w in re.findall(r"[A-Za-z0-9_+/=-]{4,}", v) if w not in logged}
+                self.assertTrue(hidden, "the log rules hide something in every case")
+                self.assertEqual(sorted(w for w in hidden if w in out), [])
+        # stronger than the log rules: an object or list under a secret key is hidden whole
+        for x, values in (({"apiKey": {"value": "hv-0006"}}, ["hv-0006"]),
+                          ({"credentials": {"user": "hv-0007", "pass": "hv-0008"}}, ["hv-0007", "hv-0008"]),
+                          ({"tokens": ["hv-0009", "hv-0010"]}, ["hv-0009", "hv-0010"])):
+            with self.subTest(x=json.dumps(x)[:50]):
+                counter = [0]
+                out = json.dumps(G._sw_redact(x, "", counter))
+                self.assertEqual((counter[0], [v for v in values if v in out]), (1, []))
+        # what stays readable
+        keep = {"id": "weather-brief-" + "a" * 60, "proposal_id": "x" * 121, "origin": {"sessionKey": "agent:main:m"},
+                "origin_session_key": "agent:main:m", "target": {"skillKey": "weather-brief"}, "draftHash": "cd" * 32,
+                "note": "plain words", "enabled": True, "count": 3, "empty_token": ""}
+        counter = [0]
+        self.assertEqual(G._sw_redact(keep, "", counter), keep)
+        self.assertEqual(counter[0], 0)
 
     def test_partial_leftover_is_rebuilt_and_a_complete_export_is_never_replaced(self):
         part = Path(str(self.dest) + ".partial")
@@ -769,6 +867,59 @@ class DoctorCopiesTests(Base):
         self.assertEqual((paths, kept), ([Path(os.path.realpath(self.state)) / C.rel(made, self.state)], []))
         self.assertFalse(made.exists())
         self.assertTrue(self.old.exists())
+
+    def test_copies_beside_agent_databases_outside_the_state_dir_are_reported_not_deleted(self):
+        """Security review: doctor also saves its full copy beside an agent database outside /config/.openclaw (an
+        agent directory registered elsewhere in /config or in /share). The add-on never deletes there: the run
+        journals the copies its doctor passes saved there, warns after the pass and at the end, `oc-upgrade status`
+        lists them and the cleanup reports them as kept (before, nothing named them and the pass line said "no new
+        pre-migration SQLite copy")."""
+        ext = self.root / "agents-ext" / "ext" / "agent"
+        T.make_1004_agent_db(self.state, "ext", uv=27, app="2026.10.10")
+        ext.parent.mkdir(parents=True)
+        os.rename(self.state / "agents" / "ext" / "agent", ext)
+        os.rmdir(self.state / "agents" / "ext")
+        c = sqlite3.connect(str(self.sdb))
+        c.execute("INSERT INTO agent_databases VALUES ('ext', ?, 27, 0, NULL)", (str(ext / "openclaw-agent.sqlite"),))
+        c.commit()
+        c.close()
+        real = Path(os.path.realpath(ext))
+        older = real / f"openclaw-agent.sqlite.pre-startup-migration-{ID_OLD}.bak"
+        older.write_bytes(b"older outside copy")
+        made = real / f"openclaw-agent.sqlite.pre-startup-migration-{ID_NEW}.bak"
+        self.doctor_script(passes=[
+            dict(self.step_1010(retire=False), write={self.full: "full copy", str(made): "outside copy"},
+                 print=[f"Saved pre-migration SQLite backup: {self.state / self.full}",
+                        f"Saved pre-migration SQLite backup: {made}"]),
+            self.step_1010(retire=False)])
+        self.hooks()
+        self.assertEqual(self.run_gate(), 0, self.out)
+        j = self.journal()
+        self.assertEqual(j["doctor_copies_outside_before"], [str(older)])
+        self.assertEqual(j["doctor"][0]["pre_migration_backups_outside"],
+                         [{"path": str(made), "size": 12, "scope": "full"}])
+        self.assertNotIn("pre_migration_backups_outside", j["doctor"][1])
+        text = (f"1 pre-migration SQLite copy by doctor beside agent databases outside {self.state} (plaintext, not "
+                f"the rollback point; the add-on does not delete it): delete it yourself once the update is "
+                f"confirmed: {made}")
+        self.assertIn(f"WARN [gate] doctor pass 1: {text}", self.out)
+        self.assertIn(f"WARN [gate] {text}", self.out.split("[gate] done: MIGRATED")[1])
+        st = "\n".join(G.status_lines())
+        self.assertIn(f"Doctor pre-migration SQLite copies beside agent databases outside {self.state}: 1, plaintext, "
+                      f"not the rollback point; the add-on does not delete them, delete them yourself: {made}", st)
+        # the cleanup deletes the copy below the state dir, reports the one outside once and leaves it (and the
+        # older one) alone
+        finished = G._parse_backup_date(j["finished_at"])
+        targets = {t[0]: t for t in G.cleanup_targets(G.gpaths(), finished, 48)}
+        self.assertEqual(targets[j["run_id"]][4], [
+            (str(made), f"beside an agent database outside {self.state}: not deleted by the add-on, delete it "
+                        "yourself")])
+        lines = []
+        self.assertEqual(G.cleanup_pass(now=finished + timedelta(hours=48), hours=48, emit=lines.append), 1, lines)
+        self.assertEqual(G.cleanup_pass(now=finished + timedelta(hours=49), hours=48, emit=lines.append), 0, lines)
+        self.assertFalse((self.state / self.full).exists())
+        self.assertTrue(made.exists() and older.exists())
+        self.assertEqual(sum(f"kept {made}: beside an agent database outside" in x for x in lines), 1, lines)
 
     def test_safe_delete_refuses_links_and_other_paths(self):
         gp = G.gpaths()

@@ -776,6 +776,60 @@ class Full2RedactTests(unittest.TestCase):
                 self.assertEqual(C.redact_text(line), line)
 
 
+class LiteralSecretRedactTests(unittest.TestCase):
+    """Security review (full5): the formats OpenClaw's own literal-secret check knows (LITERAL_SECRET_PATTERN,
+    skills/security/scan-evidence.ts) and "API key: value" are redacted; before, a PEM body, a Google key, a short
+    Slack token, a GitHub token and "API key: x" stayed readable (the Skill Workshop export uses these rules)."""
+    PEM_BODY = "MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQC7+synth/etic\nk3y+Body/Zz09==\n"
+
+    def test_pem_private_keys(self):
+        for label in ("PRIVATE KEY", "RSA PRIVATE KEY", "OPENSSH PRIVATE KEY", "ENCRYPTED PRIVATE KEY",
+                      "PGP PRIVATE KEY BLOCK"):
+            pem = f"-----BEGIN {label}-----\n{self.PEM_BODY}-----END {label}-----"
+            for raw, want in ((pem, f"-----BEGIN {label}-----***-----END {label}-----"),
+                              (f"key:\n{pem}\nrest", f"key:\n-----BEGIN {label}-----***-----END {label}-----\nrest"),
+                              (json.dumps({"pem": pem}),
+                               '{"pem": "-----BEGIN %s-----***-----END %s-----"}' % (label, label))):
+                with self.subTest(label=label, raw=raw[:12]):
+                    self.assertEqual(C.redact_text(raw), want)
+        # a block without its END line (a cut text): the body still goes
+        cut = C.redact_text("-----BEGIN PRIVATE KEY-----\n" + self.PEM_BODY)
+        self.assertTrue(cut.startswith("-----BEGIN PRIVATE KEY-----***"), cut)
+        for part in ("MIIEvQIBADAN", "synth", "Body"):
+            self.assertNotIn(part, cut)
+        whole = "-----BEGIN PRIVATE KEY-----\n" + self.PEM_BODY + "-----END PRIVATE KEY-----"
+        self.assertEqual(C.redact_text_counted(whole)[1], 1)
+
+    def test_provider_token_formats(self):
+        for raw, want in (("GOOGLE key AIza" + "Sy" + "A1_b-" * 6 + "xyz ok", "GOOGLE key *** ok"),
+                          ("xoxb-1234567890-abcdefghij", "***"), ("slack xoxp-12345-67890-abcdefghij.", "slack ***."),
+                          ("github_pat_" + "a1B2" * 6, "***"), ("ghp_" + "Z9" * 18 + " end", "*** end"),
+                          ("gho_" + "x" * 20, "***"), ("API key: abc123", "API key: ***"),
+                          ("api key = abcd1234efgh", "api key = ***"), ("Api-Key: abc", "Api-Key: ***")):
+            with self.subTest(raw=raw[:16]):
+                self.assertEqual(C.redact_text(raw), want)
+                self.assertGreaterEqual(C.redact_text_counted(raw)[1], 1)
+
+    def test_lookalikes_untouched(self):
+        for line in ("-----BEGIN PUBLIC KEY-----\nMIIBIjANBgkqh\n-----END PUBLIC KEY-----",
+                     "-----BEGIN CERTIFICATE-----\nMIIDdzCCAl+gAwIBAgIE\n-----END CERTIFICATE-----",
+                     "memory search of agent main uses provider openai without an API key, so semantic recall does not "
+                     "work until one is configured", "AIzaShort", "xoxb-short", "ghp_short", "the github_pat_ prefix"):
+            with self.subTest(line=line[:30]):
+                self.assertEqual(C.redact_text(line), line)
+
+    def test_counted_without_the_long_token_rule(self):
+        long_id = "weather-brief-" + "a" * 60
+        self.assertEqual(C.redact_text_counted(long_id), ("***", 1))
+        self.assertEqual(C.redact_text_counted(long_id, long_tokens=False), (long_id, 0))
+        for secret in ("123456789:" + "A" * 35, "sk-" + "b" * 20, "eyJhbGciOiJIUzI1.eyJzdWIiOiIx.c2lnbmF0dXJl",
+                       "AIza" + "C" * 35):
+            with self.subTest(secret=secret[:12]):
+                text, n = C.redact_text_counted(secret, long_tokens=False)
+                self.assertGreaterEqual(n, 1)
+                self.assertNotIn(secret[-12:], text)
+
+
 class SupervisorCredentialEnvTests(OptionsCase):
     def test_env_remove_lists_the_supervisor_credentials(self):
         self.assertIn("SUPERVISOR_TOKEN", C.ENV_REMOVE)

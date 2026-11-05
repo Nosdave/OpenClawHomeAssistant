@@ -2143,9 +2143,10 @@ def cron_account_forecast(jobs, cfg, profiles_for, default_agent="main"):
     without its prompt (None when unparsable); profiles_for(agent_id) -> [{"id", "provider"}] (no secrets).
     Covers enabled agentTurn jobs with no recorded inference account (inferenceBinding), no scheduled runtime
     authority and a session target other than "main". A job is affected when its primary or any fallback would
-    run on a stored auth profile. Returns {"checked": n, "bound": n, "affected": [{"id", "name", "agent",
-    "primary", "primary_affected", "refs"}]}; refs are the affected "provider/model" refs in chain order
-    (without @profile)."""
+    run on a stored auth profile; a ref that names a profile ("model@profile") does, also when its bare model id
+    is no alias (OpenClaw gives it the default provider). Returns {"checked": n, "bound": n, "affected": [{"id",
+    "name", "agent", "primary", "primary_affected", "refs"}]}; primary and refs ("provider/model", or the bare
+    model id) never carry the @profile; refs are the affected ones in chain order."""
     cfg = cfg if isinstance(cfg, dict) else {}
     res = {"checked": 0, "bound": 0, "affected": []}
     for row in jobs or []:
@@ -2165,16 +2166,19 @@ def cron_account_forecast(jobs, cfg, profiles_for, default_agent="main"):
         refs, primary_affected = [], False
         for i, raw in enumerate([primary] + fallbacks):
             r = cron_model_ref(cfg, raw) if raw else None
+            if r is None and raw:  # a bare id that is no alias: an explicit profile is still a stored login
+                m_, prof_ = split_trailing_auth_profile(raw)
+                r = (None, m_, prof_) if m_ and prof_ else None
             if r is None or not cron_ref_uses_stored_profile(cfg, r[0], r[2], profiles):
                 continue
-            ref = f"{r[0]}/{r[1]}"
+            ref = f"{r[0]}/{r[1]}" if r[0] else r[1]
             primary_affected = primary_affected or i == 0
             if ref not in refs:
                 refs.append(ref)
         if refs:
             p = cron_model_ref(cfg, primary) if primary else None
-            res["affected"].append({"id": row.get("id"), "name": row.get("name"), "agent": agent,
-                                    "primary": f"{p[0]}/{p[1]}" if p else primary,
+            shown = f"{p[0]}/{p[1]}" if p else split_trailing_auth_profile(primary)[0] if primary else primary
+            res["affected"].append({"id": row.get("id"), "name": row.get("name"), "agent": agent, "primary": shown,
                                     "primary_affected": primary_affected, "refs": refs})
     return res
 

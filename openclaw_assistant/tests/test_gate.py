@@ -959,7 +959,8 @@ class DoctorNotesTests(unittest.TestCase):
         text = "\n".join(n[1] for n in notes)
         self.assertEqual(levels, ["info", "warn", "warn", "warn", "warn", "warn"])
         self.assertIn("agents.entries.mail_reader.model has no explicit \"fallbacks\"", text)
-        self.assertIn("memory search of agent main uses provider openai without an API key", text)
+        self.assertIn("memory search of agent main uses provider openai without an API key, so semantic recall does "
+                      "not work until one is configured", text)  # not cut by the "API key: value" redaction
         self.assertIn("31 skill(s) of agent main", text)
         self.assertEqual(text.count("heartbeat monitor"), 1, "deduplicated")
         self.assertIn("~/clawd/TOOLS.md", text)

@@ -1265,7 +1265,13 @@ behaviour pin for `approvalPolicy` is not written on these versions). With OpenC
   rows with history, undo records and collection reviews), `PROPOSALS.md` (a readable
   index) and `files/` (the files of `/config/.openclaw/skill-workshop/`, every draft
   version). Secrets are replaced by `***` with the add-on's log redaction rules; the
-  exact originals exist only in the encrypted Home Assistant backup. Links, binary files
+  exact originals exist only in the encrypted Home Assistant backup. A value under a key
+  that names a secret (`token`, `password`, `apiKey`, `x-api-key`, any `…Key`) is hidden
+  whole, whatever it holds; ids and OpenClaw's session and skill keys stay readable. A
+  hash that could confirm a guess of a redacted value is not exported either: a redacted
+  file has no source sha256, and the draft, support-file and revision hashes of a
+  proposal whose files were redacted, or a hash beside a redacted text, read `***`.
+  The rules can miss formats they do not recognise. Links, binary files
   and files over 16 MiB are listed with size and sha256, not copied. The directory is
   `0700` (files `0600`), stays inside `/config` (so it is in your encrypted backups; do
   not copy it out of Home Assistant), is written once per run, and is kept until you
@@ -1400,10 +1406,16 @@ doctor, …)`) and every copy of a backup group its doctor logs name (`Saved
 pre-migration SQLite backup: …`), which covers the runs of earlier add-on versions too
 (their copies go at the first check after this update). It deletes only regular files
 with doctor's name pattern below `/config/.openclaw`, through directory handles that
-never follow a link. Copies that no gate run made (for example from the 2026.7
-gateway's own startup migrations) are left alone; `oc-upgrade status` counts all of
-them (`Doctor pre-migration SQLite copies: …`), and you can delete those by hand. Never
-copy a `.bak` or `.scoped.bak` over a database.
+never follow a link. Doctor also saves a copy beside an agent database registered outside
+`/config/.openclaw` (elsewhere in `/config` or in `/share`); the add-on never deletes
+there. The gate records the copies its doctor passes saved there and names them in a
+`WARN` after the pass and at the end of the run (`… pre-migration SQLite copy by doctor
+beside agent databases outside /config/.openclaw …: delete it yourself …`), in
+`oc-upgrade status` and as `kept` in `oc-upgrade cleanup` and the cleanup log: delete
+them yourself once the update is confirmed. Copies that no gate run made (for example
+from the 2026.7 gateway's own startup migrations) are left alone; `oc-upgrade status`
+counts all of them below `/config/.openclaw` (`Doctor pre-migration SQLite copies: …`),
+and you can delete those by hand. Never copy a `.bak` or `.scoped.bak` over a database.
 
 It also deletes the copies that earlier add-on versions left, each
 `gate_cleanup_hours` after its own time:

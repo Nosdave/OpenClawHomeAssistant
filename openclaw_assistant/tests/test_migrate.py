@@ -2770,6 +2770,21 @@ class TestCronAccountForecast(unittest.TestCase):
         # without any stored profile nothing is affected (configured keys, local models)
         self.assertEqual(self.forecast(self.job("a", payload={"model": "openai/gpt-5.5"}), profiles=[])["affected"], [])
 
+    def test_forecast_never_keeps_a_profile_id_and_counts_an_explicit_profile(self):
+        """Security review: a bare model id that is no alias but names a profile ("glm-local@lan:someone@example.org")
+        runs on that stored login (OpenClaw gives the bare id the default provider), so the primary is affected; the
+        report keeps neither the profile id of the primary nor that of a fallback."""
+        cfg = {"agents": {"defaults": {"model": {"primary": "glm-local@lan:someone@example.org",
+                                                 "fallbacks": ["openai/gpt-5.5", "other-bare@work:ops@example.org"]}},
+                          "list": [{"id": "main", "default": True}]}}
+        res = self.forecast(self.job("j1"), self.job("j2", payload={"model": "bare-local"}), cfg=cfg)
+        self.assertEqual(res["affected"], [
+            {"id": "j1", "name": "Job j1", "agent": "main", "primary": "glm-local", "primary_affected": True,
+             "refs": ["glm-local", "openai/gpt-5.5", "other-bare"]},
+            {"id": "j2", "name": "Job j2", "agent": "main", "primary": "bare-local", "primary_affected": False,
+             "refs": ["openai/gpt-5.5", "other-bare"]}])
+        self.assertNotIn("example.org", json.dumps(res))
+
     def test_forecast_skips_what_openclaw_does_not_refuse(self):
         jobs = [self.job("off", enabled=False), self.job("ev", payload={"kind": "systemEvent"}),
                 self.job("main", sessionTarget="main"), self.job("auth", authority=True),
