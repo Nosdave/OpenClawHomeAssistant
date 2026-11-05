@@ -1275,8 +1275,10 @@ behaviour pin for `approvalPolicy` is not written on these versions). With OpenC
   that names a secret (`token`, `password`, `apiKey`, `x-api-key`, any `…Key`) is hidden
   whole, whatever it holds; ids and OpenClaw's session and skill keys stay readable. A
   hash that could confirm a guess of a redacted value is not exported either: a redacted
-  file has no source sha256, and the draft, support-file and revision hashes of a
-  proposal whose files were redacted, or a hash beside a redacted text, read `***`.
+  file has no source sha256; once a draft or an undo record of a skill was redacted,
+  every proposal for that skill shows its draft, support-file, revision and target
+  hashes (the skill file and tree it was made against) as `***`; a hash beside a
+  redacted text and every other copy of the sha256 of a redacted text read `***` too.
   The rules can miss formats they do not recognise. Links, binary files
   and files over 16 MiB are listed with size and sha256, not copied. The directory is
   `0700` (files `0600`), stays inside `/config` (so it is in your encrypted backups; do
@@ -1308,7 +1310,9 @@ first, unless the key in `models.providers.<provider>.apiKey` is a SecretRef, a 
 reference or the name of a known provider variable (such as `OPENAI_API_KEY`) that is
 set, or a literal key with `models.providers.<provider>.auth: "api-key"`. Another
 upper-case value (`EMPTY`, `NONE`) counts as a literal key. OpenClaw's doctor records
-the accounts itself only from 2026.11.5 (openclaw/openclaw#172792).
+the accounts itself only from 2026.11.5 (openclaw/openclaw#172792), and only for a
+stored login: AWS SDK credentials are no stored account, so no account can be recorded
+for them, by doctor or by you.
 
 The gate only reports this: it changes no cron job and no auth store and never holds.
 With OpenClaw 2026.10.4 it prints nothing.
@@ -1316,27 +1320,36 @@ With OpenClaw 2026.10.4 it prints nothing.
 - **Precheck** (also `oc-upgrade gate --dry-run`, and `oc-upgrade check` while a
   migration is pending): one `WARN [gate] cron job '<name>' (<id>): …` per enabled
   agent-turn job without a recorded account whose model or a fallback would use a stored
-  login. The models are chosen as OpenClaw does: the job's own model, else a
-  `subagents.model` (the agent's, then `agents.defaults.subagents.model`), else the
-  agent's model, else the default; the job's own fallbacks, else those of that
+  login or AWS SDK credentials. The models are chosen as OpenClaw does: the job's own
+  model, else a `subagents.model` (the agent's, then `agents.defaults.subagents.model`),
+  else the agent's model, else the default; the job's own fallbacks, else those of that
   `subagents.model`, of the agent or of the defaults (an agent whose model is the same
   `provider/model` string as the default keeps the default fallbacks). It names the
-  affected models and says either that every run is refused (the job's own model uses a
-  stored login) or that the job keeps working on its own model and stops at the first
-  such fallback when that model fails. Only the job id, its name and model names are
-  shown, no prompt and no account.
+  affected models, each with what it would run on (a stored login or AWS SDK
+  credentials), and says either that every run is refused (the job's own model is one of
+  them) or that the job keeps working on its own model and stops at the first such
+  fallback when that model fails. Only the job id, its name and model names are shown,
+  no prompt and no account.
 - **After the migration** the gate reads the migrated jobs again: the `7/8
   postconditions` line counts them, the end of the run repeats the warnings, and
   `oc-upgrade status` lists them.
 - **What to do.** Nothing, if the job's own model needs no account and you can do
-  without that fallback until OpenClaw 2026.11.5. If the reported model's provider has
-  an API key in `models.providers.<provider>.apiKey` besides its stored login, set
+  without that fallback until OpenClaw 2026.11.5 (on AWS SDK credentials: for good, see
+  below). If the reported model's provider has an API key in
+  `models.providers.<provider>.apiKey` besides its stored login, set
   `models.providers.<provider>.auth: "api-key"` (or give the key as a SecretRef or
   `${VAR}`): OpenClaw then runs that model on the key, not on the stored login. To run a
   job on a stored login now: after the start, `openclaw automations edit <id> --model
   <provider/model>@<profileId>` records the account (and makes that model the job's
   model). The job then runs only on that account's provider: fallbacks to other
   providers are refused (openclaw/openclaw#192463).
+  A model on AWS SDK credentials (`models.providers.<provider>.auth: "aws-sdk"`) cannot
+  be recorded as a job's account: `@<profileId>` needs a stored login, and OpenClaw's own
+  migration in 2026.11.5 leaves such a job as it is. Give the job a model whose provider
+  runs on a configured key (see above), or a local model, after the start: `openclaw
+  automations edit <id> --model <provider/model>`; when the AWS SDK model is only a
+  fallback, `--fallbacks <list>` without it (the job's own list replaces the agent's and
+  the default fallbacks).
 
 #### Official plugins follow OpenClaw's version
 
@@ -1393,8 +1406,10 @@ image (OpenClaw 2026.10.4) is not affected. The add-on cannot change them.
   <channel>, <chat type>)`; no session ids are shown.
 - **Cron fallbacks.** Until OpenClaw's doctor records the inference accounts itself
   (2026.11.5, openclaw/openclaw#172792), a cron job from before 2026.10.10 is refused, or
-  stops at the first fallback, as soon as a model would use a stored login
-  (openclaw/openclaw#192195). The gate only reports the affected jobs; see
+  stops at the first fallback, as soon as a model would use a stored login or AWS SDK
+  credentials (openclaw/openclaw#192195). For AWS SDK credentials (`auth: "aws-sdk"`)
+  this stays so after 2026.11.5 too: no account can be recorded for them. The gate only
+  reports the affected jobs; see
   [Cron jobs without a recorded inference account](#cron-jobs-without-a-recorded-inference-account-openclaw-20261010).
 - **No forecast on the current image.** `oc-upgrade check` of the add-on version you
   update from does not know these checks. They run in the precheck of the new image,

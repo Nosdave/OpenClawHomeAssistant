@@ -39,7 +39,7 @@ __all__ = [
     "legacy_key_context", "is_migrated_legacy_key",
     "check_legacy_refs", "check_codex_runtime", "check_runtime_pins", "apply_pins", "auth_order_adjust",
     "split_trailing_auth_profile", "cron_job_agent", "cron_model_chain", "cron_model_ref",
-    "cron_ref_uses_stored_profile", "cron_account_forecast",
+    "cron_ref_refusal", "cron_ref_uses_stored_profile", "cron_account_forecast",
     "classify_state_files", "scan_sessions_files", "config_precheck", "flatten_paths",
     "retired_config_keys", "retired_config_rewrites", "retired_config_findings", "classify_retired_state",
     "retired_db_findings",
@@ -2167,9 +2167,11 @@ def _provider_cfg(cfg, provider):
     return None
 
 
-def cron_ref_uses_stored_profile(cfg, provider, explicit_profile, profiles):
-    """True when OpenClaw 2026.10.10 would prepare this candidate on a stored auth profile (prepare-auth.ts),
-    so a cron job without a recorded inference account is refused there.
+def cron_ref_refusal(cfg, provider, explicit_profile, profiles):
+    """Why OpenClaw 2026.10.10 refuses this candidate of a cron job without a recorded inference account
+    (prepare-auth.ts, auth-plan.ts): "profile" when it would run on a stored auth profile, "aws-sdk" when on AWS SDK
+    credentials (models.providers.<p>.auth "aws-sdk": no configured key, and no stored account that model@profile
+    could record either), None when it is not refused.
 
     profiles: [{"id", "provider"}] the job's agent can use (its own store, the shared store, auth.profiles of
     openclaw.json). A model@profile ref names a stored account. models.providers.<p>.auth "aws-sdk" runs on AWS
@@ -2180,22 +2182,28 @@ def cron_ref_uses_stored_profile(cfg, provider, explicit_profile, profiles):
     otherwise the profiles come first. A provider without stored profiles (configured key, environment, local or
     synthetic route) is not affected."""
     if explicit_profile:
-        return True
+        return "profile"
     pcfg = _provider_cfg(cfg, provider) or {}
     if pcfg.get("auth") == "aws-sdk":  # prepare-auth.ts: direct source with evidence "aws-sdk"
-        return True
+        return "aws-sdk"
     key = pcfg.get("apiKey")
     if isinstance(key, dict):
-        return False
+        return None
     if isinstance(key, str) and key.strip():
         k = key.strip()
         if _ENV_KEY_REF_RE.match(k) or k in _KNOWN_ENV_KEY_MARKERS:
-            return False
+            return None
         if any(p.get("id") == k for p in profiles):
-            return True
+            return "profile"
         if pcfg.get("auth") == "api-key" and k not in _AWS_SDK_KEY_MARKERS:
-            return False
-    return any(str(p.get("provider") or "").strip().lower() == provider for p in profiles)
+            return None
+    return "profile" if any(str(p.get("provider") or "").strip().lower() == provider for p in profiles) else None
+
+
+def cron_ref_uses_stored_profile(cfg, provider, explicit_profile, profiles):
+    """True when OpenClaw 2026.10.10 refuses this candidate of a cron job without a recorded inference account,
+    on a stored auth profile or on AWS SDK credentials (cron_ref_refusal)."""
+    return cron_ref_refusal(cfg, provider, explicit_profile, profiles) is not None
 
 
 def cron_account_forecast(jobs, cfg, profiles_for, default_agent="main"):
@@ -2205,10 +2213,12 @@ def cron_account_forecast(jobs, cfg, profiles_for, default_agent="main"):
     without its prompt (None when unparsable); profiles_for(agent_id) -> [{"id", "provider"}] (no secrets).
     Covers enabled agentTurn jobs with no recorded inference account (inferenceBinding), no scheduled runtime
     authority and a session target other than "main". A job is affected when its primary or any fallback would
-    run on a stored auth profile; a ref that names a profile ("model@profile") does, also when its bare model id
-    is no alias (OpenClaw gives it the default provider). Returns {"checked": n, "bound": n, "affected": [{"id",
-    "name", "agent", "primary", "primary_affected", "refs"}]}; primary and refs ("provider/model", or the bare
-    model id) never carry the @profile; refs are the affected ones in chain order."""
+    run on a stored auth profile or on AWS SDK credentials (cron_ref_refusal); a ref that names a profile
+    ("model@profile") does, also when its bare model id is no alias (OpenClaw gives it the default provider).
+    Returns {"checked": n, "bound": n, "affected": [{"id", "name", "agent", "primary", "primary_affected", "refs"}]};
+    primary and refs ("provider/model", or the bare model id) never carry the @profile; refs are the affected ones
+    in chain order. An entry with refs on AWS SDK credentials also has "aws_sdk": those refs (no account can be
+    recorded for them)."""
     cfg = cfg if isinstance(cfg, dict) else {}
     res = {"checked": 0, "bound": 0, "affected": []}
     for row in jobs or []:
@@ -2225,23 +2235,27 @@ def cron_account_forecast(jobs, cfg, profiles_for, default_agent="main"):
         agent = cron_job_agent(job, default_agent)
         primary, fallbacks, _src = cron_model_chain(job, cfg, agent)
         profiles = profiles_for(agent)
-        refs, primary_affected = [], False
+        refs, aws, primary_affected = [], [], False
         for i, raw in enumerate([primary] + fallbacks):
             r = cron_model_ref(cfg, raw) if raw else None
             if r is None and raw:  # a bare id that is no alias: an explicit profile is still a stored login
                 m_, prof_ = split_trailing_auth_profile(raw)
                 r = (None, m_, prof_) if m_ and prof_ else None
-            if r is None or not cron_ref_uses_stored_profile(cfg, r[0], r[2], profiles):
+            why = cron_ref_refusal(cfg, r[0], r[2], profiles) if r is not None else None
+            if why is None:
                 continue
             ref = f"{r[0]}/{r[1]}" if r[0] else r[1]
             primary_affected = primary_affected or i == 0
             if ref not in refs:
                 refs.append(ref)
+                if why == "aws-sdk":
+                    aws.append(ref)
         if refs:
             p = cron_model_ref(cfg, primary) if primary else None
             shown = f"{p[0]}/{p[1]}" if p else split_trailing_auth_profile(primary)[0] if primary else primary
-            res["affected"].append({"id": row.get("id"), "name": row.get("name"), "agent": agent, "primary": shown,
-                                    "primary_affected": primary_affected, "refs": refs})
+            res["affected"].append(dict({"id": row.get("id"), "name": row.get("name"), "agent": agent,
+                                         "primary": shown, "primary_affected": primary_affected, "refs": refs},
+                                        **({"aws_sdk": aws} if aws else {})))
     return res
 
 

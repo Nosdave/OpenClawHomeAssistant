@@ -2562,8 +2562,9 @@ class Gate:
         return None
 
     def cron_binding_forecast(self, F, mode):
-        """Precheck 11c (cron, report only): enabled agentTurn jobs whose models would use a stored auth profile
-        without a recorded inference account (runtime_caps cron_refusal). WARN/info only, never a HOLD.
+        """Precheck 11c (cron, report only): enabled agentTurn jobs whose models would use a stored auth profile or
+        AWS SDK credentials without a recorded inference account (runtime_caps cron_refusal). WARN/info only, never
+        a HOLD.
 
         Before the first write only (a resumed run reports after doctor, cron_binding_postcheck). On a runtime
         whose doctor records the accounts itself (cron_doctor_migration) one info line; the jobs doctor leaves
@@ -2582,9 +2583,12 @@ class Gate:
             self.j["cron_binding_forecast"] = rec
         n = len(rec["affected"])
         if n and caps["cron_doctor_migration"]:
+            aws = _cron_kinds(rec["affected"])[1]
             self.say(f"{self.pn('precheck')} info: {n} enabled cron job(s) without a recorded inference account use "
-                     f"a stored login; OpenClaw {self.pkg['version']} doctor records the account "
-                     "(openclaw/openclaw#172792); the gate reports the jobs it leaves after the migration")
+                     f"{_cron_on(rec['affected'])}; OpenClaw {self.pkg['version']} doctor records the account"
+                     + (" of a stored login, not of AWS SDK credentials" if aws else "")
+                     + " (openclaw/openclaw#172792); the gate reports the "
+                     "jobs it leaves after the migration")
         elif n:
             for line in cron_job_lines(rec):
                 self.warn(line)
@@ -4060,6 +4064,33 @@ CRON_REPORT_MAX = 20
 CRON_MANUAL = ("Manual alternative after the start: openclaw automations edit <id> --model "
                "<provider/model>@<profileId>; it records the account, but the job then runs only on that "
                "account's provider and its fallbacks to other providers are refused (openclaw/openclaw#192463)")
+# AWS SDK credentials are no stored account: model@profile cannot record them (prepare-auth.ts refuses an aws-sdk
+# profile as the job's account), and OpenClaw's own migration (2026.11.5) leaves such a job unbound as well.
+CRON_AWS_SDK = ("A model on AWS SDK credentials (models.providers.<provider>.auth \"aws-sdk\") cannot be recorded as "
+                "a job's account, also not by OpenClaw's own migration from 2026.11.5: after the start, give the job "
+                "a model whose provider runs on a configured key (models.providers.<provider>.apiKey, an environment "
+                "variable or a SecretRef) or a local model: openclaw automations edit <id> --model <provider/model> "
+                "(for a fallback: --fallbacks <list> without it)")
+
+
+def _cron_kinds(aff):
+    """(any affected ref on a stored login, any on AWS SDK credentials) of cron_account_report entries; a record
+    without "aws_sdk" (also one of an earlier add-on version) is all stored logins."""
+    aws = any(a.get("aws_sdk") for a in aff)
+    return any(set(a.get("refs") or []) - set(a.get("aws_sdk") or []) for a in aff) or not aws, aws
+
+
+def _cron_on(aff):
+    """What the affected jobs stop at, for the summary lines."""
+    prof, aws = _cron_kinds(aff)
+    return " or ".join(x for x, on in (("a stored login", prof), ("AWS SDK credentials", aws)) if on)
+
+
+def _cron_remedy(aff):
+    """The closing advice: the model@profile binding for a stored login, a configured-key model for AWS SDK
+    credentials (which no binding can record)."""
+    prof, aws = _cron_kinds(aff)
+    return ". ".join(x for x, on in ((CRON_MANUAL, prof), (CRON_AWS_SDK, aws)) if on)
 
 
 def cron_jobs_inventory(state_db):
@@ -4171,26 +4202,37 @@ def cron_job_lines(rec):
     lines = []
     for a in aff[:CRON_REPORT_MAX]:
         refs = [printable(r) for r in a.get("refs") or []]
+        aws = {printable(r) for r in a.get("aws_sdk") or []}
         head = f"cron job '{printable(a.get('name'))[:80]}' ({printable(a.get('id'))[:80]}): "
-        more = f"; also on a stored login: {', '.join(refs[1:])}" if refs[1:] else ""
-        if a.get("primary_affected"):
+        more = "".join(f"; also on {on}: {', '.join(x)}" for on, x in (
+            ("a stored login", [r for r in refs[1:] if r not in aws]),
+            ("AWS SDK credentials", [r for r in refs[1:] if r in aws])) if x)
+        if a.get("primary_affected") and refs[0] in aws:
+            lines.append(head + f"OpenClaw {rt} refuses every run and tries no fallback: its model {refs[0]} would "
+                         f"run on AWS SDK credentials (models.providers.{refs[0].split('/', 1)[0]}.auth "
+                         "\"aws-sdk\"), which OpenClaw refuses for a cron job without a recorded inference account "
+                         "(openclaw/openclaw#192195)" + more)
+        elif a.get("primary_affected"):
             lines.append(head + f"OpenClaw {rt} refuses every run and tries no fallback: its model {refs[0]} would "
                          "use a stored login (auth profile) and the job has no recorded inference account "
                          "(openclaw/openclaw#192195)" + more)
         else:
             primary = f"its model {printable(a['primary'])}" if a.get("primary") else "its primary model"
+            on = "AWS SDK credentials" if refs[0] in aws else "stored login"
             lines.append(head + f"{primary} needs no stored login and keeps working, but when it fails OpenClaw "
-                         f"{rt} stops at the fallback {refs[0]} (stored login, no recorded inference account; "
+                         f"{rt} stops at the fallback {refs[0]} ({on}, no recorded inference account; "
                          "openclaw/openclaw#192195) instead of trying further models" + more)
     if len(aff) > CRON_REPORT_MAX:
         lines.append(f"and {len(aff) - CRON_REPORT_MAX} more cron job(s) (oc-upgrade status)")
+    prof, aws = _cron_kinds(aff)
     if rec.get("doctor_migration"):
         lines.append(f"{len(aff)} cron job(s) above still have no recorded inference account after the migration: "
-                     f"OpenClaw {rt} doctor left them (its warnings are in oc-upgrade log). {CRON_MANUAL}")
+                     f"OpenClaw {rt} doctor left them (its warnings are in oc-upgrade log). {_cron_remedy(aff)}")
     else:
-        lines.append(f"{len(aff)} cron job(s) above: the add-on changes nothing; OpenClaw records the inference "
-                     "account of such jobs itself from 2026.11.5 (doctor migration, openclaw/openclaw#172792). "
-                     + CRON_MANUAL)
+        lines.append(f"{len(aff)} cron job(s) above: the add-on changes nothing"
+                     + (f"; OpenClaw records the inference account of {'a stored login' if aws else 'such jobs'} "
+                        "itself from 2026.11.5 (doctor migration, openclaw/openclaw#172792)" if prof else "")
+                     + ". " + _cron_remedy(aff))
     return lines
 
 
@@ -4405,19 +4447,22 @@ def _sw_kept_hash(key, obj):
             and not _sw_secret_key(key) and SW_HASH_VALUE_RE.fullmatch(obj) is not None)
 
 
-def _sw_redact(obj, key, counter):
+def _sw_redact(obj, key, counter, seen=None):
     """One JSON value of the export, redacted with the gate's log rules (oc_common.redact_text_counted): a value under
     a secret-looking key is hidden whole (a string, number, list or object); every string is redacted, an id under
     its key without the long-token rule; hashes are kept unless a value beside them was redacted (_sw_redact_items).
-    It hides at least what the log rules hide in the JSON text of the same value."""
+    It hides at least what the log rules hide in the JSON text of the same value. seen (a set): gets the sha256 of
+    every string it redacted (_sw_hide_digests)."""
     if (_sw_secret_key(key) and obj is not None and not isinstance(obj, bool)
             and not (isinstance(obj, (str, bytes, dict, list)) and not obj)):
         counter[0] += 1
+        if seen is not None and isinstance(obj, str):
+            seen.add(hashlib.sha256(obj.encode("utf-8")).hexdigest())
         return "***"
     if isinstance(obj, dict):
-        return _sw_redact_items(((str(k), v) for k, v in obj.items()), counter)
+        return _sw_redact_items(((str(k), v) for k, v in obj.items()), counter, seen)
     if isinstance(obj, list):
-        return [_sw_redact(v, key, counter) for v in obj]
+        return [_sw_redact(v, key, counter, seen) for v in obj]
     if isinstance(obj, bytes):
         return {"omitted": "binary value", "size": len(obj), "sha256": hashlib.sha256(obj).hexdigest()}
     if not isinstance(obj, str) or not obj or _sw_kept_hash(key, obj):
@@ -4425,10 +4470,12 @@ def _sw_redact(obj, key, counter):
     is_id = bool(key) and (key == "id" or key.endswith(("_id", "Id", "ID"))) and SW_ID_VALUE_RE.fullmatch(obj)
     text, n = C.redact_text_counted(obj, long_tokens=not is_id)
     counter[0] += n
+    if n and seen is not None:
+        seen.add(hashlib.sha256(obj.encode("utf-8")).hexdigest())
     return text
 
 
-def _sw_redact_items(items, counter):
+def _sw_redact_items(items, counter, seen=None):
     """A JSON object or a table row of the export, redacted value by value. When anything in it was redacted, the
     hashes kept beside (previous_content_hash next to previous_content, ...) are hidden too: the sha256 of a
     redacted text confirms a guess of the hidden part offline."""
@@ -4438,7 +4485,7 @@ def _sw_redact_items(items, counter):
             hashes.append(k)
             out[k] = v
         else:
-            out[k] = _sw_redact(v, k, counter)
+            out[k] = _sw_redact(v, k, counter, seen)
     if hashes and counter[0] > before:
         for k in hashes:
             out[k] = "***"
@@ -4458,11 +4505,33 @@ def _sw_hide_hashes(obj, counter, key=""):
     return obj
 
 
-def _sw_row(cols, values, counter):
+def _sw_hide_digests(obj, digests, counter):
+    """obj (already redacted) with every value that is the sha256 of a redacted text (digests, from _sw_redact and
+    the redacted files) replaced by "***", wherever it is: another row can keep the sha256 of the same text (a
+    proposal for another skill with the same content, an undo record or event without its proposal)."""
+    if isinstance(obj, dict):
+        return {k: _sw_hide_digests(v, digests, counter) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_sw_hide_digests(v, digests, counter) for v in obj]
+    if isinstance(obj, str) and SW_HASH_VALUE_RE.fullmatch(obj) and obj.removeprefix("sha256:") in digests:
+        counter[0] += 1
+        return "***"
+    return obj
+
+
+def _sw_skill_of(row):
+    """The target skill file (else directory) of an exported proposal row, or None."""
+    rec = row.get("record_json") if isinstance(row.get("record_json"), dict) else {}
+    target = rec.get("target") if isinstance(rec.get("target"), dict) else {}
+    skill = target.get("skillFile") or target.get("skillDir")
+    return skill if isinstance(skill, str) and skill else None
+
+
+def _sw_row(cols, values, counter, seen=None):
     def value(c, v):
         parsed = _sw_json(v) if c in SW_JSON_COLUMNS else None
         return parsed if parsed is not None else v
-    return _sw_redact_items(((c, value(c, v)) for c, v in zip(cols, values)), counter)
+    return _sw_redact_items(((c, value(c, v)) for c, v in zip(cols, values)), counter, seen)
 
 
 def _sw_md(text, limit=160):
@@ -4525,7 +4594,7 @@ def export_skill_workshop(state_dir, dest, meta, stop=STOP):
         else:
             os.unlink(part)
     _sw_mkdir(part)
-    counter = [0]
+    counter, digests, redacted_undo = [0], set(), set()
     state_db = state_dir / "state" / "openclaw.sqlite"
     tables = {}
     names = table_names(state_db) if state_db.is_file() else set()
@@ -4534,7 +4603,12 @@ def export_skill_workshop(state_dir, dest, meta, stop=STOP):
             continue
         cols = _sw_columns(state_db, t)
         rows = q(state_db, f"SELECT {', '.join(_sw_quote(c) for c in cols)} FROM {_sw_quote(t)} ORDER BY rowid")
-        tables[t] = [_sw_row(cols, r, counter) for r in rows]
+        tables[t] = []
+        for r in rows:
+            before = counter[0]
+            tables[t].append(_sw_row(cols, r, counter, digests))
+            if t == "skill_workshop_proposal_rollbacks" and counter[0] > before:
+                redacted_undo.add(str(tables[t][-1].get("proposal_id")))
         if stop is not None and stop.is_set():
             raise C.Stopped("stop requested")
     # files: a mirror of <state>/skill-workshop/
@@ -4575,10 +4649,12 @@ def export_skill_workshop(state_dir, dest, meta, stop=STOP):
         before = counter[0]
         parsed = _sw_json(text) if relp.endswith(".json") else None
         if parsed is not None:
-            out_text = C.json_dumps(_sw_redact(parsed, "", counter))
+            out_text = C.json_dumps(_sw_redact(parsed, "", counter, digests))
         else:
             out_text, n = C.redact_text_counted(text)
             counter[0] += n
+        if counter[0] > before:
+            digests.add(h.hexdigest())
         target = part / "files" / relp
         _sw_mkdir(target.parent, part)
         blob = out_text.encode("utf-8")
@@ -4601,8 +4677,20 @@ def export_skill_workshop(state_dir, dest, meta, stop=STOP):
             by_prop.setdefault(parts[1], []).append(fe)
         else:
             other.append(fe)
+    # Hashes of a skill's content: a proposal's draft/support file hashes and the revision hashes built on them; its
+    # target hashes (target.currentContentHash, supportFiles[].targetContentHash, the evaluation's
+    # targetCurrentSha256/targetTreeSha256), which cover the skill as every proposal for it saw it and as an applied
+    # one's undo record holds it. Once a draft or an undo record of a skill was redacted, every proposal for that
+    # skill keeps none of them.
+    prop_rows = tables.get("skill_workshop_proposals", [])
+    redacted_skills = {_sw_skill_of(r) for r in prop_rows
+                       if str(r.get("proposal_id")) in redacted_undo
+                       or any(fe.get("redactions") for fe in by_prop.get(str(r.get("proposal_id")), []))}
+    redacted_skills |= {r.get("target_skill_file") for pid, r in rollbacks.items()
+                        if pid in redacted_undo and isinstance(r.get("target_skill_file"), str)}
+    redacted_skills.discard(None)
     proposals, by_status = [], {}
-    for row in tables.get("skill_workshop_proposals", []):
+    for row in prop_rows:
         pid, status = str(row.get("proposal_id")), str(row.get("status"))
         by_status[status] = by_status.get(status, 0) + 1
         rec = row.get("record_json") if isinstance(row.get("record_json"), dict) else {}
@@ -4611,7 +4699,7 @@ def export_skill_workshop(state_dir, dest, meta, stop=STOP):
         pfiles = [dict(fe, current_draft=fe["path"] == draft_rel) for fe in by_prop.get(pid, [])]
         exported = any(fe["current_draft"] and fe.get("export") for fe in pfiles)
         evs = events.pop(pid, [])
-        if any(fe.get("redactions") for fe in pfiles):  # draft/support file hashes, the revision hashes built on them
+        if any(fe.get("redactions") for fe in pfiles) or pid in redacted_undo or _sw_skill_of(row) in redacted_skills:
             row, evs = _sw_hide_hashes(row, counter), [_sw_hide_hashes(e, counter) for e in evs]
         proposals.append(dict(row, events=evs, rollback=rollbacks.pop(pid, None), files=pfiles,
                               draft_export=f"files/{draft_rel}" if exported else None,
@@ -4634,7 +4722,9 @@ def export_skill_workshop(state_dir, dest, meta, stop=STOP):
            "collection_reviews": tables.get("skill_workshop_collection_reviews", []),
            "events_without_proposal": [e for v in events.values() for e in v],
            "rollbacks_without_proposal": list(rollbacks.values()),
-           "other_files": other, "omitted": omitted, "redactions_total": counter[0]}
+           "other_files": other, "omitted": omitted}
+    doc = _sw_hide_digests(doc, digests, counter)
+    doc["redactions_total"] = counter[0]
     for name, blob in (("proposals.json", C.json_dumps(doc).encode("utf-8")),
                        ("PROPOSALS.md", _sw_proposals_md(doc).encode("utf-8"))):
         _sw_write(part / name, blob)
@@ -5287,11 +5377,13 @@ def _readiness_cron(g):
     rec = g.facts.get("cron_binding_plan")
     if not g.caps()["cron_refusal"] or not isinstance(rec, dict) or not rec.get("affected"):
         return []
-    n, rt = len(rec["affected"]), g.pkg["version"]
+    aff = rec["affected"]
+    n, rt, on = len(aff), g.pkg["version"], _cron_on(aff)
     if rec.get("doctor_migration"):
-        return [f"[gate]   cron inference accounts: {n} enabled cron job(s) use a stored login without a recorded "
-                f"account; OpenClaw {rt} doctor records it (openclaw/openclaw#172792)"]
-    return [f"[gate]   cron inference accounts: {n} enabled cron job(s) stop at a stored login on OpenClaw {rt} "
+        which = " for a stored login, not for AWS SDK credentials" if _cron_kinds(aff)[1] else ""
+        return [f"[gate]   cron inference accounts: {n} enabled cron job(s) use {on} without a recorded "
+                f"account; OpenClaw {rt} doctor records it{which} (openclaw/openclaw#172792)"]
+    return [f"[gate]   cron inference accounts: {n} enabled cron job(s) stop at {on} on OpenClaw {rt} "
             "(the WARN lines above, openclaw/openclaw#192195); report only, the gate changes nothing"]
 
 
@@ -6025,11 +6117,15 @@ def _status_cron(j):
     L = [head + f"{len(aff)} affected of {rec.get('checked', 0)} checked"]
     for a in aff[:CRON_REPORT_MAX]:
         refs = [printable(r) for r in a.get("refs") or []]
+        aws = {printable(r) for r in a.get("aws_sdk") or []}
         what = "every run refused" if a.get("primary_affected") else f"stops at the fallback {refs[0] if refs else '?'}"
-        L.append(f"    '{printable(a.get('name'))[:80]}' ({printable(a.get('id'))[:80]}): {what}; {', '.join(refs)}")
+        shown = ", ".join(r + (" (AWS SDK credentials)" if r in aws else "") for r in refs)
+        L.append(f"    '{printable(a.get('name'))[:80]}' ({printable(a.get('id'))[:80]}): {what}; {shown}")
     if len(aff) > CRON_REPORT_MAX:
         L.append(f"    and {len(aff) - CRON_REPORT_MAX} more")
-    L.append("    OpenClaw records the account itself from 2026.11.5 (openclaw/openclaw#172792). " + CRON_MANUAL)
+    prof, aws = _cron_kinds(aff)
+    L.append("    " + (f"OpenClaw records the account{' of a stored login' if aws else ''} itself from 2026.11.5 "
+                       "(openclaw/openclaw#172792). " if prof else "") + _cron_remedy(aff))
     return L
 
 

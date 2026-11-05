@@ -380,6 +380,67 @@ class ExportUnitTests(Base):
         self.assertEqual((self.dest / "files" / "proposals" / "wx-quarantined" / "PROPOSAL.md").read_text(),
                          "# alarm\nUse the panel.\npassword: ***\n")
 
+    def test_target_hashes_of_a_redacted_undo_record_are_hidden(self):
+        """Recheck: an applied update's record keeps the sha256 of the skill and support files it replaced
+        (target.currentContentHash, supportFiles[].targetContentHash; OpenClaw applies only while they match), and its
+        evaluation the same hash and the tree hash of the skill. That content is the undo record's previous content:
+        once it is redacted these hashes, in the proposal's own rows, in another proposal for the same skill or
+        wherever else the same sha256 is kept, would confirm a guess of the hidden value offline."""
+        def sha(text):
+            return hashlib.sha256(text.encode()).hexdigest()
+        prev, sup = "# tram\npassword: 4711\n", "password: 0815\n"
+        ph, sh, tree, tree2 = sha(prev), sha(sup), sha("synthetic skill tree"), sha("synthetic skill tree 2")
+        tram = "/config/clawd/skills/tram-times/SKILL.md"
+
+        def setup(prev, sup):
+            c = sqlite3.connect(str(self.sdb))
+            c.execute("UPDATE skill_workshop_proposal_rollbacks SET previous_content=?, previous_content_hash=?, "
+                      "support_files_json=? WHERE proposal_id='wx-applied'",
+                      (prev, sha(prev), json.dumps([{"path": "notes.md", "existed": True,
+                                                     "previousContentHash": sha(sup), "previousContent": sup}])))
+            c.execute("UPDATE skill_workshop_proposals SET record_json=json_set(record_json, "
+                      "'$.target.currentContentHash', ?, '$.supportFiles', json(?)) WHERE proposal_id='wx-applied'",
+                      (sha(prev), json.dumps([{"path": "notes.md", "hash": "cd" * 32, "targetContentHash": sha(sup)}])))
+            c.execute("UPDATE skill_workshop_proposal_events SET payload_json=? WHERE event_id='wx-applied-ev1'",
+                      (json.dumps({"outcome": {"targetCurrentSha256": sha(prev), "targetTreeSha256": tree}}),))
+            # another proposal for the same skill, evaluated on another version of it
+            c.execute("UPDATE skill_workshop_proposals SET record_json=json_set(record_json, '$.target.skillFile', ?) "
+                      "WHERE proposal_id='wx-rejected'", (tram,))
+            c.execute("UPDATE skill_workshop_proposal_events SET payload_json=? WHERE event_id='wx-rejected-ev1'",
+                      (json.dumps({"outcome": {"targetTreeSha256": tree2}}),))
+            # the same sha256 kept by a proposal for another skill
+            c.execute("UPDATE skill_workshop_proposals SET record_json=json_set(record_json, "
+                      "'$.target.currentContentHash', ?) WHERE proposal_id='wx-stale-01'", (sha(prev),))
+            c.commit()
+            c.close()
+
+        setup(prev, sup)
+        self.export()
+        blob = all_bytes(self.dest)
+        for value in (b"4711", b"0815", ph.encode(), sh.encode(), tree.encode(), tree2.encode()):
+            self.assertNotIn(value, blob, value)
+        doc = json.loads((self.dest / "proposals.json").read_text())
+        app, rej, stale = doc["proposals"][2], doc["proposals"][3], doc["proposals"][4]
+        self.assertEqual(app["rollback"]["previous_content"], "# tram\npassword: ***\n")
+        self.assertEqual((app["record_json"]["target"]["currentContentHash"],
+                          app["record_json"]["supportFiles"][0]["targetContentHash"]), ("***", "***"))
+        ev = {e["event_id"]: e for e in app["events"]}["wx-applied-ev1"]
+        self.assertEqual(ev["payload_json"], {"outcome": {"targetCurrentSha256": "***", "targetTreeSha256": "***"}})
+        ev = {e["event_id"]: e for e in rej["events"]}["wx-rejected-ev1"]
+        self.assertEqual((ev["payload_json"], rej["record_json"]["draftHash"]),
+                         ({"outcome": {"targetTreeSha256": "***"}}, "***"))
+        self.assertEqual(stale["record_json"]["target"]["currentContentHash"], "***")
+        self.assertEqual(stale["record_json"]["draftHash"], DRAFT_HASH)  # another skill: covers nothing redacted
+        # an undo record without a secret keeps them: they confirm only what the export shows anyway
+        dest2 = self.tmp / "out2" / "skill-workshop"
+        dest2.parent.mkdir()
+        clean = "# tram\nfirst tram at 5:12\n"
+        setup(clean, "no secret here\n")
+        G.export_skill_workshop(self.state, dest2, {"run_id": "r2"})
+        app = json.loads((dest2 / "proposals.json").read_text())["proposals"][2]
+        self.assertEqual((app["record_json"]["target"]["currentContentHash"], app["rollback"]["previous_content_hash"],
+                          app["record_json"]["draftHash"]), (sha(clean), sha(clean), DRAFT_HASH))
+
     def test_redaction_hides_whatever_the_log_rules_hide(self):
         """Security review: per JSON value the export hides at least what the log rules (oc_common.redact_text) hide
         in the JSON text of the same object: *key names (x-api-key, signingKey, hmacKey), a number under a secret

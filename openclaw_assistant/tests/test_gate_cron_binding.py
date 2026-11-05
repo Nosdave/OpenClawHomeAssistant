@@ -109,6 +109,75 @@ class CronForecastGateTests(T.GateEnv):
         for bad in (PROMPT, "SECRET", "openai:default", "anthropic:default"):
             self.assertFalse([ln for ln in cl if bad in ln], bad)
 
+    def test_aws_sdk_jobs_name_their_credentials_and_a_remedy_that_applies(self):
+        """Recheck: a model on AWS SDK credentials (auth "aws-sdk") is refused too, but it is no stored login and
+        model@<profileId> cannot record it (nor can OpenClaw's own migration): the lines say AWS SDK credentials and
+        give the configured-key model as the way out; the @<profileId> alternative only where a stored login is."""
+        cfg = json.loads(json.dumps(CFG))
+        cfg["models"]["providers"]["amazon-bedrock"] = {"auth": "aws-sdk"}
+        self.write_cfg(cfg)
+        add_jobs(self.state, [
+            ("job-bedrock", {"agentId": "main", "sessionTarget": "isolated",
+                             "payload": {"kind": "agentTurn", "message": PROMPT, "model": "amazon-bedrock/claude-x",
+                                         "fallbacks": []}}),
+            ("job-bedrock-fb", {"agentId": "main", "sessionTarget": "isolated",
+                                "payload": {"kind": "agentTurn", "message": PROMPT,
+                                            "fallbacks": ["amazon-bedrock/claude-x", "openai/gpt-5.5"]}})], start=50)
+        lines = []
+        self.assertEqual(self.quiet(G.dry_run, emit=lines.append), 0, "\n".join(lines))
+        cl = self.cron_lines("\n".join(lines))
+        self.assertEqual(cl[2:], [
+            "WARN [gate] cron job 'Job Bedrock' (job-bedrock): OpenClaw 2026.10.10 refuses every run and tries no "
+            "fallback: its model amazon-bedrock/claude-x would run on AWS SDK credentials "
+            "(models.providers.amazon-bedrock.auth \"aws-sdk\"), which OpenClaw refuses for a cron job without a "
+            "recorded inference account (openclaw/openclaw#192195)",
+            "WARN [gate] cron job 'Job Bedrock Fb' (job-bedrock-fb): its model vllm/qwen3.5-122b needs no stored login "
+            "and keeps working, but when it fails OpenClaw 2026.10.10 stops at the fallback amazon-bedrock/claude-x "
+            "(AWS SDK credentials, no recorded inference account; openclaw/openclaw#192195) instead of trying further "
+            "models; also on a stored login: openai/gpt-5.5",
+            "WARN [gate] 4 cron job(s) above: the add-on changes nothing; OpenClaw records the inference account of a "
+            "stored login itself from 2026.11.5 (doctor migration, openclaw/openclaw#172792). " + G.CRON_MANUAL + ". "
+            + G.CRON_AWS_SDK,
+            "[gate]   cron inference accounts: 4 enabled cron job(s) stop at a stored login or AWS SDK credentials on "
+            "OpenClaw 2026.10.10 (the WARN lines above, openclaw/openclaw#192195); report only, the gate changes "
+            "nothing"])
+        self.assertIn("openclaw automations edit <id> --model <provider/model> (for a fallback: --fallbacks <list> "
+                      "without it)", G.CRON_AWS_SDK)
+        self.assertNotIn("@<profileId>", G.CRON_AWS_SDK)
+        # the recheck's setup: no auth profile at all, so only the AWS SDK jobs are affected; no @<profileId> remedy
+        con = sqlite3.connect(str(self.adb))
+        con.execute("DELETE FROM auth_profile_store")
+        con.commit()
+        con.close()
+        rec = G.cron_account_report(self.state, cfg, "2026.10.10")
+        self.assertEqual([(a["id"], a["refs"], a["aws_sdk"]) for a in rec["affected"]],
+                         [("job-bedrock", ["amazon-bedrock/claude-x"], ["amazon-bedrock/claude-x"]),
+                          ("job-bedrock-fb", ["amazon-bedrock/claude-x"], ["amazon-bedrock/claude-x"])])
+        lines = G.cron_job_lines(rec)
+        self.assertEqual(lines[-1], "2 cron job(s) above: the add-on changes nothing. " + G.CRON_AWS_SDK)
+        self.assertEqual(G.cron_job_lines(dict(rec, doctor_migration=True))[-1],
+                         "2 cron job(s) above still have no recorded inference account after the migration: OpenClaw "
+                         "2026.10.10 doctor left them (its warnings are in oc-upgrade log). " + G.CRON_AWS_SDK)
+        st = G._status_cron({"cron_binding": rec})
+        self.assertEqual(st[1:], [
+            "    'Job Bedrock' (job-bedrock): every run refused; amazon-bedrock/claude-x (AWS SDK credentials)",
+            "    'Job Bedrock Fb' (job-bedrock-fb): stops at the fallback amazon-bedrock/claude-x; "
+            "amazon-bedrock/claude-x (AWS SDK credentials)",
+            "    " + G.CRON_AWS_SDK])
+        for ln in lines + st:
+            self.assertNotIn("stored login (auth profile)", ln)
+            self.assertNotIn("@<profileId>", ln)
+        # a runtime whose doctor records the accounts does so only for a stored login
+        self.set_runtime("2026.11.5-beta.1", 22, 27)
+        text = self.quiet_dry()
+        self.assertIn("[gate] 1/8 info: 2 enabled cron job(s) without a recorded inference account use AWS SDK "
+                      "credentials; OpenClaw 2026.11.5-beta.1 doctor records the account of a stored login, not of "
+                      "AWS SDK credentials (openclaw/openclaw#172792); the gate reports the jobs it leaves after the "
+                      "migration", text)
+        self.assertIn("[gate]   cron inference accounts: 2 enabled cron job(s) use AWS SDK credentials without a "
+                      "recorded account; OpenClaw 2026.11.5-beta.1 doctor records it for a stored login, not for AWS "
+                      "SDK credentials (openclaw/openclaw#172792)", text)
+
     def test_bump_reports_in_precheck_finalize_and_status(self):
         before = {p: sha(p) for p in (self.sdb, self.adb)}
         self.assertEqual(self.run_gate(), 0, self.out)

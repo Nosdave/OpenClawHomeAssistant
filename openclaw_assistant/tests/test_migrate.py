@@ -2840,6 +2840,32 @@ class TestCronAccountForecast(unittest.TestCase):
                             cfg={"models": {"providers": {"vllm": {"apiKey": "EMPTY"}}}})
         self.assertEqual([a["refs"] for a in res["affected"]], [["vllm/qwen"]])
 
+    def test_forecast_tells_aws_sdk_from_a_stored_login(self):
+        """Recheck: AWS SDK credentials are refused like a stored login, but no account can be recorded for them
+        (model@profile needs a stored one), so the forecast keeps the reason: "aws_sdk" lists those refs. An explicit
+        profile is a stored login also on an aws-sdk provider (prepare-auth.ts drops the configured auth then)."""
+        cfg = json.loads(json.dumps(self.CFG))
+        cfg["models"]["providers"]["amazon-bedrock"] = {"auth": "aws-sdk"}
+        why = lambda prov, explicit=None: m.cron_ref_refusal(cfg, prov, explicit, self.PROFILES)  # noqa: E731
+        self.assertEqual((why("amazon-bedrock"), why("openai"), why("vllm"), why("amazon-bedrock", "bedrock:work")),
+                         ("aws-sdk", "profile", None, "profile"))
+        res = self.forecast(
+            self.job("a", payload={"model": "amazon-bedrock/claude", "fallbacks": ["openai/gpt-5.5"]}),
+            self.job("b", payload={"fallbacks": ["amazon-bedrock/claude", "google/g"]}),
+            self.job("c", payload={"model": "openai/gpt-5.5", "fallbacks": []}), cfg=cfg)
+        self.assertEqual(res["affected"], [
+            {"id": "a", "name": "Job a", "agent": "main", "primary": "amazon-bedrock/claude", "primary_affected": True,
+             "refs": ["amazon-bedrock/claude", "openai/gpt-5.5"], "aws_sdk": ["amazon-bedrock/claude"]},
+            {"id": "b", "name": "Job b", "agent": "main", "primary": "vllm/qwen", "primary_affected": False,
+             "refs": ["amazon-bedrock/claude"], "aws_sdk": ["amazon-bedrock/claude"]},
+            {"id": "c", "name": "Job c", "agent": "main", "primary": "openai/gpt-5.5", "primary_affected": True,
+             "refs": ["openai/gpt-5.5"]}])
+        # the recheck's setup: the default model on aws-sdk and no auth profile at all
+        cfg["agents"]["defaults"]["model"] = "amazon-bedrock/claude"
+        res = self.forecast(self.job("d"), cfg=cfg, profiles=[])
+        self.assertEqual([(a["primary_affected"], a["refs"], a.get("aws_sdk")) for a in res["affected"]],
+                         [(True, ["amazon-bedrock/claude"], ["amazon-bedrock/claude"])])
+
     def test_forecast_primary_and_fallbacks(self):
         res = self.forecast(self.job("a", payload={"model": "openai/gpt-5.5@openai:default",
                                                    "fallbacks": ["anthropic/c", "vllm/qwen", "openai/gpt-5.5"]}),
