@@ -1416,12 +1416,21 @@ after the migration gate (if one runs) and before the gateway starts, never duri
 
 - **Brave** (`@openclaw/brave-plugin`, web search) is installed in the bundled OpenClaw's
   version, once per version (marker `/config/.openclaw/.brave_plugin_<version>`), as before.
-- **The other enabled official plugins** (`oc-upgrade plugins-sync`): each one older than
-  the bundled OpenClaw is updated with `openclaw plugins update <package>@<version>`, and
-  the plugin list is read again to confirm the version. It never downgrades (a newer
-  plugin is left as is, with a `WARN`) and leaves disabled plugins alone. When no update
-  failed, it records `/config/.openclaw/.plugin_cohort_<version>` and does not run again
-  for that version (`INFO: Official plugins match OpenClaw <version>.`).
+- **The other enabled official plugins** (`oc-upgrade plugins-sync`): it reads
+  `openclaw plugins list --json` (which names no package) together with OpenClaw's install
+  records in `state/openclaw.sqlite`: a plugin installed from npm whose package is
+  `@openclaw/…` (from its install record, the recorded install spec or its install path
+  `…/node_modules/@openclaw/<name>`) counts, a bundled plugin, a plugin on a load path and
+  other npm scopes do not. Each enabled one older than the bundled OpenClaw is updated with
+  `openclaw plugins update <package>@<version>`, and the plugin list is read again to
+  confirm the version. It never downgrades (a newer plugin is left as is, with a `WARN`)
+  and leaves disabled plugins alone. Only when the list confirms every enabled one at the
+  bundled version, and shows every npm install OpenClaw recorded, does it record
+  `/config/.openclaw/.plugin_cohort_<version>` and not run again for that version
+  (`INFO: Official plugins match OpenClaw <version>.`). Otherwise the next start reads the
+  list again: after a failed update, with a newer plugin (the `WARN` repeats), or when the
+  list does not show a recorded install (`WARN: OpenClaw recorded the npm install of …`;
+  `openclaw plugins doctor` reports why OpenClaw does not load it).
   If an update fails or times out, the plugin keeps its version (OpenClaw 2026.10.10 and
   2026.11.1 still load `@openclaw/codex` from 2026.9.7 on), the start goes on with a `WARN`, and
   the next start tries again; by hand: `openclaw plugins update <package>@<version>`.
@@ -1430,8 +1439,14 @@ after the migration gate (if one runs) and before the gateway starts, never duri
   update with its npm processes; the next start tries again.
 
 The precheck of a gate run lists the installed official plugins (`1/8 info: official
-plugins: …`), and `oc-upgrade status` says whether the enabled ones match the OpenClaw
-version. The image build checks that `@openclaw/brave-plugin`, `@openclaw/codex` and
+plugins: …`). `oc-upgrade status` compares the versions of the enabled ones with the
+bundled OpenClaw (not only the marker): `enabled ones synced to OpenClaw <version>` (or
+`at`, before the step ran), `not yet at OpenClaw <version>: …` (the next start updates
+them), `newer than OpenClaw <version>, left as is: …`, or `not at OpenClaw <version>: …`
+for a plugin you enabled after the step ran for that version: delete the marker file the
+line names and restart the add-on, or update it by hand. When the postconditions of a
+gate run find an enabled official plugin older than the bundled OpenClaw (`WARN: plugin
+<id> is …`), the gate deletes that marker, so the step after the gate updates it. The image build checks that `@openclaw/brave-plugin`, `@openclaw/codex` and
 `@openclaw/acpx` exist on npm in the pinned OpenClaw version. These updates, doctor's and
 the add-on's, download from npm while the add-on runs (see SECURITY.md, "Third-Party
 Skills & Supply Chain").

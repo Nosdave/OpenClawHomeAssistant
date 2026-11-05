@@ -40,7 +40,9 @@ Commands:
                  down (internal): updates the enabled official npm plugins
                  (@openclaw/codex, @openclaw/acpx, ...; not Brave, which run.sh
                  installs itself) to the bundled OpenClaw version, once per
-                 version (marker /config/.openclaw/.plugin_cohort_<version>).
+                 version (marker /config/.openclaw/.plugin_cohort_<version>,
+                 written only when the plugin list confirms every enabled one
+                 at that version and shows every recorded npm install).
                  Never downgrades, leaves disabled plugins alone, always exits 0.
                  No update starts after 600 s; SIGTERM stops the running one
                  with its process group (no marker).
@@ -727,24 +729,26 @@ def _oc_capture(args, timeout, tmp, tag, stop=None):
     return rc, texts[0], tail
 
 
-def _official_enabled(data):
-    """{package: version} of the enabled official npm plugins in `openclaw plugins list --json` (not Brave, not
-    bundled ones, CalVer versions only); None when the output has no plugin list."""
-    plugins = data.get("plugins") if isinstance(data, dict) else None
-    if not isinstance(plugins, list):
+def _official_installs(p):
+    """oc_gate.official_plugin_installs of the state (OpenClaw's npm install records); [] when unreadable."""
+    G = _gate()
+    try:
+        return G.official_plugin_installs(p["STATE"], G._read_cfg_lenient())
+    except Exception:  # noqa: BLE001 - the plugin list still identifies the plugins (trust.installSpec, rootDir)
+        return []
+
+
+def _official_enabled(data, installs=()):
+    """{package: version or None} of the enabled official npm plugins in `openclaw plugins list --json` (not Brave,
+    not bundled ones), identified as the gate does (oc_gate.listed_official_plugins: the real output has no
+    packageName); None when the output has no plugin list."""
+    listed = _gate().listed_official_plugins(data, installs)
+    if listed is None:
         return None
     found = {}
-    for x in plugins:
-        if not isinstance(x, dict) or x.get("enabled") is not True or x.get("origin") == "bundled":
-            continue
-        pkg = x.get("packageName")
-        ver = x.get("version") or x.get("packageVersion")
-        if not isinstance(pkg, str) or not pkg.startswith("@openclaw/") or pkg == "@openclaw/brave-plugin":
-            continue
-        if not re.fullmatch(r"@openclaw/[a-z0-9][a-z0-9._-]{0,100}", pkg):
-            continue
-        if isinstance(ver, str) and version_tuple(ver):
-            found.setdefault(pkg, ver)
+    for x in listed:
+        if x["enabled"] and x["package"] != _gate().BRAVE_PLUGIN_PACKAGE:
+            found.setdefault(x["package"], x["version"])
     return found
 
 
@@ -797,20 +801,25 @@ def _plugins_sync(stop=None):
         if stop.is_set():
             print(stopped_msg)
             return RC_OK
-        found = _official_enabled(C.parse_json_output(text)) if rc == 0 else None
+        data = C.parse_json_output(text) if rc == 0 else None
+        installs = _official_installs(p)
+        found = _official_enabled(data, installs)
         if found is None:
             print(f"WARN: Official plugins not updated: openclaw plugins list failed (rc {rc}"
                   + (f": {tail}" if tail else "") + "); the add-on tries again at the next start.")
             return RC_OK
+        # D2: recorded npm installs the list does not show cannot be confirmed: no marker (see below)
+        unlisted = _gate().unlisted_official_installs(data, installs)
         rtv = version_tuple(rt)
-        todo = []
+        todo, newer = [], []
         for pkg, ver in sorted(found.items()):
             if ver == rt:
                 continue
-            if version_tuple(ver) > rtv:
+            if version_tuple(ver) and version_tuple(ver) > rtv:
                 print(f"WARN: {pkg} {ver} is newer than OpenClaw {rt}; left as is (no downgrade)")
+                newer.append(pkg)
                 continue
-            todo.append((pkg, ver))
+            todo.append((pkg, ver))  # ver None: the list names no version; the update sets it
         failed = []
         for i, (pkg, ver) in enumerate(todo):
             if stop.is_set():
@@ -819,7 +828,7 @@ def _plugins_sync(stop=None):
             if time.monotonic() - started > budget:
                 failed.append((pkg, ver, f"not started: the update step's time budget ({int(budget)} s) ran out"))
                 continue
-            print(f"INFO: Official plugins: updating {pkg} {ver} -> {rt} (OpenClaw {rt})...", flush=True)
+            print(f"INFO: Official plugins: updating {pkg} {ver or '?'} -> {rt} (OpenClaw {rt})...", flush=True)
             urc, _text, utail = _oc_capture(["plugins", "update", f"{pkg}@{rt}"], PLUGIN_UPDATE_TIMEOUT, tmp,
                                             f"update-{i}-{pkg.rsplit('/', 1)[-1]}", stop)
             if stop.is_set():
@@ -832,7 +841,7 @@ def _plugins_sync(stop=None):
             if stop.is_set():
                 print(stopped_msg)
                 return RC_OK
-            now = _official_enabled(C.parse_json_output(text)) if rc == 0 else None
+            now = _official_enabled(C.parse_json_output(text), _official_installs(p)) if rc == 0 else None
             for pkg, ver in todo:
                 if any(f[0] == pkg for f in failed):
                     continue
@@ -845,9 +854,14 @@ def _plugins_sync(stop=None):
             floor = PLUGIN_MIN_COMPATIBLE.get(pkg)
             loads = (f"; OpenClaw {rt} still loads it (minimum {floor})" if floor and version_tuple(ver)
                      and version_tuple(ver) >= version_tuple(floor) else "")
-            print(f"WARN: {pkg} stays at {ver} ({why}){loads}. The add-on tries again at the next start; by hand: "
-                  f"openclaw plugins update {pkg}@{rt}")
-        if failed:
+            print(f"WARN: {pkg} stays at {ver or 'an unknown version'} ({why}){loads}. The add-on tries again at the "
+                  f"next start; by hand: openclaw plugins update {pkg}@{rt}")
+        for x in unlisted:
+            print(f"WARN: OpenClaw recorded the npm install of {x['package']} {x['version'] or '?'} (plugin "
+                  f"{x['id']}), but openclaw plugins list does not show it, so its version is not confirmed (check: "
+                  "openclaw plugins doctor). The add-on looks again at the next start.")
+        # the marker only when every enabled official plugin is confirmed at the OpenClaw version (D2)
+        if failed or newer or unlisted:
             return RC_OK
     try:
         C.atomic_write_text(marker, f"{rt}\n")

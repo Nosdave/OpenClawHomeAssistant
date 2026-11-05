@@ -447,23 +447,91 @@ class SchemaGate1010Tests(T.GateEnv):
         st = G.status_lines()
         line = next(x for x in st if x.startswith("Official plugins:"))
         self.assertIn("; not yet at OpenClaw 2026.10.10: @openclaw/codex (the add-on retries at the next start", line)
-        G.plugin_cohort_marker(self.state, "2026.10.10").write_text("2026.10.10\n")
+        # D2: the versions decide, not the marker: a marker beside an enabled plugin that is still behind (enabled
+        # after the update step ran, or a marker of the parser that found nothing) is no "synced"
+        marker = G.plugin_cohort_marker(self.state, "2026.10.10")
+        marker.write_text("2026.10.10\n")
         line = next(x for x in G.status_lines() if x.startswith("Official plugins:"))
-        self.assertTrue(line.endswith("; enabled ones synced to OpenClaw 2026.10.10"), line)
+        self.assertNotIn("synced", line)
+        self.assertTrue(line.endswith(
+            f"; not at OpenClaw 2026.10.10: @openclaw/codex (enabled or changed after the add-on's update step for "
+            f"2026.10.10; to update: delete {marker} and restart the add-on, or by hand: openclaw plugins update "
+            "<package>@2026.10.10)"), line)
+        # every enabled one at the version: synced (with the marker) or at it (without); Brave and the disabled
+        # acpx do not count; a newer one is named, never "synced"
+        (codex / "package.json").write_text(json.dumps({"name": "@openclaw/codex", "version": "2026.10.10"}))
+        line = next(x for x in G.status_lines() if x.startswith("Official plugins:"))
+        self.assertTrue(line.endswith("@openclaw/codex 2026.10.10 (enabled); enabled ones synced to OpenClaw "
+                                      "2026.10.10"), line)
+        marker.unlink()
+        line = next(x for x in G.status_lines() if x.startswith("Official plugins:"))
+        self.assertTrue(line.endswith("; enabled ones at OpenClaw 2026.10.10"), line)
+        (codex / "package.json").write_text(json.dumps({"name": "@openclaw/codex", "version": "2026.11.1"}))
+        marker.write_text("2026.10.10\n")
+        line = next(x for x in G.status_lines() if x.startswith("Official plugins:"))
+        self.assertTrue(line.endswith("; newer than OpenClaw 2026.10.10, left as is: @openclaw/codex"), line)
         sql(self.state / "state" / "openclaw.sqlite", "DELETE FROM config_machine_state")
         self.assertEqual(G.official_plugin_installs(self.state, self.cfg), [])
 
     def test_plugin_version_warnings_1010(self):
-        data = {"plugins": [
-            {"id": "codex", "packageName": "@openclaw/codex", "version": "2026.10.4", "enabled": True},
-            {"id": "brave", "packageName": "@openclaw/brave-plugin", "version": "2026.10.4", "enabled": True},
-            {"id": "acpx", "packageName": "@openclaw/acpx", "version": "2026.10.4", "enabled": False},
-            {"id": "beta", "packageName": "@openclaw/beta", "version": "2026.11.5-beta.1", "enabled": True},
-            {"id": "same", "packageName": "@openclaw/same", "version": "2026.10.10", "enabled": True}]}
+        """Real `plugins list --json` shape (tests/fixtures/plugins-list-2026.10.10.json: no packageName); the same
+        plugins as oc-upgrade plugins-sync (G.listed_official_plugins)."""
+        data = T.plugins_list_output([
+            T.listed_plugin("codex", "@openclaw/codex", "2026.10.4", spec="@openclaw/codex@2026.10.4"),
+            T.listed_plugin("brave", "@openclaw/brave-plugin", "2026.10.4"),
+            T.listed_plugin("acpx", "@openclaw/acpx", "2026.10.4", enabled=False),
+            T.listed_plugin("beta", "@openclaw/beta", "2026.11.5-beta.1"),
+            T.listed_plugin("same", "@openclaw/same", "2026.10.10"),
+            T.listed_plugin("dev", "@openclaw/dev-tools", "2026.10.4", origin="config"),
+            T.listed_plugin("thirdparty", "openclaw-plugin-x", "1.0.0"),
+            T.listed_plugin("alibaba", "@openclaw/alibaba-provider", "2026.10.4", origin="bundled")])
         self.assertEqual(G.plugin_version_warnings(data, "2026.10.10"), [
             "plugin codex is 2026.10.4, OpenClaw is 2026.10.10: the add-on updates it before the gateway starts "
             "(oc-upgrade plugins-sync)",
             "plugin beta 2026.11.5-beta.1 is newer than OpenClaw 2026.10.10; left as is"])
+        self.assertEqual(G.plugin_version_warnings(None, "2026.10.10"),
+                         ["plugins list --json returned no parseable JSON"])
+        self.assertEqual(G.plugin_version_warnings({"ok": True}, "2026.10.10"),
+                         ["plugins list --json returned no plugin list"])
+        # the real 2026.10.10 output itself: codex, acpx, Brave at 2026.10.10
+        real = T.plugins_list_output()
+        self.assertEqual(sorted((x["id"], x["package"], x["version"], x["enabled"])
+                                for x in G.listed_official_plugins(real)),
+                         [("acpx", "@openclaw/acpx", "2026.10.10", True),
+                          ("brave", "@openclaw/brave-plugin", "2026.10.10", True),
+                          ("codex", "@openclaw/codex", "2026.10.10", True)])
+        self.assertEqual(G.plugin_version_warnings(real, "2026.10.10"), [])
+        self.assertEqual(G.plugin_version_warnings(real, "2026.11.1"), [
+            f"plugin {pid} is 2026.10.10, OpenClaw is 2026.11.1: the add-on updates it before the gateway starts "
+            "(oc-upgrade plugins-sync)" for pid in ("acpx", "codex")])
+
+    def test_postconditions_drop_a_stale_plugin_marker(self):
+        """D2: the postcondition WARN promises plugins-sync after the gate, which run.sh skips while the version's
+        marker exists: a marker beside an enabled official plugin that is still behind is deleted; one beside
+        plugins at the version is kept."""
+        self.doctor_script(state_uv=22, agent_uv=27, app_version="2026.10.10")
+        listing = self.tmp / "plugins-list.json"
+        listing.write_text(json.dumps(T.plugins_list_output([
+            T.listed_plugin("codex", "@openclaw/codex", "2026.10.4"),
+            T.listed_plugin("acpx", "@openclaw/acpx", "2026.10.4", enabled=False)])))
+        os.environ["FAKE_PLUGINS_LIST"] = str(listing)
+        marker = G.plugin_cohort_marker(self.state, "2026.10.10")
+        marker.write_text("2026.10.10\n")
+        self.assertEqual(self.run_gate(), 0, self.out)
+        self.assertIn("plugin codex is 2026.10.4, OpenClaw is 2026.10.10: the add-on updates it before the gateway "
+                      "starts (oc-upgrade plugins-sync)", self.out)
+        self.assertNotIn("plugin acpx", self.out)
+        self.assertFalse(marker.exists())
+        # plugins at the version (the disabled acpx does not count): the marker stays
+        listing.write_text(json.dumps(T.plugins_list_output([
+            T.listed_plugin("codex", "@openclaw/codex", "2026.10.10"),
+            T.listed_plugin("acpx", "@openclaw/acpx", "2026.10.4", enabled=False)])))
+        marker.write_text("2026.10.10\n")
+        self.assertEqual(G.retry_cmd(["--doctor"], emit=lambda s: None), 0)
+        self.assertEqual(self.run_gate(), 0, self.out)
+        self.assertEqual(self.journal()["mode"], "maintenance")
+        self.assertNotIn("plugin codex", self.out)
+        self.assertTrue(marker.exists())
 
 
 class CodesTests(unittest.TestCase):

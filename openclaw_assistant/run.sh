@@ -1166,8 +1166,10 @@ ensure_brave_plugin() {
 # migrations). `oc-upgrade plugins-sync` runs `openclaw plugins update
 # <pkg>@<version>` for each enabled one that is older (never a downgrade,
 # disabled plugins and Brave untouched; Brave is ensure_brave_plugin's job),
-# prints one report line and writes the per-version marker only when every
-# plugin got there, so a failed update is retried at the next start. Shares
+# prints one report line and writes the per-version marker only when the
+# plugin list confirms every enabled one at that version (and shows every npm
+# install OpenClaw recorded), so a failed update is retried at the next start;
+# the gate deletes a marker its postconditions contradict. Shares
 # the validated OPENCLAW_RUNTIME_VERSION with the Brave step. Runs after the
 # migration gate with the gateway down; best-effort, never blocks startup.
 # It runs in the background (PLUGINS_PID) so the shutdown trap can forward a

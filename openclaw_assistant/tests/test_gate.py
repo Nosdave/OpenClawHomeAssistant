@@ -73,6 +73,8 @@ if cmd[:2] == ["models", "status"]:
 if cmd[:1] == ["sessions"]:
     out({"sessions": []})
 if cmd[:2] == ["plugins", "list"]:
+    if os.environ.get("FAKE_PLUGINS_LIST"):  # a whole `plugins list --json` output (plugins_list_output)
+        out(json.load(open(os.environ["FAKE_PLUGINS_LIST"], encoding="utf-8")))
     out({"plugins": []})
 sys.stderr.write("fake node: unhandled %r\n" % (cmd,))
 sys.exit(3)
@@ -314,6 +316,81 @@ SW_1004_PROPOSALS = [
     ("prop-1", "create", "pending", {"name": "weather-brief", "draft": "synthetic draft"}),
     ("prop-2", "update", "applied", {"name": "shopping-list", "draft": "synthetic draft"}),
 ]
+
+
+# `openclaw plugins list --json` in the real shape (full5 rehearsal D2): tests/fixtures/plugins-list-2026.10.10.json
+# is OpenClaw 2026.10.10's output for a state with codex, acpx and Brave installed from npm, cut to three bundled
+# entries, with the paths and generation hashes replaced by synthetic ones. Every entry keeps the field set OpenClaw
+# writes (PluginRecord): no packageName, no packageVersion. Tests build their entries from it, never invent keys.
+PLUGINS_LIST_1010 = FIXTURES / "plugins-list-2026.10.10.json"
+
+
+def plugins_list_output(plugins=None):
+    """The fixture's whole output, with `plugins` instead of its entries when given."""
+    data = json.loads(PLUGINS_LIST_1010.read_text(encoding="utf-8"))
+    if plugins is not None:
+        data["plugins"] = plugins
+    return data
+
+
+def plugin_project_dir(state, pkg, ver):
+    """OpenClaw's generation project of an npm install: <state>/npm/projects/<name>-<hash>__openclaw-generation__g-<16
+    hex> (synthetic hashes; a new version gets a new generation)."""
+    h = hashlib.sha256(pkg.encode()).hexdigest()
+    g = hashlib.sha256(f"{pkg}@{ver}".encode()).hexdigest()
+    return f"{state}/npm/projects/{pkg.lstrip('@').replace('/', '-')}-{h[:10]}__openclaw-generation__g-{g[:16]}"
+
+
+def listed_plugin(pid, pkg, ver, enabled=True, origin="global", spec=None, state="/config/.openclaw"):
+    """One `plugins list --json` entry shaped like the fixture's. origin 'global': an npm install of `pkg` (its
+    rootDir/source in its generation project, trust.installSpec `spec` or the package name; trusted-official for
+    @openclaw/ packages, provenance-invalid for others, as OpenClaw's resolvePluginTrust says); 'bundled': a plugin of
+    the OpenClaw package; 'config'/'workspace': a load path (no install record, trust origin-path)."""
+    entries = {x["id"]: x for x in plugins_list_output()["plugins"]}
+    if origin == "bundled":
+        x = copy.deepcopy(entries["alibaba"])
+        root = f"/usr/local/lib/node_modules/openclaw/dist/extensions/{pid}"
+        x.update(id=pid, name=pkg, rootDir=root, source=f"{root}/index.js")
+    else:
+        x = copy.deepcopy(entries[pid] if pid in entries else entries["acpx"])
+        base = plugin_project_dir(state, pkg, ver) if origin == "global" else f"/config/plugins-dev/{pid}"
+        root = f"{base}/node_modules/{pkg}" if origin == "global" else base
+        old = x["rootDir"]
+        text = json.dumps(x).replace(old, root)  # rootDir, source
+        text = text.replace(old.rsplit("/node_modules/", 1)[0] + "/node_modules/", base + "/node_modules/")  # deps
+        x = json.loads(text)
+        x.update(id=pid, rootDir=root, source=f"{root}/dist/index.js", origin=origin)
+        x["trust"] = {"reason": "trusted-official", "registryPath": f"{state}/state/openclaw.sqlite", "origin": origin,
+                      "installSource": "npm", "installSpec": spec or pkg}
+        if origin != "global":
+            x["trust"] = {"reason": "origin-path", "registryPath": x["trust"]["registryPath"], "origin": origin}
+        elif not pkg.startswith("@openclaw/"):
+            x["trust"]["reason"] = "provenance-invalid"
+        if x["trust"]["reason"] != "trusted-official":
+            x.pop("trustedOfficialInstall", None)
+        else:
+            x["trustedOfficialInstall"] = True
+    x.update(version=ver, enabled=enabled, status="loaded" if enabled else "disabled")
+    return x
+
+
+def write_install_records(state, records):
+    """OpenClaw's npm install records (state DB config_machine_state 'plugins.installedIndex', as 2026.10.x and
+    2026.11.1 write them) for {plugin id: (package, version, spec or None)}; installPath is listed_plugin's rootDir."""
+    recs = {}
+    for pid, (pkg, ver, spec) in records.items():
+        recs[pid] = {"source": "npm", "spec": spec or pkg,
+                     "installPath": f"{plugin_project_dir(state, pkg, ver)}/node_modules/{pkg}", "version": ver,
+                     "resolvedName": pkg, "resolvedVersion": ver, "resolvedSpec": f"{pkg}@{ver}",
+                     "integrity": "sha512-synthetic", "shasum": "0" * 40, "resolvedAt": "2026-11-01T00:00:00.000Z",
+                     "installedAt": "2026-11-01T00:00:00.000Z"}
+    c = sqlite3.connect(str(Path(state) / "state" / "openclaw.sqlite"))
+    c.execute("DELETE FROM config_machine_state WHERE state_key='plugins.installedIndex'")
+    c.execute("INSERT INTO config_machine_state VALUES ('plugins.installedIndex', ?, 0)",
+              (json.dumps({"revision": 1, "index": {"version": 1, "installRecords": recs, "plugins": [],
+                                                    "diagnostics": []}}),))
+    c.commit()
+    c.close()
 
 
 def make_1004_agent_db(state, aid, uv=24, app="2026.10.4", auth_store=None):

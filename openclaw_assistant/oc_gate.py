@@ -3499,8 +3499,17 @@ class Gate:
         self.skill_workshop_postcheck(summary)
         # plugins (WARN only)
         res, data = self.oc_json(["plugins", "list", "--json"], 180, "pc-plugins")
-        for w in plugin_version_warnings(data, self.pkg["version"]):
+        installs = official_plugin_installs(p["STATE"], cfg)
+        for w in plugin_version_warnings(data, self.pkg["version"], installs):
             self.warn(w)
+        # D2: the WARN promises plugins-sync after the gate; run.sh skips it while the version's marker exists (a
+        # plugin enabled after that step ran), so a stale marker goes
+        cohort = plugin_cohort_marker(p["STATE"], self.pkg["version"])
+        if plugins_behind(listed_official_plugins(data, installs), self.pkg["version"]) and cohort.exists():
+            try:
+                cohort.unlink()
+            except OSError as exc:
+                self.warn(f"could not delete {cohort} ({exc}); delete it so the add-on updates the plugins")
         self.save()
         if policy:
             self.resolve(policy, "postconditions")
@@ -5172,6 +5181,62 @@ def official_plugin_installs(state_dir, cfg):
     return sorted(out_, key=lambda x: x["id"])
 
 
+_OFFICIAL_PACKAGE_RE = re.compile(r"@openclaw/[a-z0-9][a-z0-9._-]{0,100}")
+_OFFICIAL_ROOT_RE = re.compile(r"/node_modules/(@openclaw/[a-z0-9][a-z0-9._-]{0,100})(?:/|$)")
+
+
+def listed_official_plugins(data, installs=()):
+    """[{id, package, version, enabled}] of the official npm plugins (@openclaw/*, Brave included) in the output of
+    `openclaw plugins list --json`; None when it has no plugin list.
+
+    The real output (2026.10.4 to 2026.11.1: each entry is OpenClaw's PluginRecord; tests/fixtures/
+    plugins-list-2026.10.10.json) has no packageName: an entry counts when it is not bundled, comes from npm
+    (OpenClaw's install record of its id in `installs` (official_plugin_installs), trust.installSource 'npm', or
+    origin 'global') and its package is known from that install record, trust.installSpec, packageName or its
+    rootDir/source path (.../node_modules/@openclaw/<name>/). version: the loaded one (version, else
+    packageVersion; None when neither is a CalVer); enabled: OpenClaw's own verdict (True only for enabled true)."""
+    plugins = data.get("plugins") if isinstance(data, dict) else None
+    if not isinstance(plugins, list):
+        return None
+    by_id = {x["id"]: x for x in installs or () if isinstance(x, dict) and isinstance(x.get("id"), str)}
+    out_ = []
+    for x in plugins:
+        if not isinstance(x, dict) or not isinstance(x.get("id"), str) or x.get("origin") == "bundled":
+            continue
+        rec = by_id.get(x["id"])
+        trust = x.get("trust") if isinstance(x.get("trust"), dict) else {}
+        npm_trust = trust.get("installSource") == "npm"
+        if rec is None and not npm_trust and x.get("origin") != "global":
+            continue
+        names = [rec["package"] if rec else None, _npm_name(trust.get("installSpec")) if npm_trust else None,
+                 x.get("packageName")]
+        for k in ("rootDir", "source"):
+            m = _OFFICIAL_ROOT_RE.search(x[k]) if isinstance(x.get(k), str) else None
+            names.append(m.group(1) if m else None)
+        pkg = next((n for n in names if isinstance(n, str) and n), None)
+        if not pkg or not _OFFICIAL_PACKAGE_RE.fullmatch(pkg):
+            continue
+        ver = next((v for v in (x.get("version"), x.get("packageVersion"))
+                    if isinstance(v, str) and C.version_tuple(v)), None)
+        out_.append({"id": x["id"], "package": pkg, "version": ver, "enabled": x.get("enabled") is True})
+    return out_
+
+
+def unlisted_official_installs(data, installs):
+    """Official npm install records (installs: official_plugin_installs; not Brave, not disabled in openclaw.json)
+    whose plugin id `openclaw plugins list --json` does not show at all (any origin): the list cannot confirm their
+    version. All of them when the list shows none of the recorded ids (output OpenClaw did not write as expected).
+    [] when the output has no plugin list (the caller reports that)."""
+    plugins = data.get("plugins") if isinstance(data, dict) else None
+    if not isinstance(plugins, list):
+        return []
+    ids = {x["id"] for x in plugins if isinstance(x, dict) and isinstance(x.get("id"), str)}
+    recs = [x for x in installs or () if isinstance(x, dict) and x.get("id") not in ids]
+    if installs and len(recs) == len(installs):
+        return recs
+    return [x for x in recs if x.get("package") != BRAVE_PLUGIN_PACKAGE and x.get("enabled") is not False]
+
+
 def schema_meta_problems(state_dir, cls, pkg):
     probs = []
     sdb = Path(state_dir) / "state" / "openclaw.sqlite"
@@ -5331,35 +5396,34 @@ def probe_ok(data, profile_id):
     return any(isinstance(r, dict) and r.get("profileId") == profile_id and r.get("status") == "ok" for r in results)
 
 
-def plugin_version_warnings(data, runtime):
+def plugins_behind(listed, runtime):
+    """Enabled official plugins of listed_official_plugins (not Brave, run.sh's own step) older than `runtime`, the
+    ones oc-upgrade plugins-sync updates."""
+    rt = C.version_tuple(runtime)
+    return [x for x in listed or () if x["enabled"] and x["package"] != BRAVE_PLUGIN_PACKAGE and x["version"]
+            and rt and C.version_tuple(x["version"]) < rt]
+
+
+def plugin_version_warnings(data, runtime, installs=()):
     """WARN lines for enabled official plugins whose version differs from the runtime (full5 wording: the add-on
-    updates older ones before the gateway starts, oc-upgrade plugins-sync; Brave is run.sh's own step)."""
-    warns = []
+    updates older ones before the gateway starts, oc-upgrade plugins-sync; Brave is run.sh's own step). The same
+    plugins as plugins-sync (listed_official_plugins; `installs`: official_plugin_installs)."""
     if data is None:
         return ["plugins list --json returned no parseable JSON"]
-
-    def walk(x):
-        if isinstance(x, dict):
-            if isinstance(x.get("id"), str):
-                yield x
-            for v in x.values():
-                yield from walk(v)
-        elif isinstance(x, list):
-            for v in x:
-                yield from walk(v)
-    for p in walk(data):
-        spec = str(p.get("packageName") or p.get("package") or p.get("spec") or p.get("source") or "")
-        ver = p.get("version")
-        if p.get("enabled") is False or "@openclaw/" not in spec or not isinstance(ver, str):
+    listed = listed_official_plugins(data, installs)
+    if listed is None:
+        return ["plugins list --json returned no plugin list"]
+    warns = []
+    rt = C.version_tuple(runtime)
+    behind = {x["id"] for x in plugins_behind(listed, runtime)}
+    for p in listed:
+        if not p["enabled"] or p["package"] == BRAVE_PLUGIN_PACKAGE or not p["version"]:
             continue
-        if BRAVE_PLUGIN_PACKAGE in spec:
-            continue
-        v, rt = C.version_tuple(ver), C.version_tuple(runtime)
-        if v and rt and v > rt:
-            warns.append(f"plugin {p['id']} {ver} is newer than OpenClaw {runtime}; left as is")
-        elif v and v != rt:
-            warns.append(f"plugin {p['id']} is {ver}, OpenClaw is {runtime}: the add-on updates it before the gateway "
-                         "starts (oc-upgrade plugins-sync)")
+        if rt and C.version_tuple(p["version"]) > rt:
+            warns.append(f"plugin {p['id']} {p['version']} is newer than OpenClaw {runtime}; left as is")
+        elif p["id"] in behind:
+            warns.append(f"plugin {p['id']} is {p['version']}, OpenClaw is {runtime}: the add-on updates it before "
+                         "the gateway starts (oc-upgrade plugins-sync)")
     return warns
 
 
@@ -6373,13 +6437,24 @@ def _status_held_and_plugins(gp, marker):
             rt = None
         text = ", ".join(f"{x['package']} {x['version'] or '?'}"
                          + {True: " (enabled)", False: " (disabled)"}.get(x["enabled"], "") for x in official)
-        if rt and plugin_cohort_marker(gp["STATE"], rt).exists():
-            text += f"; enabled ones synced to OpenClaw {rt}"
-        elif rt:
-            behind = [x["package"] for x in official if x["enabled"] is not False and x["version"] != rt
-                      and x["package"] != BRAVE_PLUGIN_PACKAGE]
-            text += (f"; not yet at OpenClaw {rt}: {', '.join(behind)} (the add-on retries at the next start: "
-                     "oc-upgrade plugins-sync)" if behind else f"; enabled ones at OpenClaw {rt}")
+        if rt:
+            # D2: the versions decide, not the marker (it only says that plugins-sync ran for this version)
+            rtv = C.version_tuple(rt)
+            mine = [x for x in official if x["enabled"] is not False and x["package"] != BRAVE_PLUGIN_PACKAGE]
+            newer = [x for x in mine if rtv and C.version_tuple(x["version"]) and C.version_tuple(x["version"]) > rtv]
+            behind = [x["package"] for x in mine if x["version"] != rt and x not in newer]
+            cohort = plugin_cohort_marker(gp["STATE"], rt)
+            if behind and cohort.exists():
+                text += (f"; not at OpenClaw {rt}: {', '.join(behind)} (enabled or changed after the add-on's update "
+                         f"step for {rt}; to update: delete {cohort} and restart the add-on, or by hand: openclaw "
+                         f"plugins update <package>@{rt})")
+            elif behind:
+                text += (f"; not yet at OpenClaw {rt}: {', '.join(behind)} (the add-on retries at the next start: "
+                         "oc-upgrade plugins-sync)")
+            if newer:
+                text += f"; newer than OpenClaw {rt}, left as is: {', '.join(x['package'] for x in newer)}"
+            if not behind and not newer:
+                text += f"; enabled ones {'synced to' if cohort.exists() else 'at'} OpenClaw {rt}"
         L.append(f"Official plugins: {text}")
     return L
 
