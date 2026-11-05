@@ -1167,8 +1167,14 @@ ensure_brave_plugin() {
 # plugin got there, so a failed update is retried at the next start. Shares
 # the validated OPENCLAW_RUNTIME_VERSION with the Brave step. Runs after the
 # migration gate with the gateway down; best-effort, never blocks startup.
+# It runs in the background (PLUGINS_PID) so the shutdown trap can forward a
+# stop request: bash defers the trap while a foreground command runs, and npm
+# updates can take longer than the Supervisor's 300 s stop timeout. `timeout`
+# passes SIGTERM on; oc-upgrade then stops the update's process group.
 # ------------------------------------------------------------------------------
+PLUGINS_PID=""
 ensure_official_plugin_cohort() {
+  local rc=0
   if [ -z "${OPENCLAW_RUNTIME_VERSION:-}" ]; then
     echo "WARN: Official plugins not updated: the OpenClaw version is unknown (non-fatal)."
     return 0
@@ -1177,8 +1183,23 @@ ensure_official_plugin_cohort() {
   if [ -f "/config/.openclaw/.plugin_cohort_${OPENCLAW_RUNTIME_VERSION}" ]; then
     return 0
   fi
-  timeout --kill-after=30 1200 oc-upgrade plugins-sync || \
+  [ "${SHUTTING_DOWN:-false}" != "true" ] || return 0
+  timeout --kill-after=30 1200 oc-upgrade plugins-sync &
+  PLUGINS_PID=$!
+  while :; do
+    if wait "$PLUGINS_PID" 2>/dev/null; then rc=0; else rc=$?; fi
+    # The shutdown trap interrupts `wait` (>128) while the step still runs: wait for its real end.
+    if [ "$rc" -gt 128 ] && [ "${SHUTTING_DOWN:-false}" = "true" ] && kill -0 "$PLUGINS_PID" 2>/dev/null; then
+      continue
+    fi
+    break
+  done
+  PLUGINS_PID=""
+  if [ "${SHUTTING_DOWN:-false}" = "true" ]; then
+    echo "INFO: Stop requested during the official plugin update step."
+  elif [ "$rc" -ne 0 ]; then
     echo "WARN: Official plugin update step failed or timed out (non-fatal); it runs again at the next start."
+  fi
   return 0
 }
 
@@ -1285,6 +1306,11 @@ SHUTTING_DOWN="${SHUTTING_DOWN:-false}"
 shutdown() {
   SHUTTING_DOWN="true"
   echo "Shutdown requested; stopping services..."
+
+  # The official plugin update step (before the gateway starts; ensure_official_plugin_cohort waits for it).
+  if [ -n "${PLUGINS_PID:-}" ] && kill -0 "${PLUGINS_PID}" 2>/dev/null; then
+    kill -TERM "${PLUGINS_PID}" 2>/dev/null || true
+  fi
 
   # The cleanup loop stops at its next check; it is reaped after the gateway (no wait here).
   if [ -n "${CLEANUP_PID:-}" ] && kill -0 "${CLEANUP_PID}" >/dev/null 2>&1; then

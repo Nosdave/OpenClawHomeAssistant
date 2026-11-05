@@ -801,6 +801,53 @@ check "startup: ensure_official_plugin_cohort is not called right after ensure_b
   _ "${c_hold:-0}" "${c_branch:-0}" "${c_brave:-0}" "${c_cohort:-}"
 check "startup: ensure_official_plugin_cohort is called more than once" \
   [ "$(grep -c '^[[:space:]]*ensure_official_plugin_cohort || true$' "$RUN_SH")" -eq 1 ]
+got="$(PATH="$T/cohort-bin:$PATH" COHORT_LOG="$T/cohort.log" COHORT_STATE="$T/cohort-state" SHUTTING_DOWN=true \
+         OPENCLAW_RUNTIME_VERSION=2026.11.1 bash -c ': > "$COHORT_LOG"; bash "$1"' _ "$T/cohort.sh" 2>&1)"
+check "startup: the official plugin step started although a stop was requested: $(cat "$T/cohort.log") / $got" \
+  bash -c '[ ! -s "$1" ] && [ "$2" = "RESULT rc=0" ]' _ "$T/cohort.log" "$got"
+# A stop request during a slow step: the real shutdown trap forwards SIGTERM through the real `timeout` (bash defers
+# a trap while a foreground command runs, and the step may take up to 1200 s, longer than the Supervisor's 300 s).
+mkdir -p "$T/cohort-slow-bin"
+cat > "$T/cohort-slow-bin/oc-upgrade" <<'EOF'
+#!/usr/bin/env bash
+trap 'echo TERM >> "$COHORT_LOG"; exit 0' TERM
+echo "CALLED $*" >> "$COHORT_LOG"
+for _ in $(seq 1 600); do sleep 0.1; done
+exit 0
+EOF
+chmod +x "$T/cohort-slow-bin/oc-upgrade"
+{
+  cat <<'EOF'
+set -euo pipefail
+HEALTH_PID=""; NGINX_PID=""; TTYD_PID=""; GW_PID=""; CLEANUP_PID=""
+CLEAN_LOCKS_ON_EXIT=false; STATE_HOLD=false; SHUTTING_DOWN=false
+find_gateway_daemon_pid() { return 1; }
+stop_gw_relay() { :; }
+cleanup_session_locks() { :; }
+EOF
+  extract_function runtime_at_least
+  grep -x 'PLUGINS_PID=""' "$RUN_SH"
+  extract_function ensure_official_plugin_cohort | sed "s#/config/.openclaw/.plugin_cohort_#\$COHORT_STATE/.plugin_cohort_#"
+  extract_function shutdown
+  echo 'trap shutdown INT TERM'
+  echo 'ensure_official_plugin_cohort'
+  echo 'echo "RESULT rc=$? SHUTTING_DOWN=$SHUTTING_DOWN"'
+} > "$T/cohort-stop.sh"
+: > "$T/cohort.log"
+PATH="$T/cohort-slow-bin:$PATH" COHORT_LOG="$T/cohort.log" COHORT_STATE="$T/cohort-state" \
+  OPENCLAW_RUNTIME_VERSION=2026.11.2 bash "$T/cohort-stop.sh" > "$T/cohort-stop.log" 2>&1 &
+runner=$!
+for _ in $(seq 1 100); do grep -q CALLED "$T/cohort.log" && break; sleep 0.05; done
+start=$SECONDS
+kill -TERM "$runner"
+wait "$runner" 2>/dev/null || true
+check "startup: a stop during the official plugin step waited for it ($((SECONDS - start)) s)" \
+  [ $((SECONDS - start)) -le 5 ]
+check "startup: the official plugin step did not get the forwarded SIGTERM: $(cat "$T/cohort.log")" \
+  grep -qx TERM "$T/cohort.log"
+check "startup: a stop during the official plugin step was not reported: $(cat "$T/cohort-stop.log")" \
+  bash -c 'grep -qx "INFO: Stop requested during the official plugin update step." "$1" &&
+           grep -qx "RESULT rc=0 SHUTTING_DOWN=true" "$1" && ! grep -q "WARN" "$1"' _ "$T/cohort-stop.log"
 
 # known_bug DESCRIPTION COMMAND...: asserts the correct behaviour, but the
 # current run.sh is known to fail it. A failure is a KNOWN-BUG skip (not counted

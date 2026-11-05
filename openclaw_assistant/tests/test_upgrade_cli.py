@@ -676,9 +676,10 @@ class Full2CliTests(CliEnv):
 # --- full5: official plugins follow the OpenClaw version (oc-upgrade plugins-sync) ----------------------------------
 
 # Fake node for `plugins list --json` / `plugins update <pkg>@<ver>`: the plugin list lives in $FAKE_PLUGINS, every
-# call is logged to $FAKE_ARGV_LOG; FAKE_UPDATE_RC / FAKE_LIST_RC make the update / the list fail.
+# call is logged to $FAKE_ARGV_LOG; FAKE_UPDATE_RC / FAKE_LIST_RC make the update / the list fail; an update writes its
+# PID to $FAKE_UPDATE_PIDFILE and takes $FAKE_UPDATE_SLEEP seconds.
 PLUGINS_NODE = r'''#!/usr/bin/env python3
-import json, os, sys
+import json, os, sys, time
 args = sys.argv[2:]
 with open(os.environ["FAKE_ARGV_LOG"], "a") as f:
     f.write(json.dumps(args) + "\n")
@@ -691,6 +692,10 @@ if args[:2] == ["plugins", "list"]:
     print(json.dumps({"workspaceDir": "/x", "registry": {}, "plugins": plugins, "diagnostics": []}))
     sys.exit(0)
 if args[:2] == ["plugins", "update"]:
+    if os.environ.get("FAKE_UPDATE_PIDFILE"):
+        with open(os.environ["FAKE_UPDATE_PIDFILE"], "a") as f:
+            f.write(f"{os.getpid()}\n")
+    time.sleep(float(os.environ.get("FAKE_UPDATE_SLEEP") or 0))
     if os.environ.get("FAKE_UPDATE_RC"):
         sys.stderr.write("npm error 404 Not Found; npm_config_token=SECRET-NPM-TOKEN\n")
         sys.exit(int(os.environ["FAKE_UPDATE_RC"]))
@@ -793,6 +798,61 @@ class PluginsSyncTests(CliEnv):
         self.assertEqual(self.sync(), [])
         self.assertIn("OpenClaw is held", self.stdout)
         self.assertFalse(self.marker().exists())
+
+    def test_plugins_sync_time_budget_leaves_the_rest_for_the_next_start(self):
+        """No update starts after the step's time budget (PLUGIN_SYNC_BUDGET; here 2 s through the test hook), so the
+        last update and the relist end before run.sh's outer `timeout 1200`; the skipped ones keep the marker away."""
+        self.write_plugins([plugin("acpx", "@openclaw/acpx", "2026.10.4"),
+                            plugin("codex", "@openclaw/codex", "2026.10.4")])
+        self.hooks(plugin_sync_budget_s=2)
+        calls = self.sync(FAKE_UPDATE_SLEEP="3")
+        self.assertEqual([c for c in calls if c[:2] == ["plugins", "update"]],
+                         [["plugins", "update", "@openclaw/acpx@2026.10.10"]])
+        self.assertEqual(calls[-1], ["plugins", "list", "--json"])
+        self.assertIn("WARN: @openclaw/codex stays at 2026.10.4 (not started: the update step's time budget (2 s) ran "
+                      "out); OpenClaw 2026.10.10 still loads it (minimum 2026.9.7). The add-on tries again at the next "
+                      "start", self.stdout)
+        self.assertNotIn("acpx stays", self.stdout)
+        self.assertFalse(self.marker().exists())
+        self.assertEqual([c for c in self.sync() if c[:2] == ["plugins", "update"]],
+                         [["plugins", "update", "@openclaw/codex@2026.10.10"]])  # the next start
+        self.assertTrue(self.marker().is_file())
+
+    def test_plugins_sync_sigterm_stops_the_update_and_its_process_group(self):
+        """run.sh's shutdown trap (or its outer `timeout`) sends SIGTERM: the running `openclaw plugins update` runs
+        in its own session, so it is stopped with its process group (it must not keep installing while the add-on
+        stops or the gateway starts); no marker, rc 0."""
+        pidfile = self.tmp / "update.pid"
+        e = dict(os.environ, PYTHONDONTWRITEBYTECODE="1", FAKE_PLUGINS=str(self.plugins),
+                 FAKE_ARGV_LOG=str(self.argv_log), FAKE_UPDATE_PIDFILE=str(pidfile), FAKE_UPDATE_SLEEP="120")
+        proc = subprocess.Popen([sys.executable, "-B", str(SCRIPT), "plugins-sync"], stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, text=True, env=e)
+        child = None
+        try:
+            for _ in range(200):
+                if pidfile.exists() and pidfile.read_text().strip():
+                    break
+                time.sleep(0.05)
+            child = int(pidfile.read_text().split()[0])
+            start = time.monotonic()
+            proc.send_signal(signal.SIGTERM)
+            out, err = proc.communicate(timeout=60)
+            self.assertLess(time.monotonic() - start, 20)
+            self.assertEqual(proc.returncode, 0, out + err)
+            self.assertIn("INFO: Official plugins: update step stopped (add-on stop or time limit); the add-on tries "
+                          "again at the next start.", out)
+            with self.assertRaises(ProcessLookupError):
+                os.kill(child, 0)
+            self.assertFalse(self.marker().exists())
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.communicate()
+            if child is not None:
+                try:
+                    os.kill(child, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
 
 
 class HeldStoreCheckTests(CliEnv):

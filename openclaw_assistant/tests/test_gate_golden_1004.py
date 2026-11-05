@@ -16,12 +16,21 @@ OpenClaw 2026.10.4 enforces too; CHANGELOG "Migration gate, foreign keys"); doct
 pre-migration SQLite copy by doctor ...; not the rollback point", none in the maintenance run), the journal records
 them per pass (scope, pre_migration_backups_older, doctor_copies_before), finalize says they are deleted with the
 doctor captures, and the status lines name them ("Doctor pre-migration SQLite copies", "Gate options: delete doctor
-captures and SQLite copies").
+captures and SQLite copies"); the official plugins (CHANGELOG "Official plugins follow the OpenClaw version"; the
+fixture has Brave and an enabled codex in OpenClaw's install index): the precheck's "info: official plugins: ..."
+line, the journal's plugins_official_before and the status line "Official plugins: ..."; a store of an unconfigured
+agent that a retained deletion keeps (CHANGELOG "agent databases outside the configured agents"; OpenClaw 2026.10.4
+reads retained deletions too): an "info: ... is kept from a deleted agent" line instead of the acceptable HOLD
+orphan-agent-db, `oc-upgrade check` lists it under "held agent databases", the journal's orphans entry has
+held/reason.
+Not in the fixture because each one is a HOLD (DOCS "Upgrading to OpenClaw 2026.10"): the reworded orphan-agent-db
+text and the hard code agent-db-held for a configured agent whose store a retained deletion keeps.
 """
 
 import json
 import os
 import re
+import sqlite3
 import subprocess
 import sys
 import unittest
@@ -50,6 +59,7 @@ CFG = {
     "models": {"providers": {"vllm": {"baseUrl": "http://127.0.0.1:8000/v1", "models": [{"id": "qwen3.5-122b"}]}}},
     "gateway": {"mode": "local", "auth": {"token": "SECRET-GATEWAY-TOKEN"}},
     "channels": {"telegram": {"enabled": True, "botToken": "123456:SECRET-BOT-TOKEN"}},
+    "plugins": {"entries": {"codex": {"enabled": True}}},
 }
 
 # durations of C.fmt_duration ("0s", "1m05s", "1h00m"), sizes of C.human, ISO times, run ids
@@ -84,15 +94,36 @@ class Golden1004Tests(T.GateEnv):
         sess.mkdir(parents=True)
         (sess / "sessions.json").write_text(json.dumps({
             "agent:main:main": {"sessionId": "s1", "updatedAt": 1, "model": "vllm/qwen3.5-122b"}}))
+        self.add_plugins_and_retained_store()
         (self.upg / "gate").mkdir(parents=True)
         (self.upg / "gate" / "migrated.json").write_text(json.dumps({"runtime": "2026.9.9", "mode": "from-7x"}))
         self.hooks()
-        # pass 1 of the bump makes doctor's full pre-migration copy of the state DB; later passes make none
+        # pass 1 of the bump makes doctor's full pre-migration copy of the state DB; later passes make none.
+        # Doctor leaves the store a retained deletion keeps alone (agent-deletion-journal.read.ts, also in 10.4).
         step = {"state_uv": 20, "agent_uv": 24, "app_version": "2026.10.4", "drop_tables": ["cron_run_logs"],
-                "remove": ["identity/device.json"]}
+                "remove": ["identity/device.json"], "skip_agents": ["retired"]}
         self.doctor_script(passes=[dict(step, baks=["state/openclaw.sqlite"]), step])
         self.pylib = self.tmp / "pylib"
         self.pylib.mkdir()
+
+    def add_plugins_and_retained_store(self):
+        """Two official npm plugins in OpenClaw's install index (Brave, codex enabled, both behind 2026.10.4) and the
+        store of an unconfigured agent that a retained deletion keeps (schema 20, below the target): synthetic."""
+        codex = self.state / "npm" / "projects" / "openclaw-codex" / "node_modules" / "@openclaw" / "codex"
+        codex.mkdir(parents=True)
+        (codex / "package.json").write_text(json.dumps({"name": "@openclaw/codex", "version": "2026.10.2"}))
+        idx = {"index": {"installRecords": {
+            "brave": {"source": "npm", "spec": "npm:@openclaw/brave-plugin@2026.10.2", "version": "2026.10.2"},
+            "codex": {"source": "npm", "spec": "@openclaw/codex@2026.10.2", "resolvedName": "@openclaw/codex",
+                      "resolvedVersion": "2026.10.2", "installPath": str(codex)}}}}
+        T.make_1004_agent_db(self.state, "retired", uv=20, app="2026.9.9")
+        con = sqlite3.connect(str(self.state / "state" / "openclaw.sqlite"))
+        con.execute("INSERT INTO config_machine_state VALUES ('plugins.installedIndex', ?, 0)", (json.dumps(idx),))
+        con.execute("INSERT INTO agent_deletion_journal (agent_id, agent_dir, workspace_dir, sessions_dir, created_at, "
+                    "cleanup_completed, delete_files) VALUES ('retired', ?, '/w', '/s', 0, 1, 0)",
+                    (str(self.state / "agents" / "retired" / "agent"),))
+        con.commit()
+        con.close()
 
     # ----- normalization -----
     def norm(self, text):

@@ -42,15 +42,20 @@ Commands:
                  installs itself) to the bundled OpenClaw version, once per
                  version (marker /config/.openclaw/.plugin_cohort_<version>).
                  Never downgrades, leaves disabled plugins alone, always exits 0.
+                 No update starts after 600 s; SIGTERM stops the running one
+                 with its process group (no marker).
 """
 
 import json
 import os
 import re
 import shutil
+import signal
 import stat
 import subprocess
 import sys
+import threading
+import time
 from datetime import datetime, timezone
 
 _PYLIB = os.environ.get("OC_ADDON_PYLIB", "/usr/local/lib/oc-addon/python")
@@ -682,6 +687,10 @@ def cmd_cleanup(args):
 # post-core pass, which the add-on cannot run): the add-on does it after the gate, before the gateway starts.
 PLUGIN_LIST_TIMEOUT = 180
 PLUGIN_UPDATE_TIMEOUT = 300
+# No update starts later than this (s after the step began): the last one (300 s + 30 s kill grace) and the relist
+# (180 s + 30 s) still end before run.sh's `timeout --kill-after=30 1200`; the rest waits for the next start.
+PLUGIN_SYNC_BUDGET = 600
+PLUGIN_STOP_GRACE = 10  # a stop request (SIGTERM from run.sh's shutdown trap via timeout): SIGTERM, then SIGKILL
 _RUNTIME_VERSION_RE = re.compile(r"^\d{4}\.\d+\.\d+(?:-\d+)?$")
 # OpenClaw keeps loading a version-bound plugin from this release on (official-runtime-plugins.ts)
 PLUGIN_MIN_COMPATIBLE = {"@openclaw/codex": "2026.9.7"}
@@ -698,10 +707,12 @@ def _sync_runtime_version():
         return None
 
 
-def _oc_capture(args, timeout, tmp, tag):
-    """Run the bundled OpenClaw CLI (never through the wrapper); (rc, stdout text, redacted tail)."""
+def _oc_capture(args, timeout, tmp, tag, stop=None):
+    """Run the bundled OpenClaw CLI (never through the wrapper); (rc, stdout text, redacted tail). A set `stop`
+    event ends it (its whole process group, npm included)."""
     out_p, err_p = os.path.join(tmp, f"{tag}.out"), os.path.join(tmp, f"{tag}.err")
-    res = C.run_oc(args, timeout=timeout, log_path=err_p, stdout_path=out_p)
+    res = C.run_oc(args, timeout=timeout, log_path=err_p, stdout_path=out_p, stop_event=stop,
+                   stop_grace=PLUGIN_STOP_GRACE)
     texts = []
     for f in (out_p, err_p):
         try:
@@ -737,19 +748,35 @@ def _official_enabled(data):
 
 
 def cmd_plugins_sync(args):
-    """`oc-upgrade plugins-sync` (internal; run.sh after the gate, gateway down). Always returns 0."""
+    """`oc-upgrade plugins-sync` (internal; run.sh after the gate, gateway down). Always returns 0.
+
+    SIGTERM/SIGINT (run.sh's shutdown trap, or its outer `timeout`) stop the running `openclaw plugins update` with
+    its process group (it runs in its own session, so it would otherwise outlive this process) and end the step
+    without the marker."""
     if args:
         print("usage: oc-upgrade plugins-sync")
         return RC_OK
+    stop = threading.Event()
+
+    def _on_signal(_signum, _frame):
+        stop.set()
+
+    signal.signal(signal.SIGTERM, _on_signal)
+    signal.signal(signal.SIGINT, _on_signal)
     try:
-        return _plugins_sync()
+        return _plugins_sync(stop)
     except Exception as exc:  # noqa: BLE001 - best effort: never stops the add-on start
         print(f"WARN: Official plugins not updated ({type(exc).__name__}: {C.redact_text(str(exc))[:200]}); the add-on "
               "tries again at the next start.")
         return RC_OK
 
 
-def _plugins_sync():
+def _plugins_sync(stop=None):
+    stop = stop or threading.Event()
+    started = time.monotonic()
+    budget = PLUGIN_SYNC_BUDGET
+    if os.environ.get("OC_GATE_TEST_HOOKS") == "1":  # tests only (oc_gate.load_hooks)
+        budget = float(_gate().load_hooks().get("plugin_sync_budget_s", budget))
     p = P()
     rt = _sync_runtime_version()
     if not rt:
@@ -762,8 +789,13 @@ def _plugins_sync():
     if marker.exists():
         return RC_OK
     import tempfile  # noqa: PLC0415
+    stopped_msg = ("INFO: Official plugins: update step stopped (add-on stop or time limit); the add-on tries again "
+                   "at the next start.")
     with tempfile.TemporaryDirectory(prefix="oc-plugins-sync-") as tmp:
-        rc, text, tail = _oc_capture(["plugins", "list", "--json"], PLUGIN_LIST_TIMEOUT, tmp, "list")
+        rc, text, tail = _oc_capture(["plugins", "list", "--json"], PLUGIN_LIST_TIMEOUT, tmp, "list", stop)
+        if stop.is_set():
+            print(stopped_msg)
+            return RC_OK
         found = _official_enabled(C.parse_json_output(text)) if rc == 0 else None
         if found is None:
             print(f"WARN: Official plugins not updated: openclaw plugins list failed (rc {rc}"
@@ -779,14 +811,26 @@ def _plugins_sync():
                 continue
             todo.append((pkg, ver))
         failed = []
-        for pkg, ver in todo:
+        for i, (pkg, ver) in enumerate(todo):
+            if stop.is_set():
+                print(stopped_msg)
+                return RC_OK
+            if time.monotonic() - started > budget:
+                failed.append((pkg, ver, f"not started: the update step's time budget ({int(budget)} s) ran out"))
+                continue
             print(f"INFO: Official plugins: updating {pkg} {ver} -> {rt} (OpenClaw {rt})...", flush=True)
             urc, _text, utail = _oc_capture(["plugins", "update", f"{pkg}@{rt}"], PLUGIN_UPDATE_TIMEOUT, tmp,
-                                            f"update-{len(failed)}-{pkg.rsplit('/', 1)[-1]}")
+                                            f"update-{i}-{pkg.rsplit('/', 1)[-1]}", stop)
+            if stop.is_set():
+                print(stopped_msg)
+                return RC_OK
             if urc != 0:
                 failed.append((pkg, ver, f"openclaw plugins update failed, rc {urc}" + (f": {utail}" if utail else "")))
         if todo:
-            rc, text, tail = _oc_capture(["plugins", "list", "--json"], PLUGIN_LIST_TIMEOUT, tmp, "relist")
+            rc, text, tail = _oc_capture(["plugins", "list", "--json"], PLUGIN_LIST_TIMEOUT, tmp, "relist", stop)
+            if stop.is_set():
+                print(stopped_msg)
+                return RC_OK
             now = _official_enabled(C.parse_json_output(text)) if rc == 0 else None
             for pkg, ver in todo:
                 if any(f[0] == pkg for f in failed):

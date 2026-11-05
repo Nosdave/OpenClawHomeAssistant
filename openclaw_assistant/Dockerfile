@@ -85,7 +85,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # /usr/local/bin), never from PATH or Homebrew. Uses: duration of Telegram voice and
 # audio uploads (ffprobe, OpenClaw 2026.10.10+; without it Telegram can show 0:00),
 # video dimensions for Telegram video sends (ffprobe), Control UI playback
-# conversion and video understanding (ffmpeg); all degrade silently without it.
+# conversion, video understanding and the Opus voice-note conversion of Google
+# (Gemini) and MiniMax TTS replies (ffmpeg; already in 2026.10.4). Without it these
+# are skipped, or OpenClaw falls back to the next TTS provider (with ffmpeg, a
+# Google/MiniMax TTS setup answers Telegram voice replies with that provider).
 RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/* \

@@ -93,7 +93,7 @@ REMOVED_HOLD_ADVICE = ("this check was removed in 0.5.94-full3 (the encrypted Ho
 POST_RUN_HOLDS = frozenset({"exit78", "crash-loop"})
 HOOK_KEYS = ("raise_in_phase", "doctor_cmd", "skip_network_check", "accept", "skip_cleanup_kinds",
              "doctor_timeout_s", "skip_space_check", "skip_backup_check", "supervisor_url",
-             "supervisor_token_file", "cleanup_interval_s", "cleanup_clock_offset_s")
+             "supervisor_token_file", "cleanup_interval_s", "cleanup_clock_offset_s", "plugin_sync_budget_s")
 
 DOCTOR_MIRROR_CAP = 3000
 HEARTBEAT_S = 60
@@ -304,7 +304,6 @@ SW_JSON_COLUMNS = frozenset({"record_json", "actor_json", "payload_json", "suppo
                              "written_names_json", "dropped_json"})
 # doctor's own SQLite copies beside each database it migrates: <db>.pre-startup-migration-<id>.bak (full) and, from
 # OpenClaw 2026.10.10, <db>.pre-startup-migration-<id>.scoped.bak (only the tables of a declared migration)
-DOCTOR_COPY_GLOB = "*.pre-startup-migration-*.bak"
 DOCTOR_COPY_RE = re.compile(r"[^/]{1,240}\.pre-startup-migration-([A-Za-z0-9][A-Za-z0-9-]{0,63})(?:\.scoped)?\.bak")
 # "Saved/Reused pre-migration SQLite backup: <db>.pre-startup-migration-<group id>[.scoped].bak" in a doctor log, matched
 # with every blank and box character removed (a long path can wrap inside doctor's box): the id names the group
@@ -4597,18 +4596,24 @@ def sw_export_record(gp, run_id):
 
 def doctor_copies(state_dir):
     """{state-relative path: (size, "full" | "scoped")} of doctor's SQLite copies below the state dir (regular files
-    only; links are not followed)."""
+    only; links are not followed). The walk runs beside the gateway (cleanup loop): a directory that vanishes or
+    cannot be read during it is skipped (os.walk without onerror), never an error that would hold back the rest of
+    a run's cleanup (Path.rglob raises FileNotFoundError for it on Python 3.11)."""
     state_dir = Path(state_dir)
     found = {}
     if not state_dir.is_dir():
         return found
-    for pth in state_dir.rglob(DOCTOR_COPY_GLOB):
-        try:
-            st = os.lstat(pth)
-        except OSError:
-            continue
-        if stat.S_ISREG(st.st_mode) and DOCTOR_COPY_RE.fullmatch(pth.name):
-            found[C.rel(pth, state_dir)] = (st.st_size, "scoped" if pth.name.endswith(".scoped.bak") else "full")
+    for root, _dirs, files in os.walk(state_dir, followlinks=False):
+        for name in files:
+            if not DOCTOR_COPY_RE.fullmatch(name):
+                continue
+            pth = Path(root) / name
+            try:
+                st = os.lstat(pth)
+            except OSError:
+                continue
+            if stat.S_ISREG(st.st_mode):
+                found[C.rel(pth, state_dir)] = (st.st_size, "scoped" if name.endswith(".scoped.bak") else "full")
     return found
 
 

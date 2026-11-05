@@ -735,6 +735,41 @@ class DoctorCopiesTests(Base):
             self.assertTrue(p.exists(), p)
         self.assertTrue(os.path.islink(link))
 
+    def test_a_directory_vanishing_during_the_scan_is_skipped(self):
+        """The cleanup loop walks the state dir beside the gateway: a directory removed between its parent's listing
+        and its own scan (browser profiles, plugin installs) is skipped, and the run's copies are still listed and
+        deleted (with Path.rglob the FileNotFoundError left the whole run, captures and archive included, out of
+        that cleanup pass)."""
+        gp = G.gpaths()
+        rid = "20261001T120000Z-abcdef"
+        rd = gp["RUNS"] / rid
+        rd.mkdir(parents=True)
+        made = self.state / "state" / f"openclaw.sqlite.pre-startup-migration-{ID_NEW}.bak"
+        made.write_bytes(b"copy of that run")
+        (rd / "doctor-pass1.log").write_text(f"Saved pre-migration SQLite backup: {made}\n")
+        (rd / "journal.json").write_text(json.dumps({
+            "run_id": rid, "status": "done", "finished_at": "2026-10-01T12:00:00Z",
+            "started_at": "2026-10-01T11:00:00Z"}))
+        (self.state / "browser" / "default" / "user-data" / "Default").mkdir(parents=True)
+        real_scandir = os.scandir
+
+        def vanishing(path="."):
+            if os.fspath(path).endswith("/user-data"):
+                raise FileNotFoundError(2, "No such file or directory", os.fspath(path))
+            return real_scandir(path)
+
+        now = G._parse_backup_date("2026-11-01T00:00:00Z")
+        with mock.patch("os.scandir", vanishing):
+            self.assertEqual(G.doctor_copies(self.state), {C.rel(self.old, self.state): (30, "full"),
+                                                           C.rel(made, self.state): (16, "full")})
+            targets = {t[0]: t for t in G.cleanup_targets(gp, now, 48)}
+            lines = []
+            self.assertEqual(G.cleanup_pass(now=now, hours=48, emit=lines.append), 1, lines)
+        _rid, _label, _due, paths, kept = targets[rid]
+        self.assertEqual((paths, kept), ([Path(os.path.realpath(self.state)) / C.rel(made, self.state)], []))
+        self.assertFalse(made.exists())
+        self.assertTrue(self.old.exists())
+
     def test_safe_delete_refuses_links_and_other_paths(self):
         gp = G.gpaths()
         real = Path(os.path.realpath(self.state))

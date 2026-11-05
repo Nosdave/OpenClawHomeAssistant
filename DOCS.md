@@ -852,7 +852,7 @@ The add-on image includes these tools, available in the terminal:
 | pnpm | `pnpm` | Fast Node package manager |
 | Homebrew | `brew` | Package manager (optional — may not be available on all CPUs) |
 | Chromium | `chromium` | Headless browser for automation |
-| FFmpeg | `ffmpeg` / `ffprobe` | Used by OpenClaw for media: duration of Telegram voice and audio messages (OpenClaw 2026.10.10+), video dimensions, Control UI playback, video understanding |
+| FFmpeg | `ffmpeg` / `ffprobe` | Used by OpenClaw for media: duration of Telegram voice and audio messages (OpenClaw 2026.10.10+), video dimensions, Control UI playback, video understanding, Opus voice notes from Google (Gemini) and MiniMax TTS (without FFmpeg OpenClaw falls back to the next TTS provider) |
 | SSH | `ssh` | Remote access |
 | oc-cleanup | `oc-cleanup` | Interactive disk space monitor & cache cleanup helper |
 | oc-gateway | `oc-gateway status` / `oc-gateway restart` | Add-on-native gateway status/restart helper (`run.sh` supervised, no systemd) |
@@ -1028,8 +1028,15 @@ report of [cron jobs without a recorded inference account](#cron-jobs-without-a-
 and, after the gate, the [official plugin update](#official-plugins-follow-openclaws-version).
 Read the [known limits](#known-limits-with-openclaw-20261010-and-2026111) of that line
 before you update. With OpenClaw 2026.10.4 the gate works as before, except for the
-foreign-key check in the precheck, a few reworded messages and the deletion of doctor's
-SQLite copies ([Automatic deletion](#automatic-deletion-gate_cleanup_hours)).
+foreign-key check in the precheck, the deletion of doctor's SQLite copies
+([Automatic deletion](#automatic-deletion-gate_cleanup_hours)), the official plugins (an
+information line in the precheck, a line in `oc-upgrade status` and the
+[update after the gate](#official-plugins-follow-openclaws-version)), agent databases
+outside the configured agents (a store that OpenClaw keeps from a deleted agent is only
+listed instead of holding with `orphan-agent-db`, a configured agent whose store is kept
+that way holds with `agent-db-held`, the `orphan-agent-db` reason is reworded; see
+[HOLD codes added for the OpenClaw 2026.10.10 line](#hold-codes-added-for-the-openclaw-20261010-line))
+and a few reworded messages.
 
 **Rule for backups:** no plaintext secrets in archives or backups. Home Assistant
 backups stay inside the Home Assistant backup system and are encrypted. The add-on's
@@ -1205,9 +1212,9 @@ These codes prepare the move to OpenClaw 2026.10.10/2026.11.1 (`orphan-agent-db`
 before; its text is new). They hold before doctor changes anything:
 `skill-workshop-export-failed` right before doctor pass 1, the others in the precheck.
 Only `doctor-retired-warning` comes after a doctor pass (state already migrated).
-`sqlite-fk-violation` and `orphan-agent-db` apply with every OpenClaw version, the others
-only from the version named. Cron jobs never hold: the gate only reports them (see
-[Cron jobs without a recorded inference account](#cron-jobs-without-a-recorded-inference-account-openclaw-20261010)).
+`sqlite-fk-violation`, `orphan-agent-db` and `agent-db-held` apply with every OpenClaw
+version, the others only from the version named. Cron jobs never hold: the gate only
+reports them (see [Cron jobs without a recorded inference account](#cron-jobs-without-a-recorded-inference-account-openclaw-20261010)).
 
 **Agent databases outside the configured agents.** OpenClaw's doctor migrates the
 database of every agent folder it finds under `/config/.openclaw/agents/`, also of agents
@@ -1326,6 +1333,9 @@ the migration gate (if one runs) and before the gateway starts, never during a H
   If an update fails or times out, the plugin keeps its version (OpenClaw 2026.10.10
   still loads `@openclaw/codex` from 2026.9.7 on), the start goes on with a `WARN`, and
   the next start tries again; by hand: `openclaw plugins update <package>@<version>`.
+  Each update may take 5 minutes, and none starts more than 10 minutes into the step
+  (the others wait for the next start). An add-on stop during the step ends the running
+  update with its npm processes; the next start tries again.
 
 The precheck of a gate run lists the installed official plugins (`1/8 info: official
 plugins: …`), and `oc-upgrade status` says whether the enabled ones match the OpenClaw
