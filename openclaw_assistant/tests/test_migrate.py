@@ -3128,6 +3128,89 @@ class TestCronKeyCopyForecast(unittest.TestCase):
                                            "where": "config", "pending": True}])
 
 
+class TestCronKeyAutofix(unittest.TestCase):
+    """decisions.md addendum 2026-11-05: the gate sets models.providers.<p>.auth "api-key" itself before doctor pass 1
+    for a provider whose literal openclaw.json key doctor copies and that a cron job uses (pure part)."""
+
+    KEY = "sk-synth-glm-autofix"
+
+    def cfg(self):
+        return {"models": {"providers": {
+            "glm": {"baseUrl": "http://127.0.0.1:8000/v1", "apiKey": self.KEY},
+            "tok": {"apiKey": self.KEY, "auth": "token"},
+            "cat": {"baseUrl": "http://127.0.0.1:8002/v1"},
+            "My.Glm": {"apiKey": self.KEY},
+            "acct": {"apiKey": self.KEY}}}}
+
+    def key_fix(self, *provs, where="config"):
+        return [{"provider": p, "path": m.config_path(p), "auth": None, "where": where, "pending": True}
+                for p in provs]
+
+    def test_which_providers_are_fixed(self):
+        cfg = self.cfg()
+        snap = copy.deepcopy(cfg)
+        seen = []
+
+        def own(cand):
+            seen.append(dict(cand))
+            return {"acct"}
+        kf = self.key_fix("glm", "tok", "my.glm", "acct") + self.key_fix("cat", where="catalog") \
+            + [{"provider": ""}, "x", None]
+        fix, kept = m.cron_key_autofix(cfg, kf, own)
+        self.assertEqual(fix, [{"provider": "glm", "entry": "glm", "path": "models.providers.glm.auth"},
+                               {"provider": "my.glm", "entry": "My.Glm", "path": 'models.providers["My.Glm"].auth'}])
+        self.assertEqual(kept, [{"provider": "tok", "path": "models.providers.tok.auth", "why": "auth"},
+                                {"provider": "cat", "path": "models.providers.cat.auth", "why": "catalog"},
+                                {"provider": "acct", "path": "models.providers.acct.auth", "why": "login"}])
+        # the stored-login check sees only the candidates, each with its literal key (compared in memory)
+        self.assertEqual(seen, [{"glm": self.KEY, "my.glm": self.KEY, "acct": self.KEY}])
+        self.assertNotIn(self.KEY, json.dumps([fix, kept]))
+        # a resume never repeats a provider this run set; a catalog-only provider never gets an entry
+        fix, kept = m.cron_key_autofix(cfg, self.key_fix("glm"), done={"glm"})
+        self.assertEqual((fix, kept), ([], [{"provider": "glm", "path": "models.providers.glm.auth", "why": "done"}]))
+        fix, kept = m.cron_key_autofix(cfg, self.key_fix("nope", where="catalog"))
+        self.assertEqual((fix, [k["why"] for k in kept]), ([], ["catalog"]))
+        # an entry whose key doctor does not copy (SecretRef, marker) is no candidate
+        cfg2 = {"models": {"providers": {"glm": {"apiKey": "${GLM_API_KEY}"}, "v": {"apiKey": "VLLM_API_KEY"}}}}
+        self.assertEqual(m.cron_key_autofix(cfg2, self.key_fix("glm", "v"))[0], [])
+        self.assertEqual(cfg, snap)
+
+    def test_set_provider_auth(self):
+        cfg = self.cfg()
+        snap = copy.deepcopy(cfg)
+        fix, _kept = m.cron_key_autofix(cfg, self.key_fix("glm", "my.glm"))
+        new, ledger = m.set_provider_auth(cfg, fix)
+        self.assertEqual(cfg, snap)  # pure
+        self.assertEqual(new["models"]["providers"]["glm"], dict(snap["models"]["providers"]["glm"], auth="api-key"))
+        self.assertEqual(new["models"]["providers"]["My.Glm"]["auth"], "api-key")
+        expect = copy.deepcopy(snap)
+        expect["models"]["providers"]["glm"]["auth"] = "api-key"
+        expect["models"]["providers"]["My.Glm"]["auth"] = "api-key"
+        self.assertEqual(new, expect)  # nothing else changes
+        self.assertEqual(ledger, [{"step": "C1", "path": "models.providers.glm.auth", "before": None, "after": "api-key"},
+                                  {"step": "C1", "path": 'models.providers["My.Glm"].auth', "before": None,
+                                   "after": "api-key"}])
+        # idempotent: an entry that has auth by now is left as it is
+        again, ledger = m.set_provider_auth(new, fix)
+        self.assertEqual((again, ledger), (new, []))
+
+    def test_auth_api_key_lifts_the_refusal_after_the_copy(self):
+        """research_d1 section 2: a literal key with auth "api-key" is not refused, also with doctor's copy stored."""
+        cfg = {"models": {"providers": {"glm": {"apiKey": self.KEY}}}}
+        copy_ = [{"id": "glm:default", "provider": "glm"}]
+        self.assertEqual(m.cron_ref_refusal(cfg, "glm", None, copy_), "profile")
+        new, _l = m.set_provider_auth(cfg, m.cron_key_autofix(cfg, self.key_fix("glm"))[0])
+        self.assertIsNone(m.cron_ref_refusal(new, "glm", None, copy_))
+        self.assertEqual(m.cron_ref_refusal(new, "glm", "glm:default", copy_), "profile")  # model@profile stays bound
+
+    def test_include_paths(self):
+        self.assertEqual(m.include_paths({"a": {"$include": "x.json5"}}), ["a.$include"])
+        self.assertEqual(m.include_paths({"a": [{"$include": "x"}]}), ["a[0].$include"])
+        self.assertEqual(m.include_paths({}, '{"x": {"$include" : "y"}}'), ["(raw text)"])
+        self.assertEqual(m.include_paths({"a": 1}, '{"a": 1}'), [])
+        self.assertEqual(m.include_paths(None), [])
+
+
 class TestPurity(unittest.TestCase):
     def test_all_transforms_leave_inputs_alone(self):
         before = spec_example()

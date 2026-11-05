@@ -1026,7 +1026,8 @@ configured; no longer part of the schema check), invalid heartbeat windows (the 
 doctor keeps them and then stops), the new codes in
 [HOLD codes added for the OpenClaw 2026.10.10 line](#hold-codes-added-for-the-openclaw-20261010-line),
 the export of [Skill Workshop proposals](#skill-workshop-proposals-openclaw-20261010), a
-report of [cron jobs without a recorded inference account](#cron-jobs-without-a-recorded-inference-account-openclaw-20261010),
+report of [cron jobs without a recorded inference account](#cron-jobs-without-a-recorded-inference-account-openclaw-20261010)
+(with one automatic `openclaw.json` fixup for providers whose literal key doctor stores as a login),
 and, after the gate, the [official plugin update](#official-plugins-follow-openclaws-version).
 Read the [known limits](#known-limits-with-openclaw-20261010-and-2026111) of that line
 before you update. With OpenClaw 2026.10.4 (an image built with
@@ -1126,10 +1127,10 @@ its next run and counts the rest).
 
 | Phase | What happens |
 |---|---|
-| 1 precheck | Read-only checks: runtime package, Node/SQLite, no other OpenClaw process, readable config, state not newer than the image, clean 2026.7 state, no symlinked state or workspace directory (a backup would hold only the link), model preflight, legacy files, sessions, pre-July-2026 leftovers (below), with OpenClaw 2026.11.1+ invalid `heartbeat.activeHours` windows (`config-heartbeat-hours`, hard), agent databases outside the configured agents (orphan, held, or registered for an agent that is no longer configured: information), free space in `/config` (including the Skill Workshop export), SQLite `quick_check`, SQLite foreign-key check (`PRAGMA foreign_key_check`, read-only: OpenClaw stops an agent database migration on any violation), npm reachable, an encrypted Home Assistant backup with this add-on (Supervisor API; see step 3 above). Information lines: the installed official plugins; with OpenClaw 2026.10.10+ also the Skill Workshop proposals, cron jobs without a recorded inference account (`WARN`) and the largest agent database and session. All findings are collected, then one HOLD if needed. |
+| 1 precheck | Read-only checks: runtime package, Node/SQLite, no other OpenClaw process, readable config, state not newer than the image, clean 2026.7 state, no symlinked state or workspace directory (a backup would hold only the link), model preflight, legacy files, sessions, pre-July-2026 leftovers (below), with OpenClaw 2026.11.1+ invalid `heartbeat.activeHours` windows (`config-heartbeat-hours`, hard), agent databases outside the configured agents (orphan, held, or registered for an agent that is no longer configured: information), free space in `/config` (including the Skill Workshop export), SQLite `quick_check`, SQLite foreign-key check (`PRAGMA foreign_key_check`, read-only: OpenClaw stops an agent database migration on any violation), npm reachable, an encrypted Home Assistant backup with this add-on (Supervisor API; see step 3 above). Information lines: the installed official plugins; with OpenClaw 2026.10.10+ also the Skill Workshop proposals, cron jobs without a recorded inference account (`WARN`), the config fixup the gate makes before doctor pass 1 for them (`1/8 config fixup: will set …`) and the largest agent database and session. All findings are collected, then one HOLD if needed. |
 | 2 cleanup | Transient SQLite sidecars, legacy Telegram caches and pre-July-2026 files whose content is already in SQLite are moved to `/config/.openclaw-upgrade/gate/quarantine/<run>/` (kept, listed in the log; with OpenClaw 2026.10.5+ also the retired runtime files OpenClaw already imported, with the proof in the log and in the quarantine's `MANIFEST.json`). |
 | 3 pre-migrate | `plugins.installs` is removed from `openclaw.json` when its records are in the SQLite plugin index. For legacy `openai-codex/…` refs: wildcards → explicit models; these refs keep the OpenClaw runtime they used on 2026.7. With OpenClaw 2026.10.5+ an `openai-codex-responses` API id becomes `openai-chatgpt-responses` and the `cdpUrl` of an extension browser profile is removed, as 2026.10.4 doctor did. |
-| 4–6 doctor | With OpenClaw 2026.10.10+ the gate first exports every Skill Workshop proposal ([below](#skill-workshop-proposals-openclaw-20261010)). Then `openclaw doctor --fix --non-interactive` twice (a third time only if the second still changed the config), each with a time limit and a progress line every minute; scoped fixups in between. Canonical `openai/*` refs keep their runtime (Codex app-server by default, as on 2026.7; an `agentRuntime` pin on an `openai/…` entry is kept). A model used both as `openai-codex/<model>` and as `openai/<model>` gets one route in 2026.9+: the precheck holds with the acceptable code `models-route-collision`. Agent databases doctor "held back" (acceptable `doctor-held-back`), plugin data upgrades still "unfinished", login renames still deferred and a dreaming cron inspection still pending after the last pass hold. With `glm_thinking_levels` on, GLM models are switched to thinking levels after the fixups (below). Each pass line counts the SQLite copies doctor saved in that pass (full `.bak`, or table-scoped `.scoped.bak` from 2026.10.10); they are not the rollback point and are deleted with the doctor captures ([Automatic deletion](#automatic-deletion-gate_cleanup_hours)). With OpenClaw 2026.10.5+ a doctor warning about retired files it left unchanged holds (acceptable `doctor-retired-warning`). With OpenClaw 2026.11.1+ a pass that ends with "Doctor blocked; required repairs remain incomplete." (exit 1) holds with `doctor-blocked`, whose reason lists doctor's findings. |
+| 4–6 doctor | With OpenClaw 2026.10.10+ the gate first exports every Skill Workshop proposal ([below](#skill-workshop-proposals-openclaw-20261010)) and makes its one cron config fixup: `models.providers.<p>.auth = "api-key"` in `openclaw.json` for a provider whose literal key doctor would store as a login and that an enabled cron job uses (`4/8 config fixup: …`, [below](#cron-jobs-without-a-recorded-inference-account-openclaw-20261010)). Then `openclaw doctor --fix --non-interactive` twice (a third time only if the second still changed the config), each with a time limit and a progress line every minute; scoped fixups in between. Canonical `openai/*` refs keep their runtime (Codex app-server by default, as on 2026.7; an `agentRuntime` pin on an `openai/…` entry is kept). A model used both as `openai-codex/<model>` and as `openai/<model>` gets one route in 2026.9+: the precheck holds with the acceptable code `models-route-collision`. Agent databases doctor "held back" (acceptable `doctor-held-back`), plugin data upgrades still "unfinished", login renames still deferred and a dreaming cron inspection still pending after the last pass hold. With `glm_thinking_levels` on, GLM models are switched to thinking levels after the fixups (below). Each pass line counts the SQLite copies doctor saved in that pass (full `.bak`, or table-scoped `.scoped.bak` from 2026.10.10); they are not the rollback point and are deleted with the doctor captures ([Automatic deletion](#automatic-deletion-gate_cleanup_hours)). With OpenClaw 2026.10.5+ a doctor warning about retired files it left unchanged holds (acceptable `doctor-retired-warning`). With OpenClaw 2026.11.1+ a pass that ends with "Doctor blocked; required repairs remain incomplete." (exit 1) holds with `doctor-blocked`, whose reason lists doctor's findings. |
 | 7 postconditions | Schema versions (with OpenClaw 2026.10.10+ the stores OpenClaw keeps from deleted agents that are not configured are listed, not required: the gateway does not open them), `config validate`, `doctor --lint`, no legacy refs, runtime of migrated refs, `models status`, sessions. With 2026.10.10+ also: the migrated cron jobs are read again for the cron report, and a `WARN` if doctor kept the Skill Workshop proposal storage. |
 | 8 pins | Keeps 2026.7 defaults where you have not set the key (see the 0.5.94-full1 changelog), recorded in `/config/.openclaw-upgrade/gate/pins-ledger.json` and never re-applied (`skills.workshop.approvalPolicy` only with OpenClaw versions that still have Skill Workshop proposals, before 2026.10.10). |
 
@@ -1227,7 +1228,7 @@ precheck. Only `doctor-retired-warning` and `doctor-blocked` come after a doctor
 `sqlite-fk-violation`, `orphan-agent-db` and `agent-db-held` apply with every OpenClaw
 version (with 2026.10.4, `agent-db-held` needs a configured agent whose store a finished
 deletion keeps below its target, agent schema 24), the others only from the version
-named. Cron jobs never hold: the gate only reports them
+named. Cron jobs never hold: the gate reports them and makes only its one config fixup
 (see [Cron jobs without a recorded inference account](#cron-jobs-without-a-recorded-inference-account-openclaw-20261010)).
 
 **Agent databases outside the configured agents.** OpenClaw's doctor migrates the
@@ -1359,16 +1360,63 @@ itself only from 2026.11.5 (openclaw/openclaw#172792), and only for a stored log
 SDK credentials are no stored account, so no account can be recorded for them, by
 doctor or by you.
 
-The gate only reports this: it changes no cron job, no auth store and no provider
-setting, and never holds. With OpenClaw 2026.10.4 it prints nothing.
+**The gate fixes the literal-key case itself.** Before doctor pass 1 it sets
+`models.providers.<p>.auth` to `"api-key"` in `openclaw.json` for each provider `<p>`
+that meets all of these:
+
+- its `models.providers.<p>.apiKey` in `openclaw.json` is a literal key that doctor
+  stores as a login (placeholders such as `EMPTY` count, see above);
+- an enabled cron job without a recorded account uses `<p>`, as its model or as a fallback;
+- `models.providers.<p>.auth` is not set;
+- `<p>` has no stored login of its own: a subscription login, a token or another API
+  key. `"api-key"` would set such a login aside for every run of `<p>`, not only for
+  cron jobs. Doctor's copy of the same key does not count.
+
+OpenClaw then runs `<p>` on the configured key instead of doctor's copy, and the jobs
+keep running with their fallbacks. The rehearsal on 2026.10.10 verified this. `auth` is
+part of the provider schema in 2026.10.4, 2026.10.10 and 2026.11.1.
+
+What you see:
+
+- In the log, one line per provider: `[gate] 4/8 config fixup:
+  models.providers.glm.auth = "api-key" (doctor stores its literal key as a login;
+  without this OpenClaw 2026.11.1 refuses every unbound cron run on glm:
+  openclaw/openclaw#192195)`.
+- The precheck says `will set` and lists the jobs the fix keeps working (`kept working by
+  the automatic fix`). `oc-upgrade gate --dry-run`, `oc-upgrade gate --plan` and
+  `oc-upgrade check` say `would set` and write nothing.
+- The end of the run and `oc-upgrade status` repeat the line.
+
+How the gate writes it:
+
+- It writes `openclaw.json` the way its other fixups do: an atomic replace that keeps the
+  file mode and owner, and no new copy of the file. `config.pre-pass1.json` of the run
+  shows what doctor pass 1 started from.
+- The run journal (`cron_autofix`) and `transform-ledger.json` (step `C1`) record the change.
+- A resumed run never repeats it: if you remove the setting during a HOLD, it stays removed.
+- This is the only setting the gate changes for cron jobs. It never writes into OpenClaw's
+  databases or auth stores, and it never holds for this.
+- OpenClaw 2026.10.4 runs such a provider on the same key with or without the setting.
+  It differs only when a provider environment variable is set as well; the configured key
+  then wins. The encrypted backup that a rollback restores holds `openclaw.json` as it was.
+
+The gate leaves these cases to you (the `WARN` lines below stay):
+
+- `auth` is already set (`"oauth"`, `"token"`): only the SecretRef helps;
+- the key is only in an agent's model catalog: the gate creates no provider entry;
+- the provider has a stored login of its own: an info line says so;
+- `openclaw.json` uses `$include`: a `WARN` gives the command.
+
+Apart from this fixup the gate only reports: it changes no cron job and no auth store, and
+never holds. With OpenClaw 2026.10.4 it prints and changes nothing.
 
 - **Precheck** (also `oc-upgrade gate --dry-run`, and `oc-upgrade check` while a
   migration is pending): one `WARN [gate] cron job '<name>' (<id>): …` per enabled
   agent-turn job without a recorded account whose model or a fallback would use a stored
   login or AWS SDK credentials, counting the logins doctor creates from literal keys
-  during this migration. The models are chosen as OpenClaw does: the job's own model,
-  else a `subagents.model` (the agent's, then `agents.defaults.subagents.model`), else the
-  agent's model, else the default; the job's own fallbacks, else those of that
+  during this migration, after the gate's own config fixup (above). The models are
+  chosen as OpenClaw does: the job's own model, else a `subagents.model` (the agent's,
+  then `agents.defaults.subagents.model`), else the agent's model, else the default; the job's own fallbacks, else those of that
   `subagents.model`, of the agent or of the defaults (an agent whose model is the same
   `provider/model` string as the default keeps the default fallbacks). It names the
   affected models, each with what it would run on (a stored login, the literal key doctor
@@ -1386,7 +1434,8 @@ setting, and never holds. With OpenClaw 2026.10.4 it prints nothing.
   postconditions` line counts them, the end of the run repeats the warnings (with the
   provider lines), and `oc-upgrade status` lists them.
 - **What to do**, in this order:
-  1. **A literal key** (`provider <p>: …` line): after the start, run
+  1. **A literal key** (`provider <p>: …` line, where the gate could not set it itself,
+     see above): after the start, run
      `openclaw config set models.providers.<p>.auth api-key` (no restart needed;
      for a provider key that is no identifier, the path is quoted, for example
      `'models.providers["my.glm"].auth'`, as the line prints it). OpenClaw then runs

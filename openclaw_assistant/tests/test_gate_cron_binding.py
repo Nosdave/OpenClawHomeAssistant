@@ -406,12 +406,19 @@ D1_FIX = ("provider glm: its key in models.providers.glm.apiKey is a literal val
           "--strict-json)")
 
 
+def included(cfg):
+    """openclaw.json with $include: the gate writes nothing to it (no automatic config fixup)."""
+    return dict(json.loads(json.dumps(cfg)), **{"$include": "./extra.json5"})
+
+
 class CronKeyCopyGateTests(T.GateEnv):
     """Rehearsal D1: OpenClaw's doctor (also 2026.10.10 and 2026.11.1, in the gate's doctor --fix passes) copies a
     literal models.providers.<p>.apiKey (also EMPTY or NONE), or a literal key in an agent's model catalog, into its
     auth store; from then on these runtimes refuse every cron run on that provider without a recorded inference
     account. The precheck forecast counts that copy and names the fix (auth "api-key" or an env SecretRef) before
-    the binding; the postconditions, finalize and status give it too. Report only; synthetic key and jobs."""
+    the binding; the postconditions, finalize and status give it too. Where the gate can, it sets auth "api-key"
+    itself before doctor pass 1 (CronConfigFixupTests); the gate runs here use openclaw.json with $include, where it
+    cannot. Synthetic key and jobs."""
 
     def setUp(self):
         super().setUp()
@@ -439,7 +446,9 @@ class CronKeyCopyGateTests(T.GateEnv):
         return cfg
 
     def test_precheck_counts_doctors_copy_of_a_literal_key(self):
-        """The D1 regression: the glm-only job of agent haus was reported as working; 2026.10.10 refused every run."""
+        """The D1 regression: the glm-only job of agent haus was reported as working; 2026.10.10 refused every run.
+        Here openclaw.json uses $include, so the gate cannot set auth "api-key" itself (CronConfigFixupTests)."""
+        self.write_cfg(included(CFG_GLM))
         for rt in ("2026.10.10", "2026.11.1"):
             with self.subTest(runtime=rt):
                 self.set_runtime(rt, 22, 27)
@@ -552,7 +561,8 @@ class CronKeyCopyGateTests(T.GateEnv):
 
     def test_postconditions_finalize_and_status_after_doctors_copy(self):
         """After the migration doctor's copy glm:default is in the shared store (state DB); the literal key still
-        names the fix, before the binding as the last resort."""
+        names the fix, before the binding as the last resort (openclaw.json with $include: no automatic fixup)."""
+        self.write_cfg(included(CFG_GLM))
         store = json.loads(json.dumps(T.AUTH_1004_STORE))
         store["profiles"]["glm:default"] = {"type": "api_key", "provider": "glm", "key": GLM_KEY}
         self.doctor_script(state_uv=22, agent_uv=27, app_version="2026.10.10", sql=[
@@ -660,6 +670,413 @@ class CronKeyCopyGateTests(T.GateEnv):
         j = self.journal()
         self.assertNotIn("cron_binding", j)
         self.assertNotIn("cron_binding_forecast", j)
+
+
+FIXUP_WHY = ("doctor stores its literal key as a login; without this OpenClaw {rt} refuses every unbound cron run on "
+             "glm: openclaw/openclaw#192195")
+FIXUP = 'config fixup: models.providers.glm.auth = "api-key" (' + FIXUP_WHY + ")"
+FIXUP_PRE = ('config fixup: {verb} models.providers.glm.auth = "api-key" before doctor pass 1 (' + FIXUP_WHY + ")")
+FIXUP_KEPT = ("info: 3 enabled cron job(s) kept working by the automatic fix (models.providers.glm.auth = \"api-key\" "
+              "before doctor pass 1; otherwise OpenClaw {rt} refuses glm/glm-5 on doctor's copy of the literal key): "
+              "'Local digest' (job-local), 'Job Glm Haus' (job-glm-haus), 'Job Lan Fb' (job-lan-fb)")
+FIXUP_ENTRY = {"provider": "glm", "entry": "glm", "path": "models.providers.glm.auth", "old": None, "new": "api-key"}
+
+
+class CronConfigFixupTests(T.GateEnv):
+    """decisions.md addendum 2026-11-05 (rehearsal D1): glm is the owner's local model, its apiKey only a non-blank
+    placeholder, and its cron jobs must keep running on 2026.11.1 without the owner's help. On runtimes with the cron
+    refusal (2026.10.10+) the gate sets models.providers.<p>.auth "api-key" in openclaw.json before doctor pass 1 for
+    each provider whose literal openclaw.json key doctor copies and that an enabled cron job uses (auth unset, no
+    stored login of its own): one config fixup line per provider, journal cron_autofix, ledger step C1. Nothing in
+    OpenClaw's databases or auth stores, nothing on 2026.10.4. Synthetic key and jobs (10.4-layout state)."""
+
+    def setUp(self):
+        super().setUp()
+        T.make_1004_state(self.state, agents=("main", "haus"), content=True)
+        add_jobs(self.state, GLM_JOBS)
+        self.write_cfg(CFG_GLM)
+        self.cfgp = self.state / "openclaw.json"
+        os.chmod(self.cfgp, 0o640)
+        (self.upg / "gate").mkdir(parents=True, exist_ok=True)
+        (self.upg / "gate" / "migrated.json").write_text(json.dumps({"runtime": "2026.10.4", "mode": "bump"}))
+        self.set_runtime("2026.11.1", 22, 27)
+        self.hooks()
+        self.sdb = self.state / "state" / "openclaw.sqlite"
+
+    def doctor_copies_key(self, rt, **step):
+        """The fake doctor migrates and, like OpenClaw's, stores the literal glm key as glm:default (shared store)."""
+        store = json.loads(json.dumps(T.AUTH_1004_STORE))
+        store["profiles"]["glm:default"] = {"type": "api_key", "provider": "glm", "key": GLM_KEY}
+        self.doctor_script(state_uv=22, agent_uv=27, app_version=rt, sql=[
+            "INSERT OR REPLACE INTO config_machine_state VALUES ('auth.sharedStore', '{\"location\": \"state-db\"}', 0)",
+            "INSERT OR REPLACE INTO config_machine_state VALUES ('authProfiles.store', '%s', 0)" % json.dumps(store)],
+            **step)
+
+    def dry(self):
+        lines = []
+        self.assertEqual(self.quiet(G.dry_run, emit=lines.append), 0, "\n".join(lines))
+        return lines
+
+    def cfg_now(self):
+        return json.loads(self.cfgp.read_text())
+
+    def run_dir(self):
+        return self.upg / "gate" / "runs" / self.journal()["run_id"]
+
+    def gate_obj(self, journal=None):
+        """A Gate for a direct call of cron_config_fixup (a resumed run's state)."""
+        g = G.Gate(emit=lambda s: None)
+        g.pkg = C.runtime_package()
+        lines = []
+        g.emit = lines.append
+        g.j = dict({"run_id": "20261105T120000Z-abc123", "runtime": g.pkg["version"], "mode": "bump"}, **(journal or {}))
+        return g, lines
+
+    def key_holders(self):
+        """Files below /config that hold the synthetic key, relative to the config root."""
+        key = GLM_KEY.encode()
+        return sorted(str(x.relative_to(self.root)) for x in self.root.rglob("*")
+                      if x.is_file() and not x.is_symlink() and key in x.read_bytes())
+
+    def test_precheck_presents_the_jobs_as_kept_working(self):
+        """dry-run (also `oc-upgrade check`) and --plan say "would set" and write nothing; the jobs on glm are kept
+        working, not refused; what stays is the report of the stored-login fallbacks."""
+        for rt in ("2026.10.10", "2026.11.1"):
+            with self.subTest(runtime=rt):
+                self.set_runtime(rt, 22, 27)
+                before = (self.cfgp.read_bytes(), os.stat(self.cfgp).st_mode, sha(self.sdb))
+                lines = self.dry()
+                self.assertIn("[gate] 1/8 " + FIXUP_PRE.format(verb="would set", rt=rt), lines)
+                self.assertIn("[gate] 1/8 " + FIXUP_KEPT.format(rt=rt), lines)
+                self.assertNotIn("WARN [gate] " + D1_HAUS.format(rt=rt), lines)
+                self.assertFalse([ln for ln in lines if ln.startswith(("WARN [gate] provider glm:",
+                                                                       "WARN [gate] cron job 'Job Glm Haus'"))], lines)
+                self.assertIn("WARN [gate] cron job 'Job Lan Fb' (job-lan-fb): its model lan/q needs no stored login "
+                              f"and keeps working, but when it fails OpenClaw {rt} stops at the fallback openai/gpt-5.5 "
+                              "(stored login, no recorded inference account; openclaw/openclaw#192195) instead of "
+                              "trying further models", lines)
+                self.assertIn("WARN [gate] cron job 'Local digest' (job-local): its model glm/glm-5 needs no stored "
+                              f"login and keeps working, but when it fails OpenClaw {rt} stops at the fallback "
+                              "openai/gpt-5.5 (stored login, no recorded inference account; openclaw/openclaw#192195) "
+                              "instead of trying further models", lines)
+                self.assertIn("[gate]   cron config fixup: would set models.providers.glm.auth = \"api-key\" before "
+                              "doctor pass 1 (keeps 3 enabled cron job(s) on glm working; openclaw/openclaw#192195)",
+                              lines)
+                self.assertIn(f"[gate]   cron inference accounts: 3 enabled cron job(s) stop at a stored login on "
+                              f"OpenClaw {rt} (the WARN lines above, openclaw/openclaw#192195); report only, the gate "
+                              "changes nothing", lines)
+                self.assertIn("[gate] dry-run: the precheck would pass", lines)
+                d = self.plan()
+                self.assertEqual(d["rc"], 10)
+                self.assertIn("[gate] plan: " + FIXUP_PRE.format(verb="would set", rt=rt), self.out.splitlines())
+                # read-only: openclaw.json (bytes and mode), the databases, no journal or ledger
+                self.assertEqual((self.cfgp.read_bytes(), os.stat(self.cfgp).st_mode, sha(self.sdb)), before)
+                self.assertFalse((self.upg / "gate" / "journal.json").exists())
+                self.assertFalse(list((self.upg / "gate").rglob("transform-ledger.json")))
+                self.assertNotIn(GLM_KEY, "\n".join(lines) + self.out)
+
+    def check_gate_run(self, rt):
+        self.set_runtime(rt, 22, 27)
+        self.doctor_copies_key(rt)
+        cfg0 = self.cfg_now()
+        self.assertEqual(self.run_gate(), 0, self.out)
+        out = self.out.splitlines()
+        pre = out.index("[gate] 1/8 " + FIXUP_PRE.format(verb="will set", rt=rt))
+        self.assertIn("[gate] 1/8 " + FIXUP_KEPT.format(rt=rt), out)
+        fix = out.index("[gate] 4/8 " + FIXUP.format(rt=rt))
+        pass1 = next(i for i, ln in enumerate(out) if ln.startswith("[gate] 4/8 doctor pass 1 started"))
+        self.assertLess(pre, fix)
+        self.assertLess(fix, pass1)
+        self.assertEqual(sum(1 for ln in out if "config fixup: models.providers" in ln), 1)  # pass 2: nothing again
+        # openclaw.json: only auth added (doctor sets meta.lastTouchedVersion); mode kept; pass 1 started with it
+        cfg1 = self.cfg_now()
+        self.assertEqual(cfg1["models"]["providers"]["glm"]["auth"], "api-key")
+        expect = json.loads(json.dumps(cfg0))
+        expect["models"]["providers"]["glm"]["auth"] = "api-key"
+        expect["meta"] = cfg1["meta"]
+        self.assertEqual(cfg1, expect)
+        self.assertEqual(stat_mode(self.cfgp), 0o640)
+        rd = self.run_dir()
+        self.assertEqual(json.loads((rd / "config.pre-pass1.json").read_text())["models"]["providers"]["glm"]["auth"],
+                         "api-key")
+        j = self.journal()
+        applied = j["cron_autofix"]["applied"]
+        self.assertEqual([{k: a[k] for k in FIXUP_ENTRY} for a in applied], [FIXUP_ENTRY])
+        self.assertEqual((applied[0]["reason"], applied[0]["phase"]), (FIXUP_WHY.format(rt=rt), "doctor1"))
+        self.assertNotIn("pending", j["cron_autofix"])
+        led = json.loads((rd / "transform-ledger.json").read_text())
+        self.assertIn({"step": "C1", "path": "models.providers.glm.auth", "before": None, "after": "api-key"}, led)
+        # the precheck forecast shows the state after the fixup; the jobs it keeps are listed with it
+        fc = j["cron_binding_forecast"]
+        self.assertEqual(fc["autofix"], [{"provider": "glm", "path": "models.providers.glm.auth",
+                                          "jobs": ["job-local", "job-glm-haus", "job-lan-fb"]}])
+        self.assertEqual(fc["key_fix"], [])
+        # the postcheck reads doctor's real copy (glm:default in the shared store): no glm job is refused
+        self.assertIn("glm:default", self.sdb.read_bytes().decode("utf-8", "replace"))
+        rec = j["cron_binding"]
+        self.assertEqual(rec["key_fix"], [])
+        self.assertEqual([(a["id"], a["refs"]) for a in rec["affected"]],
+                         [("job-morning", ["openai/gpt-5.5", "anthropic/claude-sonnet-4-6"]),
+                          ("job-local", ["openai/gpt-5.5"]), ("job-lan-fb", ["openai/gpt-5.5"])])
+        self.assertFalse([ln for ln in out if "provider glm:" in ln])
+        done = ("info: config fixup of this run: models.providers.glm.auth = \"api-key\" (before doctor pass 1): "
+                f"OpenClaw {rt} runs glm on the configured key, so its unbound cron runs on glm are not refused on "
+                "doctor's copy (openclaw/openclaw#192195); transform-ledger.json step C1")
+        fin = out.index("[gate] " + done)
+        self.assertLess(fin, next(i for i, ln in enumerate(out) if ln.startswith("[gate] done: MIGRATED")))
+        st = G.status_lines()
+        self.assertIn("  " + done.removeprefix("info: "), st)
+        # no key value in any output, journal, ledger or event log; no new plaintext copy of openclaw.json: the key
+        # is only in openclaw.json, doctor's copy (state DB) and the run's documented config copies
+        events = (rd / "events.log").read_text()
+        for blob in (self.out, json.dumps(j), json.dumps(led), "\n".join(st), events):
+            self.assertNotIn(GLM_KEY, blob)
+        rid = j["run_id"]
+        allowed = {".openclaw/openclaw.json", ".openclaw/state/openclaw.sqlite"}
+        holders = [h for h in self.key_holders() if h not in allowed]
+        self.assertTrue(holders)
+        for h in holders:
+            self.assertRegex(h, rf"\A\.openclaw-upgrade/gate/runs/{rid}/config\.[a-z0-9-]+\.json\Z")
+        self.assertFalse(list(self.state.glob(".openclaw.json.*")))  # no temp file left behind
+
+    def test_gate_run_sets_auth_before_doctor_pass_1_on_1111(self):
+        self.check_gate_run("2026.11.1")
+
+    def test_gate_run_sets_auth_before_doctor_pass_1_on_1010(self):
+        self.check_gate_run("2026.10.10")
+
+    def test_resume_does_not_repeat_it(self):
+        """Doctor pass 1 fails after the fixup (HOLD); the user even removes the setting by hand; `oc-upgrade retry`
+        resumes before pass 1 and leaves it to the report: one journal entry, one config fixup line in all."""
+        self.doctor_copies_key("2026.11.1", rc=1)
+        self.assertEqual(self.run_gate(), 20, self.out)
+        first = self.out
+        self.assertIn("[gate] 4/8 " + FIXUP.format(rt="2026.11.1"), first.splitlines())
+        self.assertEqual(self.journal()["status"], "hold")
+        cfg = self.cfg_now()
+        self.assertEqual(cfg["models"]["providers"]["glm"]["auth"], "api-key")
+        del cfg["models"]["providers"]["glm"]["auth"]
+        self.write_cfg(cfg)
+        self.doctor_copies_key("2026.11.1")
+        self.assertEqual(self.quiet(G.retry_cmd, []), 0)
+        self.assertEqual(self.run_gate(), 0, self.out)
+        self.assertNotIn("config fixup", self.out.replace("config fixup of this run", ""))
+        self.assertNotIn("auth", self.cfg_now()["models"]["providers"]["glm"])
+        j = self.journal()
+        self.assertEqual([a["provider"] for a in j["cron_autofix"]["applied"]], ["glm"])
+        # the setting is gone, so the postconditions report the refusal with the fix (report only)
+        self.assertIn("job-glm-haus", [a["id"] for a in j["cron_binding"]["affected"]])
+        self.assertTrue([ln for ln in self.out.splitlines() if ln.startswith("WARN [gate] provider glm:")
+                         and "openclaw config set models.providers.glm.auth api-key" in ln])
+
+    def test_interrupted_write_and_idempotence(self):
+        """A write cut off before its journal record ("pending") counts as applied when openclaw.json has it; one
+        that never reached the file is planned again; a second call changes nothing."""
+        entry = dict(FIXUP_ENTRY, reason=FIXUP_WHY.format(rt="2026.11.1"), phase="doctor1", at="2026-11-05T12:00:00Z")
+        cfg = self.cfg_now()
+        cfg["models"]["providers"]["glm"]["auth"] = "api-key"
+        self.write_cfg(cfg)
+        g, lines = self.gate_obj({"cron_autofix": {"pending": [entry]}})
+        g.cron_config_fixup("doctor1")
+        self.assertEqual(g.j["cron_autofix"], {"applied": [entry]})
+        self.assertEqual(lines, [])
+        led = json.loads((self.upg / "gate" / "runs" / g.j["run_id"] / "transform-ledger.json").read_text())
+        self.assertEqual(led, [{"step": "C1", "path": "models.providers.glm.auth", "before": None, "after": "api-key"}])
+        # the write never happened: planned again, written once
+        self.write_cfg(CFG_GLM)
+        g, lines = self.gate_obj({"cron_autofix": {"pending": [entry]}})
+        g.cron_config_fixup("doctor1")
+        self.assertEqual(lines, ["[gate] 4/8 " + FIXUP.format(rt="2026.11.1")])
+        self.assertEqual([{k: a[k] for k in FIXUP_ENTRY} for a in g.j["cron_autofix"]["applied"]], [FIXUP_ENTRY])
+        after = self.cfgp.read_bytes()
+        g.cron_config_fixup("doctor1")
+        g.cron_config_fixup("doctor2")
+        self.assertEqual((len(lines), self.cfgp.read_bytes(), len(g.j["cron_autofix"]["applied"])), (1, after, 1))
+
+    def test_before_pass_2_when_pass_1_ran_without_it(self):
+        """A run of an earlier add-on version whose pass 1 ran without the fixup: it comes before pass 2."""
+        g, lines = self.gate_obj({"phases_done": ["precheck", "cleanup", "doctor1", "fixups"]})
+        g.cron_config_fixup("doctor2")
+        self.assertEqual(lines, ["[gate] 6/8 " + FIXUP.format(rt="2026.11.1")])
+        self.assertEqual(g.j["cron_autofix"]["applied"][0]["phase"], "doctor2")
+        self.assertIn("(before doctor pass 2)", G.cron_fixup_done_lines(g.j)[0])
+
+    def test_write_failure_warns_and_never_holds(self):
+        """A failed write or an openclaw.json the gate cannot parse: openclaw.json unchanged, a WARN, no HOLD."""
+        g, lines = self.gate_obj()
+        before = self.cfgp.read_bytes()
+
+        def broken(_cfg):
+            raise OSError(28, "No space left on device")
+        g.write_config = broken
+        self.assertIsNone(g.cron_config_fixup("doctor1"))
+        self.assertEqual(lines, ["WARN [gate] 4/8 config fixup failed: openclaw.json could not be written (OSError: "
+                                 "[Errno 28] No space left on device); unchanged"])
+        self.assertEqual((g.j["cron_autofix"], self.cfgp.read_bytes()), ({"applied": []}, before))
+        # openclaw.json that is no strict JSON (JSON5 comment): nothing written, a WARN
+        text = self.cfgp.read_text().replace("{", "{\n  // edited by hand", 1)
+        self.cfgp.write_text(text)
+        g, lines = self.gate_obj()
+        g.cron_config_fixup("doctor1")
+        self.assertEqual(len(lines), 1)
+        self.assertTrue(lines[0].startswith("WARN [gate] 4/8 config fixup skipped: openclaw.json cannot be read ("),
+                        lines)
+        self.assertEqual((self.cfgp.read_text(), "cron_autofix" in g.j), (text, False))
+
+    def test_auth_already_set_is_left_alone(self):
+        """auth "oauth"/"token": no write; the precheck keeps the WARN with the SecretRef advice."""
+        for auth in ("oauth", "token"):
+            with self.subTest(auth=auth):
+                cfg = json.loads(json.dumps(CFG_GLM))
+                cfg["models"]["providers"]["glm"]["auth"] = auth
+                self.write_cfg(cfg)
+                lines = self.dry()
+                self.assertFalse([ln for ln in lines if "config fixup" in ln], lines)
+                fix = next(ln for ln in lines if ln.startswith("WARN [gate] provider glm:"))
+                self.assertIn(f"give the key as an env SecretRef: a gateway_env_vars entry, then openclaw config set "
+                              f"models.providers.glm.apiKey '{G.CRON_ENV_REF}' --strict-json (models.providers.glm.auth "
+                              f"\"{auth}\" stays)", fix)
+        before = self.cfgp.read_bytes()
+        self.doctor_copies_key("2026.11.1")
+        self.assertEqual(self.run_gate(), 0, self.out)
+        self.assertNotIn("config fixup", self.out)
+        self.assertEqual(self.cfg_now()["models"]["providers"]["glm"]["auth"], "token")
+        self.assertEqual(json.loads((self.run_dir() / "config.pre-pass1.json").read_bytes()), json.loads(before))
+        self.assertNotIn("cron_autofix", self.journal())
+
+    def test_catalog_only_key_is_left_alone(self):
+        """A key only in an agent's models.json: no provider entry is created; the WARN says to declare it."""
+        cfg = json.loads(json.dumps(CFG_GLM))
+        cfg["models"]["providers"]["glm"]["auth"] = "api-key"
+        self.write_cfg(cfg)
+        add_jobs(self.state, [("job-cat", {"agentId": "haus", "sessionTarget": "isolated",
+                                           "payload": {"kind": "agentTurn", "message": PROMPT, "model": "cat/m",
+                                                       "fallbacks": []}})], start=50)
+        (self.state / "agents" / "haus" / "agent" / "models.json").write_text(
+            '{"providers": {"cat": {"apiKey": "sk-synthetic-cat-0000"}}}')
+        lines = self.dry()
+        self.assertFalse([ln for ln in lines if "config fixup" in ln], lines)
+        self.assertTrue([ln for ln in lines if ln.startswith("WARN [gate] provider cat: an agent's model catalog")])
+        before = self.cfgp.read_bytes()
+        self.assertEqual(self.run_gate(), 0, self.out)
+        self.assertNotIn("config fixup", self.out)
+        self.assertNotIn("cat", self.cfg_now()["models"]["providers"])
+        self.assertEqual(json.loads((self.run_dir() / "config.pre-pass1.json").read_bytes()), json.loads(before))
+        self.assertNotIn("cron_autofix", self.journal())
+        self.assertNotIn("sk-synthetic-cat-0000", self.out + json.dumps(self.journal()))
+
+    def test_no_enabled_cron_job_uses_the_provider(self):
+        cfg = json.loads(json.dumps(CFG_GLM))
+        cfg["agents"]["defaults"]["model"] = {"primary": "lan/q", "fallbacks": ["openai/gpt-5.5"]}
+        self.write_cfg(cfg)
+        con = sqlite3.connect(str(self.sdb))
+        con.execute("UPDATE cron_jobs SET enabled=0 WHERE job_id IN ('job-glm-haus', 'job-lan-fb')")
+        con.commit()
+        con.close()
+        lines = self.dry()
+        self.assertFalse([ln for ln in lines if "config fixup" in ln or "provider glm" in ln], lines)
+        before = self.cfgp.read_bytes()
+        self.assertEqual(self.run_gate(), 0, self.out)
+        self.assertNotIn("config fixup", self.out)
+        self.assertNotIn("auth", self.cfg_now()["models"]["providers"]["glm"])
+        self.assertEqual(json.loads((self.run_dir() / "config.pre-pass1.json").read_bytes()), json.loads(before))
+        self.assertNotIn("cron_autofix", self.journal())
+
+    def test_own_stored_login_is_left_alone(self):
+        """auth "api-key" would set a provider's own login aside for every run (here an OAuth login next to a literal
+        openai key): no fixup, an info line; doctor's copy of the same key (an earlier doctor run) is no own login."""
+        cfg = json.loads(json.dumps(CFG_GLM))
+        cfg["models"]["providers"]["openai"] = {"apiKey": "sk-synthetic-openai-0000"}
+        self.write_cfg(cfg)
+        adb = self.state / "agents" / "main" / "agent" / "openclaw-agent.sqlite"
+        store = json.loads(json.dumps(T.AUTH_1004_STORE))
+        store["profiles"]["glm:default"] = {"type": "api_key", "provider": "glm", "key": GLM_KEY}  # earlier copy
+        con = sqlite3.connect(str(adb))
+        con.execute("UPDATE auth_profile_store SET store_json=? WHERE store_key='primary'", (json.dumps(store),))
+        con.commit()
+        con.close()
+        lines = self.dry()
+        self.assertIn("[gate] 1/8 " + FIXUP_PRE.format(verb="would set", rt="2026.11.1"), lines)
+        self.assertIn("[gate] 1/8 info: no automatic config fixup for openai: it has a stored login of its own (a "
+                      "subscription login, a token or another API key), which models.providers.openai.auth = "
+                      "\"api-key\" would set aside for every run of openai, not only for cron; the provider openai "
+                      "line says what you can do", lines)
+        self.assertTrue([ln for ln in lines if ln.startswith("WARN [gate] provider openai:")
+                         and "auth api-key" in ln])
+        self.assertFalse([ln for ln in lines if "would set models.providers.openai" in ln])
+        self.assertEqual(G.own_provider_logins(self.state, cfg, {"glm": GLM_KEY, "openai": "x"}), {"openai"})
+        # another key for glm, a declared non-api_key profile: an own login too
+        self.assertEqual(G.own_provider_logins(self.state, cfg, {"glm": "sk-synthetic-other"}), {"glm"})
+        decl = dict(cfg, auth={"profiles": {"glm:sub": {"provider": "glm", "mode": "oauth"}}})
+        self.assertEqual(G.own_provider_logins(self.state, decl, {"glm": GLM_KEY}), {"glm"})
+        self.assertEqual(G.own_provider_logins(self.state, cfg, {}), set())
+        self.assertEqual(self.run_gate(), 0, self.out)
+        provs = self.cfg_now()["models"]["providers"]
+        self.assertEqual((provs["glm"].get("auth"), provs["openai"].get("auth")), ("api-key", None))
+        self.assertNotIn("sk-synthetic-openai-0000", self.out + json.dumps(self.journal()))
+
+    def test_include_config_writes_nothing_and_warns(self):
+        """openclaw.json with $include: the gate cannot write it safely; a WARN gives the command, the D1 report
+        stays (the jobs on glm are refused once doctor copied the key)."""
+        self.write_cfg(included(CFG_GLM))
+        warn = ("config fixup skipped: openclaw.json uses $include ($include), so the gate does not write it; after "
+                "the start run: openclaw config set models.providers.glm.auth api-key (" + FIXUP_WHY + ")")
+        lines = self.dry()
+        self.assertIn("WARN [gate] 1/8 " + warn.format(rt="2026.11.1"), lines)
+        self.assertIn("WARN [gate] " + D1_HAUS.format(rt="2026.11.1"), lines)
+        self.assertIn("WARN [gate] " + D1_FIX.format(rt="2026.11.1"), lines)
+        self.assertFalse([ln for ln in lines if "would set" in ln], lines)
+        self.plan()
+        self.assertIn("WARN [gate] plan: " + warn.format(rt="2026.11.1"), self.out.splitlines())
+        before = self.cfgp.read_bytes()
+        self.doctor_copies_key("2026.11.1")
+        self.assertEqual(self.run_gate(), 0, self.out)
+        self.assertIn("WARN [gate] 4/8 " + warn.format(rt="2026.11.1"), self.out.splitlines())
+        self.assertEqual((self.run_dir() / "config.pre-pass1.json").read_bytes(), before)
+        self.assertNotIn("auth", self.cfg_now()["models"]["providers"]["glm"])
+        j = self.journal()
+        self.assertNotIn("cron_autofix", j)
+        self.assertEqual(j["cron_binding_forecast"]["autofix_skipped"],
+                         [{"provider": "glm", "path": "models.providers.glm.auth", "why": "include"}])
+        self.assertIn("job-glm-haus", [a["id"] for a in j["cron_binding"]["affected"]])
+        self.assertNotIn(GLM_KEY, self.out + json.dumps(j))
+
+    def test_status_of_a_run_that_stopped_before_doctor(self):
+        rec = {"runtime": "2026.11.1", "checked": 4, "affected": [],
+               "autofix": [{"provider": "glm", "path": "models.providers.glm.auth", "jobs": ["job-glm-haus"]}]}
+        st = G._status_cron({"cron_binding_forecast": rec})
+        self.assertEqual(st[0], "  config fixup before doctor pass 1: would set models.providers.glm.auth = "
+                         "\"api-key\" (" + FIXUP_WHY.format(rt="2026.11.1") + "; precheck forecast)")
+        self.assertEqual(G._status_cron({"cron_binding_forecast": rec, "doctor_started": True})[:1],
+                         ["  cron jobs without a recorded inference account (openclaw/openclaw#192195, OpenClaw "
+                          "2026.11.1, precheck forecast): none affected (4 checked)"])
+
+    def test_nothing_on_1004(self):
+        """2026.10.4 (no cron refusal): no line, no write, no journal key, no ledger step."""
+        self.set_runtime("2026.10.4", 20, 24)
+        (self.upg / "gate" / "migrated.json").write_text(json.dumps({"runtime": "2026.9.9", "mode": "bump"}))
+        con = sqlite3.connect(str(self.sdb))
+        con.execute("PRAGMA user_version=19")
+        con.execute("UPDATE schema_meta SET schema_version=19, app_version='2026.9.9' WHERE meta_key='primary'")
+        con.commit()
+        con.close()
+        lines = self.dry()
+        self.assertFalse([ln for ln in lines if "config fixup" in ln], lines)
+        self.plan()
+        self.assertNotIn("config fixup", self.out)
+        before = self.cfgp.read_bytes()
+        self.assertEqual(self.run_gate(), 0, self.out)
+        self.assertNotIn("config fixup", self.out)
+        self.assertEqual((self.run_dir() / "config.pre-pass1.json").read_bytes(), before)
+        self.assertNotIn("auth", self.cfg_now()["models"]["providers"]["glm"])
+        self.assertNotIn("cron_autofix", self.journal())
+        led = C.load_json_or_none(self.run_dir() / "transform-ledger.json") or []
+        self.assertFalse([e for e in led if e.get("step") == "C1"])
+        self.assertFalse([ln for ln in G.status_lines() if "config fixup" in ln])
+
+
+def stat_mode(p):
+    return os.stat(p).st_mode & 0o777
 
 
 class LargeSessionInfoTests(T.GateEnv):

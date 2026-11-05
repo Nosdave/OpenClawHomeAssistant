@@ -1152,11 +1152,39 @@ def plan(apply=False, emit=out):
     elif d["rc"] == 10:
         run = (journal or {}).get("run_id") if d["action"] == "resume" else "new"
         emit(f"[gate] plan: {bits} -> gate {d['action']} mode={d.get('mode') or '-'} run={run} ({d['reason']})")
+        for line in plan_fixup_lines(d, gp):  # full5: the config fixup before a doctor pass (read-only)
+            emit(line)
     else:
         emit(f"[gate] plan: {bits} -> no gate ({d['reason']})")
     if apply:
         apply_bookkeeping(d)
     return d
+
+
+def plan_fixup_lines(d, gp):
+    """`gate --plan` with a gate run ahead (rc 10): the config fixup that run would make before its next doctor pass
+    (Gate.cron_config_fixup; runtime_caps cron_refusal), read-only. Nothing when the run has no doctor pass left or on
+    any error: planning never depends on it."""
+    try:
+        pkg, j = d.get("pkg") or {}, d.get("journal") or {}
+        caps = C.runtime_caps(pkg)
+        if not caps["cron_refusal"]:
+            return []
+        resume = d.get("action") == "resume"
+        if resume and "doctor2" in (j.get("phases_done") or []) and not (d.get("bk") or {}).get("redo_doctor"):
+            return []
+        done = {a.get("provider") for a in (j.get("cron_autofix") or {}).get("applied") or []
+                if isinstance(a, dict)} if resume else set()
+        cfg, raw = C.read_json_strict(gp["CONFIG_PATH"], with_text=True)
+        plan_ = cron_fixup_plan(gp["STATE"], cfg, raw, pkg["version"], caps["cron_doctor_migration"], done=done)
+    except Exception:  # noqa: BLE001 - B11: a preview must not break planning
+        return []
+    rt = pkg["version"]
+    if plan_["include"]:
+        return [f"WARN [gate] plan: {cron_fixup_include_text(f, rt, plan_['include'])}" for f in plan_["fix"]]
+    when = "the next doctor pass" if resume and j.get("doctor_started") else "doctor pass 1"
+    return [f"[gate] plan: config fixup: would set {printable(f['path'])} = \"api-key\" before {when} "
+            f"({cron_fixup_why(f['provider'], rt)})" for f in plan_["fix"]]
 
 
 def apply_bookkeeping(d):
@@ -2631,8 +2659,10 @@ class Gate:
         """Precheck 11c (cron, report only): enabled agentTurn jobs whose models would use a stored auth profile or
         AWS SDK credentials without a recorded inference account (runtime_caps cron_refusal). WARN/info only, never
         a HOLD. The stored logins include the ones doctor creates during this migration from literal provider keys
-        (pending_copies; their key fix lines say how to keep the jobs). A HOLD would also make the wrapper refuse
-        the `config set` fix; if one is ever wanted, raise it here from rec["key_fix"] entries with "pending".
+        (pending_copies; their key fix lines say how to keep the jobs). The providers whose auth "api-key" the gate
+        sets itself before doctor pass 1 (cron_config_fixup) get a "config fixup: would set|will set" line, their
+        jobs one "kept working by the automatic fix" info line, and the report shows the state after the fixup
+        (journal: "autofix"); with $include in openclaw.json the gate writes nothing and WARNs the command instead.
 
         Before the first write only (a resumed run reports after doctor, cron_binding_postcheck). On a runtime
         whose doctor records the accounts itself (cron_doctor_migration) one info line; the jobs doctor leaves
@@ -2640,13 +2670,44 @@ class Gate:
         caps = self.caps()
         if not caps["cron_refusal"] or (self.j or {}).get("first_write_at"):
             return None
+        rt, dm, pn = self.pkg["version"], caps["cron_doctor_migration"], self.pn("precheck")
         try:
-            rec = cron_account_report(self.gp["STATE"], self.cfg, self.pkg["version"], caps["cron_doctor_migration"],
-                                      pending_copies=True)
+            rec = cron_account_report(self.gp["STATE"], self.cfg, rt, dm, pending_copies=True)
         except (sqlite3.Error, C.NodeQueryError, OSError, ValueError, TypeError) as exc:
             self.warn(f"could not check the cron jobs for their inference account ({type(exc).__name__}: "
                       f"{C.redact_text(str(exc))[:200]})")
             return None
+        # the automatic config fixup before doctor pass 1 (cron_config_fixup): the jobs it keeps working are no
+        # refusals, so the report shows the state after it
+        plan, after = {"fix": [], "kept": [], "include": []}, None
+        try:
+            plan = cron_fixup_plan(self.gp["STATE"], self.cfg, self.cfg_raw, rt, dm, rec=rec)
+            if plan["fix"] and not plan["include"]:
+                after = cron_account_report(self.gp["STATE"], mig().set_provider_auth(self.cfg, plan["fix"])[0], rt,
+                                            dm, pending_copies=True)
+        except (sqlite3.Error, C.NodeQueryError, OSError, ValueError, TypeError) as exc:
+            plan = {"fix": [], "kept": [], "include": []}
+            self.warn(f"{pn} config fixup: could not check the auth stores ({type(exc).__name__}: "
+                      f"{C.redact_text(str(exc))[:200]}); doctor pass 1 checks again")
+        if after is not None:
+            kept = cron_fixup_kept_jobs(rec, after, {f["provider"] for f in plan["fix"]})
+            for f in plan["fix"]:
+                self.say(f"{pn} config fixup: {'would set' if self.dry_run else 'will set'} {printable(f['path'])} = "
+                         f"\"api-key\" before doctor pass 1 ({cron_fixup_why(f['provider'], rt)})")
+            if kept:
+                self.say(f"{pn} info: {cron_fixup_kept_text(kept, plan['fix'], rt)}")
+            rec = dict(after, autofix=[{"provider": f["provider"], "path": f["path"],
+                                        "jobs": [str(a.get("id"))[:120] for a, refs in kept
+                                                 if any(r.split("/", 1)[0] == f["provider"] for r in refs)]}
+                                       for f in plan["fix"]])
+        elif plan["fix"]:
+            for f in plan["fix"]:
+                self.warn(f"{pn} {cron_fixup_include_text(f, rt, plan['include'])}")
+            rec = dict(rec, autofix_skipped=[{"provider": f["provider"], "path": f["path"], "why": "include"}
+                                             for f in plan["fix"]])
+        for k in plan["kept"]:
+            if k["why"] == "login":
+                self.say(f"{pn} info: {cron_fixup_login_text(k)}")
         self.facts["cron_binding_plan"] = rec
         if self.j is not None:
             self.j["cron_binding_forecast"] = rec
@@ -2665,6 +2726,83 @@ class Gate:
         if un:
             self.say(f"{self.pn('precheck')} info: {un}")
         return None
+
+    def cron_config_fixup(self, phase):
+        """Before doctor pass 1, and before pass 2 if pass 1 ran without it (a run of an earlier add-on version):
+        the automatic config fixup for openclaw/openclaw#192195 (decisions.md addendum 2026-11-05; runtime_caps
+        cron_refusal, so nothing on 2026.10.4). For each provider whose literal openclaw.json key doctor copies into
+        its auth store and that an enabled cron job uses (cron_fixup_plan), with no auth set and no stored login of
+        its own: models.providers.<p>.auth = "api-key" in openclaw.json. OpenClaw then runs <p> on the configured
+        key and does not refuse its unbound cron runs on doctor's copy.
+
+        The one write of the cron work: openclaw.json through write_config (atomic replace, mode and owner kept,
+        strict JSON as the gate reads it), never with $include (WARN with the command instead), never OpenClaw's
+        databases or auth stores, no new copy of openclaw.json (config.pre-pass1.json, taken right after, shows what
+        pass 1 starts from). No `config validate` before doctor pass 1: the pre-migration config may hold what only
+        doctor converts; the value is in the provider schema of every runtime since 2026.10.4, and pc-config
+        validates the result. Journal cron_autofix: "pending" before the write, "applied" after it ({provider, entry,
+        path, old None = absent, new, reason, phase, at}; a resume never repeats an applied provider), ledger step C1.
+        Never HOLDs: a failure leaves openclaw.json unchanged with a WARN."""
+        caps = self.caps()
+        if not caps["cron_refusal"]:
+            return None
+        rt, pn = self.pkg["version"], self.pn(phase)
+        rec = self.j.get("cron_autofix") if isinstance(self.j.get("cron_autofix"), dict) else {}
+        applied = [dict(a) for a in rec.get("applied") or [] if isinstance(a, dict) and a.get("provider")]
+        pending = [dict(a) for a in rec.get("pending") or [] if isinstance(a, dict) and a.get("provider")]
+        try:
+            cfg, raw = C.read_json_strict(self.gp["CONFIG_PATH"], with_text=True)
+        except C.ConfigReadError as exc:
+            self.warn(f"{pn} config fixup skipped: openclaw.json cannot be read ({C.redact_text(str(exc))[:200]})")
+            return None
+        if pending:  # cut off between the write and its journal record: applied when openclaw.json has it
+            provs = _cfg_get(cfg, "models", "providers")
+            applied += [a for a in pending if isinstance(provs, dict) and isinstance(provs.get(a.get("entry")), dict)
+                        and provs[a["entry"]].get("auth") == mig().CRON_FIXUP_AUTH]
+            self.j["cron_autofix"] = {"applied": applied}
+            if applied:
+                self.cron_fixup_ledger(applied)
+            self.save()
+        try:
+            plan = cron_fixup_plan(self.gp["STATE"], cfg, raw, rt, caps["cron_doctor_migration"],
+                                   done={a["provider"] for a in applied})
+        except (sqlite3.Error, C.NodeQueryError, OSError, ValueError, TypeError) as exc:
+            self.warn(f"{pn} config fixup skipped: could not check the cron jobs ({type(exc).__name__}: "
+                      f"{C.redact_text(str(exc))[:200]}); openclaw.json unchanged")
+            return None
+        if not plan["fix"]:
+            return None
+        if plan["include"]:
+            for f in plan["fix"]:
+                self.warn(f"{pn} {cron_fixup_include_text(f, rt, plan['include'])}")
+            return None
+        new_cfg, _ledger = mig().set_provider_auth(cfg, plan["fix"])
+        ents = [{"provider": f["provider"], "entry": f["entry"], "path": f["path"], "old": None,
+                 "new": mig().CRON_FIXUP_AUTH, "reason": cron_fixup_why(f["provider"], rt), "phase": phase,
+                 "at": C.utc_iso()} for f in plan["fix"]]
+        self.j["cron_autofix"] = {"applied": applied, "pending": ents}
+        self.save()
+        try:
+            self.write_config(new_cfg)
+        except (OSError, ValueError) as exc:
+            self.j["cron_autofix"] = {"applied": applied}
+            self.save()
+            self.warn(f"{pn} config fixup failed: openclaw.json could not be written ({type(exc).__name__}: "
+                      f"{C.redact_text(str(exc))[:200]}); unchanged")
+            return None
+        self.j["cron_autofix"] = {"applied": applied + ents}
+        self.cron_fixup_ledger(applied + ents)
+        self.save()
+        for a in ents:
+            self.say(f"{pn} config fixup: {printable(a['path'])} = \"{a['new']}\" ({a['reason']})")
+        return None
+
+    def cron_fixup_ledger(self, applied):
+        """transform-ledger.json step C1: one entry per config fixup of this run (no value but "api-key")."""
+        M = mig()
+        self.ledger_add([{"step": "C1", "path": M.fmt_path(["models", "providers", a["entry"], "auth"]),
+                          "before": None, "after": a.get("new") or M.CRON_FIXUP_AUTH}
+                         for a in applied if isinstance(a.get("entry"), str)], {"C1"})
 
     def skill_workshop_export(self):
         """Doctor pass 1 pre-pass hook (Skill Workshop): export every proposal before doctor retires them; runs
@@ -2800,8 +2938,10 @@ class Gate:
         return new
 
     def _finalize_cron_lines(self):
-        """Finalize, after the Skill Workshop lines (cron): WARN lines per affected job of the postconditions'
-        report (journal cron_binding)."""
+        """Finalize, after the Skill Workshop lines (cron): an info line per config fixup of this run (journal
+        cron_autofix), then WARN lines per affected job of the postconditions' report (journal cron_binding)."""
+        for line in cron_fixup_done_lines(self.j):
+            self.say(f"info: {line}")
         for line in cron_job_lines(self.j.get("cron_binding")):
             self.warn(line)
         un = cron_unconfigured_line(self.j.get("cron_binding"))
@@ -3090,6 +3230,7 @@ class Gate:
             if outside:  # beside agent databases outside the state dir (only journaled when there are any)
                 self.j["doctor_copies_outside_before"] = outside[:1000]
         self.save()
+        self.cron_config_fixup("doctor1")  # full5: auth "api-key" for cron jobs on a literal key (2026.10.10+)
         self.copy_once(p["CONFIG_PATH"], rd / "config.pre-pass1.json")
         if self.j.get("plugins_before") is None:
             self.j["plugins_before"] = plugin_snapshot(p["STATE"])
@@ -3293,6 +3434,7 @@ class Gate:
 
     def phase_doctor2(self):
         p, rd = self.gp, self.run_dir()
+        self.cron_config_fixup("doctor2")  # full5: only when pass 1 ran without it (earlier add-on version)
         sha0 = _sha_or_none(p["CONFIG_PATH"])
         ev = self.run_doctor_pass(2, "doctor2")
         self.after_later_pass(ev, 2)
@@ -4160,8 +4302,11 @@ def codex_cron_ids(state_db, provider="openai-codex"):
 
 # --- cron inference accounts (full5, openclaw/openclaw#192195; report only) ----------------------
 # Read-only. codex_cron_ids (F15) keeps its own 7.x column reader: a 10.x job on an openai/ model must not
-# mark Codex as in use (critic). Nothing here writes into OpenClaw's databases or auth stores.
+# mark Codex as in use (critic). Nothing here writes into OpenClaw's databases or auth stores. The one write is
+# the config fixup of Gate.cron_config_fixup (decisions.md addendum 2026-11-05): models.providers.<p>.auth
+# "api-key" in openclaw.json, before doctor pass 1, for a provider whose literal key doctor copies.
 CRON_REPORT_MAX = 20
+CRON_FIXUP_ISSUE = "openclaw/openclaw#192195"
 CRON_MANUAL_EDIT = ("openclaw automations edit <id> --model <provider/model>@<profileId>; it records the account, but "
                     "the job then runs only on that account's provider and its fallbacks to other providers are "
                     "refused (openclaw/openclaw#192463)")
@@ -4507,6 +4652,124 @@ def cron_job_lines(rec):
                      + (f"; OpenClaw records the inference account of {who} itself from 2026.11.5 (doctor migration, "
                         "openclaw/openclaw#172792)" if who else "") + ". " + remedy)
     return lines
+
+
+def own_provider_logins(state_dir, cfg, candidates):
+    """The providers of `candidates` ({provider (lower case): its literal models.providers.<p>.apiKey}) that have a
+    stored login of their own: a profile of that provider that is not an api_key profile holding exactly that key
+    (doctor's copy; credentialMatches of doctor-model-catalog-credentials.ts), in an auth store the gateway reads
+    (each configured or registered agent database's auth_profile_store, the shared store in the state database), or
+    an auth.profiles entry of openclaw.json for it in another mode than api_key. auth "api-key" would set such a
+    login aside for every run of the provider (a subscription login, a token, another key), not only for cron, so
+    the config fixup leaves that provider to the report. The values are compared in memory and never kept, printed
+    or journaled. Raises sqlite3.Error, C.NodeQueryError or OSError when a store cannot be read."""
+    state_dir = Path(state_dir)
+    state_db = state_dir / "state" / "openclaw.sqlite"
+    tables = table_names(state_db) if state_db.exists() else set()
+    targets, _orphans = agent_databases(state_dir, cfg, tables)
+    texts = []
+    for _aid, pth in targets:
+        if "auth_profile_store" in table_names(pth):
+            texts += [r[0] for r in q(pth, "SELECT store_json FROM auth_profile_store WHERE store_key='primary'")]
+    if "config_machine_state" in tables:  # read also while auth.sharedStore points elsewhere: only ever skips a fixup
+        texts += [r[0] for r in q(state_db, "SELECT value_json FROM config_machine_state "
+                                            "WHERE state_key='authProfiles.store'")]
+    own = set()
+    for text in texts:
+        try:
+            store = json.loads(text) if isinstance(text, str) else None
+        except ValueError:
+            store = None
+        profiles = store.get("profiles") if isinstance(store, dict) else None
+        for prof in profiles.values() if isinstance(profiles, dict) else []:
+            p = str(prof.get("provider") or "").strip().lower() if isinstance(prof, dict) else ""
+            if p in candidates and not (prof.get("type") == "api_key" and prof.get("key") == candidates[p]):
+                own.add(p)
+    declared = _cfg_get(cfg, "auth", "profiles")
+    for prof in declared.values() if isinstance(declared, dict) else []:
+        p = str(prof.get("provider") or "").strip().lower() if isinstance(prof, dict) else ""
+        if p in candidates and prof.get("mode") != "api_key":
+            own.add(p)
+    return own
+
+
+def cron_fixup_plan(state_dir, cfg, raw_text, runtime, doctor_migration=False, done=(), rec=None):
+    """The config fixup of Gate.cron_config_fixup on the current state (read-only): {"rec": the cron_account_report
+    with doctor's pending copies (`rec` when the caller has it), "fix" / "kept": oc_migrate.cron_key_autofix with
+    own_provider_logins, "include": the $include paths of openclaw.json (then the gate writes nothing)}. May raise
+    what cron_account_report and own_provider_logins raise."""
+    cfg = cfg if isinstance(cfg, dict) else {}
+    if rec is None:
+        rec = cron_account_report(state_dir, cfg, runtime, doctor_migration, pending_copies=True)
+    fix, kept = mig().cron_key_autofix(cfg, rec.get("key_fix"), lambda c: own_provider_logins(state_dir, cfg, c),
+                                       set(done))
+    return {"rec": rec, "fix": fix, "kept": kept, "include": mig().include_paths(cfg, raw_text) if fix else []}
+
+
+def cron_fixup_why(provider, runtime):
+    """The reason of a config fixup line (provider id only, never a key)."""
+    return (f"doctor stores its literal key as a login; without this OpenClaw {runtime or '2026.10.10+'} refuses every "
+            f"unbound cron run on {printable(provider)}: {CRON_FIXUP_ISSUE}")
+
+
+def cron_fixup_include_text(f, runtime, inc):
+    """WARN text for a fixup the gate does not make because openclaw.json uses $include."""
+    return (f"config fixup skipped: openclaw.json uses $include ({', '.join(printable(x) for x in inc[:4])}), so the "
+            f"gate does not write it; after the start run: openclaw config set {shlex.quote(f['path'])} api-key "
+            f"({cron_fixup_why(f['provider'], runtime)})")
+
+
+def cron_fixup_login_text(k):
+    """Info text for a provider the fixup leaves alone because it has a stored login of its own."""
+    p = printable(k["provider"])
+    return (f"no automatic config fixup for {p}: it has a stored login of its own (a subscription login, a token or "
+            f"another API key), which {printable(k['path'])} = \"api-key\" would set aside for every run of {p}, not "
+            f"only for cron; the provider {p} line says what you can do")
+
+
+def cron_fixup_kept_jobs(before, after, providers):
+    """[(affected entry of `before`, [refs])]: the jobs whose refs on `providers` are refused in `before` (the forecast
+    without the fixup) and not in `after` (with it)."""
+    later = {}
+    for a in (after or {}).get("affected") or []:
+        later.setdefault(a.get("id"), set()).update(a.get("refs") or [])
+    out = []
+    for a in (before or {}).get("affected") or []:
+        refs = [r for r in a.get("refs") or [] if "/" in r and r.split("/", 1)[0] in providers
+                and r not in later.get(a.get("id"), set())]
+        if refs:
+            out.append((a, refs))
+    return out
+
+
+def cron_fixup_kept_text(kept, fix, runtime):
+    """Info text: the cron jobs the automatic fix keeps working (job id, name and model refs only)."""
+    paths = ", ".join(printable(f["path"]) for f in fix)
+    models = ", ".join(dict.fromkeys(printable(r) for _a, refs in kept for r in refs))
+    jobs = ", ".join(f"'{printable(a.get('name'))[:80]}' ({printable(a.get('id'))[:80]})"
+                     for a, _r in kept[:CRON_REPORT_MAX])
+    more = f" and {len(kept) - CRON_REPORT_MAX} more" if len(kept) > CRON_REPORT_MAX else ""
+    return (f"{len(kept)} enabled cron job(s) kept working by the automatic fix ({paths} = \"api-key\" before doctor "
+            f"pass 1; otherwise OpenClaw {runtime} refuses {models} on doctor's copy of the literal key): {jobs}{more}")
+
+
+def _fixup_pass(phase):
+    return {"doctor1": 1, "doctor2": 2}.get(phase, 1)
+
+
+def cron_fixup_done_lines(j):
+    """The config fixups gate run `j` made (journal cron_autofix "applied"), for finalize and `oc-upgrade status`."""
+    rec = (j or {}).get("cron_autofix")
+    rt = printable((j or {}).get("runtime") or "2026.10.10+")
+    out = []
+    for a in rec.get("applied") or [] if isinstance(rec, dict) else []:
+        if isinstance(a, dict) and a.get("provider") and a.get("path"):
+            p = printable(a["provider"])
+            out.append(f"config fixup of this run: {printable(a['path'])} = \"{printable(a.get('new') or 'api-key')}\" "
+                       f"(before doctor pass {_fixup_pass(a.get('phase'))}): OpenClaw {rt} runs {p} on the configured "
+                       f"key, so its unbound cron runs on {p} are not refused on doctor's copy ({CRON_FIXUP_ISSUE}); "
+                       "transform-ledger.json step C1")
+    return out
 
 
 def _db_bytes(pth):
@@ -5875,21 +6138,28 @@ def _readiness_skills(g):
 
 
 def _readiness_cron(g):
-    """Readiness lines before the doctor budget (cron, full5, report only): from g.facts of the precheck."""
+    """Readiness lines before the doctor budget (cron, full5): from g.facts of the precheck. The config fixup the
+    gate would make before doctor pass 1 (cron_config_fixup), then the report-only line."""
     rec = g.facts.get("cron_binding_plan")
-    if not g.caps()["cron_refusal"] or not isinstance(rec, dict) or not rec.get("affected"):
+    if not g.caps()["cron_refusal"] or not isinstance(rec, dict):
         return []
+    fix = [a for a in rec.get("autofix") or [] if isinstance(a, dict) and a.get("provider")]
+    lines = [f"[gate]   cron config fixup: would set {printable(a['path'])} = \"api-key\" before doctor pass 1 "
+             f"(keeps {len(a.get('jobs') or [])} enabled cron job(s) on {printable(a['provider'])} working; "
+             f"{CRON_FIXUP_ISSUE})" for a in fix]
+    if not rec.get("affected"):
+        return lines
     aff = rec["affected"]
     n, rt, on = len(aff), g.pkg["version"], _cron_on(aff)
     if rec.get("doctor_migration"):
         which = " for a stored login, not for AWS SDK credentials" if _cron_kinds(aff)[1] else ""
-        return [f"[gate]   cron inference accounts: {n} enabled cron job(s) use {on} without a recorded "
-                f"account; OpenClaw {rt} doctor records it{which} (openclaw/openclaw#172792)"]
+        return lines + [f"[gate]   cron inference accounts: {n} enabled cron job(s) use {on} without a recorded "
+                        f"account; OpenClaw {rt} doctor records it{which} (openclaw/openclaw#172792)"]
     copied = sum(1 for a in aff if a.get("key_copy"))
-    return [f"[gate]   cron inference accounts: {n} enabled cron job(s) stop at {on} on OpenClaw {rt} "
-            + (f"({copied} because OpenClaw's doctor copies a literal provider key into its auth store; fix: "
-               "models.providers.<provider>.auth \"api-key\" or an env SecretRef) " if copied else "")
-            + "(the WARN lines above, openclaw/openclaw#192195); report only, the gate changes nothing"]
+    return lines + [f"[gate]   cron inference accounts: {n} enabled cron job(s) stop at {on} on OpenClaw {rt} "
+                    + (f"({copied} because OpenClaw's doctor copies a literal provider key into its auth store; fix: "
+                       "models.providers.<provider>.auth \"api-key\" or an env SecretRef) " if copied else "")
+                    + "(the WARN lines above, openclaw/openclaw#192195); report only, the gate changes nothing"]
 
 
 def hold_after_start(code, last_rc=None, emit=out):
@@ -6609,19 +6879,28 @@ def leftover_note(hours):
 def _status_cron(j):
     """`oc-upgrade status` lines of the gate run `j` (cron inference accounts, full5, report only): the
     postconditions' report, else the precheck forecast of a run that stopped before."""
+    fix = ["  " + x for x in cron_fixup_done_lines(j)]  # the config fixups this run made
     rec, when = j.get("cron_binding"), "after the migration"
     if not isinstance(rec, dict):
         rec, when = j.get("cron_binding_forecast"), "precheck forecast"
     if not isinstance(rec, dict):
-        return []
+        return fix
+    if not fix and when == "precheck forecast" and not j.get("doctor_started"):  # stopped before doctor pass 1
+        rt = rec.get("runtime")
+        fix = [f"  config fixup before doctor pass 1: would set {printable(a.get('path'))} = \"api-key\" "
+               f"({cron_fixup_why(a.get('provider'), rt)}; precheck forecast)"
+               for a in rec.get("autofix") or [] if isinstance(a, dict) and a.get("provider")]
+        fix += [f"  config fixup skipped for {printable(a.get('provider'))}: openclaw.json uses $include; after the "
+                f"start run: openclaw config set {shlex.quote(str(a.get('path')))} api-key"
+                for a in rec.get("autofix_skipped") or [] if isinstance(a, dict) and a.get("provider")]
     aff = [a for a in rec.get("affected") or [] if isinstance(a, dict)]
     head = (f"  cron jobs without a recorded inference account (openclaw/openclaw#192195, OpenClaw "
             f"{printable(rec.get('runtime'))}, {when}): ")
     un = cron_unconfigured_line(rec)  # D6
     if not aff:
-        return ([head + f"none affected ({rec['checked']} checked)"] if rec.get("checked") else []) \
+        return fix + ([head + f"none affected ({rec['checked']} checked)"] if rec.get("checked") else []) \
             + ([f"  {un}"] if un else [])
-    L = [head + f"{len(aff)} affected of {rec.get('checked', 0)} checked"]
+    L = fix + [head + f"{len(aff)} affected of {rec.get('checked', 0)} checked"]
     for a in aff[:CRON_REPORT_MAX]:
         refs = [printable(r) for r in a.get("refs") or []]
         aws = {printable(r) for r in a.get("aws_sdk") or []}

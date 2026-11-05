@@ -2430,6 +2430,69 @@ def cron_account_forecast(jobs, cfg, profiles_for, default_agent="main", copies_
     return res
 
 
+# The automatic config fixup for openclaw/openclaw#192195 (decisions.md, addendum 2026-11-05): a literal key with
+# models.providers.<p>.auth "api-key" makes OpenClaw 2026.10.10 and 2026.11.1 run <p> on the configured key, with
+# evidence "provider-config", so a cron run without a recorded inference account is not refused even after doctor
+# copied the key into its auth store (prepare-auth.ts providerBindingSuppressesProfiles; rehearsal logs/85).
+# The value is in the provider schema of 2026.10.4, 2026.10.10 and 2026.11.1 (config/zod-schema.core.ts
+# ModelProviderSchema.auth); on 2026.10.4 the configured key is what such a provider runs on anyway.
+CRON_FIXUP_AUTH = "api-key"
+
+
+def cron_key_autofix(cfg, key_fix, own_logins=None, done=()):
+    """The providers the gate sets models.providers.<p>.auth "api-key" for before doctor pass 1 (pure): (fix, kept).
+
+    key_fix: the "key_fix" entries of cron_account_forecast (providers whose literal key, as doctor's copy, is what a
+    refused cron ref runs on). A provider is fixed when its literal key is in openclaw.json (where "config"; also
+    when doctor copied it already), its models.providers entry (the first whose key matches case-insensitively, the
+    one OpenClaw reads) has no "auth" key, it has no stored login of its own and this run did not set it before.
+    own_logins(candidates) -> the providers (lower case) with a stored login that is not an api_key profile holding
+    exactly that literal key; candidates: {provider: the literal apiKey} (values only for that comparison).
+    fix: [{"provider", "entry" (the models.providers key as written), "path" ("models.providers.<entry>.auth" as
+    OpenClaw writes it)}]; kept: [{"provider", "path", "why"}], why "auth" (set to another value), "catalog" (the key
+    is only in a model catalog: no entry is created), "login" (auth "api-key" would set that login aside for every
+    run) or "done" (set by this run already; a resume never repeats it). No key value in the result."""
+    provs = _get(cfg, ["models", "providers"], None)
+    provs = provs if isinstance(provs, dict) else {}
+    cand, kept = [], []
+    for k in key_fix or []:
+        if not isinstance(k, dict) or not isinstance(k.get("provider"), str) or not k["provider"]:
+            continue
+        p = k["provider"]
+        entry = next((x for x, v in provs.items() if isinstance(x, str) and x.strip().lower() == p
+                      and isinstance(v, dict)), None)
+        pcfg = provs[entry] if entry is not None else None
+        path = (config_path(entry) if entry is not None else str(k.get("path") or config_path(p))) + ".auth"
+        if p in done:
+            why = "done"
+        elif k.get("where") != "config" or pcfg is None or not doctor_copies(pcfg.get("apiKey"), pcfg):
+            why = "catalog"
+        elif "auth" in pcfg:
+            why = "auth"
+        else:
+            cand.append({"provider": p, "entry": entry, "path": path})
+            continue
+        kept.append({"provider": p, "path": path, "why": why})
+    own = set(own_logins({c["provider"]: provs[c["entry"]]["apiKey"] for c in cand})) if cand and own_logins else set()
+    kept += [{"provider": c["provider"], "path": c["path"], "why": "login"} for c in cand if c["provider"] in own]
+    return [c for c in cand if c["provider"] not in own], kept
+
+
+def set_provider_auth(cfg, fix):
+    """(new config, ledger) with models.providers.<entry>.auth = "api-key" for each cron_key_autofix entry that still
+    has no auth (pure; the input is not changed). Ledger entries: step C1, path, before None (absent), after."""
+    new = copy.deepcopy(cfg)
+    provs = _get(new, ["models", "providers"], None)
+    ledger = []
+    for f in fix or []:
+        entry = provs.get(f.get("entry")) if isinstance(provs, dict) else None
+        if isinstance(entry, dict) and "auth" not in entry:
+            entry["auth"] = CRON_FIXUP_AUTH
+            ledger.append({"step": "C1", "path": fmt_path(["models", "providers", f["entry"], "auth"]),
+                           "before": None, "after": CRON_FIXUP_AUTH})
+    return new, ledger
+
+
 # --- state files (§7.1 item 6.3, §7.3) --------------------------------------------------------
 
 
@@ -4136,6 +4199,14 @@ def _find_key_paths(node, key, parts=None):
     return out
 
 
+def include_paths(cfg, raw_text=None):
+    """fmt_path of each $include key of openclaw.json; ["(raw text)"] when only its text has one."""
+    inc = [fmt_path(p) for p in _find_key_paths(cfg, "$include")] if isinstance(cfg, (dict, list)) else []
+    if not inc and isinstance(raw_text, str) and re.search(r'"\$include"\s*:', raw_text):
+        inc = ["(raw text)"]
+    return inc
+
+
 def config_precheck(cfg, raw_text):
     """Hard config findings: config-unreadable (not an object), config-includes ($include, B14),
     custom-session-store (non-empty session.store)."""
@@ -4144,9 +4215,7 @@ def config_precheck(cfg, raw_text):
         return [_finding("config-unreadable", "hard",
                          "openclaw.json must be a strict JSON object (JSON5 comments are unsupported)", phase)]
     findings = []
-    inc = [fmt_path(p) for p in _find_key_paths(cfg, "$include")]
-    if not inc and isinstance(raw_text, str) and re.search(r'"\$include"\s*:', raw_text):
-        inc = ["(raw text)"]
+    inc = include_paths(cfg, raw_text)
     if inc:
         findings.append(_finding(
             "config-includes", "hard",
