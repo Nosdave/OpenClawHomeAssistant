@@ -42,7 +42,7 @@ __all__ = [
     "cron_ref_refusal", "cron_ref_uses_stored_profile", "cron_account_forecast",
     "classify_state_files", "scan_sessions_files", "config_precheck", "flatten_paths",
     "retired_config_keys", "retired_config_rewrites", "retired_config_findings", "classify_retired_state",
-    "retired_db_findings",
+    "retired_db_findings", "heartbeat_hours_findings",
     "retired_tuning_dropped", "RETIRED_QUARANTINE_KINDS",
 ]
 
@@ -1965,9 +1965,10 @@ def auth_order_adjust(cfg, profiles, store_order):
 
 
 # --- cron inference accounts (openclaw/openclaw#192195; report only) ---------------------------------
-# OpenClaw 2026.10.10 and the 2026.11.1 candidate refuse a cron agent turn that has no recorded inference
-# account (job_json inferenceBinding, #172590) as soon as a prepared candidate would run on a stored auth
-# profile or a direct credential that is not a configured key (embedded-agent-runner/run/auth-plan.ts), and
+# OpenClaw 2026.10.10 and 2026.11.1 (the cron/auth sources are unchanged between them) refuse a cron agent turn
+# that has no recorded inference account (job_json inferenceBinding, #172590) as soon as a prepared candidate
+# would run on a stored auth profile or a direct credential that is not a configured key
+# (embedded-agent-runner/run/auth-plan.ts), and
 # the refusal stops the fallback chain (recordModelFallbackStop). OpenClaw's own doctor migration (#172792)
 # ships with 2026.11.5. The gate only forecasts which jobs are affected; it writes nothing.
 
@@ -3731,6 +3732,80 @@ def retired_config_findings(cfg, mode="from-7x", caps=None, runtime=None):
          "oc-upgrade retry" if mode == "from-7x" else
          "openclaw.json contains settings OpenClaw 2026.10 refuses (retired before July 2026): %s; remove them "
          "(or migrate them with OpenClaw %s), then oc-upgrade retry") % (_brief(paths, 10), bridge), "precheck")]
+
+
+# heartbeat.activeHours (2026.11.1 HeartbeatSchema, zod-schema.agent-runtime.ts:41-103): a strict object of optional
+# strings start/end/timezone; a non-empty start/end must be HH:MM 24h, 24:00 only as end. JS \d is ASCII and $ (no m
+# flag) is the end of the string: [0-9] and fullmatch.
+_HB_TIME_RE = re.compile(r"([01][0-9]|2[0-3]|24):([0-5][0-9])")
+_HB_ACTIVE_KEYS = ("start", "end", "timezone")
+
+
+def _heartbeat_hours_problems(heartbeat, parts):
+    """[(path, value, why)] for heartbeat.activeHours at `parts` (doctor: HeartbeatSchema.safeParse({activeHours}))."""
+    if not _rec(heartbeat) or "activeHours" not in heartbeat:
+        return []
+    active, base = heartbeat["activeHours"], parts + ["activeHours"]
+    if not _rec(active):
+        return [(fmt_path(base), active, "expected an object with start/end (HH:MM) and optional timezone")]
+    out = [(fmt_path(base + [k]), active[k], "unknown key") for k in active if k not in _HB_ACTIVE_KEYS]
+    out += [(fmt_path(base + [k]), active[k], "expected a string") for k in _HB_ACTIVE_KEYS
+            if k in active and not isinstance(active[k], str)]
+    for k in ("start", "end"):
+        raw = active.get(k)
+        if not isinstance(raw, str) or not raw:
+            continue
+        m = _HB_TIME_RE.fullmatch(raw)
+        if not m:
+            why = 'invalid time (use "HH:MM" 24h format)'
+        elif m.group(1) == "24" and m.group(2) != "00":
+            why = "invalid time (24:00 is the only allowed 24:xx value)"
+        elif m.group(1) == "24" and k == "start":
+            why = "invalid time (start cannot be 24:00)"
+        else:
+            continue
+        out.append((fmt_path(base + [k]), raw, why))
+    return out
+
+
+def heartbeat_hours_findings(cfg, caps=None, runtime=None):
+    """Hard `config-heartbeat-hours` for invalid heartbeat.activeHours windows (caps heartbeat_hours_kept, 2026.11.1+).
+
+    OpenClaw 2026.10.4 and 2026.10.10 doctor removed an invalid window (unrestricted hours afterwards); from 2026.11.1
+    it keeps it and reports it (openclaw/openclaw#186305, legacy-config-core-migrate.ts:55-73), so the final config
+    stays invalid and `doctor --fix` exits 1 with "Doctor blocked" (#187192) after it has started migrating. Port of
+    reportInvalidHeartbeatActiveHours: agents.defaults.heartbeat, then every record of the agent roster
+    (readAgentRosterProperty: agents.entries if present, else agents.list). Read-only; [] without the capability."""
+    if not _cap(caps, "heartbeat_hours_kept") or not _rec(cfg) or not _rec(cfg.get("agents")):
+        return []
+    agents = cfg["agents"]
+    probs = _heartbeat_hours_problems(_get(agents, ["defaults", "heartbeat"], None),
+                                      ["agents", "defaults", "heartbeat"])
+    kind = "entries" if "entries" in agents else "list" if "list" in agents else None
+    roster = agents.get(kind) if kind else None
+    if kind == "entries" and _rec(roster):
+        for key, agent in roster.items():
+            if _rec(agent):
+                probs += _heartbeat_hours_problems(agent.get("heartbeat"), ["agents", "entries", key, "heartbeat"])
+    elif kind == "list" and isinstance(roster, list):
+        for i, agent in enumerate(roster):
+            if _rec(agent):
+                probs += _heartbeat_hours_problems(agent.get("heartbeat"), ["agents", "list", i, "heartbeat"])
+    if not probs:
+        return []
+
+    def show(value):
+        text = json.dumps(value, ensure_ascii=False)
+        return text if len(text) <= 60 else text[:57] + "..."
+
+    items = ["%s=%s (%s)" % (path, show(value), why) for path, value, why in probs]
+    return [_finding(
+        "config-heartbeat-hours", "hard",
+        "openclaw.json has heartbeat windows that OpenClaw %s refuses: %s. Its doctor no longer removes them "
+        "(openclaw/openclaw#186305) and would stop with \"Doctor blocked\" after the migration has started. Fix: "
+        "set each to HH:MM (00:00-23:59, 24:00 only as end) or remove that activeHours (an agent then uses "
+        "agents.defaults.heartbeat.activeHours; without one, heartbeats run at any hour), then oc-upgrade retry"
+        % (runtime or "2026.11.1+", _brief(items, 6)), "precheck")]
 
 
 def _exact_cols(cols, expected):

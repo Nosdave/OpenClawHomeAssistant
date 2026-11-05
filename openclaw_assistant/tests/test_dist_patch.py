@@ -381,7 +381,8 @@ _HOTFIX_2026_10 = {"memory-search-half-life", "telegram-voice-text-first", "tele
                    "telegram-notice-live-guard", "telegram-fetch-fresh-audio"}
 EXPECTED_PATCHES = {
     "2026.10.4": _HOTFIX_2026_10,
-    "2026.10.10": _HOTFIX_2026_10,  # rehearsal of the 2026.11.1 line (not the image default)
+    "2026.10.10": _HOTFIX_2026_10,  # rehearsal stand-in for the 2026.11.1 line
+    "2026.11.1": _HOTFIX_2026_10,  # the image default (Dockerfile ARG OPENCLAW_VERSION)
 }
 
 

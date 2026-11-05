@@ -36,13 +36,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 # Install Node.js 24 LTS from NodeSource.
 # OpenClaw's package.json engines: >=24.16.0 <25 || >=26.1.0 for 2026.10.4 and
-# again from 2026.10.10 (also the 2026.11.1 candidate), which only recommends the
-# releases below (openclaw/openclaw#186589); 2026.10.6 to 2026.10.9 required them.
+# again from 2026.10.10 (also 2026.11.1), which only recommends the releases below
+# (openclaw/openclaw#186589); 2026.10.6 to 2026.10.9 required them.
 # On an older Node OpenClaw refuses to run or tries to install another Node.
 # The image requires >=24.22.1 <25 || >=26.12.1: the October 2026 Node security
 # releases, which reject TLS chains signed with the compromised certificate keys
-# (and the remedy OpenClaw 2026.10.10 names when Node's SQLite fails its
-# WAL-safety check).
+# (and the remedy OpenClaw 2026.10.10 and 2026.11.1 name when Node's SQLite fails
+# its WAL-safety check).
 # Use explicit keyring + apt source instead of setup_24.x pipe script for deterministic builds.
 RUN mkdir -p /etc/apt/keyrings \
     && curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key \
@@ -158,21 +158,30 @@ USER root
 #   NPM_BEFORE            npm resolves every dependency as of this UTC time.
 #                         openclaw ships no npm-shrinkwrap.json, so this limits
 #                         dependency drift between rebuilds. Must be after the
-#                         publish times of the pins (openclaw@2026.10.4
-#                         2026-10-15T23:58:28Z, its newest exact dependency
-#                         @openclaw/ai 23:43:35Z; @openclaw/brave-plugin@2026.10.4
-#                         2026-10-15T23:19:50Z is installed at runtime by run.sh
-#                         and checked here only for existence). Keep the exact
-#                         value the rehearsal image was built with: a different
-#                         cutoff can resolve a different transitive tree.
-# Rehearsal of the 2026.10.10 line (not released; the target is 2026.11.1):
-#   --build-arg OPENCLAW_VERSION=2026.10.10 --build-arg NPM_BEFORE=2026-11-03T03:00:00Z
-#   (openclaw@2026.10.10 2026-11-03T02:26:08Z, @openclaw/ai@2026.10.10 02:11:11Z,
-#   @openclaw/brave-plugin@2026.10.10 01:52:47Z, @openclaw/codex@2026.10.10 01:53:01Z,
-#   @openclaw/acpx@2026.10.10 01:53:22Z).
-ARG OPENCLAW_VERSION=2026.10.4
+#                         publish times of the pins (openclaw@2026.11.1, npm
+#                         latest, 2026-11-05T09:41:26Z, its newest exact
+#                         dependency @openclaw/ai@2026.11.1 09:16:05Z;
+#                         @openclaw/brave-plugin@2026.11.1 06:00:58Z is installed
+#                         at runtime by run.sh, @openclaw/codex@2026.11.1
+#                         05:59:04Z and @openclaw/acpx@2026.11.1 05:57:48Z by
+#                         OpenClaw's doctor or oc-upgrade plugins-sync; all three
+#                         are checked here only for existence). Keep the exact
+#                         value the release image is rehearsed and built with: a
+#                         different cutoff can resolve a different transitive tree.
+# Earlier pins, for rebuilding a previous image (e.g. to rehearse an update from it;
+# oc-patches/ keeps their patch sets until the release decides to drop them):
+#   2026.10.4 (0.5.94-full4): --build-arg OPENCLAW_VERSION=2026.10.4
+#     --build-arg NPM_BEFORE=2026-10-16T00:30:00Z (openclaw@2026.10.4
+#     2026-10-15T23:58:28Z, @openclaw/ai 23:43:35Z, @openclaw/brave-plugin
+#     23:19:50Z)
+#   2026.10.10 (rehearsal stand-in for the 2026.11.1 line, never shipped):
+#     --build-arg OPENCLAW_VERSION=2026.10.10 --build-arg NPM_BEFORE=2026-11-03T03:00:00Z
+#     (openclaw@2026.10.10 2026-11-03T02:26:08Z, @openclaw/ai@2026.10.10 02:11:11Z,
+#     @openclaw/brave-plugin@2026.10.10 01:52:47Z, @openclaw/codex@2026.10.10
+#     01:53:01Z, @openclaw/acpx@2026.10.10 01:53:22Z)
+ARG OPENCLAW_VERSION=2026.11.1
 ARG BRAVE_PLUGIN_VERSION=${OPENCLAW_VERSION}
-ARG NPM_BEFORE=2026-10-16T00:30:00Z
+ARG NPM_BEFORE=2026-11-05T09:45:00Z
 # Repeated here (cheap) so this part of the build also checks the Node range
 # when it is built on top of another base.
 RUN node -e 'const[a,b,c]=process.versions.node.split(".").map(Number);if(!((a===24&&(b>22||b===22&&c>=1))||(a===26&&(b>12||b===12&&c>=1))||a>26)){console.error("Node "+process.versions.node+" does not satisfy >=24.22.1 <25 || >=26.12.1");process.exit(1)}'
@@ -205,13 +214,14 @@ RUN npm config set fund false && npm config set audit false \
 # are updated to match; every inventory entry is re-checked.
 #  - memory search half-life 365 days: OpenClaw hard-codes the temporal-decay half-life of memory
 #    search at 30 days (dist/memory-search-*.mjs, //#region src/agents/memory-search.ts; no config
-#    key, doctor removes the old ones). 2026.10.4 checks minScore 0.35 after the decay, so dated
-#    memory notes older than ~45 days can never be found; from 2026.10.10 minScore is checked before
-#    the decay (openclaw/openclaw#168692) and the half-life only sets the ranking (and with it which
-#    eligible hits fit into the returned maxResults, default 6).
+#    key, doctor removes the old ones; still so in 2026.11.1). 2026.10.4 checks minScore 0.35 after
+#    the decay, so dated memory notes older than ~45 days can never be found; from 2026.10.10
+#    minScore is checked before the decay (openclaw/openclaw#168692) and the half-life only sets the
+#    ranking (and with it which eligible hits fit into the returned maxResults, default 6).
 #  - Telegram hotfix VOLT-TG-20261023 (send-, lifecycle-, execution-, fetch-*.mjs): long voice
 #    replies send their text first, no "couldn't confirm" notice while a reply is still being
-#    delivered, voice/audio uploads on a fresh connection without replay.
+#    delivered, voice/audio uploads on a fresh connection without replay. Not fixed upstream in
+#    2026.11.1 (the patched sources are unchanged from 2026.10.10).
 COPY oc_dist_patch.py /usr/local/lib/oc-addon/oc_dist_patch.py
 COPY oc-patches/ /usr/local/lib/oc-addon/oc-patches/
 RUN set -eu; \
@@ -245,13 +255,13 @@ RUN set -eu; \
 # ACP / ACPX harness: lets OpenClaw drive external coding agents (Codex, Claude Code)
 # via the Agent Client Protocol. Volt authenticates Anthropic + OpenAI via OAuth
 # (not API keys), so the harness must ship in the image. Codex is NOT bundled in
-# OpenClaw (2026.7.35 to 2026.10.10): it is the external @openclaw/codex plugin, and
+# OpenClaw (2026.7.35 to 2026.11.1): it is the external @openclaw/codex plugin, and
 # Brave and acpx are external plugins too; plugins live in the persistent state
 # (/config/.openclaw/npm/projects). acpx + the Claude Code CLI cover the
 # OAuth/ACP path. acpx auto-downloads the codex-acp / claude-agent-acp adapters
 # via npx on first use. OpenClaw's own ACP plugin (@openclaw/acpx) loads its own
-# pinned acpx library (2026.10.4: 0.19.1, 2026.10.10: 0.19.4), not this CLI; the
-# CLI is aligned with the 2026.10.10 line (0.19.4).
+# pinned acpx library (2026.10.4: 0.19.1, 2026.10.10 and 2026.11.1: 0.19.4), not
+# this CLI; the CLI is aligned with it (0.19.4).
 # Pinned (not floating) so an image rebuild cannot silently change the harness.
 RUN npm install -g acpx@0.19.4 @anthropic-ai/claude-code@2.1.283
 

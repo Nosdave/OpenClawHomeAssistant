@@ -164,6 +164,8 @@ ADVICE = {
                       "System > Backups), then oc-upgrade retry",
     "cleanup-failed": "check permissions under /config/.openclaw-upgrade, then oc-upgrade retry",
     "premigrate-failed": "check free space and permissions, then oc-upgrade retry",
+    "config-heartbeat-hours": "correct the listed heartbeat.activeHours values in openclaw.json (HH:MM, 24:00 only as "
+                              "end) or remove that activeHours, then oc-upgrade retry",
     "config-retired-keys": "change or remove the listed settings in openclaw.json as the reason says (every OpenClaw "
                            "2026.10 refuses them; OpenClaw 2026.7.35 of 0.5.93 does not use them), then oc-upgrade retry",
     "retired-state-outside": "move the listed pre-July-2026 files away by hand (they are in your backup), then oc-upgrade retry",
@@ -188,6 +190,10 @@ ADVICE = {
                                   ".bak or .scoped.bak over a database by hand), or oc-upgrade retry to let doctor "
                                   "try again",
     "doctor-incomplete": "oc-upgrade retry (doctor resumes from its last committed step)",
+    "doctor-blocked": "fix what doctor's [error] lines name (the reason lists them; oc-upgrade log shows each with its "
+                      "fix: hint): edit the openclaw.json values it rejects (openclaw config validate lists them; "
+                      "openclaw config set/unset are refused during a HOLD), or remove the blocker of a deferred "
+                      "migration, then oc-upgrade retry (doctor resumes from its last committed step)",
     "doctor-failed": "see oc-upgrade log, fix the reported check, then oc-upgrade retry",
     "doctor-timeout": "oc-upgrade retry (doctor resumes; it is not re-run automatically in the same start)",
     "doctor-interrupted": "oc-upgrade retry",
@@ -245,6 +251,12 @@ RETIRED_FORMAT_MARKERS = (
 # "Held agent <id> database ... (retained-by-deletion)" is an agent deleted with its files kept: not a problem
 # (docs/cli/doctor/state-migrations.md:171-174), so that line is ignored on rc 0.
 HELD_BACK_MARKERS = ("held back", "remain held")
+DOCTOR_BLOCKED_MARKER = "Doctor blocked; required repairs remain incomplete"
+# runFinalConfigValidationHealth findings (renderStructuredHealthFindings): "[error] <checkId>[ <path>] - <message>",
+# then "  fix: <hint>" (normalized to one line); checkIds core/doctor/final-config-validation or core/doctor/<step>
+_BLOCKED_FINDING_RE = re.compile(r"\[error\] (core/doctor/[A-Za-z0-9._:/-]{1,120})((?: [^ ]{1,300})?) - (.{1,400}?)"
+                                 r"(?= fix: | \[(?:error|warning|warn|info)\] |" + re.escape(DOCTOR_BLOCKED_MARKER)
+                                 + r"|$)")
 _HELD_AGENT_RE = re.compile(r"Held agent (?:(?!\(retained-by-deletion\)).){1,300}?(?:deletion history needs repair|"
                             r"deletion journal|unverified)", re.I)
 FATAL_MARKERS = (
@@ -259,6 +271,10 @@ FATAL_MARKERS = (
     ("doctor-maintenance-refused", ("Doctor could not enter maintenance", "Doctor could not complete",
                                     "Doctor could not acquire", "Doctor could not reacquire",
                                     "Doctor could not promote"), None),
+    # OpenClaw 2026.11.1+ (#187192): --fix exits 1 when the final config is invalid or a required migration step was
+    # deferred (doctor-health.ts recordRepairRefusal; not printed by 2026.10.4/2026.10.10). Before the held-back and
+    # schema markers: it is the summary of the run, the listed [error] findings are the cause
+    ("doctor-blocked", (DOCTOR_BLOCKED_MARKER,), None),
     # after the specific failures: 2026.10 prints held-back warnings on otherwise normal runs
     ("doctor-held-back", HELD_BACK_MARKERS + ("Held agent ", "unverified-agent-databases", "Agent deletion journal"),
      None),
@@ -1475,6 +1491,22 @@ def _snippet(norm, idx, width=160):
     return C.redact_text(s)
 
 
+def blocked_message(rc, norm, idx):
+    """HOLD reason of doctor-blocked: the [error] findings doctor listed before "Doctor blocked" (path and message,
+    redacted, at most 5), else the text around the marker."""
+    found = []
+    for m in _BLOCKED_FINDING_RE.finditer(norm[:idx]):
+        where = m.group(2).strip()
+        item = (f"{where}: " if where else f"{m.group(1)}: ") + m.group(3).strip()
+        if item not in found:
+            found.append(item)
+    if not found:
+        return f"doctor rc {rc}: ...{_snippet(norm, idx)}..."
+    shown = "; ".join(C.redact_text(f)[:200] for f in found[:5])  # redact first: a cut never exposes more
+    more = f" (+{len(found) - 5} more in oc-upgrade log)" if len(found) > 5 else ""
+    return f"doctor rc {rc}: doctor blocked, required repairs remain incomplete: {shown}{more}"
+
+
 def evaluate_doctor(rc, text, *, timed_out=False, stopping=False, final=False, retired_warning=False):
     """Classify one doctor pass (B3: markers only when rc != 0, except held-back stores, which 2026.10
     reports with rc 0; B8: signals/OOM -> doctor-crashed). final: the pass that should leave nothing
@@ -1541,6 +1573,8 @@ def evaluate_doctor(rc, text, *, timed_out=False, stopping=False, final=False, r
             if idx >= 0:
                 res.update(code=code, cls="hard", markers=[s],
                            message=f"doctor rc {rc}: ...{_snippet(norm, idx)}...")
+                if code == "doctor-blocked":
+                    res["message"] = blocked_message(rc, norm, idx)
                 return res
         if rx is not None:
             m = rx.search(norm)
@@ -2085,6 +2119,11 @@ class Gate:
         # 6b every gate mode, before the first write: pre-July-2026 formats OpenClaw 2026.10 refuses
         if not (self.j or {}).get("first_write_at"):
             F += self.retired_format_findings(mode, cfg_ok)
+        # 6c every gate mode (also on a resume): heartbeat windows that OpenClaw 2026.11.1+ doctor keeps invalid and
+        # then stops on ("Doctor blocked"); runtime_caps heartbeat_hours_kept, so nothing on 2026.10.4/2026.10.10
+        if cfg_ok:
+            F += [dict(f) for f in mig().heartbeat_hours_findings(self.cfg, caps=self.caps(),
+                                                                  runtime=self.pkg["version"])]
         # 7 sizes (and F1: a backup stores a symlinked state/agent directory or workspace root as a bare link)
         links = state_symlinks(p["STATE"], self.cls) + self.workspace_symlinks()
         if links:

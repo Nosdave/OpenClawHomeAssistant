@@ -658,6 +658,9 @@ RUNTIME_CAPS = (
     # open issue openclaw/openclaw#191847: the 512 MB SQLite worker runs out of memory on large sessions
     # (precheck information only: largest agent database, biggest session)
     ("large_session_oom_issue", (2026, 10, 10, 0)),
+    # doctor keeps an invalid heartbeat.activeHours window instead of removing it (#186305) and, with #187192,
+    # then exits 1 ("Doctor blocked; required repairs remain incomplete."): the precheck holds on it first
+    ("heartbeat_hours_kept", (2026, 11, 1, 0)),
     # doctor records the cron inference accounts itself (#172792; 2026.11.5-beta.1 parses as 2026.11.5)
     ("cron_doctor_migration", (2026, 11, 5, 0)),
 )
