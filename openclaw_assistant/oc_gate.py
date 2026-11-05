@@ -313,8 +313,10 @@ SW_DRAFT_RE = re.compile(r"(?:generations/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0
 SW_EXPORTED_STATUSES = ("pending", "quarantined")
 SW_STATUSES = ("pending", "quarantined", "applied", "rejected", "stale")
 # export redaction per JSON value: a value under one of these keys is hidden whole, whatever its type (the keys the
-# log rules of oc_common hide too, *key, api-key and x-api-key included), except the identifiers OpenClaw itself
-# writes under such keys (SW_KEY_KEEP, compared lower-cased: origin.sessionKey, origin_session_key, target.skillKey);
+# log rules of oc_common hide too, *key, api-key and x-api-key included, and every key the "key: value" rule names,
+# oc_common.SECRET_NAME_RE: Passwort, Kennwort, pwd, SMTP_PASS, ...; a PIN of 3 to 12 digits under a PIN key too,
+# oc_common.PIN_NAME_RE), except the identifiers OpenClaw itself writes under such keys (SW_KEY_KEEP, compared
+# lower-cased: origin.sessionKey, origin_session_key, target.skillKey);
 # hashes under their keys are kept unless a value beside them was redacted; ids get every log rule except the
 # long-token one (a proposal id has up to 121 characters)
 SW_SECRET_KEY_RE = re.compile(r"(?i)token|secret|password|passwd|api[_-]?key|private_?key|access_?key|credential|"
@@ -4642,7 +4644,17 @@ def _sw_mkdir(path, root=None):
 
 
 def _sw_secret_key(key):
-    return bool(key) and SW_SECRET_KEY_RE.search(key) is not None and key.lower() not in SW_KEY_KEEP
+    return (bool(key) and (SW_SECRET_KEY_RE.search(key) is not None or C.SECRET_NAME_RE.fullmatch(key) is not None)
+            and key.lower() not in SW_KEY_KEEP)
+
+
+def _sw_pin(key, obj):
+    """True for a PIN the log rules hide in the JSON text too: 3 to 12 digits (a number or a string) under a PIN key
+    (pin, PIN-Code, simPin, wifi_pin, puk)."""
+    if not key or C.PIN_NAME_RE.fullmatch(key) is None or isinstance(obj, bool):
+        return False
+    return ((isinstance(obj, int) and obj >= 0 and C.PIN_VALUE_RE.fullmatch(str(obj)) is not None)
+            or (isinstance(obj, str) and C.PIN_VALUE_RE.fullmatch(obj) is not None))
 
 
 def _sw_kept_hash(key, obj):
@@ -4653,12 +4665,13 @@ def _sw_kept_hash(key, obj):
 
 def _sw_redact(obj, key, counter, seen=None):
     """One JSON value of the export, redacted with the gate's log rules (oc_common.redact_text_counted): a value under
-    a secret-looking key is hidden whole (a string, number, list or object); every string is redacted, an id under
-    its key without the long-token rule; hashes are kept unless a value beside them was redacted (_sw_redact_items).
+    a secret-looking key is hidden whole (a string, number, list or object), so is a PIN under a PIN key (_sw_pin);
+    every string is redacted, an id under its key without the long-token rule; hashes are kept unless a value beside
+    them was redacted (_sw_redact_items).
     It hides at least what the log rules hide in the JSON text of the same value. seen (a set): gets the sha256 of
     every string it redacted (_sw_hide_digests)."""
     if (_sw_secret_key(key) and obj is not None and not isinstance(obj, bool)
-            and not (isinstance(obj, (str, bytes, dict, list)) and not obj)):
+            and not (isinstance(obj, (str, bytes, dict, list)) and not obj)) or _sw_pin(key, obj):
         counter[0] += 1
         if seen is not None and isinstance(obj, str):
             seen.add(hashlib.sha256(obj.encode("utf-8")).hexdigest())

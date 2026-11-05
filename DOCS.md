@@ -1276,10 +1276,15 @@ behaviour pin for `approvalPolicy` is not written on these versions). With OpenC
   `/config/.openclaw-upgrade/gate/runs/<run>/skill-workshop/`: `proposals.json` (all
   rows with history, undo records and collection reviews), `PROPOSALS.md` (a readable
   index) and `files/` (the files of `/config/.openclaw/skill-workshop/`, every draft
-  version). Secrets are replaced by `***` with the add-on's log redaction rules; the
-  exact originals exist only in the encrypted Home Assistant backup. A value under a key
-  that names a secret (`token`, `password`, `apiKey`, `x-api-key`, any `…Key`) is hidden
-  whole, whatever it holds; ids and OpenClaw's session and skill keys stay readable. A
+  version). Secrets are replaced by `***` with the add-on's log redaction rules (SECURITY.md,
+  section 10, lists what they hide and what they miss); the exact originals exist only in
+  the encrypted Home Assistant backup. A value after a key that names a secret
+  (`token`, `password`, `apiKey`, `Passwort`, `Kennwort`, `pwd`, `SMTP_PASS`, a `PIN` of
+  digits, …) is hidden whole: in quotes up to the closing quote, else to the end of the
+  line or a delimiter such as `, `, a closing bracket or a sentence-final `.`
+  (`Passwort: correct horse battery` → `Passwort: ***`). In `proposals.json` a value under
+  such a key (also any `…Key`) is hidden whatever it holds; ids and OpenClaw's session and
+  skill keys stay readable. A
   hash that could confirm a guess of a redacted value is not exported either: a redacted
   file has no source sha256; once a draft or an undo record of a skill was redacted,
   every proposal for that skill shows its draft, support-file, revision and target

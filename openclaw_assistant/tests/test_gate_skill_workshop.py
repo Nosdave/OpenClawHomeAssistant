@@ -138,6 +138,14 @@ def all_bytes(root):
     return out
 
 
+def leaked(value, blob):
+    """True when value is in blob. A short number counts only on its own (not inside a word or a hex digest): the
+    export also holds sha256 values of files with a timestamp, and one in about 150 runs had "4711" in one of them."""
+    if value.isdigit():
+        return re.search(rb"(?<![0-9A-Za-z])" + re.escape(value) + rb"(?![0-9A-Za-z])", blob) is not None
+    return value in blob
+
+
 def tree_state(root):
     return {str(p): (st.st_mode, st.st_size, st.st_mtime_ns) for p, st in C.walk_lstat(root)}
 
@@ -367,7 +375,7 @@ class ExportUnitTests(Base):
         self.export()
         blob = all_bytes(self.dest)
         for value in (b"4711", b"1234\n", dh.encode(), rev.encode(), ph.encode()):
-            self.assertNotIn(value, blob, value)
+            self.assertFalse(leaked(value, blob), value)
         doc = json.loads((self.dest / "proposals.json").read_text())
         quar = doc["proposals"][1]
         self.assertEqual((quar["draft_hash"], quar["record_json"]["draftHash"],
@@ -379,6 +387,27 @@ class ExportUnitTests(Base):
         self.assertNotIn("sha256_source", f)
         self.assertEqual((self.dest / "files" / "proposals" / "wx-quarantined" / "PROPOSAL.md").read_text(),
                          "# alarm\nUse the panel.\npassword: ***\n")
+
+    def test_multi_word_and_german_secrets_in_a_draft(self):
+        """full5 rehearsal: the export kept 'Passwort: 4711' of a German draft in clear, and only the first word of a
+        quoted or multi-word value was hidden."""
+        draft = ("# router-ssh\n\nssh admin@192.168.1.1, Passwort: 4711\n\n- **Kennwort:** correct horse battery\n"
+                 "- PIN: 0815\n- wifi:\n    passphrase: \"korrekt pferd batterie\"  # home\n"
+                 "- Notfall (password: 2468). Danach neu starten.\n- Das Passwort ist 1357.\n")
+        (self.state / "skill-workshop" / "proposals" / "wx-quarantined" / "PROPOSAL.md").write_text(draft)
+        self.export()
+        blob = all_bytes(self.dest)
+        for secret in (b"4711", b"correct", b"horse", b"battery", b"0815", b"korrekt", b"pferd", b"batterie", b"2468",
+                       b"1357", hashlib.sha256(draft.encode()).hexdigest().encode()):
+            self.assertFalse(leaked(secret, blob), secret)
+        self.assertEqual((self.dest / "files" / "proposals" / "wx-quarantined" / "PROPOSAL.md").read_text(),
+                         "# router-ssh\n\nssh admin@192.168.1.1, Passwort: ***\n\n- **Kennwort:** ***\n- PIN: ***\n"
+                         "- wifi:\n    passphrase: \"***\"  # home\n- Notfall (password: ***). Danach neu starten.\n"
+                         "- Das Passwort ist ***.\n")
+        quar = json.loads((self.dest / "proposals.json").read_text())["proposals"][1]
+        f = next(x for x in quar["files"] if x["path"] == "proposals/wx-quarantined/PROPOSAL.md")
+        self.assertEqual(f["redactions"], 6)
+        self.assertNotIn("sha256_source", f)
 
     def test_target_hashes_of_a_redacted_undo_record_are_hidden(self):
         """Recheck: an applied update's record keeps the sha256 of the skill and support files it replaced
@@ -418,7 +447,7 @@ class ExportUnitTests(Base):
         self.export()
         blob = all_bytes(self.dest)
         for value in (b"4711", b"0815", ph.encode(), sh.encode(), tree.encode(), tree2.encode()):
-            self.assertNotIn(value, blob, value)
+            self.assertFalse(leaked(value, blob), value)
         doc = json.loads((self.dest / "proposals.json").read_text())
         app, rej, stale = doc["proposals"][2], doc["proposals"][3], doc["proposals"][4]
         self.assertEqual(app["rollback"]["previous_content"], "# tram\npassword: ***\n")
@@ -454,7 +483,12 @@ class ExportUnitTests(Base):
             {"id": bot}, {"chat_id": bot}, {"requestId": "sk-hv0011abcdefghij"}, {"note": "use API key: hv-0012 here"},
             {"evidence": "key AIza" + "B" * 35}, {"slack": "xoxb-1234567890-hv0014abcd"},
             {"evidence": "-----BEGIN PRIVATE KEY-----\nMIIEhv0013+abc/def\nZZ09==\n-----END PRIVATE KEY-----"},
-            {"url": "https://user:hv-0015@example.com/x"}, {"password": "hv-0016", "previous_content_hash": "ab" * 32}]
+            {"url": "https://user:hv-0015@example.com/x"}, {"password": "hv-0016", "previous_content_hash": "ab" * 32},
+            # full5 rehearsal: German, short and locale keywords, PINs, multi-word values
+            {"Passwort": "hv-0017"}, {"WLAN-Kennwort": "hv-0018 hv-0019"}, {"smtp": {"pass": "hv-0020"}},
+            {"MYSQL_PWD": "hv-0021"}, {"dbPwd": 47110815}, {"senha": "hv-0022"}, {"pin": 4711}, {"wifi_pin": "0815"},
+            {"PIN-Code": "123456"}, {"note": "ssh admin@192.168.1.1, Passwort: hv-0023 hv-0024"},
+            {"note": 'passphrase: "hv-0025 hv-0026" # home'}, {"note": "Das Kennwort ist hv-0027."}]
         for x in cases:
             with self.subTest(x=json.dumps(x)[:50]):
                 logged = C.redact_text(json.dumps(x))
@@ -481,7 +515,10 @@ class ExportUnitTests(Base):
         # what stays readable
         keep = {"id": "weather-brief-" + "a" * 60, "proposal_id": "x" * 121, "origin": {"sessionKey": "agent:main:m"},
                 "origin_session_key": "agent:main:m", "target": {"skillKey": "weather-brief"}, "draftHash": "cd" * 32,
-                "note": "plain words", "enabled": True, "count": 3, "empty_token": ""}
+                "note": "plain words", "enabled": True, "count": 3, "empty_token": "",
+                # no secret names: a pin that is no PIN, words that only contain a keyword
+                "pin": True, "pinned": True, "pin_count": 4711, "passed": 3, "bypass": "first pass: plain words",
+                "compass": "north", "resenha": "um livro", "pinVersion": "2026.11.1"}
         counter = [0]
         self.assertEqual(G._sw_redact(keep, "", counter), keep)
         self.assertEqual(counter[0], 0)

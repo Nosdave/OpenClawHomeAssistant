@@ -434,8 +434,10 @@ class RedactTests(unittest.TestCase):
         self.assertEqual(C.redact_text("Doctor complete."), "Doctor complete.")
 
     def test_redact_text_counted_and_scoped_bak_path(self):
-        """full5: the same rules with a count (Skill Workshop export); doctor's copy names are no tokens."""
-        s = ('key sk-abcdefghijklmnop "apiKey": "abc123" token=deadbeef '
+        """full5: the same rules with a count (Skill Workshop export); doctor's copy names are no tokens.
+        (A line break after token=deadbeef: the value of a secret key now runs to the end of its line and would take
+        the secrets after it into one count.)"""
+        s = ('key sk-abcdefghijklmnop "apiKey": "abc123" token=deadbeef\n'
              '123456789:AAHbcdefghijklmnopqrstuvwxyz0123456 ' + "A" * 45 + ' Bearer abcdefghijkl')
         text, n = C.redact_text_counted(s)
         self.assertEqual(text, C.redact_text(s))
@@ -829,6 +831,158 @@ class LiteralSecretRedactTests(unittest.TestCase):
                 text, n = C.redact_text_counted(secret, long_tokens=False)
                 self.assertGreaterEqual(n, 1)
                 self.assertNotIn(secret[-12:], text)
+
+
+class KeyValueRedactTests(unittest.TestCase):
+    """full5 rehearsal (checker findings): the value of a key that names a secret is hidden whole, not only its first
+    word ('password: "correct horse battery"' gave '"*** horse battery"'); German and other keywords count
+    ('Passwort: 4711' was exported in clear); a closing bracket and a sentence-final "." after the value stay
+    ('(password: 4711).' gave '(password: ***'). Normal words and OpenClaw's own log lines stay readable."""
+
+    def check(self, cases):
+        for raw, want in cases:
+            with self.subTest(raw=raw):
+                self.assertEqual(C.redact_text(raw), want)
+                text, n = C.redact_text_counted(raw)
+                self.assertEqual(text, want)
+                self.assertGreaterEqual(n, 1)
+
+    def test_checker_examples_hide_the_whole_value(self):
+        self.check((
+            ('password: "correct horse battery"', 'password: "***"'),
+            ("password: 'correct horse battery'", "password: '***'"),
+            ("PASSWORD=correct horse", "PASSWORD=***"),
+            ("api key: abc def ghi", "api key: ***"),
+            ('Password="a b c"', 'Password="***"'),
+            ("(password: 4711).", "(password: ***)."),
+            ("ssh admin@192.168.1.1, Passwort: 4711", "ssh admin@192.168.1.1, Passwort: ***"),
+            ("Kennwort: geheim", "Kennwort: ***"), ("PIN: 1234", "PIN: ***"), ("pwd=hunter2", "pwd=***"),
+            ("pass: hunter2", "pass: ***"), ("password is 4711", "password is ***")))
+
+    def test_quoted_value_up_to_its_closing_quote(self):
+        self.check((
+            ('password: "a \\"b\\" c" # note', 'password: "***" # note'),
+            ("password: 'it's mine'", "password: '***'"),  # an apostrophe does not end it
+            ("token: `abc def`.", "token: `***`."),
+            ("{ mode: 'token', token: 'x y z', retries: 2 }", "{ mode: 'token', token: '***', retries: 2 }"),
+            ('{"note": "Passwort: 4711", "x": 1}', '{"note": "Passwort: ***", "x": 1}'),
+            ('- `export DB_PASSWORD="op://vault/db/password"`', '- `export DB_PASSWORD="***"`')))
+
+    def test_unquoted_value_to_the_end_of_the_line_or_a_clear_delimiter(self):
+        self.check((
+            ("Passwort: correct horse battery staple\nnext line", "Passwort: ***\nnext line"),
+            ("token: abc def # comment", "token: *** # comment"),
+            ("| password: abc def | next |", "| password: *** | next |"),
+            ("http://127.0.0.1:18789/?token=abc&lang=de", "http://127.0.0.1:18789/?token=***&lang=de"),
+            ("password=x reason=y", "password=*** reason=y"),
+            ("Passwort: 4711 Benutzer: admin", "Passwort: *** Benutzer: admin"),
+            ("boom password=pw-1 Authorization: Bearer bt-abcdefgh12", "boom password=*** Authorization: Bearer ***"),
+            ("secret: x y; next", "secret: ***; next"),
+            ("{ token: abc def, mode: 1 }", "{ token: ***, mode: 1 }"),
+            ('{"secret":123,"mode":"x"}', '{"secret":***,"mode":"x"}'),
+            ("Passwort: 4711. Danach neu starten.", "Passwort: ***. Danach neu starten."),
+            ("password: S3cret.v2 ok", "password: ***"),
+            ("password: abc(1) def", "password: ***"), ("password: {{ op://vault/item }}", "password: ***"),
+            ("password: a.b,c;d&e!", "password: ***"), ("Passwort: Tom&Jerry", "Passwort: ***"),
+            ("token:\n  abc def", "token:\n  ***"),
+            # a command line: a flag's value is one word, and the next --flag ends a value
+            ("openclaw --token=abc status", "openclaw --token=*** status"),
+            ("x --passwort=geheim status", "x --passwort=*** status"),
+            ("password: abc --json", "password: *** --json")))
+
+    def test_closing_brackets_and_final_dot_stay(self):
+        self.check((
+            ("(password: 4711).", "(password: ***)."), ("(token=abc).", "(token=***)."),
+            ("[api key: abc def]", "[api key: ***]"), ("{ password: x }", "{ password: *** }"),
+            ("(PIN: 1234).", "(PIN: ***)."), ("see (Passwort: a b), then", "see (Passwort: ***), then"),
+            ("password: hunter2.", "password: ***.")))
+
+    def test_german_short_and_other_locale_keywords(self):
+        for key in ("Passwort", "passwort", "Kennwort", "WLAN-Passwort", "Routerkennwort", "Gerätepasswort",
+                    "pwd", "PWD", "MYSQL_PWD", "dbPwd", "pass", "Pass", "SMTP_PASS", "smtp.pass", "smtpPass",
+                    "passphrase", "Pass Phrase", "passcode", "API-Schlüssel", "contraseña", "Contrasena", "senha",
+                    "hasło", "haslo", "Mot de passe", "wachtwoord", "парола", "Паролата", "пароль"):
+            for sep in (": ", "=", " = ", ":\t"):
+                raw = f"{key}{sep}geheim 4711"
+                with self.subTest(raw=raw):
+                    self.assertEqual(C.redact_text(raw), f"{key}{sep}***")
+        self.check((("user: admin, pass: hunter2", "user: admin, pass: ***"), ("- pass: hunter2", "- pass: ***"),
+                    ("login admin / pass: x y", "login admin / pass: ***")))
+
+    def test_pin_needs_digits(self):
+        self.check((
+            ("PIN: 1234", "PIN: ***"), ("pin = '0000'", "pin = '***'"), ("PIN-Code: 4711, PUK: 12345678",
+                                                                       "PIN-Code: ***, PUK: ***"),
+            ("SIM-PIN: 1234", "SIM-PIN: ***"), ("simPin: 4321", "simPin: ***"), ("wifi_pin=98765", "wifi_pin=***"),
+            ("Geräte-PIN: 4711.", "Geräte-PIN: ***."), ('{"pin": 1234}', '{"pin": ***}'),
+            ('{"pin": "1234"}', '{"pin": "***"}')))
+
+    def test_markdown_and_yaml(self):
+        self.check((
+            ("**Passwort:** 4711 (Router)", "**Passwort:** ***"), ("__Passwort__: 4711", "__Passwort__: ***"),
+            ("- **Kennwort**: correct horse", "- **Kennwort**: ***"), ("`password`: hunter2", "`password`: ***"),
+            ("Passwort: `4711`.", "Passwort: `***`."), ("**Passwort:**\n4711", "**Passwort:**\n***"),
+            ("wifi:\n  ssid: Haus\n  passphrase: correct horse battery staple  # home\n  band: 5",
+             "wifi:\n  ssid: Haus\n  passphrase: ***  # home\n  band: 5")))
+
+    def test_prose_rule(self):
+        self.check((
+            ("Das Passwort ist 4711.", "Das Passwort ist ***."),
+            ('The password is "correct horse".', 'The password is "***".'),
+            ("set the password to hunter2!", "set the password to ***!"),
+            ("Kennwort lautet: geheim1", "Kennwort lautet: ***"), ("la contraseña es abc123", "la contraseña es ***"),
+            ("a senha é 9876", "a senha é ***"),
+            ("Das WLAN-Passwort heißt „Sommer 2026“", "Das WLAN-Passwort heißt „***“")))
+
+    def test_normal_words_and_openclaw_log_lines_untouched(self):
+        for line in (
+                # bare "pass" right after a word (OpenClaw: before_agent_finalize, doctor passes)
+                "First pass: collect data", "Second pass: every computed in the list",
+                "before_agent_finalize requested one more pass: runId=1 attempt=2", "doctor pass 1: rc 0",
+                # pin is a version or TLS pin in OpenClaw's logs; a PIN needs 3 to 12 digits
+                "pin=true", "pinned: true", "TLS pin: 8f3a9c01", "pin: 2026.11.1", "PIN: 12",
+                "Selected plugin x requires an exact dependency pin: @openclaw/codex@2026.11.1",
+                "Plugin update retained an official plugin pin: @openclaw/acpx@2026.11.1",
+                "Invalid runtime pin: v24.22.1 is not supported",
+                # the keyword must end the key, and short keywords are words of their own
+                "passed: 3", "bypass: true", "compass: north", "OLDPWD=/config", "resenha: um livro",
+                "password_hint: my dog", "maxTokens: 8", "spin: 2",
+                "Paths: gateway.auth.token, channels.telegram.botToken",
+                "sessionKey: agent:main:main",
+                # a bare true, false, null, undefined or none is no secret
+                '"pass": true,', "apiKey: undefined", "token: null }", "password: false # unset",
+                # no value
+                'password: ""', "token: ...", "token:\n\nnext paragraph",
+                # prose without a value that looks like one
+                "gateway password is configured.", "password is required to observe this", "the password is incorrect.",
+                "Change your password to something long", "token is missing", "passphrase was not set"):
+            with self.subTest(line=line):
+                self.assertEqual(C.redact_text(line), line)
+                self.assertEqual(C.redact_text_counted(line), (line, 0))
+
+    def test_secret_names_for_json_keys(self):
+        """The key names the Skill Workshop export hides whole (oc_gate._sw_secret_key, _sw_pin)."""
+        for key in ("password", "Passwort", "WLAN-Kennwort", "pass", "SMTP_PASS", "smtpPass", "pwd", "MYSQL_PWD",
+                    "passphrase", "senha", "hasło", "api-key"):
+            self.assertIsNotNone(C.SECRET_NAME_RE.fullmatch(key), key)
+        for key in ("bypass", "compass", "passed", "password_hint", "first pass", "OLDPWD", "resenha", "pin"):
+            self.assertIsNone(C.SECRET_NAME_RE.fullmatch(key), key)
+        for key in ("pin", "PIN", "pinCode", "PIN-Code", "simPin", "wifi_pin", "puk"):
+            self.assertIsNotNone(C.PIN_NAME_RE.fullmatch(key), key)
+        for key in ("pinned", "spin", "pins", "pin_count", "pinning"):
+            self.assertIsNone(C.PIN_NAME_RE.fullmatch(key), key)
+
+    def test_linear_time_on_long_runs(self):
+        """A long run of word characters joined by "-" or "." (base64url, a dashed id) and long blank or bracket runs
+        are read in linear time; before, 15 kB of "ab-ab-..." took seconds (16 MiB export files are redacted)."""
+        n = 8000  # about 24 kB each: well under 0.1 s now, about 20 s for "ab-" * n before
+        for s in ("ab-" * n, "a." * n, "Ab_9-" * n, "token: " + "a b " * n, "password:" + " " * n + ")",
+                  "pin:" + " " * n + "x", "password is " + "1a" * n + "(", "password: " + "(a " * n, "key-" * n,
+                  "x pass " * n):
+            with self.subTest(s=s[:12]):
+                t = time.monotonic()
+                C.redact_text_counted(s)
+                self.assertLess(time.monotonic() - t, 2.0)
 
 
 class SupervisorCredentialEnvTests(OptionsCase):

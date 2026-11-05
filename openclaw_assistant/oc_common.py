@@ -736,13 +736,70 @@ def openclaw_env():
 
 # --- redaction --------------------------------------------------------------------------
 
-_SECRET_KEY = r"[A-Za-z0-9_.-]*(?:token|secret|password|apikey|api_key|bottoken)[A-Za-z0-9_.-]*|[A-Za-z0-9_.-]*key"
-# a key that names a secret (token, botToken, apiKey, x-api-key, "API key", password ...), for "key: value" forms
-_SECRET_WORD = r"[A-Za-z0-9_.-]*?(?:token|secret|password|passwd|api[ _-]?key)"
+# Every key pattern starts at the beginning of a run of word characters, "." and "-" (a lookbehind, not \b) and
+# reads the run once: with \b each "-" or "." of a long run (base64url, a dashed id) started a new scan of the rest
+# of the run, quadratic (15 kB took seconds; a 16 MiB Skill Workshop file never finished).
+# _SECRET_KEY: a key containing token/secret/password/apikey anywhere, or ending in "key" (JSON and key=value forms)
+_SECRET_KEY = (r"(?<![A-Za-z0-9_.-])(?=[A-Za-z0-9_.-]*?(?:token|secret|password|apikey|api_key)"
+               r"|[A-Za-z0-9_.-]*?key(?![A-Za-z0-9_.-]))[A-Za-z0-9_.-]*+")
+# A key that names a secret, for the "key: value" / "key = value" rule below. It ends in one of:
+# - token, secret, password, passwd, passphrase, passcode, "API key" (also api-key, x-api-key, botToken,
+#   db_password), Passwort, Kennwort, API-Schlüssel, wachtwoord, contraseña, after any prefix (WLAN-Passwort,
+#   Routerkennwort);
+# - pwd, senha, hasło, парола, пароль, "mot de passe" as a word of their own, after "_", "." or "-" (MYSQL_PWD) or
+#   in camelCase (dbPwd); never inside a word (OLDPWD, resenha);
+# - pass the same way (SMTP_PASS, smtp.pass, smtpPass, "pass: x", "user: a, pass: b"), but a bare "pass" not right
+#   after a word ("first pass: ...", "one more pass: ..." in OpenClaw's own logs), and not in bypass or compass.
+# The keyword must end the key: maxTokens, passed, password_hint, pinned are no secret names.
+_LONG_SECRET_WORDS = (r"token|secret|password|passwd|passwort|kennwort|pass[ _-]?phrase|pass[ _-]?code|wachtwoord"
+                      r"|contrase(?:ñ|n)a|api[ _-]?key|api[ _-]?schl(?:ü|ue)ssel")
+_IN_KEY = r"(?<=[_.-])|(?<=(?-i:[a-z0-9]))(?=(?-i:P))"  # after a separator, or camelCase (dbPwd, simPin)
+_WORD_START = r"(?:" + _IN_KEY + r"|(?<![\w.-]))"
+_SECRET_WORD = (r"[\w.-]*?(?:" + _LONG_SECRET_WORDS
+                + r"|" + _WORD_START + r"(?:pwd|senha|has[łl]o|парола(?:та)?|пароль|mot[ _-]de[ _-]passe)"
+                + r"|(?:" + _IN_KEY + r"|(?<![\w.-])(?<!\w\s)(?<!\w\s\s))pass)")
+# a PIN (pin, PIN-Code, SIM-PIN, wifi_pin, simPin, PUK): only a value of 3 to 12 digits counts as one; OpenClaw's
+# logs use "pin" for version and TLS pins ("dependency pin: name@1.2.3", "pin=true")
+_PIN_WORD = r"[\w.-]*?" + _WORD_START + r"(?:pin(?:[ _-]?(?:code|nummer|number))?|puk)"
+# between key and value: ":" or "=" (not "==", "::"), blanks, a quote or Markdown emphasis that closes the key
+# (**Passwort:** x, `token`: x, "apiKey": x), and at most one line break (YAML "password:" + indented value)
+_KV_SEP = (r"(?:\*\*?|__?|`)?[\"']?[^\S\r\n]*+[:=](?![:=])[^\S\r\n]*+(?:(?:\*\*?|__?)(?=\s)[^\S\r\n]*+)?"
+           r"(?:\r?\n[^\S\r\n]*+)?")
+# The value of a secret key, hidden whole (before, only its first word: "*** horse battery"):
+# - a value in "double", 'single' or `back` quotes up to its closing quote (the quotes stay);
+# - else up to the end of the line, but not past: a comma or semicolon before a blank or a quote, a ")", "]" or "}"
+#   that closes a bracket opened before the value, a sentence-final "." (also before a blank, a closing bracket or
+#   a quote), a blank before "#" (comment) or "|" (table cell), "&name=" (next query parameter) or a blank before
+#   "name=", "Name: " or "--flag" (next field: "password=x reason=y", "Passwort: 4711 Benutzer: admin"); a bracket
+#   pair inside the value, also nested once, is part of it (abc(1), {{ ref }});
+# - the value of a command-line flag (--token=x, --passwort=x) is one word: a blank ends it;
+# - a bare true, false, null, undefined or none is no secret ("pass": true, apiKey: undefined stay readable).
+_KV_VALUE = (r"(?P<v>(?=\S)(?!(?:true|false|null|undefined|none)[^\S\r\n]*+(?:[,;)\]}#|\r\n]|\Z))"
+             r"(?:\"(?:[^\"\\\n]|\\.)++\"(?!\w)|'(?:[^'\\\n]|\\.)++'(?!\w)|`[^`\n]++`(?!\w)"
+             r"|(?:[^\s()\[\]{}.,;&\"']"
+             r"|(?:\.|[,;](?![\"'])|[\"'])++(?=[^\s.,;\"')\]}])"
+             r"|&(?![\w.-]++=)"
+             r"|\((?:(?:[^()\n]|\([^()\n]*+\))*+\))?|\[(?:(?:[^\[\]\n]|\[[^\[\]\n]*+\])*+\])?"
+             r"|\{(?:(?:[^{}\n]|\{[^{}\n]*+\})*+\})?"
+             r"|(?(flag)(?!)|[^\S\r\n]++(?![#|]|--\w|[\w.-]++(?:=|:\s|:\Z))))++))")
+# "Passwort ist 4711", "the password is 'correct horse'", "set the password to hunter2": a value in quotes, or one
+# word that contains a digit ("password is configured", "password is required" stay readable)
+_PROSE_VALUE = (r"(?P<v>\"[^\"\n]*\"|'[^'\n]*'|`[^`\n]*`|„[^“”\n]*[“”]|“[^”\n]*”|«[^»\n]*»"
+                r"|(?=[^\s,;()\[\]{}\"'`]*?\d)(?:[^\s,;()\[\]{}\"'`.!?:]|[.!?:]++(?=[^\s,;()\[\]{}\"'`.!?:]))++"
+                r"(?=[.!?:]*+(?:[\s,;)\]}\"'`]|\Z)))")
 
 
 def _pem_redact(m):
     return f"-----BEGIN {m.group(1)}-----***" + (f"-----END {m.group(1)}-----" if m.group(2) else "")
+
+
+def _kv_redact(m):
+    """key + separator + *** in place of the value; quotes around it and blanks after it stay."""
+    v = m.group("v")
+    core = v.rstrip()
+    q = core[0] if len(core) > 1 and core[0] in "\"'`„“«" else ""
+    end = core[-1] if q and core[-1] in "\"'`“”»" else ""
+    return m.group("k") + m.group("s") + q + "***" + end + v[len(core):]
 
 
 # Long standalone tokens. A run next to "/" or "." (path segment, file name such as
@@ -758,10 +815,22 @@ _REDACT_RES = [
                 re.S), _pem_redact),
     (re.compile(r"\b(?:AIza[0-9A-Za-z_-]{35}|xox[baprs]-[A-Za-z0-9-]{10,}|gh[pousr]_[A-Za-z0-9]{20,}"
                 r"|github_pat_[A-Za-z0-9_]{20,})(?![A-Za-z0-9_-])"), "***"),
-    (re.compile(r'("(?:' + _SECRET_KEY + r')"\s*:\s*)"(?:[^"\\]|\\.)*"', re.I), r'\1"***"'),
-    (re.compile(r"\b((?:" + _SECRET_KEY + r")=)[^\s&\"']+", re.I), r"\1***"),
-    # token: value / apiKey: 'value' / x-api-key: value (YAML, JS object inspection, HTTP headers)
-    (re.compile(r"\b(" + _SECRET_WORD + r")([\"']?\s*[:=]\s*[\"']?)[^\s'\",;&}]+", re.I), r"\1\2***"),
+    (re.compile(r'("' + _SECRET_KEY + r'"\s*:\s*)"(?:[^"\\]|\\.)*"', re.I), r'\1"***"'),
+    # key=value (URL query, env, logfmt): one word, not past "&", a quote, a closing bracket or a final "." or ","
+    (re.compile(r"(" + _SECRET_KEY + r"=)(?:[^\s()\[\]{}.,;&\"']|[.,;]++(?=[^\s()\[\]{}.,;&\"'])"
+                r"|\((?:[^()\s]*+\))?|\[(?:[^\[\]\s]*+\])?|\{(?:[^{}\s]*+\})?)++", re.I), r"\1***"),
+    # token: value / apiKey: 'value' / x-api-key: value / Passwort: value (YAML, .env, JS object inspection, HTTP
+    # headers, Markdown, prose): the whole value (_KV_VALUE)
+    (re.compile(r"(?<![\w.-])(?P<k>(?P<flag>-)?" + _SECRET_WORD + r")(?P<s>" + _KV_SEP + r")" + _KV_VALUE, re.I),
+     _kv_redact),
+    # PIN: 1234, SIM-PIN = '0000', **PIN-Code:** 4711 (digits only)
+    (re.compile(r"(?<![\w.-])(?P<k>" + _PIN_WORD + r")(?P<s>" + _KV_SEP + r")"
+                r"(?P<v>(?P<q>[\"'`]?)\d{3,12}(?P=q)(?![.,:/@-]?\w))", re.I), _kv_redact),
+    # Das Passwort ist 4711 / the password is "correct horse" / Kennwort lautet: geheim1
+    (re.compile(r"(?<![\w.-])(?P<k>[\w.-]*?(?:password|passwd|passwort|kennwort|pass[ _-]?phrase|pass[ _-]?code"
+                r"|wachtwoord|contrase(?:ñ|n)a)|(?<![\w.-])(?:senha|has[łl]o|парола(?:та)?|пароль|mot de passe))"
+                r"(?P<s>[^\S\r\n]++(?:is|was|ist|war|lautet|heißt|heisst|to|auf|est|es|é|jest|е):?[^\S\r\n]++)"
+                + _PROSE_VALUE, re.I), _kv_redact),
     # --token <value>, --password <value>, --api-key <value>
     (re.compile(r"(?i)(--(?:token|password|secret|api[-_]?key)\s+)(?!-)\S+"), r"\1***"),
     # URL userinfo: scheme://user:password@host
@@ -773,6 +842,13 @@ _REDACT_RES = [
     (re.compile(r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}"), "***"),  # JWT
     _LONG_TOKEN_RULE,
 ]
+
+
+# the key names of the "key: value" and PIN rules, for a redaction per JSON value (the Skill Workshop export hides
+# the value under such a key whole: a fullmatch of SECRET_NAME_RE, or of PIN_NAME_RE with a value of 3 to 12 digits)
+SECRET_NAME_RE = re.compile(_SECRET_WORD, re.I)
+PIN_NAME_RE = re.compile(_PIN_WORD, re.I)
+PIN_VALUE_RE = re.compile(r"\d{3,12}")
 
 
 def redact_text(s):
