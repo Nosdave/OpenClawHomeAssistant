@@ -23,6 +23,7 @@ LedgerEntry = {"step", "file", "path", "before", "after"[, "note"]}  (raw values
 from __future__ import annotations
 
 import copy
+import ipaddress
 import json
 import os
 import re
@@ -39,7 +40,8 @@ __all__ = [
     "legacy_key_context", "is_migrated_legacy_key",
     "check_legacy_refs", "check_codex_runtime", "check_runtime_pins", "apply_pins", "auth_order_adjust",
     "split_trailing_auth_profile", "cron_job_agent", "cron_model_chain", "cron_model_ref",
-    "cron_ref_refusal", "cron_ref_uses_stored_profile", "cron_account_forecast",
+    "cron_ref_refusal", "cron_ref_uses_stored_profile", "cron_account_forecast", "is_secret_ref", "is_key_marker",
+    "doctor_copies", "doctor_key_copies", "config_path", "parse_model_catalog_json",
     "classify_state_files", "scan_sessions_files", "config_precheck", "flatten_paths",
     "retired_config_keys", "retired_config_rewrites", "retired_config_findings", "classify_retired_state",
     "retired_db_findings", "heartbeat_hours_findings",
@@ -1970,15 +1972,25 @@ def auth_order_adjust(cfg, profiles, store_order):
 # would run on a stored auth profile or a direct credential that is not a configured key
 # (embedded-agent-runner/run/auth-plan.ts), and
 # the refusal stops the fallback chain (recordModelFallbackStop). OpenClaw's own doctor migration (#172792)
-# ships with 2026.11.5. The gate only forecasts which jobs are affected; it writes nothing.
+# ships with 2026.11.5. The gate only forecasts which jobs are affected; it writes nothing. The stored logins include
+# the ones OpenClaw's doctor creates during the migration from literal provider keys (doctor_key_copies; found in the
+# add-on's 10.10 rehearsal): a job on such a provider is refused unless the key is a SecretRef or has auth "api-key".
 
 _PROFILE_SUFFIX_NOT_PROFILE = (re.compile(r"[0-9]{8}(?:@|\Z)", re.A),
                                re.compile(r"(?:i?q[0-9]+(?:_[a-z0-9]+)*|[0-9]+bit)(?:@|\Z)", re.A | re.I))
-# models.providers.<p>.apiKey values that are no literal key: ${ENV} references, and the env-var names OpenClaw
-# knows as markers (agents/model-auth-markers.ts: its core and legacy names and those of the bundled provider
-# manifests of 2026.10.10; any other ALL_CAPS value is a literal key there). A marker of a plugin that is not
-# bundled counts as a literal key here, so the forecast can only over-report it.
-_ENV_KEY_REF_RE = re.compile(r"\A\$\{[A-Za-z_][A-Za-z0-9_]*\}\Z")
+# models.providers.<p>.apiKey values OpenClaw 2026.10.10 and 2026.11.1 do not take as a literal key (unchanged
+# between them):
+# - a SecretRef (config/types.secrets.ts parseSecretRef): an object of exactly source/provider/id, or an env template
+#   "${VAR}" or "$VAR" (VAR upper case, at most 128 characters; the value trimmed). "${lower}", "${_X}",
+#   "${X:-default}" or "prefix${X}" are no reference and count as a literal key;
+# - a non-secret marker (agents/model-auth-markers.ts isNonSecretApiKeyMarker; trimmed, case-sensitive): "oauth:..."
+#   and "secretref-env:..." prefixes, the core markers, the nonSecretAuthMarkers of the bundled plugins (equal in the
+#   2026.10.10 and 2026.11.1 npm packages), the AWS SDK names, and the env-var names OpenClaw knows (its core and
+#   legacy names and those of the bundled provider manifests). Any other value (also "EMPTY", "NONE",
+#   "MY_LOCAL_KEY", "openai_api_key") is a literal key. A marker of a plugin that is not bundled counts as a literal
+#   key here, so the forecast can only over-report it.
+_ENV_REF_RE = re.compile(r"\A(?:\$\{[A-Z][A-Z0-9_]{0,127}\}|\$[A-Z][A-Z0-9_]{0,127})\Z")
+_SECRET_REF_SOURCES = ("env", "file", "exec", "store")
 _KNOWN_ENV_KEY_MARKERS = frozenset((
     "ANTHROPIC_ADMIN_API_KEY", "ANTHROPIC_ADMIN_KEY", "ANTHROPIC_API_KEY", "ANTHROPIC_OAUTH_TOKEN", "AZURE_API_KEY",
     "AZURE_OPENAI_API_KEY", "AZURE_SPEECH_API_KEY", "AZURE_SPEECH_KEY", "AZURE_SPEECH_REGION", "CEREBRAS_API_KEY",
@@ -1992,6 +2004,125 @@ _KNOWN_ENV_KEY_MARKERS = frozenset((
     "TOGETHER_API_KEY", "VLLM_API_KEY", "VOYAGE_API_KEY", "XAI_API_KEY", "XI_API_KEY"))
 # AWS SDK markers are markers, but never a usable key: the stored profiles still come first
 _AWS_SDK_KEY_MARKERS = frozenset(("AWS_BEARER_TOKEN_BEDROCK", "AWS_ACCESS_KEY_ID", "AWS_PROFILE"))
+_CORE_KEY_MARKERS = frozenset(("custom-local", "codex-app-server", "gcp-vertex-credentials", "ollama-local",
+                               "secretref-managed"))
+_BUNDLED_KEY_MARKERS = frozenset(("openclaw:claude-cli-native-auth", "apple-fm-local", "lmstudio-local",
+                                  "minimax-oauth", "ollama-local"))
+_KEY_MARKERS = _KNOWN_ENV_KEY_MARKERS | _AWS_SDK_KEY_MARKERS | _CORE_KEY_MARKERS | _BUNDLED_KEY_MARKERS
+# model-auth-provider-config.ts MODEL_AUTH_LOCAL_HOST_ALIASES (with model-provider-local.ts isLocalProviderBaseUrl)
+_LOCAL_HOST_ALIASES = frozenset(("localhost", "0.0.0.0", "docker.orb.internal", "host.docker.internal",
+                                 "host.orb.internal"))
+_RFC1918 = tuple(ipaddress.ip_network(n) for n in ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"))
+
+
+def is_secret_ref(value):
+    """OpenClaw's parseSecretRef on an authored config value: an object of exactly source (env/file/exec/store),
+    provider and id (both non-blank strings), or an env template "${VAR}" / "$VAR" (VAR upper case)."""
+    if isinstance(value, dict):
+        return (len(value) == 3 and value.get("source") in _SECRET_REF_SOURCES
+                and isinstance(value.get("provider"), str) and bool(value["provider"].strip())
+                and isinstance(value.get("id"), str) and bool(value["id"].strip()))
+    return isinstance(value, str) and bool(_ENV_REF_RE.match(value.strip()))
+
+
+def is_key_marker(value):
+    """OpenClaw's isNonSecretApiKeyMarker (agents/model-auth-markers.ts): a placeholder, not a key."""
+    t = value.strip() if isinstance(value, str) else ""
+    return bool(t) and (t.startswith("oauth:") or t.startswith("secretref-env:") or t in _KEY_MARKERS)
+
+
+def _local_base_url(url):
+    """model-provider-local.ts isLocalProviderBaseUrl with the model-auth host aliases: localhost, 0.0.0.0, *.local,
+    the Docker/OrbStack host names, a loopback or an RFC 1918 IPv4 address."""
+    try:
+        host = (_urlsplit(url.strip()).hostname or "") if isinstance(url, str) else ""
+    except ValueError:
+        return False
+    if not host:
+        return False
+    if host in _LOCAL_HOST_ALIASES or host.endswith(".local"):
+        return True
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    ip = getattr(ip, "ipv4_mapped", None) or ip
+    return ip.is_loopback or (ip.version == 4 and any(ip in n for n in _RFC1918))
+
+
+def doctor_copies(value, cfg_entry=None, store_ids=()):
+    """True when OpenClaw's doctor copies this provider apiKey value into an auth store as an api_key profile (its
+    plaintext model-credential step since 2026.8.1, unchanged in 2026.10.10 and 2026.11.1 and run by
+    `doctor --fix` without a prompt: doctor-model-catalog-credentials.ts collectCredentials).
+
+    value: the apiKey of a models.providers entry in openclaw.json or of an agent's model catalog; cfg_entry: the
+    openclaw.json entry of the same provider (None without one); store_ids: ids of the profiles of the store the copy
+    would go to. Not copied: no string or a blank one, any value when the openclaw.json entry holds a SecretRef (also
+    a "${VAR}"/"$VAR" template there), a non-secret marker, a value that is the id of a stored profile. Not modelled:
+    a profile of that provider that already holds the same key (the gate never reads key values); that provider has
+    a stored login anyway. models.providers.<p>.auth plays no part ("api-key" does not stop the copy)."""
+    if not isinstance(value, str) or not value.strip():
+        return False
+    if isinstance(cfg_entry, dict) and is_secret_ref(cfg_entry.get("apiKey")):
+        return False
+    return not is_key_marker(value) and value not in store_ids
+
+
+_CATALOG_COMMENT_RE = re.compile(r'"(?:\\.|[^"\\])*"|//[^\n]*')
+_CATALOG_TRAILING_COMMA_RE = re.compile(r'"(?:\\.|[^"\\])*"|,(\s*[}\]])')
+
+
+def parse_model_catalog_json(text):
+    """OpenClaw's parseModelCatalogJson (agents/model-catalog-json.ts) for an agent's models.json: // comments
+    outside strings and trailing commas are dropped, then strict JSON. Raises ValueError like JSON.parse."""
+    text = _CATALOG_COMMENT_RE.sub(lambda m: m.group(0) if m.group(0)[0] == '"' else "", text)
+    text = _CATALOG_TRAILING_COMMA_RE.sub(lambda m: m.group(1) if m.group(1) is not None else m.group(0), text)
+    return json.loads(text, parse_constant=_reject_json_constant)
+
+
+def _reject_json_constant(name):
+    raise ValueError(f"not JSON: {name}")
+
+
+def config_path(provider_key):
+    """models.providers.<key> as OpenClaw prints and parses it (shared/dot-path.ts appendConfigPathSegment): a key
+    that is no identifier in brackets, JSON-quoted."""
+    if re.fullmatch(r"[A-Za-z_$][A-Za-z0-9_$:-]*", provider_key):
+        return f"models.providers.{provider_key}"
+    return f"models.providers[{json.dumps(provider_key, ensure_ascii=False)}]"
+
+
+def doctor_key_copies(cfg, catalogs=(), store_ids_for=None):
+    """The auth profiles OpenClaw's doctor creates from plaintext provider keys (pure; port of
+    maybeMigrateModelCatalogCredentials, 2026.10.10 = 2026.11.1): {"shared": [...], "agents": {agent id: [...]}},
+    each {"id", "provider", "copy"}, no key value.
+
+    copy "config": models.providers.<p>.apiKey of openclaw.json, into the shared store every agent inherits.
+    copy "catalog": a provider of an agent's model catalog (models.json, generated plugin catalogs); the main agent's
+    (agents/main/agent) go to the shared store, any other agent's to that agent's own store.
+    catalogs: [(agent id, is the main agent dir, {provider key: apiKey value})]; store_ids_for(agent id, or None for
+    the shared store) -> the ids of its stored profiles. The id is allocateProfileId's first choice,
+    "<provider>:default"; one entry per provider and store (doctor stores a second key as "<provider>:models-json")."""
+    cfg = cfg if isinstance(cfg, dict) else {}
+    ids = store_ids_for or (lambda _aid: ())
+    res = {"shared": [], "agents": {}}
+
+    def add(dest, key, how):
+        p = key.strip().lower()
+        if not any(x["provider"] == p for x in dest):
+            dest.append({"id": f"{p}:default", "provider": p, "copy": how})
+    provs = _get(cfg, ["models", "providers"], None)
+    shared_ids = set(ids(None))
+    for k, entry in provs.items() if isinstance(provs, dict) else []:
+        if isinstance(k, str) and k.strip() and isinstance(entry, dict) \
+                and doctor_copies(entry.get("apiKey"), entry, shared_ids):
+            add(res["shared"], k, "config")
+    for aid, is_main, providers in catalogs or ():
+        own = shared_ids if is_main else shared_ids | set(ids(aid))
+        for k, value in providers.items() if isinstance(providers, dict) else []:
+            if isinstance(k, str) and k.strip() and doctor_copies(value, _provider_cfg(cfg, k.strip().lower()), own):
+                add(res["shared"] if is_main else res["agents"].setdefault(str(aid).lower(), []), k, "catalog")
+    return res
 
 
 def split_trailing_auth_profile(raw):
@@ -2169,34 +2300,37 @@ def _provider_cfg(cfg, provider):
 
 
 def cron_ref_refusal(cfg, provider, explicit_profile, profiles):
-    """Why OpenClaw 2026.10.10 refuses this candidate of a cron job without a recorded inference account
+    """Why OpenClaw 2026.10.10 and 2026.11.1 refuse this candidate of a cron job without a recorded inference account
     (prepare-auth.ts, auth-plan.ts): "profile" when it would run on a stored auth profile, "aws-sdk" when on AWS SDK
     credentials (models.providers.<p>.auth "aws-sdk": no configured key, and no stored account that model@profile
     could record either), None when it is not refused.
 
     profiles: [{"id", "provider"}] the job's agent can use (its own store, the shared store, auth.profiles of
-    openclaw.json). A model@profile ref names a stored account. models.providers.<p>.auth "aws-sdk" runs on AWS
-    credentials, which are no configured key: refused. models.providers.<p>.apiKey: a SecretRef, an env reference
-    or a known env-var marker is a configured key that suppresses the profiles (a marker only while its variable
-    is set, which is assumed here); a value that names a stored profile pins it; a literal key (also an ALL_CAPS
-    value OpenClaw does not know as a marker, such as "EMPTY") suppresses them only with auth "api-key",
-    otherwise the profiles come first. A provider without stored profiles (configured key, environment, local or
-    synthetic route) is not affected."""
+    openclaw.json, and in a precheck forecast the copies doctor_key_copies predicts). A model@profile ref names a
+    stored account. models.providers.<p>.auth "aws-sdk" runs on AWS credentials, which are no configured key: refused.
+    models.providers.<p>.apiKey: a SecretRef (also "${VAR}"/"$VAR") is a configured key that suppresses the profiles;
+    a marker does only while usable (a known env-var name while its variable is set, which is assumed here; another
+    marker only on a local base URL with api "openai-completions" or "ollama"); a value that names a stored profile
+    pins it; a literal key (also an ALL_CAPS value OpenClaw does not know as a marker, such as "EMPTY") suppresses
+    them only with auth "api-key", otherwise the profiles come first. A provider without stored profiles
+    (configured key, environment, local or synthetic route) is not affected."""
     if explicit_profile:
         return "profile"
     pcfg = _provider_cfg(cfg, provider) or {}
     if pcfg.get("auth") == "aws-sdk":  # prepare-auth.ts: direct source with evidence "aws-sdk"
         return "aws-sdk"
     key = pcfg.get("apiKey")
-    if isinstance(key, dict):
+    if isinstance(key, dict) or is_secret_ref(key):
         return None
     if isinstance(key, str) and key.strip():
         k = key.strip()
-        if _ENV_KEY_REF_RE.match(k) or k in _KNOWN_ENV_KEY_MARKERS:
-            return None
-        if any(p.get("id") == k for p in profiles):
+        if is_key_marker(k):
+            if k in _KNOWN_ENV_KEY_MARKERS or (pcfg.get("api") in ("openai-completions", "ollama")
+                                               and _local_base_url(pcfg.get("baseUrl"))):
+                return None
+        elif any(p.get("id") == k for p in profiles):
             return "profile"
-        if pcfg.get("auth") == "api-key" and k not in _AWS_SDK_KEY_MARKERS:
+        elif pcfg.get("auth") == "api-key":
             return None
     return "profile" if any(str(p.get("provider") or "").strip().lower() == provider for p in profiles) else None
 
@@ -2207,21 +2341,30 @@ def cron_ref_uses_stored_profile(cfg, provider, explicit_profile, profiles):
     return cron_ref_refusal(cfg, provider, explicit_profile, profiles) is not None
 
 
-def cron_account_forecast(jobs, cfg, profiles_for, default_agent="main"):
+def cron_account_forecast(jobs, cfg, profiles_for, default_agent="main", copies_for=None, copies_pending=False):
     """Report-only forecast for openclaw/openclaw#192195 (no I/O).
 
     jobs: [{"id", "name", "enabled", "runtime_authority", "job"}] in store order, "job" the parsed job_json
     without its prompt (None when unparsable); profiles_for(agent_id) -> [{"id", "provider"}] (no secrets).
+    copies_for(agent_id) -> the profiles OpenClaw's doctor creates from the literal provider keys that agent's runs
+    see (doctor_key_copies); copies_pending: they are not in the stores yet (precheck, doctor has not run), so they
+    are added to profiles_for's; otherwise they only tell which refusals a key fix lifts.
     Covers enabled agentTurn jobs with no recorded inference account (inferenceBinding), no scheduled runtime
     authority and a session target other than "main". A job is affected when its primary or any fallback would
     run on a stored auth profile or on AWS SDK credentials (cron_ref_refusal); a ref that names a profile
     ("model@profile") does, also when its bare model id is no alias (OpenClaw gives it the default provider).
-    Returns {"checked": n, "bound": n, "affected": [{"id", "name", "agent", "primary", "primary_affected", "refs"}]};
-    primary and refs ("provider/model", or the bare model id) never carry the @profile; refs are the affected ones
-    in chain order. An entry with refs on AWS SDK credentials also has "aws_sdk": those refs (no account can be
-    recorded for them)."""
+    Returns {"checked": n, "bound": n, "affected": [{"id", "name", "agent", "primary", "primary_affected", "refs"}],
+    "key_fix": [...]}; primary and refs ("provider/model", or the bare model id) never carry the @profile; refs are
+    the affected ones in chain order. An entry with refs on AWS SDK credentials also has "aws_sdk": those refs (no
+    account can be recorded for them); one with refs refused only because of doctor's pending copy has "key_copy".
+    key_fix: one {"provider", "path", "auth", "where", "pending"} per provider whose refused refs (without an
+    explicit @profile) run on a literal key doctor copies or copied, so that auth "api-key" or a SecretRef lifts the
+    refusal: where "config" (models.providers.<p>.apiKey of openclaw.json holds the key) or "catalog" (only an agent's
+    model catalog does), path "models.providers.<p>" as OpenClaw writes it, auth the configured mode or None,
+    pending: the stored login is doctor's copy during this migration. No key value anywhere."""
     cfg = cfg if isinstance(cfg, dict) else {}
-    res = {"checked": 0, "bound": 0, "affected": []}
+    res = {"checked": 0, "bound": 0, "affected": [], "key_fix": []}
+    keyed = {}
     for row in jobs or []:
         job = row.get("job")
         if not row.get("enabled") or not isinstance(job, dict) or row.get("runtime_authority"):
@@ -2235,28 +2378,48 @@ def cron_account_forecast(jobs, cfg, profiles_for, default_agent="main"):
         res["checked"] += 1
         agent = cron_job_agent(job, default_agent)
         primary, fallbacks, _src = cron_model_chain(job, cfg, agent)
-        profiles = profiles_for(agent)
-        refs, aws, primary_affected = [], [], False
+        profiles = list(profiles_for(agent))
+        copies = list(copies_for(agent)) if copies_for else []
+        refs, aws, copied, primary_affected = [], [], [], False
         for i, raw in enumerate([primary] + fallbacks):
             r = cron_model_ref(cfg, raw) if raw else None
             if r is None and raw:  # a bare id that is no alias: an explicit profile is still a stored login
                 m_, prof_ = split_trailing_auth_profile(raw)
                 r = (None, m_, prof_) if m_ and prof_ else None
-            why = cron_ref_refusal(cfg, r[0], r[2], profiles) if r is not None else None
+            if r is None:
+                continue
+            now = cron_ref_refusal(cfg, r[0], r[2], profiles)
+            why = cron_ref_refusal(cfg, r[0], r[2], profiles + copies) if copies_pending and copies else now
             if why is None:
                 continue
             ref = f"{r[0]}/{r[1]}" if r[0] else r[1]
             primary_affected = primary_affected or i == 0
+            # the refusal is on a literal key doctor copies (or copied): auth "api-key" or a SecretRef lifts it
+            if why == "profile" and r[0] and not r[2] and cron_ref_refusal(cfg, r[0], None, copies) == "profile":
+                keyed[r[0]] = keyed.get(r[0], False) or now is None
             if ref not in refs:
                 refs.append(ref)
                 if why == "aws-sdk":
                     aws.append(ref)
+                elif now is None:
+                    copied.append(ref)
         if refs:
             p = cron_model_ref(cfg, primary) if primary else None
             shown = f"{p[0]}/{p[1]}" if p else split_trailing_auth_profile(primary)[0] if primary else primary
             res["affected"].append(dict({"id": row.get("id"), "name": row.get("name"), "agent": agent,
                                          "primary": shown, "primary_affected": primary_affected, "refs": refs},
-                                        **({"aws_sdk": aws} if aws else {})))
+                                        **({"aws_sdk": aws} if aws else {}),
+                                        **({"key_copy": copied} if copied else {})))
+    provs = _get(cfg, ["models", "providers"], None)
+    provs = provs if isinstance(provs, dict) else {}
+    for prov in sorted(keyed):
+        key = next((k for k, v in provs.items() if isinstance(k, str) and k.strip().lower() == prov
+                    and isinstance(v, dict)), None)
+        pcfg = _provider_cfg(cfg, prov) or {}
+        auth = pcfg.get("auth") if pcfg.get("auth") in ("api-key", "aws-sdk", "oauth", "token") else None
+        res["key_fix"].append({"provider": prov, "path": config_path(key.strip() if key else prov), "auth": auth,
+                               "where": "config" if doctor_copies(pcfg.get("apiKey"), pcfg) else "catalog",
+                               "pending": keyed[prov]})
     return res
 
 

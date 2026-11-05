@@ -1309,46 +1309,91 @@ as soon as the model it is about to use would run on a stored login (a subscript
 login, a token or an API key in OpenClaw's auth store) or on AWS SDK credentials
 (`auth: "aws-sdk"`), with "Automation has no recorded inference account" in the run
 history (openclaw/openclaw#192195). The refusal also ends the fallback chain: no further
-model is tried. A model needs no account and keeps working when its provider has no
-stored login (a local model such as vLLM, or a key only in the environment or the
-provider config). If the provider also has a stored login, OpenClaw tries that login
-first, unless the key in `models.providers.<provider>.apiKey` is a SecretRef, a `${VAR}`
-reference or the name of a known provider variable (such as `OPENAI_API_KEY`) that is
-set, or a literal key with `models.providers.<provider>.auth: "api-key"`. Another
-upper-case value (`EMPTY`, `NONE`) counts as a literal key. OpenClaw's doctor records
-the accounts itself only from 2026.11.5 (openclaw/openclaw#172792), and only for a
-stored login: AWS SDK credentials are no stored account, so no account can be recorded
-for them, by doctor or by you.
+model is tried.
 
-The gate only reports this: it changes no cron job and no auth store and never holds.
-With OpenClaw 2026.10.4 it prints nothing.
+A model needs no account only when its provider has no stored login **and** no literal
+key: a local model without a key (such as vLLM), a key only in the environment, or a key
+given as a SecretRef. During the migration OpenClaw's doctor (`doctor --fix`, in the
+gate's doctor passes) copies a literal `models.providers.<provider>.apiKey` of
+`openclaw.json` into its auth store as an API-key login (`<provider>:default`), and so
+it does with a literal key in an agent's model catalog (its `models.json` or a generated
+plugin catalog; another agent's than `main` only into that agent's store). That copy is
+a stored login, and from then on every cron run on that provider is refused. This
+applies to placeholders too: `EMPTY`, `NONE`, `none`, `MY_LOCAL_KEY` or `${lower_case}`
+are literal keys. Doctor does not copy a SecretRef (`{"source": "env", "provider":
+"default", "id": "GLM_API_KEY"}`, also `file`, `exec`, `store`), an upper-case
+`${VAR}` or `$VAR` reference, OpenClaw's own markers (such as `custom-local`,
+`ollama-local`, `oauth:…`) or the name of a known provider variable (such as
+`OPENAI_API_KEY`, `VLLM_API_KEY`). `auth: "api-key"` does not stop the copy, but it
+makes OpenClaw run the provider on the configured key instead of the copy (below).
+Doctor has copied such keys since 2026.8.1, so an earlier migration may already have
+left the copy.
+If the provider has a stored login, OpenClaw tries that login first, unless the key in
+`models.providers.<provider>.apiKey` is a SecretRef, a `${VAR}` reference or the name of
+a known provider variable that is set, or a literal key with
+`models.providers.<provider>.auth: "api-key"`. OpenClaw's doctor records the accounts
+itself only from 2026.11.5 (openclaw/openclaw#172792), and only for a stored login: AWS
+SDK credentials are no stored account, so no account can be recorded for them, by
+doctor or by you.
+
+The gate only reports this: it changes no cron job, no auth store and no provider
+setting, and never holds. With OpenClaw 2026.10.4 it prints nothing.
 
 - **Precheck** (also `oc-upgrade gate --dry-run`, and `oc-upgrade check` while a
   migration is pending): one `WARN [gate] cron job '<name>' (<id>): …` per enabled
   agent-turn job without a recorded account whose model or a fallback would use a stored
-  login or AWS SDK credentials. The models are chosen as OpenClaw does: the job's own
-  model, else a `subagents.model` (the agent's, then `agents.defaults.subagents.model`),
-  else the agent's model, else the default; the job's own fallbacks, else those of that
+  login or AWS SDK credentials, counting the logins doctor creates from literal keys
+  during this migration. The models are chosen as OpenClaw does: the job's own model,
+  else a `subagents.model` (the agent's, then `agents.defaults.subagents.model`), else the
+  agent's model, else the default; the job's own fallbacks, else those of that
   `subagents.model`, of the agent or of the defaults (an agent whose model is the same
   `provider/model` string as the default keeps the default fallbacks). It names the
-  affected models, each with what it would run on (a stored login or AWS SDK
-  credentials), and says either that every run is refused (the job's own model is one of
-  them) or that the job keeps working on its own model and stops at the first such
-  fallback when that model fails. Only the job id, its name and model names are shown,
-  no prompt and no account.
+  affected models, each with what it would run on (a stored login, the literal key doctor
+  copies, or AWS SDK credentials), and says either that every run is refused (the job's
+  own model is one of them) or that the job keeps working on its own model and stops at
+  the first such fallback when that model fails. Then one `WARN [gate] provider <p>: …`
+  line per provider whose literal key is the reason, with the fix (below). Only the job
+  id, its name, model names, provider ids and config paths are shown, no prompt, no
+  account and no key.
 - **After the migration** the gate reads the migrated jobs again: the `7/8
-  postconditions` line counts them, the end of the run repeats the warnings, and
-  `oc-upgrade status` lists them.
-- **What to do.** Nothing, if the job's own model needs no account and you can do
-  without that fallback until OpenClaw 2026.11.5 (on AWS SDK credentials: for good, see
-  below). If the reported model's provider has an API key in
-  `models.providers.<provider>.apiKey` besides its stored login, set
-  `models.providers.<provider>.auth: "api-key"` (or give the key as a SecretRef or
-  `${VAR}`): OpenClaw then runs that model on the key, not on the stored login. To run a
-  job on a stored login now: after the start, `openclaw automations edit <id> --model
-  <provider/model>@<profileId>` records the account (and makes that model the job's
-  model). The job then runs only on that account's provider: fallbacks to other
-  providers are refused (openclaw/openclaw#192463).
+  postconditions` line counts them, the end of the run repeats the warnings (with the
+  provider lines), and `oc-upgrade status` lists them.
+- **What to do**, in this order:
+  1. **A literal key** (`provider <p>: …` line): after the start, run
+     `openclaw config set models.providers.<p>.auth api-key` (no restart needed;
+     for a provider key that is no identifier, the path is quoted, for example
+     `'models.providers["my.glm"].auth'`, as the line prints it). OpenClaw then runs
+     `<p>` on the configured key, not on the stored copy, and the job keeps its
+     fallbacks; the add-on's rehearsal on 2026.10.10 confirmed it. OpenClaw 2026.10.4
+     accepts the setting too, so you can set it before the update: there it changes
+     nothing unless the provider also has a stored login or a key in the environment,
+     which the configured key then outranks. Without it, OpenClaw 2026.11.5's own
+     migration would tie these jobs to doctor's copy, with the cost of item 5.
+  2. **Or an env SecretRef**: add the key as a `gateway_env_vars` entry (for example
+     name `GLM_API_KEY`) and restart the add-on, then run `openclaw config set
+     models.providers.<p>.apiKey '{"source":"env","provider":"default","id":"GLM_API_KEY"}'
+     --strict-json`. Doctor then copies nothing, and OpenClaw runs `<p>` on the key from
+     the environment. The rehearsal verified this object form; OpenClaw reads an
+     upper-case `"${GLM_API_KEY}"` string the same way. With `auth: "oauth"` or `"token"`
+     the line offers only this way (`"api-key"` would change how OpenClaw sends the key).
+  3. **A key only in an agent's model catalog** (`models.json`): declare it in
+     `openclaw.json` instead, as `models.providers.<p>.apiKey` with `auth: "api-key"`, or
+     as an env SecretRef (`auth: "api-key"` alone does not help there: it needs the key in
+     `openclaw.json`).
+  4. Nothing, if the job's own model needs no account and you can do without that
+     fallback until OpenClaw 2026.11.5 (on AWS SDK credentials: for good, see below).
+  5. **Last resort**, for a model on a stored login (a subscription login, a token or a
+     stored API key without one in `openclaw.json`):
+     after the start, `openclaw automations edit <id> --model
+     <provider/model>@<profileId>` records the account (and makes that model the job's
+     model). The job then runs only on that account's provider: fallbacks to other
+     providers are refused (openclaw/openclaw#192463).
+
+  `openclaw config set` is refused while a HOLD is active (the wrapper allows only
+  `config validate|get|file|schema`): then edit `openclaw.json` by hand, or set it after
+  the migration. Deleting doctor's copy (`<p>:default`) does not help: the next `doctor
+  --fix` copies the key again; neither do `auth.order` or `auth.profiles` entries.
+
   A model on AWS SDK credentials (`models.providers.<provider>.auth: "aws-sdk"`) cannot
   be recorded as a job's account: `@<profileId>` needs a stored login, and OpenClaw's own
   migration in 2026.11.5 leaves such a job as it is. Give the job a model whose provider
@@ -1415,7 +1460,10 @@ them.
 - **Cron fallbacks.** Until OpenClaw's doctor records the inference accounts itself
   (2026.11.5, openclaw/openclaw#172792), a cron job from before 2026.10.10 is refused, or
   stops at the first fallback, as soon as a model would use a stored login or AWS SDK
-  credentials (openclaw/openclaw#192195). For AWS SDK credentials (`auth: "aws-sdk"`)
+  credentials (openclaw/openclaw#192195). A literal key in
+  `models.providers.<provider>.apiKey` (also a placeholder such as `EMPTY`) becomes a
+  stored login during the migration: set `models.providers.<provider>.auth: "api-key"`
+  or use an env SecretRef. For AWS SDK credentials (`auth: "aws-sdk"`)
   this stays so after 2026.11.5 too: no account can be recorded for them. The gate only
   reports the affected jobs; see
   [Cron jobs without a recorded inference account](#cron-jobs-without-a-recorded-inference-account-openclaw-20261010).

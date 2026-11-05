@@ -22,6 +22,7 @@ import json
 import math
 import os
 import re
+import shlex
 import shutil
 import signal
 import sqlite3
@@ -2603,7 +2604,9 @@ class Gate:
     def cron_binding_forecast(self, F, mode):
         """Precheck 11c (cron, report only): enabled agentTurn jobs whose models would use a stored auth profile or
         AWS SDK credentials without a recorded inference account (runtime_caps cron_refusal). WARN/info only, never
-        a HOLD.
+        a HOLD. The stored logins include the ones doctor creates during this migration from literal provider keys
+        (pending_copies; their key fix lines say how to keep the jobs). A HOLD would also make the wrapper refuse
+        the `config set` fix; if one is ever wanted, raise it here from rec["key_fix"] entries with "pending".
 
         Before the first write only (a resumed run reports after doctor, cron_binding_postcheck). On a runtime
         whose doctor records the accounts itself (cron_doctor_migration) one info line; the jobs doctor leaves
@@ -2612,7 +2615,8 @@ class Gate:
         if not caps["cron_refusal"] or (self.j or {}).get("first_write_at"):
             return None
         try:
-            rec = cron_account_report(self.gp["STATE"], self.cfg, self.pkg["version"], caps["cron_doctor_migration"])
+            rec = cron_account_report(self.gp["STATE"], self.cfg, self.pkg["version"], caps["cron_doctor_migration"],
+                                      pending_copies=True)
         except (sqlite3.Error, C.NodeQueryError, OSError, ValueError, TypeError) as exc:
             self.warn(f"could not check the cron jobs for their inference account ({type(exc).__name__}: "
                       f"{C.redact_text(str(exc))[:200]})")
@@ -4100,9 +4104,13 @@ def codex_cron_ids(state_db, provider="openai-codex"):
 # Read-only. codex_cron_ids (F15) keeps its own 7.x column reader: a 10.x job on an openai/ model must not
 # mark Codex as in use (critic). Nothing here writes into OpenClaw's databases or auth stores.
 CRON_REPORT_MAX = 20
-CRON_MANUAL = ("Manual alternative after the start: openclaw automations edit <id> --model "
-               "<provider/model>@<profileId>; it records the account, but the job then runs only on that "
-               "account's provider and its fallbacks to other providers are refused (openclaw/openclaw#192463)")
+CRON_MANUAL_EDIT = ("openclaw automations edit <id> --model <provider/model>@<profileId>; it records the account, but "
+                    "the job then runs only on that account's provider and its fallbacks to other providers are "
+                    "refused (openclaw/openclaw#192463)")
+CRON_MANUAL = "Manual alternative after the start: " + CRON_MANUAL_EDIT
+# after a key fix line (cron_key_fix_lines): the binding is the last resort, it costs the cross-provider fallbacks
+CRON_MANUAL_LAST = "Otherwise (last resort), after the start: " + CRON_MANUAL_EDIT
+CRON_ENV_REF = '{"source":"env","provider":"default","id":"<VAR>"}'
 # AWS SDK credentials are no stored account: model@profile cannot record them (prepare-auth.ts refuses an aws-sdk
 # profile as the job's account), and OpenClaw's own migration (2026.11.5) leaves such a job unbound as well.
 CRON_AWS_SDK = ("A model on AWS SDK credentials (models.providers.<provider>.auth \"aws-sdk\") cannot be recorded as "
@@ -4125,11 +4133,75 @@ def _cron_on(aff):
     return " or ".join(x for x, on in (("a stored login", prof), ("AWS SDK credentials", aws)) if on)
 
 
-def _cron_remedy(aff):
-    """The closing advice: the model@profile binding for a stored login, a configured-key model for AWS SDK
-    credentials (which no binding can record)."""
+def _cron_remedy(aff, key_fix=False):
+    """The closing advice: the model@profile binding for a stored login (the last resort after key fix lines), a
+    configured-key model for AWS SDK credentials (which no binding can record)."""
     prof, aws = _cron_kinds(aff)
-    return ". ".join(x for x, on in ((CRON_MANUAL, prof), (CRON_AWS_SDK, aws)) if on)
+    return ". ".join(x for x, on in ((CRON_MANUAL_LAST if key_fix else CRON_MANUAL, prof), (CRON_AWS_SDK, aws)) if on)
+
+
+def _cron_key_fix(rec):
+    """{provider: key_fix entry} of a cron_account_report record (none in a record of an earlier add-on version)."""
+    return {k["provider"]: k for k in (rec or {}).get("key_fix") or []
+            if isinstance(k, dict) and isinstance(k.get("provider"), str) and k["provider"]}
+
+
+def _cron_promise(aff, rec):
+    """The closing note's promise that OpenClaw records the accounts itself from 2026.11.5 (#172792), for the jobs on
+    a stored login that is no copy of a provider key: its migration would bind a key-fix provider's jobs to doctor's
+    copy, and then their fallbacks to other providers are refused. "" when no such job is left."""
+    keyed = _cron_key_fix(rec)
+    other = [a for a in aff if set(a.get("refs") or []) - set(a.get("aws_sdk") or [])
+             and not any("/" in r and r.split("/", 1)[0] in keyed for r in a.get("refs") or [])]
+    if not other:
+        return ""
+    if keyed:
+        return "the jobs on other stored logins"
+    return "a stored login" if _cron_kinds(aff)[1] else "such jobs"
+
+
+def cron_key_fix_lines(rec, indent=""):
+    """One line per provider of a cron_account_report record's key_fix: OpenClaw's doctor copies (copied) the
+    provider's literal key into its auth store, a stored login on which the cron jobs above are refused; the fix
+    keeps them and their fallbacks: auth "api-key" (accepted by 2026.10.4 too) or an env SecretRef (the only one
+    offered with auth "oauth"/"token"; for a key only in a model catalog: declare it in openclaw.json). Provider ids
+    and config paths only, never a key value."""
+    rt = (rec or {}).get("runtime") or "2026.10.10+"
+    lines = []
+    for p_, k in _cron_key_fix(rec).items():
+        p, base = printable(p_), printable(k.get("path") or f"models.providers.{p_}")
+        pending = bool(k.get("pending"))
+        env_ref = (f"a gateway_env_vars entry, then openclaw config set {shlex.quote(base + '.apiKey')} "
+                   f"'{CRON_ENV_REF}' --strict-json")
+        how = ("To keep them and their fallbacks, " if pending else
+               f"To lift the refusal for the cron jobs above that use {p} and keep their fallbacks, ")
+        if k.get("where") == "catalog":
+            head = (f"provider {p}: an agent's model catalog (models.json) holds a literal API key for {p} "
+                    "(placeholders such as EMPTY or NONE count as keys); "
+                    + (f"OpenClaw {rt} doctor copies it into OpenClaw's auth store during the migration, and the cron "
+                       f"jobs above that use {p} are refused on it from then on" if pending else
+                       f"OpenClaw {rt} runs {p} on a stored login (OpenClaw's doctor copies such a key into its auth "
+                       "store)"))
+            fix = (how + f"declare the key in openclaw.json instead: {base}.apiKey with {base}.auth \"api-key\", or "
+                   f"as an env SecretRef (a gateway_env_vars entry and {CRON_ENV_REF} as {base}.apiKey)")
+        else:
+            if pending:
+                head = (f"provider {p}: its key in {base}.apiKey is a literal value (placeholders such as EMPTY or "
+                        f"NONE count as keys); OpenClaw {rt} doctor copies it into OpenClaw's auth store during the "
+                        f"migration, and the cron jobs above that use {p} are refused on it from then on")
+                how += "after the start, "
+            else:
+                head = (f"provider {p}: OpenClaw {rt} runs {p} on a stored login although {base}.apiKey holds a key (a "
+                        "literal value, which OpenClaw's doctor copies into its auth store)")
+            if k.get("auth") in ("oauth", "token"):
+                fix = how + f"give the key as an env SecretRef: {env_ref} ({base}.auth \"{k['auth']}\" stays)"
+            else:
+                fix = (how + f"run: openclaw config set {shlex.quote(base + '.auth')} api-key (OpenClaw then uses the "
+                       f"configured key for {p}, not the stored {'copy' if pending else 'login'}; no restart needed"
+                       + ("; 2026.10.4 accepts this setting and runs the same" if pending else "")
+                       + f"), or give the key as an env SecretRef ({env_ref})")
+        lines.append(f"{indent}{head}. {fix}")
+    return lines
 
 
 def cron_jobs_inventory(state_db):
@@ -4205,19 +4277,78 @@ def auth_profile_index(state_dir, targets, state_db, tables):
     return {"agents": agents, "shared": shared}
 
 
-def cron_account_report(state_dir, cfg, runtime=None, doctor_migration=False):
+PLUGIN_CATALOG_SCOPE = "plugin-model-catalog-v1"
+PLUGIN_CATALOG_GENERATED_BY = "openclaw-plugin-model-catalog-v1"
+
+
+def doctor_catalogs(state_dir, targets, orphans):
+    """[(agent id, is the main agent dir, {provider key: apiKey value})] of the model catalogs OpenClaw's doctor reads
+    for plaintext credentials (doctor-model-catalog-credentials.ts, 2026.10.10 = 2026.11.1): <agentDir>/models.json
+    (oc_migrate.parse_model_catalog_json; unreadable or invalid files are skipped, as doctor does) and the agent
+    database's generated plugin catalogs (cache_entries, scope plugin-model-catalog-v1, generatedBy
+    openclaw-plugin-model-catalog-v1), for agents/main/agent, every agents/*/agent and the directory of each
+    configured or registered agent database, minus agents retained after deletion. Read-only; the values stay in
+    memory for oc_migrate.doctor_key_copies and are never kept or printed. Not modelled: a configured agentDir
+    without an agent database, OPENCLAW_AGENT_DIR."""
+    state_dir = Path(state_dir)
+    main = state_dir / "agents" / "main" / "agent"
+    dirs = {os.path.realpath(main): ("main", main)}
+    for aid, pth in list(targets) + list(orphans):
+        dirs.setdefault(os.path.realpath(pth.parent), (str(aid).lower(), pth.parent))
+    root = state_dir / "agents"
+    for d in sorted(root.glob("*/agent")) if root.is_dir() else []:
+        if d.is_dir():
+            dirs.setdefault(os.path.realpath(d), (d.parent.name.lower(), d))
+    retained = {os.path.dirname(p) for p, (_a, why) in deletion_journal_held(state_dir).items() if why == HELD_RETAINED}
+    out = []
+    for real, (aid, d) in sorted(dirs.items()):
+        if real in retained:
+            continue
+        found = []
+        text = mig()._read_regular_text(str(d / "models.json"))
+        try:
+            root_json = mig().parse_model_catalog_json(text) if text is not None else None
+        except (ValueError, RecursionError):
+            root_json = None
+        if isinstance(root_json, dict) and isinstance(root_json.get("providers"), dict):
+            found.append(root_json["providers"])
+        db = d / "openclaw-agent.sqlite"
+        try:
+            rows = q(db, "SELECT value_json FROM cache_entries WHERE scope=? ORDER BY key", (PLUGIN_CATALOG_SCOPE,)) \
+                if db.is_file() and "cache_entries" in table_names(db) else []
+        except (sqlite3.Error, C.NodeQueryError, OSError):
+            rows = []
+        for (vj,) in rows:
+            try:
+                cat = json.loads(vj) if isinstance(vj, str) else None
+            except (ValueError, RecursionError):
+                continue
+            if isinstance(cat, dict) and cat.get("generatedBy") == PLUGIN_CATALOG_GENERATED_BY \
+                    and isinstance(cat.get("providers"), dict):
+                found.append(cat["providers"])
+        for provs in found:
+            keys = {k: v.get("apiKey") for k, v in provs.items() if isinstance(k, str) and isinstance(v, dict)}
+            if keys:
+                out.append((aid, real == os.path.realpath(main), keys))
+    return out
+
+
+def cron_account_report(state_dir, cfg, runtime=None, doctor_migration=False, pending_copies=False):
     """Forecast for openclaw/openclaw#192195 on the current state (read-only): oc_migrate.cron_account_forecast
-    with the auth profiles of the stores and of auth.profiles in openclaw.json. Names and ids are cut for the
-    journal; no prompt, profile id or credential is kept."""
+    with the auth profiles of the stores and of auth.profiles in openclaw.json, and the profiles OpenClaw's doctor
+    creates from literal provider keys (oc_migrate.doctor_key_copies over openclaw.json and doctor_catalogs);
+    pending_copies (precheck, before doctor ran): those copies are not in the stores yet. Names and ids are cut for
+    the journal; no prompt, profile id or credential is kept."""
     state_dir = Path(state_dir)
     cfg = cfg if isinstance(cfg, dict) else {}
     state_db = state_dir / "state" / "openclaw.sqlite"
-    rec = {"runtime": runtime, "doctor_migration": bool(doctor_migration), "checked": 0, "bound": 0, "affected": []}
+    rec = {"runtime": runtime, "doctor_migration": bool(doctor_migration), "checked": 0, "bound": 0, "affected": [],
+           "key_fix": []}
     jobs = cron_jobs_inventory(state_db)
     if not jobs:
         return rec
     tables = table_names(state_db)
-    targets, _orphans = agent_databases(state_dir, cfg, tables)
+    targets, orphans = agent_databases(state_dir, cfg, tables)
     index = auth_profile_index(state_dir, targets, state_db, tables)
     cfg_profiles = _cfg_get(cfg, "auth", "profiles")
     declared = [{"id": str(pid), "provider": str(p.get("provider") or "")}
@@ -4226,22 +4357,33 @@ def cron_account_report(state_dir, cfg, runtime=None, doctor_migration=False):
 
     def profiles_for(aid):
         return index["agents"].get(aid, []) + index["shared"] + declared
-    fc = mig().cron_account_forecast(jobs, cfg, profiles_for, default_agent_id(cfg))
+
+    def store_ids(aid):
+        return {p["id"] for p in (index["shared"] if aid is None else index["agents"].get(aid, []))}
+    copies = mig().doctor_key_copies(cfg, doctor_catalogs(state_dir, targets, orphans), store_ids)
+
+    def copies_for(aid):
+        return copies["shared"] + copies["agents"].get(aid, [])
+    fc = mig().cron_account_forecast(jobs, cfg, profiles_for, default_agent_id(cfg), copies_for, pending_copies)
     rec.update(checked=fc["checked"], bound=fc["bound"],
-               affected=[dict(a, id=str(a["id"])[:120], name=str(a["name"])[:120]) for a in fc["affected"]])
+               affected=[dict(a, id=str(a["id"])[:120], name=str(a["name"])[:120]) for a in fc["affected"]],
+               key_fix=fc["key_fix"])
     return rec
 
 
 def cron_job_lines(rec):
-    """Per-job WARN texts of a cron_account_report record, then the closing note (empty when none)."""
+    """Per-job WARN texts of a cron_account_report record, the key fix lines, then the closing note (empty when
+    none)."""
     aff = (rec or {}).get("affected") or []
     if not aff:
         return []
     rt = rec.get("runtime") or "2026.10.10+"
+    keyed = _cron_key_fix(rec)
     lines = []
     for a in aff[:CRON_REPORT_MAX]:
         refs = [printable(r) for r in a.get("refs") or []]
         aws = {printable(r) for r in a.get("aws_sdk") or []}
+        copied = {printable(r) for r in a.get("key_copy") or []}
         head = f"cron job '{printable(a.get('name'))[:80]}' ({printable(a.get('id'))[:80]}): "
         more = "".join(f"; also on {on}: {', '.join(x)}" for on, x in (
             ("a stored login", [r for r in refs[1:] if r not in aws]),
@@ -4251,27 +4393,41 @@ def cron_job_lines(rec):
                          f"run on AWS SDK credentials (models.providers.{refs[0].split('/', 1)[0]}.auth "
                          "\"aws-sdk\"), which OpenClaw refuses for a cron job without a recorded inference account "
                          "(openclaw/openclaw#192195)" + more)
+        elif a.get("primary_affected") and refs[0] in copied:
+            k = keyed.get((a.get("refs") or [""])[0].split("/", 1)[0]) or {}
+            p = printable(k.get("path") or f"models.providers.{refs[0].split('/', 1)[0]}")
+            where = (f"a literal API key in an agent's model catalog (models.json, provider "
+                     f"{printable(k.get('provider'))})" if k.get("where") == "catalog" else
+                     f"the API key written as a literal value in {p}.apiKey")
+            lines.append(head + f"OpenClaw {rt} refuses every run and tries no fallback: its model {refs[0]} runs on "
+                         f"{where}, which OpenClaw {rt} doctor copies into its auth store during this migration (a "
+                         "stored login from then on); the job has no recorded inference account "
+                         "(openclaw/openclaw#192195)" + more)
         elif a.get("primary_affected"):
             lines.append(head + f"OpenClaw {rt} refuses every run and tries no fallback: its model {refs[0]} would "
                          "use a stored login (auth profile) and the job has no recorded inference account "
                          "(openclaw/openclaw#192195)" + more)
         else:
             primary = f"its model {printable(a['primary'])}" if a.get("primary") else "its primary model"
-            on = "AWS SDK credentials" if refs[0] in aws else "stored login"
+            on = ("AWS SDK credentials" if refs[0] in aws else
+                  "its literal API key becomes a stored login during the migration" if refs[0] in copied else
+                  "stored login")
+            sep = ";" if refs[0] in copied else ","
             lines.append(head + f"{primary} needs no stored login and keeps working, but when it fails OpenClaw "
-                         f"{rt} stops at the fallback {refs[0]} ({on}, no recorded inference account; "
+                         f"{rt} stops at the fallback {refs[0]} ({on}{sep} no recorded inference account; "
                          "openclaw/openclaw#192195) instead of trying further models" + more)
     if len(aff) > CRON_REPORT_MAX:
         lines.append(f"and {len(aff) - CRON_REPORT_MAX} more cron job(s) (oc-upgrade status)")
-    prof, aws = _cron_kinds(aff)
+    lines += cron_key_fix_lines(rec)
+    remedy = _cron_remedy(aff, bool(keyed))
     if rec.get("doctor_migration"):
         lines.append(f"{len(aff)} cron job(s) above still have no recorded inference account after the migration: "
-                     f"OpenClaw {rt} doctor left them (its warnings are in oc-upgrade log). {_cron_remedy(aff)}")
+                     f"OpenClaw {rt} doctor left them (its warnings are in oc-upgrade log). {remedy}")
     else:
+        who = _cron_promise(aff, rec)
         lines.append(f"{len(aff)} cron job(s) above: the add-on changes nothing"
-                     + (f"; OpenClaw records the inference account of {'a stored login' if aws else 'such jobs'} "
-                        "itself from 2026.11.5 (doctor migration, openclaw/openclaw#172792)" if prof else "")
-                     + ". " + _cron_remedy(aff))
+                     + (f"; OpenClaw records the inference account of {who} itself from 2026.11.5 (doctor migration, "
+                        "openclaw/openclaw#172792)" if who else "") + ". " + remedy)
     return lines
 
 
@@ -5422,8 +5578,11 @@ def _readiness_cron(g):
         which = " for a stored login, not for AWS SDK credentials" if _cron_kinds(aff)[1] else ""
         return [f"[gate]   cron inference accounts: {n} enabled cron job(s) use {on} without a recorded "
                 f"account; OpenClaw {rt} doctor records it{which} (openclaw/openclaw#172792)"]
+    copied = sum(1 for a in aff if a.get("key_copy"))
     return [f"[gate]   cron inference accounts: {n} enabled cron job(s) stop at {on} on OpenClaw {rt} "
-            "(the WARN lines above, openclaw/openclaw#192195); report only, the gate changes nothing"]
+            + (f"({copied} because OpenClaw's doctor copies a literal provider key into its auth store; fix: "
+               "models.providers.<provider>.auth \"api-key\" or an env SecretRef) " if copied else "")
+            + "(the WARN lines above, openclaw/openclaw#192195); report only, the gate changes nothing"]
 
 
 def hold_after_start(code, last_rc=None, emit=out):
@@ -6157,14 +6316,21 @@ def _status_cron(j):
     for a in aff[:CRON_REPORT_MAX]:
         refs = [printable(r) for r in a.get("refs") or []]
         aws = {printable(r) for r in a.get("aws_sdk") or []}
+        copied = {printable(r) for r in a.get("key_copy") or []}
         what = "every run refused" if a.get("primary_affected") else f"stops at the fallback {refs[0] if refs else '?'}"
-        shown = ", ".join(r + (" (AWS SDK credentials)" if r in aws else "") for r in refs)
+        shown = ", ".join(r + (" (AWS SDK credentials)" if r in aws else
+                               " (literal key that doctor copies)" if r in copied else "") for r in refs)
         L.append(f"    '{printable(a.get('name'))[:80]}' ({printable(a.get('id'))[:80]}): {what}; {shown}")
     if len(aff) > CRON_REPORT_MAX:
         L.append(f"    and {len(aff) - CRON_REPORT_MAX} more")
-    prof, aws = _cron_kinds(aff)
-    L.append("    " + (f"OpenClaw records the account{' of a stored login' if aws else ''} itself from 2026.11.5 "
-                       "(openclaw/openclaw#172792). " if prof else "") + _cron_remedy(aff))
+    L += cron_key_fix_lines(rec, "    ")
+    who = _cron_promise(aff, rec)
+    if who in ("such jobs", "a stored login"):
+        who = "the account" + (" of a stored login" if who == "a stored login" else "")
+    elif who:
+        who = "the account of " + who
+    L.append("    " + (f"OpenClaw records {who} itself from 2026.11.5 (openclaw/openclaw#172792). " if who else "")
+             + _cron_remedy(aff, bool(_cron_key_fix(rec))))
     return L
 
 

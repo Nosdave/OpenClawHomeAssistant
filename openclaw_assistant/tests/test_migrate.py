@@ -2817,6 +2817,35 @@ class TestCronAccountForecast(unittest.TestCase):
         self.assertTrue(uses(prov(apiKey="sk-synthetic")))
         # apiKey naming a stored profile pins it
         self.assertTrue(uses(prov(apiKey="anthropic:default")))
+        # rehearsal D1: OpenClaw's SecretRef grammar (config/types.secrets.ts): "${VAR}" and "$VAR" with VAR upper
+        # case, trimmed; anything else is a literal key (the stored profiles come first)
+        for ref in ("$OPENAI_API_KEY", " ${OPENAI_API_KEY} ", "${A" + "B" * 127 + "}",
+                    {"source": "file", "provider": "vault", "id": "/openai"}):
+            with self.subTest(ref=ref):
+                self.assertFalse(uses(prov(apiKey=ref)))
+        for literal in ("${openai_key}", "${_OPENAI}", "${OPENAI:-x}", "Bearer ${OPENAI}", "${A" + "B" * 128 + "}",
+                        "$openai"):
+            with self.subTest(literal=literal):
+                self.assertTrue(uses(prov(apiKey=literal)))
+                self.assertFalse(uses(prov(apiKey=literal, auth="api-key")))
+
+    def test_stored_profile_rules_non_env_markers(self):
+        """Rehearsal D1 research: a non-env marker suppresses the stored profiles only while usable
+        (model-auth-provider-config.ts resolveUsableCustomProviderApiKey): on a local base URL with api
+        "openai-completions" or "ollama"; auth "api-key" does not make a marker a key."""
+        vllm = [{"id": "vllm:default", "provider": "vllm"}]
+        uses = lambda pcfg: m.cron_ref_uses_stored_profile(  # noqa: E731
+            {"models": {"providers": {"vllm": pcfg}}}, "vllm", None, vllm)
+        local = {"baseUrl": "http://127.0.0.1:8000/v1", "api": "openai-completions"}
+        self.assertFalse(uses(dict(local, apiKey="custom-local")))
+        self.assertFalse(uses(dict(local, apiKey="ollama-local", api="ollama")))
+        self.assertFalse(uses(dict(local, apiKey="lmstudio-local", baseUrl="http://192.168.1.5:1234/v1")))
+        self.assertFalse(uses(dict(local, apiKey="custom-local", baseUrl="http://host.docker.internal:8000")))
+        self.assertTrue(uses(dict(local, apiKey="custom-local", baseUrl="https://api.example.org/v1")))
+        self.assertTrue(uses(dict(local, apiKey="custom-local", api="anthropic-messages")))
+        self.assertTrue(uses(dict(local, apiKey="custom-local", baseUrl="https://api.example.org/v1", auth="api-key")))
+        self.assertTrue(uses(dict(local, apiKey="oauth:vllm", baseUrl="https://api.example.org/v1")))
+        self.assertFalse(uses(dict(local, apiKey="VLLM_API_KEY", baseUrl="https://api.example.org/v1")))
 
     def test_stored_profile_rules_aws_sdk_and_unknown_markers(self):
         """Review (gate1010): auth "aws-sdk" is a direct source OpenClaw does not count as a configured key
@@ -2909,6 +2938,194 @@ class TestCronAccountForecast(unittest.TestCase):
         snap, cfg_snap = copy.deepcopy(jobs), copy.deepcopy(self.CFG)
         self.forecast(*jobs)
         self.assertEqual((jobs, self.CFG), (snap, cfg_snap))
+
+
+class TestDoctorKeyCopies(unittest.TestCase):
+    """Rehearsal D1: OpenClaw's doctor (2026.8.1+, unchanged in 2026.10.10 and 2026.11.1) copies a literal provider
+    apiKey into its auth store as "<provider>:default" (doctor-model-catalog-credentials.ts collectCredentials), and
+    OpenClaw 2026.10.10/2026.11.1 then refuse every cron run on that provider without a recorded inference account.
+    The cases follow doctor's skip rules; synthetic values only."""
+
+    COPIED = ["sk-synth-1", "EMPTY", "NONE", "none", " EMPTY ", "LOCAL", "MY_LOCAL_KEY", "openai_api_key",
+              "Ollama-Local", "oauth", "llama-cpp-local", "${glm_key}", "${_GLM}", "${GLM:-x}", "Bearer ${GLM}",
+              "${" + "A" * 129 + "}", "$glm", "glm:default"]
+    KEPT = ["", "  ", "${GLM_API_KEY}", " ${GLM_API_KEY} ", "$GLM_API_KEY", "${EMPTY}", "OPENAI_API_KEY",
+            "VLLM_API_KEY", "AWS_PROFILE", "AWS_BEARER_TOKEN_BEDROCK", "AWS_ACCESS_KEY_ID", "secretref-env:X",
+            "oauth:glm", "custom-local", "codex-app-server", "gcp-vertex-credentials", "ollama-local",
+            "secretref-managed", "openclaw:claude-cli-native-auth", "apple-fm-local", "lmstudio-local",
+            "minimax-oauth", None, 3, {"source": "env", "provider": "default", "id": "GLM_API_KEY"}]
+    REFS = [{"source": s, "provider": "default", "id": "GLM_API_KEY"} for s in ("env", "file", "exec", "store")]
+
+    def test_doctor_copies_follows_the_skip_rules(self):
+        for v in self.COPIED:
+            with self.subTest(copied=v):
+                self.assertTrue(m.doctor_copies(v, {"apiKey": v}))
+                self.assertTrue(m.doctor_copies(v, {"apiKey": v, "auth": "api-key"}))  # auth plays no part
+        for v in self.KEPT:
+            with self.subTest(kept=v):
+                self.assertFalse(m.doctor_copies(v, {"apiKey": v}))
+        for ref in self.REFS:
+            with self.subTest(ref=ref):
+                self.assertTrue(m.is_secret_ref(ref))
+                self.assertFalse(m.doctor_copies(ref, {"apiKey": ref}))
+                # a catalog literal of a provider whose openclaw.json entry is a SecretRef is not copied either
+                self.assertFalse(m.doctor_copies("sk-synth-catalog", {"apiKey": ref}))
+        self.assertFalse(m.doctor_copies("sk-synth-catalog", {"apiKey": "${GLM_API_KEY}"}))
+        # a catalog value is copied as it is: only the openclaw.json entry is checked for a reference
+        self.assertTrue(m.doctor_copies("${GLM_API_KEY}", None))
+        self.assertTrue(m.doctor_copies("${GLM_API_KEY}", {"apiKey": "sk-synth-1"}))
+        # a value that is the id of a stored profile is a reference to it, not a key
+        self.assertFalse(m.doctor_copies("glm:default", {"apiKey": "glm:default"}, {"glm:default"}))
+        self.assertTrue(m.doctor_copies("glm:work", {"apiKey": "glm:work"}, {"glm:default"}))
+
+    def test_secret_ref_and_marker_grammar(self):
+        for v in ({"source": "env", "provider": "default"}, {"source": "env", "provider": " ", "id": "X"},
+                  {"source": "keychain", "provider": "default", "id": "X"},
+                  {"source": "env", "provider": "default", "id": "X", "extra": 1}, "${glm}", "$1X", "${X}y", ""):
+            with self.subTest(v=v):
+                self.assertFalse(m.is_secret_ref(v))
+        self.assertTrue(m.is_key_marker(" oauth:x "))
+        self.assertFalse(m.is_key_marker("OAuth:x"))
+        self.assertFalse(m.is_key_marker("EMPTY"))
+        self.assertEqual(len(m._KNOWN_ENV_KEY_MARKERS), 54)  # the 2026.11.1 set (core, legacy, bundled manifests)
+
+    def test_model_catalog_json_is_parsed_like_openclaw(self):
+        text = '{\n // comment\n "providers": {"glm": {"apiKey": "a//b", "models": [1, 2,],},}, // end\n}\n'
+        self.assertEqual(m.parse_model_catalog_json(text), {"providers": {"glm": {"apiKey": "a//b", "models": [1, 2]}}})
+        for bad in ("{", "\ufeff{}", '{"a": NaN}', "{'a': 1}"):
+            with self.subTest(bad=bad):
+                with self.assertRaises(ValueError):
+                    m.parse_model_catalog_json(bad)
+
+    def test_config_path_follows_append_config_path_segment(self):
+        self.assertEqual(m.config_path("glm"), "models.providers.glm")
+        self.assertEqual(m.config_path("GLM_2:x-y"), "models.providers.GLM_2:x-y")
+        self.assertEqual(m.config_path("my.glm"), 'models.providers["my.glm"]')
+        self.assertEqual(m.config_path("2glm"), 'models.providers["2glm"]')
+
+    def test_doctor_key_copies_destinations(self):
+        cfg = {"models": {"providers": {
+            "GLM": {"apiKey": "sk-synth-1"}, "vllm": {"apiKey": "VLLM_API_KEY"},
+            "envref": {"apiKey": {"source": "env", "provider": "default", "id": "ENVREF_KEY"}},
+            "pinned": {"apiKey": "pinned:work"}, "blank": {"apiKey": " "}}}}
+        catalogs = [("main", True, {"cat": "sk-synth-2", "envref": "sk-synth-3", "glm": "sk-synth-4"}),
+                    ("haus", False, {"local": "EMPTY", "vllm": "VLLM_API_KEY", "x": None}),
+                    ("Ops", False, {"dup": "sk-synth-5", "dup ": "sk-synth-6"})]
+        stores = {None: {"pinned:work"}, "haus": set()}
+        res = m.doctor_key_copies(cfg, catalogs, lambda aid: stores.get(aid, set()))
+        self.assertEqual(res, {
+            "shared": [{"id": "glm:default", "provider": "glm", "copy": "config"},
+                       {"id": "cat:default", "provider": "cat", "copy": "catalog"}],
+            "agents": {"haus": [{"id": "local:default", "provider": "local", "copy": "catalog"}],
+                       "ops": [{"id": "dup:default", "provider": "dup", "copy": "catalog"}]}})
+        self.assertNotIn("sk-synth", json.dumps(res))
+        self.assertEqual(m.doctor_key_copies({}, [], None), {"shared": [], "agents": {}})
+
+
+class TestCronKeyCopyForecast(unittest.TestCase):
+    """Rehearsal D1 (report only): the precheck forecast counts the stored login doctor creates from a literal
+    provider key during the migration (copies_pending) and names the fix that keeps the job and its fallbacks."""
+
+    PROFILES = [{"id": "openai:default", "provider": "openai"}]
+
+    def cfg(self, **glm):
+        return {"agents": {"defaults": {"model": {"primary": "glm/glm-5", "fallbacks": ["openai/gpt-5.5"]}},
+                           "list": [{"id": "main", "default": True}, {"id": "haus"}]},
+                "models": {"providers": {"glm": dict({"baseUrl": "http://127.0.0.1:8000/v1",
+                                                      "api": "openai-completions"}, **glm),
+                                         "vllm": {"baseUrl": "http://127.0.0.1:8001/v1"}}}}
+
+    def job(self, jid, agent="haus", **payload):
+        return {"id": jid, "name": f"Job {jid}", "enabled": True, "runtime_authority": False,
+                "job": {"agentId": agent, "sessionTarget": "isolated",
+                        "payload": dict({"kind": "agentTurn", "message": "synthetic prompt"}, **payload)}}
+
+    def forecast(self, cfg, *jobs, pending=True, profiles=None, catalogs=()):
+        copies = m.doctor_key_copies(cfg, catalogs, lambda aid: set())
+        return m.cron_account_forecast(list(jobs), cfg, lambda aid: self.PROFILES if profiles is None else profiles,
+                                       "main", lambda aid: copies["shared"] + copies["agents"].get(aid, []), pending)
+
+    def test_literal_key_is_refused_after_the_copy(self):
+        """The D1 regression: a glm-only job on a literal glm key with no stored glm login was "not affected"."""
+        res = self.forecast(self.cfg(apiKey="sk-synth-glm"), self.job("only", fallbacks=[]))
+        self.assertEqual(res["affected"], [{"id": "only", "name": "Job only", "agent": "haus", "primary": "glm/glm-5",
+                                            "primary_affected": True, "refs": ["glm/glm-5"],
+                                            "key_copy": ["glm/glm-5"]}])
+        self.assertEqual(res["key_fix"], [{"provider": "glm", "path": "models.providers.glm", "auth": None,
+                                           "where": "config", "pending": True}])
+        # without the pending copy (the old forecast) it was not affected
+        self.assertEqual(self.forecast(self.cfg(apiKey="sk-synth-glm"), self.job("only", fallbacks=[]),
+                                       pending=False)["affected"], [])
+        self.assertNotIn("sk-synth", json.dumps(res))
+
+    def test_what_keeps_a_literal_key_job_working(self):
+        for glm in ({"apiKey": "sk-synth-glm", "auth": "api-key"},
+                    {"apiKey": {"source": "env", "provider": "default", "id": "GLM_API_KEY"}},
+                    {"apiKey": "${GLM_API_KEY}"}, {"apiKey": "$GLM_API_KEY"}, {"apiKey": "VLLM_API_KEY"},
+                    {"apiKey": "custom-local"}, {}, {"apiKey": ""}):
+            with self.subTest(glm=glm):
+                res = self.forecast(self.cfg(**glm), self.job("only", fallbacks=[]))
+                self.assertEqual((res["affected"], res["key_fix"]), ([], []))
+        for literal in ("EMPTY", "NONE", "${glm_key}"):
+            with self.subTest(literal=literal):
+                res = self.forecast(self.cfg(apiKey=literal), self.job("only", fallbacks=[]))
+                self.assertEqual([a.get("key_copy") for a in res["affected"]], [["glm/glm-5"]])
+
+    def test_auth_modes(self):
+        res = self.forecast(self.cfg(apiKey="sk-synth-glm", auth="oauth"), self.job("only", fallbacks=[]))
+        self.assertEqual([(k["auth"], k["pending"]) for k in res["key_fix"]], [("oauth", True)])
+        # aws-sdk stays AWS SDK credentials (no stored login, no key fix)
+        res = self.forecast(self.cfg(apiKey="sk-synth-glm", auth="aws-sdk"), self.job("only", fallbacks=[]))
+        self.assertEqual([(a["refs"], a.get("aws_sdk"), a.get("key_copy")) for a in res["affected"]],
+                         [(["glm/glm-5"], ["glm/glm-5"], None)])
+        self.assertEqual(res["key_fix"], [])
+
+    def test_fallback_on_a_copied_provider_and_explicit_profiles(self):
+        res = self.forecast(self.cfg(apiKey="sk-synth-glm"),
+                            self.job("fb", model="vllm/q", fallbacks=["glm/glm-5", "openai/gpt-5.5"]),
+                            self.job("pin", model="glm/glm-5@glm:work", fallbacks=[]))
+        self.assertEqual(res["affected"], [
+            {"id": "fb", "name": "Job fb", "agent": "haus", "primary": "vllm/q", "primary_affected": False,
+             "refs": ["glm/glm-5", "openai/gpt-5.5"], "key_copy": ["glm/glm-5"]},
+            {"id": "pin", "name": "Job pin", "agent": "haus", "primary": "glm/glm-5", "primary_affected": True,
+             "refs": ["glm/glm-5"]}])
+        self.assertEqual([k["provider"] for k in res["key_fix"]], ["glm"])
+        # an explicit @profile is no key: alone it gives no key fix
+        res = self.forecast(self.cfg(apiKey="sk-synth-glm"), self.job("pin", model="glm/glm-5@glm:work",
+                                                                       fallbacks=[]))
+        self.assertEqual(res["key_fix"], [])
+
+    def test_after_the_migration_the_key_fix_stays(self):
+        """Postconditions: doctor's copy is in the stores; the literal key still names the fix (pending False)."""
+        stored = [{"id": "glm:default", "provider": "glm"}]
+        res = self.forecast(self.cfg(apiKey="sk-synth-glm"), self.job("only", fallbacks=[]), pending=False,
+                            profiles=stored)
+        self.assertEqual([(a["primary_affected"], a.get("key_copy")) for a in res["affected"]], [(True, None)])
+        self.assertEqual(res["key_fix"], [{"provider": "glm", "path": "models.providers.glm", "auth": None,
+                                           "where": "config", "pending": False}])
+        # a stored glm login without a literal key: no key fix (only the binding helps)
+        res = self.forecast(self.cfg(), self.job("only", fallbacks=[]), pending=False, profiles=stored)
+        self.assertEqual((len(res["affected"]), res["key_fix"]), (1, []))
+
+    def test_catalog_keys_reach_their_agent_only(self):
+        cfg = self.cfg()
+        jobs = (self.job("h", fallbacks=[]), self.job("m", agent="main", fallbacks=[]))
+        res = self.forecast(cfg, *jobs, catalogs=[("haus", False, {"glm": "sk-synth-cat"})])
+        self.assertEqual([(a["id"], a.get("key_copy")) for a in res["affected"]], [("h", ["glm/glm-5"])])
+        self.assertEqual(res["key_fix"], [{"provider": "glm", "path": "models.providers.glm", "auth": None,
+                                           "where": "catalog", "pending": True}])
+        res = self.forecast(cfg, *jobs, catalogs=[("main", True, {"GLM": "sk-synth-cat"})])
+        self.assertEqual([a["id"] for a in res["affected"]], ["h", "m"])
+        # an env SecretRef in openclaw.json stops the catalog copy too
+        cfg = self.cfg(apiKey={"source": "env", "provider": "default", "id": "GLM_API_KEY"})
+        self.assertEqual(self.forecast(cfg, *jobs, catalogs=[("main", True, {"glm": "sk-synth-cat"})])["affected"], [])
+
+    def test_bracket_path_for_a_provider_key_that_is_no_identifier(self):
+        cfg = self.cfg()
+        cfg["models"]["providers"]["my.glm"] = {"apiKey": "sk-synth-glm"}
+        res = self.forecast(cfg, self.job("only", model="my.glm/glm-5", fallbacks=[]))
+        self.assertEqual(res["key_fix"], [{"provider": "my.glm", "path": 'models.providers["my.glm"]', "auth": None,
+                                           "where": "config", "pending": True}])
 
 
 class TestPurity(unittest.TestCase):
