@@ -1080,7 +1080,11 @@ coming from `0.5.94-full1`, `0.5.94-full2` or `0.5.94-full3`, see the note after
    **Configuration** tab. Start the add-on. Leave the log open. While the gate runs
    the add-on page is not available yet; **do not stop the add-on while
    `[gate] … doctor pass … running` is shown** (it would resume once on the next
-   start, but it costs time).
+   start, but it costs time). A doctor pass that was stopped keeps OpenClaw's plugin
+   lifecycle lease until it expires, 5 minutes after its last heartbeat: the resumed
+   doctor (or `oc-upgrade retry --doctor`) first prints `Waiting for plugin lifecycle
+   lease … held by …` and waits for it (up to 10 minutes); that is no hang. The gate also
+   stops the npm processes the stopped doctor had started.
 5. The precheck line names
    `HA backup ok ('<name>', … old, encrypted, add-on 0.5.93-full2)`. Success ends with
    `[gate] done: MIGRATED <bundled OpenClaw version> …` (2026.10.4 up to `0.5.94-full4`,
@@ -1122,7 +1126,7 @@ its next run and counts the rest).
 
 | Phase | What happens |
 |---|---|
-| 1 precheck | Read-only checks: runtime package, Node/SQLite, no other OpenClaw process, readable config, state not newer than the image, clean 2026.7 state, no symlinked state or workspace directory (a backup would hold only the link), model preflight, legacy files, sessions, pre-July-2026 leftovers (below), with OpenClaw 2026.11.1+ invalid `heartbeat.activeHours` windows (`config-heartbeat-hours`, hard), agent databases outside the configured agents (orphan or held), free space in `/config` (including the Skill Workshop export), SQLite `quick_check`, SQLite foreign-key check (`PRAGMA foreign_key_check`, read-only: OpenClaw stops an agent database migration on any violation), npm reachable, an encrypted Home Assistant backup with this add-on (Supervisor API; see step 3 above). Information lines: the installed official plugins; with OpenClaw 2026.10.10+ also the Skill Workshop proposals, cron jobs without a recorded inference account (`WARN`) and the largest agent database and session. All findings are collected, then one HOLD if needed. |
+| 1 precheck | Read-only checks: runtime package, Node/SQLite, no other OpenClaw process, readable config, state not newer than the image, clean 2026.7 state, no symlinked state or workspace directory (a backup would hold only the link), model preflight, legacy files, sessions, pre-July-2026 leftovers (below), with OpenClaw 2026.11.1+ invalid `heartbeat.activeHours` windows (`config-heartbeat-hours`, hard), agent databases outside the configured agents (orphan, held, or registered for an agent that is no longer configured: information), free space in `/config` (including the Skill Workshop export), SQLite `quick_check`, SQLite foreign-key check (`PRAGMA foreign_key_check`, read-only: OpenClaw stops an agent database migration on any violation), npm reachable, an encrypted Home Assistant backup with this add-on (Supervisor API; see step 3 above). Information lines: the installed official plugins; with OpenClaw 2026.10.10+ also the Skill Workshop proposals, cron jobs without a recorded inference account (`WARN`) and the largest agent database and session. All findings are collected, then one HOLD if needed. |
 | 2 cleanup | Transient SQLite sidecars, legacy Telegram caches and pre-July-2026 files whose content is already in SQLite are moved to `/config/.openclaw-upgrade/gate/quarantine/<run>/` (kept, listed in the log; with OpenClaw 2026.10.5+ also the retired runtime files OpenClaw already imported, with the proof in the log and in the quarantine's `MANIFEST.json`). |
 | 3 pre-migrate | `plugins.installs` is removed from `openclaw.json` when its records are in the SQLite plugin index. For legacy `openai-codex/…` refs: wildcards → explicit models; these refs keep the OpenClaw runtime they used on 2026.7. With OpenClaw 2026.10.5+ an `openai-codex-responses` API id becomes `openai-chatgpt-responses` and the `cdpUrl` of an extension browser profile is removed, as 2026.10.4 doctor did. |
 | 4–6 doctor | With OpenClaw 2026.10.10+ the gate first exports every Skill Workshop proposal ([below](#skill-workshop-proposals-openclaw-20261010)). Then `openclaw doctor --fix --non-interactive` twice (a third time only if the second still changed the config), each with a time limit and a progress line every minute; scoped fixups in between. Canonical `openai/*` refs keep their runtime (Codex app-server by default, as on 2026.7; an `agentRuntime` pin on an `openai/…` entry is kept). A model used both as `openai-codex/<model>` and as `openai/<model>` gets one route in 2026.9+: the precheck holds with the acceptable code `models-route-collision`. Agent databases doctor "held back" (acceptable `doctor-held-back`), plugin data upgrades still "unfinished", login renames still deferred and a dreaming cron inspection still pending after the last pass hold. With `glm_thinking_levels` on, GLM models are switched to thinking levels after the fixups (below). Each pass line counts the SQLite copies doctor saved in that pass (full `.bak`, or table-scoped `.scoped.bak` from 2026.10.10); they are not the rollback point and are deleted with the doctor captures ([Automatic deletion](#automatic-deletion-gate_cleanup_hours)). With OpenClaw 2026.10.5+ a doctor warning about retired files it left unchanged holds (acceptable `doctor-retired-warning`). With OpenClaw 2026.11.1+ a pass that ends with "Doctor blocked; required repairs remain incomplete." (exit 1) holds with `doctor-blocked`, whose reason lists doctor's findings. |
@@ -1229,10 +1233,24 @@ named. Cron jobs never hold: the gate only reports them
 **Agent databases outside the configured agents.** OpenClaw's doctor migrates the
 database of every agent folder it finds under `/config/.openclaw/agents/`, also of agents
 that are neither configured nor registered, one-way, unless its deletion history holds
-the store back; the gateway opens only the configured agents' databases. The gate holds
-once with the acceptable code `orphan-agent-db`, so you can move unused folders away
-first; it checks such a store with `quick_check` and the foreign-key check, but not its
-schema afterwards. Stores that OpenClaw keeps from deleted agents (its deletion journal;
+the store back; the gateway opens only the configured agents' databases. A store that
+records another agent as its owner (for example a copied agent folder) is not migrated:
+if it is a byte-identical copy of that agent's database, doctor renames it to
+`<file>.corrupt-<time>` ("Preserved the copy at …"), otherwise it refuses it with a
+repair hint. The gate holds once with the acceptable code `orphan-agent-db`, so you can
+move unused folders away first; it checks such a store with `quick_check` and the
+foreign-key check, but not its schema afterwards. After doctor it looks at each such
+store again and reports what happened (`doctor migrated it to schema 27`, `set it aside
+as …corrupt-…`, `still at schema …`, `gone after doctor`) at the end of the run and in
+`oc-upgrade status`. A `<file>.corrupt-<time>` is the renamed original, a complete
+plaintext database: OpenClaw and the add-on keep it (`gate_cleanup_hours` does not apply).
+`oc-upgrade status` lists every such file below `/config/.openclaw/state/` and the agent
+folders ("Databases OpenClaw set aside"); delete them by hand once you are satisfied.
+A store that OpenClaw registered for an agent that `openclaw.json` no longer configures
+is checked and migrated like the configured ones; the precheck names it (`1/8 info: … is
+registered in OpenClaw's state, but the agent is not configured …`). OpenClaw does not
+run such an agent and cancels the runs of its cron jobs ("cron job agent is
+unavailable"). Stores that OpenClaw keeps from deleted agents (its deletion journal;
 with 2026.10.10 also those of a pending deletion) and stores doctor reports as held back
 are only listed (`1/8 info: …`, `7/8 info: held agent database(s) …`, `oc-upgrade check`,
 `oc-upgrade status`) while their agent is not configured: from 2026.10.10 the gateway does
@@ -1360,6 +1378,10 @@ setting, and never holds. With OpenClaw 2026.10.4 it prints nothing.
   line per provider whose literal key is the reason, with the fix (below). Only the job
   id, its name, model names, provider ids and config paths are shown, no prompt, no
   account and no key.
+- **Jobs of an agent that `openclaw.json` does not configure** are left out: OpenClaw
+  cancels their runs anyway ("cron job agent is unavailable"). One `1/8 info: N enabled
+  cron job(s) belong to agent(s) not configured in openclaw.json …` line names them (again
+  at the end of the run and in `oc-upgrade status`).
 - **After the migration** the gate reads the migrated jobs again: the `7/8
   postconditions` line counts them, the end of the run repeats the warnings (with the
   provider lines), and `oc-upgrade status` lists them.
@@ -1456,6 +1478,27 @@ gate run find an enabled official plugin older than the bundled OpenClaw (`WARN:
 the add-on's, download from npm while the add-on runs (see SECURITY.md, "Third-Party
 Skills & Supply Chain").
 
+What OpenClaw leaves beside the plugins, the add-on reports and never deletes:
+
+- **Install leftovers.** OpenClaw installs a plugin through a work directory in
+  `/config/.openclaw/npm/projects/` (also `extensions/`, `git/`):
+  `.openclaw-install-stage-XXXXXX` and `.openclaw-install-rollback-XXXXXX` remain only when
+  an install or update was interrupted (for example a doctor pass that was stopped), and
+  OpenClaw does not remove them later; `.openclaw-install-backups/` keeps the previous
+  version of a plugin whose update failed or was interrupted. They are no plugins: after
+  doctor pass 2 the gate warns `plugin install leftovers: …`, and `oc-upgrade status`
+  lists them. Delete them by hand while OpenClaw is not installing plugins (no doctor or
+  `plugins` command running), the backups once the plugins work.
+- **Plugin captures** (`/config/.openclaw/tmp/plugin-captures/<id>/`). When OpenClaw
+  admits a plugin with native files (codex, acpx, …, for example after doctor updated it),
+  it keeps a checked copy of those files there, which its install records refer to. Most
+  of it consists of hard links to the installed plugin files, so `du` shows the plugin's
+  size (over a gigabyte with codex and acpx) while the extra disk space is small; `oc-upgrade status`
+  shows both (`… of their own, … in hard links …`). It is live data: OpenClaw removes a
+  capture itself once no plugin install refers to it (at gateway start and in `doctor
+  --fix`). The add-on does not delete it and does not leave it out of backups: OpenClaw
+  does not rebuild a capture its install records still refer to, so a restore needs it.
+
 #### Known limits with OpenClaw 2026.10.10 and 2026.11.1
 
 These apply to this add-on version, which bundles OpenClaw 2026.11.1 (the 2026.10.10
@@ -1530,6 +1573,13 @@ them yourself once the update is confirmed. Copies that no gate run made (for ex
 from the 2026.7 gateway's own startup migrations) are left alone; `oc-upgrade status`
 counts all of them below `/config/.openclaw` (`Doctor pre-migration SQLite copies: …`),
 and you can delete those by hand. Never copy a `.bak` or `.scoped.bak` over a database.
+Two other things OpenClaw leaves are never deleted by the add-on, only listed by
+`oc-upgrade status`: a database doctor set aside as `<database>.corrupt-<time>` (the
+renamed original, a complete plaintext database; see
+[HOLD codes added for the OpenClaw 2026.10.10 line](#hold-codes-added-for-the-openclaw-20261010-line)),
+which you delete by hand once you are satisfied, and the plugin captures in
+`/config/.openclaw/tmp/plugin-captures/`, which OpenClaw still uses and removes itself
+(see [Official plugins follow OpenClaw's version](#official-plugins-follow-openclaws-version)).
 
 It also deletes the copies that earlier add-on versions left, each
 `gate_cleanup_hours` after its own time:
@@ -2162,6 +2212,10 @@ Example: started without network access (`--accept no-network`) with the Codex
 plugin from 2026.7, doctor cannot update it ("Official runtime plugin codex
 2026.7.35 is incompatible …") and the gate holds with `doctor-plugin-load`; once npm
 is reachable again, `oc-upgrade retry` and a restart finish the migration.
+Accepting `no-network` is slow in any case: doctor retries each npm fetch for many
+minutes (over 10 minutes per pass were seen) and a pass can run into its time budget
+(`doctor-timeout`, one hour or more). Make the npm registry reachable instead where you
+can.
 
 ### Gateway exited with code 78
 

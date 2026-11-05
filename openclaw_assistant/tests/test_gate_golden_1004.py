@@ -24,7 +24,8 @@ reads retained deletions too): an "info: ... is kept from a deleted agent" line 
 orphan-agent-db, `oc-upgrade check` lists it under "held agent databases", the journal's orphans entry has
 held/reason.
 Not in the fixture because each one is a HOLD (DOCS "Upgrading to OpenClaw 2026.10"); Holds1004Tests pins them
-instead: the reworded orphan-agent-db text, quick_check and the foreign-key check on such a store below the target
+instead: the reworded orphan-agent-db text (reworded again after the host rehearsal, D11: doctor sets a copy of
+another agent's database aside instead of migrating it; CHANGELOG "orphan agent databases"), quick_check and the foreign-key check on such a store below the target
 (its counts, and a hard sqlite-fk-violation for a damaged one), and the hard code agent-db-held for a configured
 agent whose store a retained deletion keeps.
 """
@@ -200,10 +201,16 @@ class Holds1004Tests(T.GateEnv):
     CFG = {"meta": {"lastTouchedVersion": "2026.9.9"}, "gateway": {"mode": "local"},
            "agents": {"list": [{"id": "main", "default": True}]}}
     GHOST = "agents/ghost/agent/openclaw-agent.sqlite"
+    # rehearsal D11: 2026.10.4 doctor (like 2026.10.10 and 2026.11.1, state-migrations.agent-owner-recovery.ts) does
+    # not migrate a store that records another agent as its owner; it sets a byte-identical copy aside as
+    # <file>.corrupt-<time> and refuses any other, so the text no longer promises the one-way migration for every store
     ORPHAN = ("agent database(s) of agents that are neither configured nor registered: " + GHOST + " (schema 20). "
-              "Doctor of OpenClaw 2026.10.4 finds such a store under agents/ and migrates it one-way to schema 24 "
-              "unless its deletion history holds it back; the gateway does not open it. The gate checks that it is "
-              "readable (quick_check, foreign keys) but not its schema afterwards")
+              "Doctor of OpenClaw 2026.10.4 finds such a store under agents/ and, unless its deletion history holds "
+              "it back, migrates it one-way to schema 24; a store that records another agent as its owner is not "
+              "migrated: doctor moves it aside as <file>.corrupt-<time> when it is a byte-identical copy of that "
+              "agent's database (a plaintext copy that is kept) and refuses it otherwise. The gateway does not open "
+              "it. The gate checks that it is readable (quick_check, foreign keys) but not its schema afterwards; "
+              "what doctor did is in the gate's final lines and oc-upgrade status")
 
     def setUp(self):
         super().setUp()

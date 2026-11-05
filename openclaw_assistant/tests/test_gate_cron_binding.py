@@ -282,9 +282,15 @@ class CronForecastGateTests(T.GateEnv):
         con.execute("INSERT INTO auth_profile_store VALUES ('primary', ?, 0)", (json.dumps(T.AUTH_1004_STORE),))
         con.commit()
         con.close()
-        rec = G.cron_account_report(self.state, CFG, "2026.10.10")
+        cfg = json.loads(json.dumps(CFG))
+        cfg["agents"]["list"].append({"id": "mail"})
+        rec = G.cron_account_report(self.state, cfg, "2026.10.10")
         self.assertIn(("job-mail", "mail", True), [(a["id"], a["agent"], a["primary_affected"])
                                                    for a in rec["affected"]])
+        # D6: with the agent not configured, OpenClaw cancels its runs ("cron job agent is unavailable"): left out
+        rec = G.cron_account_report(self.state, CFG, "2026.10.10")
+        self.assertNotIn("job-mail", [a["id"] for a in rec["affected"]])
+        self.assertEqual(rec["unconfigured"], [{"id": "job-mail", "name": "Job Mail", "agent": "mail"}])
 
     def test_runtime_authority_and_7x_layout_are_skipped(self):
         con = sqlite3.connect(str(self.sdb))

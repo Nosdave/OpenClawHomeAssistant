@@ -2341,7 +2341,8 @@ def cron_ref_uses_stored_profile(cfg, provider, explicit_profile, profiles):
     return cron_ref_refusal(cfg, provider, explicit_profile, profiles) is not None
 
 
-def cron_account_forecast(jobs, cfg, profiles_for, default_agent="main", copies_for=None, copies_pending=False):
+def cron_account_forecast(jobs, cfg, profiles_for, default_agent="main", copies_for=None, copies_pending=False,
+                          configured=None):
     """Report-only forecast for openclaw/openclaw#192195 (no I/O).
 
     jobs: [{"id", "name", "enabled", "runtime_authority", "job"}] in store order, "job" the parsed job_json
@@ -2361,9 +2362,12 @@ def cron_account_forecast(jobs, cfg, profiles_for, default_agent="main", copies_
     explicit @profile) run on a literal key doctor copies or copied, so that auth "api-key" or a SecretRef lifts the
     refusal: where "config" (models.providers.<p>.apiKey of openclaw.json holds the key) or "catalog" (only an agent's
     model catalog does), path "models.providers.<p>" as OpenClaw writes it, auth the configured mode or None,
-    pending: the stored login is doctor's copy during this migration. No key value anywhere."""
+    pending: the stored login is doctor's copy during this migration. No key value anywhere.
+    configured: the agent ids openclaw.json configures (lower case), or None for no check. OpenClaw cancels every run
+    of a job whose agent is not configured ("cron job agent is unavailable", the gateway's isAgentAvailable), so such
+    a job is not checked; it is listed in "unconfigured": [{"id", "name", "agent"}]."""
     cfg = cfg if isinstance(cfg, dict) else {}
-    res = {"checked": 0, "bound": 0, "affected": [], "key_fix": []}
+    res = {"checked": 0, "bound": 0, "affected": [], "key_fix": [], "unconfigured": []}
     keyed = {}
     for row in jobs or []:
         job = row.get("job")
@@ -2372,11 +2376,14 @@ def cron_account_forecast(jobs, cfg, profiles_for, default_agent="main", copies_
         payload = job.get("payload") if isinstance(job.get("payload"), dict) else {}
         if payload.get("kind") != "agentTurn" or job.get("sessionTarget") == "main":
             continue
+        agent = cron_job_agent(job, default_agent)
+        if configured is not None and agent not in configured:
+            res["unconfigured"].append({"id": row.get("id"), "name": row.get("name"), "agent": agent})
+            continue
         if job.get("inferenceBinding") or job.get("authProfileBinding"):
             res["bound"] += 1
             continue
         res["checked"] += 1
-        agent = cron_job_agent(job, default_agent)
         primary, fallbacks, _src = cron_model_chain(job, cfg, agent)
         profiles = list(profiles_for(agent))
         copies = list(copies_for(agent)) if copies_for else []

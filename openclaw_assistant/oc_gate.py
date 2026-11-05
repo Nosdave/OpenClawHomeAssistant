@@ -17,6 +17,7 @@ as "[doctor] ..." (redacted). Secrets are never printed.
 """
 
 import errno
+import glob
 import hashlib
 import json
 import math
@@ -184,6 +185,8 @@ ADVICE = {
     "doctor-maintenance-refused": "oc-upgrade retry (doctor resumes from its last committed step); if the reason mentions "
                                   "a different PID namespace, wait 90 s after the previous stop first",
     "doctor-plugin-load": "make sure the network is available, then oc-upgrade retry",
+    "no-network": "make the npm registry reachable (network, DNS, proxy), then oc-upgrade retry; accepting it makes "
+                  "doctor retry npm for a long time (see the reason)",
     "doctor-config-write": "oc-upgrade retry",
     "doctor-backup-unverifiable": "data at risk: doctor could not verify its own pre-migration SQLite copies "
                                   "(*.pre-startup-migration-*.bak / .scoped.bak beside the databases). Restore the "
@@ -2194,7 +2197,8 @@ class Gate:
 
     def agent_store_findings(self):
         """Precheck 5 (full5): orphan stores doctor would migrate one-way (acceptable orphan-agent-db), stores the
-        deletion journal keeps (info), and configured agents whose store is held back (hard agent-db-held)."""
+        deletion journal keeps (info), registered stores of agents openclaw.json does not configure (info, D6), and
+        configured agents whose store is held back (hard agent-db-held)."""
         F = []
         cls, a_target, ver = self.cls, self.pkg["schema_agent"], self.pkg["version"]
         orphans = [o for o in cls["orphans"] if not o.get("held") and (o.get("uv") is None or o["uv"] < a_target)]
@@ -2203,10 +2207,14 @@ class Gate:
                              "agent database(s) of agents that are neither configured nor registered: "
                              + ", ".join(f"{o['path']} (schema {o['uv'] if o.get('uv') is not None else 'unreadable'})"
                                          for o in orphans)
-                             + f". Doctor of OpenClaw {ver} finds such a store under agents/ and migrates it one-way "
-                               f"to schema {a_target} unless its deletion history holds it back; the gateway does "
-                               "not open it. The gate checks that it is readable (quick_check, foreign keys) but not "
-                               "its schema afterwards", "precheck"))
+                             + f". Doctor of OpenClaw {ver} finds such a store under agents/ and, unless its "
+                               f"deletion history holds it back, migrates it one-way to schema {a_target}; a store "
+                               "that records another agent as its owner is not migrated: doctor moves it aside as "
+                               "<file>.corrupt-<time> when it is a byte-identical copy of that agent's database (a "
+                               "plaintext copy that is kept) and refuses it otherwise. The gateway does not open it. "
+                               "The gate checks that it is readable (quick_check, foreign keys) but not its schema "
+                               "afterwards; what doctor did is in the gate's final lines and oc-upgrade status",
+                             "precheck"))
         for h in [o for o in cls["orphans"] if o.get("held")] + list(cls.get("held") or []):
             if h.get("reason") == HELD_PENDING:
                 what = "belongs to an agent OpenClaw is deleting (deletion journal: pending)"
@@ -2216,6 +2224,19 @@ class Gate:
                 what = f"was held back by doctor ({h.get('reason')}); OpenClaw does not migrate or open it"
             self.say(f"{self.pn('precheck')} info: {h['path']} (agent {h['id']}, schema {h['uv']}) {what}, and the "
                      "gate leaves it out of the schema checks")
+        # D6: a store OpenClaw registered for an agent that openclaw.json no longer configures
+        configured = set(configured_agent_ids(self.cfg))
+        held = self.held_map(False)
+        for key, relp in sorted((cls.get("agent_paths") or {}).items()):
+            aid = (cls.get("agent_ids") or {}).get(key, key)
+            if aid in configured or aid.lower() in configured \
+                    or os.path.realpath(self.gp["STATE"] / relp) in held:
+                continue
+            self.say(f"{self.pn('precheck')} info: {relp} (agent {aid}, schema {(cls.get('agents') or {}).get(key)}) "
+                     "is registered in OpenClaw's state, but the agent is not configured in openclaw.json: the gate "
+                     "checks it with the other agent databases (doctor migrates registered stores too); OpenClaw "
+                     "does not run an agent that is not configured, and cancels the runs of its cron jobs ('cron job "
+                     "agent is unavailable')")
         for h in cls.get("held_configured") or []:
             why = "from a deletion (deletion journal)" if h.get("reason") == HELD_RETAINED else \
                 f"back ({held_reason_text(h.get('reason'))})"
@@ -2424,7 +2445,10 @@ class Gate:
         if res.rc == 0 and data == self.pkg["version"]:
             return "network ok"
         F.append(finding("no-network", "acceptable",
-                         f"npm registry not reachable (rc {res.rc}); doctor installs/updates official plugins", "precheck"))
+                         f"npm registry not reachable (rc {res.rc}); doctor installs/updates official plugins from it. "
+                         "Accepted, doctor keeps retrying npm for many minutes per plugin (over 10 minutes were seen) "
+                         f"and can run into its time budget per pass ({C.fmt_duration(self.budget()['doctor_pass_seconds'])}"
+                         "; then the gate holds with doctor-timeout); prefer fixing the network", "precheck"))
         return "network FAILED"
 
     def info_items(self, mode, generic_only):
@@ -2637,6 +2661,9 @@ class Gate:
         elif n:
             for line in cron_job_lines(rec):
                 self.warn(line)
+        un = cron_unconfigured_line(rec)
+        if un:
+            self.say(f"{self.pn('precheck')} info: {un}")
         return None
 
     def skill_workshop_export(self):
@@ -2777,6 +2804,9 @@ class Gate:
         report (journal cron_binding)."""
         for line in cron_job_lines(self.j.get("cron_binding")):
             self.warn(line)
+        un = cron_unconfigured_line(self.j.get("cron_binding"))
+        if un:
+            self.say(f"info: {un}")
         return None
 
     def large_session_info(self):
@@ -3304,6 +3334,9 @@ class Gate:
         others = [x for x in new if x not in codex]
         if others:
             self.warn("doctor installed new plugin package(s): " + ", ".join(others) + " (left in place)")
+        leftovers = plugin_install_leftovers(p["STATE"])  # D8: not plugins; whether doctor or an earlier run left them
+        if leftovers:
+            self.warn("plugin install leftovers: " + install_leftovers_text(leftovers))
         self.say(f"6/8 doctor pass 2 rc={ev['rc']} in {C.fmt_duration(ev['duration'])}: Doctor complete.; {result}")
         self.complete_phase("doctor2")
         F = []
@@ -3601,8 +3634,16 @@ class Gate:
         cfg = _read_cfg_lenient()
         cls = classify(p["STATE"], cfg, self.pkg["schema_state"], self.pkg["schema_agent"], self.pkg["version"],
                        held=self.held_map(True))
+        # D11: what doctor did with the orphan stores the precheck recorded (migrated, set aside as .corrupt-<ms>, ...)
+        outcomes = orphan_outcomes(p["STATE"], self.j.get("orphans"), self.pkg["schema_agent"],
+                                   since=self.j.get("started_at"))
+        if outcomes:
+            self.j["orphan_outcomes"] = outcomes
+        after = {o["path"]: o["outcome"] for o in outcomes}
+        orphans = [dict(o, after=after[o["path"]]) if isinstance(o, dict) and o.get("path") in after else o
+                   for o in self.j.get("orphans") or []]
         write_marker(mode=self.j["mode"], run_id=self.j["run_id"], binding=current_binding(p["STATE"], cls),
-                     runtime=self.pkg["version"], accepted=sorted(self.accepted), orphans=self.j.get("orphans") or [],
+                     runtime=self.pkg["version"], accepted=sorted(self.accepted), orphans=orphans,
                      held=held_marker_entries(p["STATE"], cls))
         self.j["status"] = "done"
         self.j["hold"] = None
@@ -3618,6 +3659,12 @@ class Gate:
         for path, old in self.j.get("doctor_retired_removed") or []:
             self.say(C.redact_text(f"info: doctor removed retired model {old} from {path} (it inherits the default "
                                    "model)"))
+        for o in outcomes:  # D11: a WARN where something is left for the user
+            text = orphan_outcome_text(o, self.pkg["schema_agent"])
+            if o["outcome"] in ("migrated", "gone") and not o["set_aside"]:
+                self.say(f"info: {text}")
+            else:
+                self.warn(text)
         self._finalize_skill_lines()  # full5: doctor notes -> Skill Workshop -> cron -> done
         self._finalize_cron_lines()
         total = _elapsed_since(self.j.get("started_at"))
@@ -4375,11 +4422,31 @@ def cron_account_report(state_dir, cfg, runtime=None, doctor_migration=False, pe
 
     def copies_for(aid):
         return copies["shared"] + copies["agents"].get(aid, [])
-    fc = mig().cron_account_forecast(jobs, cfg, profiles_for, default_agent_id(cfg), copies_for, pending_copies)
+    configured = {a.lower() for a in configured_agent_ids(cfg)}
+    fc = mig().cron_account_forecast(jobs, cfg, profiles_for, default_agent_id(cfg), copies_for, pending_copies,
+                                     configured=configured)
     rec.update(checked=fc["checked"], bound=fc["bound"],
                affected=[dict(a, id=str(a["id"])[:120], name=str(a["name"])[:120]) for a in fc["affected"]],
                key_fix=fc["key_fix"])
+    if fc["unconfigured"]:  # D6: only when there are any (a record of an earlier add-on version has none)
+        rec["unconfigured"] = [dict(a, id=str(a["id"])[:120], name=str(a["name"])[:120])
+                               for a in fc["unconfigured"]]
     return rec
+
+
+def cron_unconfigured_line(rec):
+    """D6: the info text for the enabled agentTurn jobs of a cron_account_report record whose agent openclaw.json
+    does not configure (OpenClaw cancels their runs), or None."""
+    un = [a for a in (rec or {}).get("unconfigured") or [] if isinstance(a, dict)]
+    if not un:
+        return None
+    agents = ", ".join(dict.fromkeys(printable(a.get("agent")) for a in un))
+    jobs = ", ".join(f"'{printable(a.get('name'))[:80]}' ({printable(a.get('id'))[:80]})"
+                     for a in un[:CRON_REPORT_MAX])
+    more = f" and {len(un) - CRON_REPORT_MAX} more" if len(un) > CRON_REPORT_MAX else ""
+    return (f"{len(un)} enabled cron job(s) belong to agent(s) not configured in openclaw.json ({agents}): OpenClaw "
+            f"cancels their runs ('cron job agent is unavailable'), so the inference-account report leaves them out: "
+            f"{jobs}{more}")
 
 
 def cron_job_lines(rec):
@@ -4751,6 +4818,17 @@ def _sw_row(cols, values, counter, seen=None):
     return _sw_redact_items(((c, value(c, v)) for c, v in zip(cols, values)), counter, seen)
 
 
+def _sw_name(rec):
+    """The skill name of an exported proposal record: name or skillName (as the add-on's tests and later records
+    have it), else target.skillName (what OpenClaw 2026.10.4 stores), else the title ("Create wetter-kurz")."""
+    rec = rec if isinstance(rec, dict) else {}
+    target = rec.get("target") if isinstance(rec.get("target"), dict) else {}
+    for v in (rec.get("name"), rec.get("skillName"), target.get("skillName"), rec.get("title")):
+        if isinstance(v, str) and v.strip():
+            return v
+    return None
+
+
 def _sw_md(text, limit=160):
     s = " ".join(str(text if text is not None else "").split())
     s = s if len(s) <= limit else s[:limit - 1] + "…"
@@ -4773,12 +4851,14 @@ def _sw_proposals_md(doc):
         rec = p.get("record_json") if isinstance(p.get("record_json"), dict) else {}
         target = rec.get("target") if isinstance(rec.get("target"), dict) else {}
         L.append("| " + " | ".join(_sw_md(x, 80) for x in (
-            p.get("proposal_id"), p.get("status"), p.get("kind"), rec.get("name") or rec.get("skillName"),
+            p.get("proposal_id"), p.get("status"), p.get("kind"), _sw_name(rec),
             target.get("skillDir") or target.get("skillFile"), p.get("updated_at"), p.get("status_reason"))) + " |")
     for p in doc["proposals"]:
         rec = p.get("record_json") if isinstance(p.get("record_json"), dict) else {}
         L += ["", f"## {_sw_md(p.get('proposal_id'))} ({_sw_md(p.get('status'))})", ""]
-        for k in ("name", "description", "goal", "evidence"):
+        if _sw_name(rec):
+            L.append(f"- name: {_sw_md(_sw_name(rec), 600)}")
+        for k in ("description", "goal", "evidence"):
             if rec.get(k):
                 L.append(f"- {k}: {_sw_md(rec.get(k), 600)}")
         L.append(f"- draft: `{p['draft_export']}`" if p.get("draft_export") else "- draft: not in the export")
@@ -4992,6 +5072,100 @@ def doctor_copies(state_dir):
     return found
 
 
+# D11: OpenClaw sets a SQLite database aside as <file>.corrupt-<Date.now()>[.N] (also its -wal/-shm/-journal), e.g.
+# doctor for an agent database that is a byte-identical copy of another agent's ("Preserved the copy at ...",
+# state-migrations.agent-owner-recovery.ts / sqlite-recovery-files.ts, 2026.10.4 = 2026.11.1). The file is the
+# renamed original, a complete plaintext database; the add-on lists it and never deletes it.
+SQLITE_SET_ASIDE_RE = re.compile(r"[^/]{1,200}\.sqlite(?:-wal|-shm|-journal)?\.corrupt-(\d{10,16})(?:\.\d{1,3})?")
+
+
+def sqlite_set_aside(state_dir, cfg=None):
+    """{path (state-relative, absolute outside it): size} of the <db>.corrupt-<ms> files in <state>/state/,
+    <state>/agents/*/agent/ and the directories of agent databases outside the state dir. Regular files only, links
+    are not followed; read-only."""
+    state_dir = Path(state_dir)
+    dirs = [state_dir / "state"] + sorted(state_dir.glob("agents/*/agent"))
+    dirs += [Path(d) for d in outside_agent_dirs(state_dir, cfg)] if cfg is not None else []
+    found = {}
+    for d in dirs:
+        try:
+            with os.scandir(d) as it:
+                entries = [(e.name, e.path) for e in it]
+        except OSError:
+            continue
+        for name, path in entries:
+            if not SQLITE_SET_ASIDE_RE.fullmatch(name):
+                continue
+            try:
+                st = os.lstat(path)
+            except OSError:
+                continue
+            if stat.S_ISREG(st.st_mode):
+                found[C.rel(path, state_dir)] = st.st_size
+    return found
+
+
+def orphan_outcomes(state_dir, orphans, a_target, since=None):
+    """D11: what doctor did with each recorded orphan store (not held back): [{"id", "path", "uv", "outcome",
+    "uv_after", "set_aside"}], outcome "migrated" (at a_target or above), "not-migrated" (still below), "set-aside"
+    (gone, and doctor renamed it to <file>.corrupt-<ms>), "gone" or "unreadable". set_aside: the state-relative
+    <file>.corrupt-<ms> names of that store made at or after `since` (ISO time, the gate run's start; all without
+    it). Read-only."""
+    state_dir = Path(state_dir)
+    since_ms = None
+    try:
+        since_ms = int(datetime.fromisoformat(str(since).replace("Z", "+00:00")).timestamp() * 1000) - 1000 \
+            if since else None
+    except ValueError:
+        since_ms = None
+    out = []
+    for o in orphans or []:
+        if not isinstance(o, dict) or o.get("held") or not isinstance(o.get("path"), str) or not o["path"]:
+            continue
+        pth = state_dir / o["path"]
+        aside = []
+        for x in sorted(pth.parent.glob(glob.escape(pth.name) + ".corrupt-*")):  # the database, not its -wal/-shm
+            m = SQLITE_SET_ASIDE_RE.fullmatch(x.name)
+            if m and (since_ms is None or int(m.group(1)) >= since_ms):
+                aside.append(C.rel(x, state_dir))
+        rec = {"id": o.get("id"), "path": o["path"], "uv": o.get("uv"), "outcome": None, "uv_after": None,
+               "set_aside": aside}
+        if os.path.lexists(pth):
+            try:
+                v = agent_db_version(pth)
+            except (sqlite3.Error, C.SchemaUnknown, C.NodeQueryError, OSError) as exc:
+                rec.update(outcome="unreadable", error=type(exc).__name__)
+            else:
+                rec.update(uv_after=v, outcome="migrated" if v is not None and v >= a_target else "not-migrated")
+        else:
+            rec["outcome"] = "set-aside" if aside else "gone"
+        out.append(rec)
+    return out
+
+
+def orphan_outcome_text(o, a_target=None):
+    """The finalize/status text of an orphan_outcomes entry."""
+    head = f"orphan agent database {printable(o.get('path'))} (agent {printable(o.get('id'))}, schema " \
+           f"{o.get('uv') if o.get('uv') is not None else 'unreadable'} before): "
+    aside = ", ".join(printable(x) for x in o.get("set_aside") or [])
+    kept = (f"set it aside as {aside}: the renamed original, a complete plaintext database that OpenClaw and the "
+            "add-on keep; delete it by hand once you are satisfied (oc-upgrade status lists such files)")
+    out = o.get("outcome")
+    if out == "set-aside":
+        return head + "doctor found it to be a byte-identical copy of another agent's database and " + kept
+    if out == "migrated":
+        text = f"doctor migrated it to schema {o.get('uv_after')}; the gateway does not open it"
+    elif out == "not-migrated":
+        text = (f"still at schema {o.get('uv_after')}" + (f" (target {a_target})" if a_target else "")
+                + ": doctor did not migrate it (refused or held back; oc-upgrade log says why); the gateway does "
+                "not open it")
+    elif out == "gone":
+        text = "gone after doctor"
+    else:
+        text = f"could not be read after doctor ({printable(o.get('error'))})"
+    return head + text + (f"; doctor also {kept}" if aside else "")
+
+
 def outside_agent_dirs(state_dir, cfg):
     """The real directories of the agent databases (configured or registered) that lie outside the real state dir.
     Doctor saves its SQLite copies beside these databases too, where the add-on does not delete them. Read-only;
@@ -5109,18 +5283,74 @@ def run_doctor_copies(gp, j, present=None):
     return [state_real / r for r in sorted(want) if r in present], kept
 
 
+PLUGIN_INSTALL_BASES = ("npm/projects", "extensions", "git")
+# OpenClaw's own work directories in a plugin install base (install-package-dir.ts, 2026.10.4 = 2026.11.1): mkdtemp
+# stage and rollback directories that only an interrupted install leaves behind (OpenClaw never removes them later),
+# and the backups of an update that could not be finished ("backup retained at ..."). Never plugins.
+PLUGIN_INSTALL_LEFTOVER_RE = re.compile(r"\.openclaw-install-(?:stage|rollback)-[A-Za-z0-9]{6}|\.openclaw-install-backups")
+
+
 def plugin_snapshot(state_dir):
+    """The plugin packages in OpenClaw's install bases (a generation suffix cut off); OpenClaw's dot-named work
+    directories (staging, rollback and backup directories, retention markers) are no plugins and left out (D8)."""
     names = set()
     state_dir = Path(state_dir)
-    for sub in ("npm/projects", "extensions", "git"):
+    for sub in PLUGIN_INSTALL_BASES:
         d = state_dir / sub
         try:
             with os.scandir(d) as it:
                 for e in it:
+                    if e.name.startswith("."):
+                        continue
                     names.add(f"{sub}/" + re.sub(r"__openclaw-generation__g-[0-9a-f]+$", "", e.name))
         except OSError:
             continue
     return sorted(names)
+
+
+def plugin_install_leftovers(state_dir):
+    """D8: [(relative path, kind)] of OpenClaw's install work directories in the plugin install bases: "stage" or
+    "rollback" (left by an interrupted plugin install or update, e.g. a doctor that was stopped), "backups" (a
+    non-empty .openclaw-install-backups: the previous version of a plugin whose update could not be finished).
+    Read-only; the add-on never deletes them."""
+    out = []
+    state_dir = Path(state_dir)
+    for sub in PLUGIN_INSTALL_BASES:
+        try:
+            with os.scandir(state_dir / sub) as it:
+                entries = sorted((e.name, e.is_dir(follow_symlinks=False)) for e in it)
+        except OSError:
+            continue
+        for name, is_dir in entries:
+            if not is_dir or not PLUGIN_INSTALL_LEFTOVER_RE.fullmatch(name):
+                continue
+            if name == ".openclaw-install-backups":
+                try:
+                    if not any(os.scandir(state_dir / sub / name)):
+                        continue
+                except OSError:
+                    continue
+                out.append((f"{sub}/{name}", "backups"))
+            else:
+                out.append((f"{sub}/{name}", "stage" if "-stage-" in name else "rollback"))
+    return out
+
+
+def install_leftovers_text(items):
+    """The WARN/status text of plugin_install_leftovers items (D8)."""
+    work = [p for p, kind in items if kind != "backups"]
+    backs = [p for p, kind in items if kind == "backups"]
+    parts = []
+    if work:
+        parts.append(f"{len(work)} staging/rollback director(ies) of an interrupted OpenClaw plugin install or update "
+                     f"({', '.join(printable(p) for p in work[:6])}{' …' if len(work) > 6 else ''}): no plugin; "
+                     "OpenClaw does not use or remove them, delete them by hand while OpenClaw is not installing "
+                     "plugins")
+    if backs:
+        parts.append(f"OpenClaw kept the previous version of a plugin whose update failed or was interrupted in "
+                     f"{', '.join(printable(p) for p in backs)}: delete it by hand once the plugins work (oc-upgrade "
+                     "status lists their versions)")
+    return "; ".join(parts)
 
 
 OFFICIAL_PLUGIN_SCOPE = "@openclaw/"
@@ -6387,8 +6617,10 @@ def _status_cron(j):
     aff = [a for a in rec.get("affected") or [] if isinstance(a, dict)]
     head = (f"  cron jobs without a recorded inference account (openclaw/openclaw#192195, OpenClaw "
             f"{printable(rec.get('runtime'))}, {when}): ")
+    un = cron_unconfigured_line(rec)  # D6
     if not aff:
-        return [head + f"none affected ({rec['checked']} checked)"] if rec.get("checked") else []
+        return ([head + f"none affected ({rec['checked']} checked)"] if rec.get("checked") else []) \
+            + ([f"  {un}"] if un else [])
     L = [head + f"{len(aff)} affected of {rec.get('checked', 0)} checked"]
     for a in aff[:CRON_REPORT_MAX]:
         refs = [printable(r) for r in a.get("refs") or []]
@@ -6408,6 +6640,8 @@ def _status_cron(j):
         who = "the account of " + who
     L.append("    " + (f"OpenClaw records {who} itself from 2026.11.5 (openclaw/openclaw#172792). " if who else "")
              + _cron_remedy(aff, bool(_cron_key_fix(rec))))
+    if un:
+        L.append(f"  {un}")
     return L
 
 
@@ -6424,6 +6658,74 @@ def _status_skills(gp):
     n = (sw_export_record(gp, rid) or {}).get("proposals")
     return [f"Skill Workshop exports: {len(found)} (newest {d}/, {n} proposals; secrets redacted; kept until you "
             "delete them)"]
+
+
+PLUGIN_CAPTURES_DIR = ("tmp", "plugin-captures")
+PLUGIN_CAPTURES_WALK_MAX = 200_000
+
+
+def plugin_captures_usage(state_dir):
+    """OpenClaw's native plugin captures (<state>/tmp/plugin-captures/<uuid>/, made when a plugin with native files is
+    admitted, e.g. by doctor's plugin update; referenced from the installed plugin index and removed by OpenClaw itself
+    once nothing refers to them, at gateway start and in doctor --fix): {"path", "captures", "files", "own", "linked",
+    "partial"} or None when there is none. own: bytes of the regular files with a single link (data only the capture
+    holds); linked: bytes of the files with more links (hard links that share the installed plugin packages' disk
+    space; each inode once). Read-only; the walk stops after PLUGIN_CAPTURES_WALK_MAX entries (partial)."""
+    root = Path(state_dir).joinpath(*PLUGIN_CAPTURES_DIR)
+    try:
+        with os.scandir(root) as it:
+            caps = sum(1 for e in it if e.is_dir(follow_symlinks=False))
+    except OSError:
+        return None
+    if not caps:
+        return None
+    res = {"path": str(root), "captures": caps, "files": 0, "own": 0, "linked": 0, "partial": False}
+    seen = set()
+    for n, (_p, st) in enumerate(C.walk_lstat(root), 1):
+        if n > PLUGIN_CAPTURES_WALK_MAX:
+            res["partial"] = True
+            break
+        if not stat.S_ISREG(st.st_mode):
+            continue
+        res["files"] += 1
+        if st.st_nlink <= 1:
+            res["own"] += st.st_size
+        elif (st.st_dev, st.st_ino) not in seen:
+            seen.add((st.st_dev, st.st_ino))
+            res["linked"] += st.st_size
+    return res
+
+
+def _status_openclaw_leftovers(gp):
+    """`oc-upgrade status` lines (D8, D11, plugin captures): OpenClaw's plugin install leftovers, the databases it set
+    aside as <file>.corrupt-<time>, and its native plugin captures. Never deleted by the add-on."""
+    L = []
+    try:
+        cfg = _read_cfg_lenient()
+    except Exception:  # noqa: BLE001 - status must never fail on these lines
+        cfg = {}
+    try:
+        left = plugin_install_leftovers(gp["STATE"])
+        if left:
+            L.append("Plugin install leftovers: " + install_leftovers_text(left))
+        aside = sqlite_set_aside(gp["STATE"], cfg)
+        if aside:
+            names = sorted(aside)
+            L.append(f"Databases OpenClaw set aside (<file>.corrupt-<time>): {len(names)} file(s), "
+                     f"{C.human(sum(aside.values()))}: " + ", ".join(printable(x) for x in names[:8])
+                     + (" …" if len(names) > 8 else "")
+                     + " — complete plaintext databases (e.g. doctor's renamed copy of another agent's database); "
+                       "OpenClaw and the add-on keep them: delete them by hand once you are satisfied")
+        cap = plugin_captures_usage(gp["STATE"])
+        if cap:
+            L.append(f"OpenClaw plugin captures: {cap['path']} ({cap['captures']} capture(s), {cap['files']} files"
+                     + (" or more" if cap["partial"] else "") + f"; {C.human(cap['own'])} of their own, "
+                     f"{C.human(cap['linked'])} in hard links that share the installed plugins' disk space): OpenClaw's "
+                     "live copy of the native plugin files, removed by OpenClaw once no plugin install refers to it; "
+                     "the add-on does not delete it")
+    except Exception as exc:  # noqa: BLE001 - status must never fail on these lines
+        L.append(f"OpenClaw leftovers not checked ({type(exc).__name__})")
+    return L
 
 
 def plugin_cohort_marker(state_dir, version):
@@ -6520,6 +6822,9 @@ def status_lines():
             else:
                 L.append(f"  GLM thinking levels (G1): not applied to {refs} ({g1.get('reason')})")
         L += _status_cron(j)  # full5
+        for o in j.get("orphan_outcomes") or []:  # D11
+            if isinstance(o, dict):
+                L.append("  " + orphan_outcome_text(o))
     else:
         L.append("Gate: no run recorded.")
     m = load_marker()
@@ -6548,6 +6853,7 @@ def status_lines():
         n = sum(1 for _p, st in C.walk_lstat(qd) if not stat.S_ISDIR(st.st_mode) and _p.name != "MANIFEST.json")
         L.append(f"Quarantine: {qd} ({n} files)")
     L += _status_skills(gp)  # full5
+    L += _status_openclaw_leftovers(gp)  # D8, D11, plugin captures
     baks = doctor_copies(gp["STATE"])
     if baks:
         ns = sum(1 for _size, scope in baks.values() if scope == "scoped")

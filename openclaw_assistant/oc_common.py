@@ -911,6 +911,96 @@ def _group_alive(pgid):
         return False
 
 
+def _proc_stat(pid):
+    """(state, ppid, pgrp, session, starttime) from /proc/<pid>/stat, or None (gone, or no /proc)."""
+    try:
+        with open(f"/proc/{pid}/stat", "rb") as f:
+            data = f.read()
+    except OSError:
+        return None
+    try:
+        rest = data[data.rindex(b")") + 2:].split()  # the command name may hold spaces and parentheses
+        return rest[0].decode("ascii", "replace"), int(rest[1]), int(rest[2]), int(rest[3]), int(rest[19])
+    except (ValueError, IndexError):
+        return None
+
+
+def _proc_table():
+    """{pid: _proc_stat} of every process /proc shows ({} without /proc)."""
+    out = {}
+    try:
+        names = os.listdir("/proc")
+    except OSError:
+        return out
+    for n in names:
+        if n.isdigit():
+            st = _proc_stat(int(n))
+            if st is not None:
+                out[int(n)] = st
+    return out
+
+
+def _proc_live(st):
+    return st is not None and st[0] not in ("Z", "X")
+
+
+def _descendants(root, table):
+    """{pid: starttime} of the live descendants of `root` in a _proc_table, by parent-pid lineage."""
+    kids = {}
+    for pid, st in table.items():
+        kids.setdefault(st[1], []).append(pid)
+    out, todo = {}, list(kids.get(root, []))
+    while todo:
+        pid = todo.pop()
+        if pid in out or not _proc_live(table.get(pid)):
+            continue
+        out[pid] = table[pid][4]
+        todo.extend(kids.get(pid, []))
+    return out
+
+
+def _track_descendants(tracked, root):
+    """Add the live descendants of `root` to tracked {pid: starttime} (D10: a child in its own session, such as the
+    npm process OpenClaw's doctor starts detached, is reparented away when its parent dies, so the lineage is
+    recorded while the parent runs)."""
+    for pid, start in _descendants(root, _proc_table()).items():
+        tracked.setdefault(pid, start)
+
+
+def _kill_strays(tracked, grace=5.0):
+    """D10: SIGTERM, then after `grace` s SIGKILL, every tracked descendant that still runs (the same start time:
+    a reused pid is left alone) and its own descendants; killpg of the child's group does not reach a descendant
+    that changed its session or group. Returns the pids signalled."""
+    if not tracked:
+        return []
+    table = _proc_table()
+    strays = {pid: start for pid, start in tracked.items()
+              if _proc_live(table.get(pid)) and table[pid][4] == start}
+    for pid in list(strays):
+        for d, start in _descendants(pid, table).items():
+            strays.setdefault(d, start)
+    if not strays:
+        return []
+
+    def alive(pid, start):
+        st = _proc_stat(pid)
+        return _proc_live(st) and st[4] == start
+
+    def signal_all(sig):
+        for pid, start in strays.items():
+            if alive(pid, start):
+                try:
+                    os.kill(pid, sig)
+                except (ProcessLookupError, PermissionError):
+                    pass
+    signal_all(signal.SIGTERM)
+    deadline = time.monotonic() + grace
+    while time.monotonic() < deadline and any(alive(p, s) for p, s in strays.items()):
+        time.sleep(0.1)
+    signal_all(signal.SIGKILL)
+    return sorted(strays)
+
+
 def run_process(argv, *, timeout, log_path, stop_event=None, kill_grace=30, stop_grace=None, env=None,
                 cwd=None, stdout_path=None, on_tick=None, tick=1.0):
     """Run argv in its own session; stdout/stderr appended to files (never a pipe).
@@ -918,6 +1008,8 @@ def run_process(argv, *, timeout, log_path, stop_event=None, kill_grace=30, stop
     - timeout (s, None = unlimited): SIGTERM to the process group, `kill_grace` s, SIGKILL.
     - stop_event set: SIGTERM, `stop_grace` s (default kill_grace), SIGKILL.
     - on_tick(elapsed_s) is called about every `tick` seconds while the process runs.
+    - When it has ended (or was killed), whatever is left of its process group is killed, and so are the descendants
+      that left the group (another session, e.g. a detached npm child; seen in /proc while argv ran) (D10).
     Returns RunResult(rc, duration_s); rc < 0 means killed by a signal; rc 127 = could not start.
     """
     stop_grace = kill_grace if stop_grace is None else stop_grace
@@ -939,6 +1031,7 @@ def run_process(argv, *, timeout, log_path, stop_event=None, kill_grace=30, stop
             pgid = proc.pid
             timed_out = stopped = False
             kill_at = None
+            tracked = {}  # D10: {pid: starttime} of its descendants, seen while it runs
             try:
                 while True:
                     try:
@@ -946,6 +1039,7 @@ def run_process(argv, *, timeout, log_path, stop_event=None, kill_grace=30, stop
                         break
                     except subprocess.TimeoutExpired:
                         pass
+                    _track_descendants(tracked, proc.pid)
                     now = time.monotonic()
                     if on_tick is not None:
                         on_tick(now - start)
@@ -959,15 +1053,18 @@ def run_process(argv, *, timeout, log_path, stop_event=None, kill_grace=30, stop
                         _killpg(pgid, signal.SIGTERM)
                         kill_at = now + kill_grace
                     if kill_at is not None and now >= kill_at:
+                        _track_descendants(tracked, proc.pid)
                         _killpg(pgid, signal.SIGKILL)
                         kill_at = float("inf")
             except BaseException:
+                _track_descendants(tracked, proc.pid)
                 _killpg(pgid, signal.SIGTERM)
                 try:
                     proc.wait(timeout=5)
                 except subprocess.TimeoutExpired:
                     _killpg(pgid, signal.SIGKILL)
                     proc.wait()
+                _kill_strays(tracked)
                 raise
             # Leftover group members (e.g. npm children) must not keep writing state.
             if _group_alive(pgid):
@@ -977,6 +1074,11 @@ def run_process(argv, *, timeout, log_path, stop_event=None, kill_grace=30, stop
                         break
                     time.sleep(0.1)
                 _killpg(pgid, signal.SIGKILL)
+            # ... nor descendants that left the group (D10: OpenClaw starts npm detached, in its own session)
+            strays = _kill_strays(tracked)
+            if strays:
+                log.write(f"[oc] stopped {len(strays)} leftover descendant process(es) outside its process group "
+                          f"(pids {', '.join(map(str, strays[:10]))})\n".encode())
             return RunResult(rc, time.monotonic() - start, timed_out, stopped)
         finally:
             if out is not log:
