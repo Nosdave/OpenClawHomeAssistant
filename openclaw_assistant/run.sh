@@ -1159,8 +1159,11 @@ ensure_brave_plugin() {
 # ------------------------------------------------------------------------------
 # Bring the ENABLED official npm plugins (@openclaw/codex, @openclaw/acpx, ...)
 # to the bundled OpenClaw version (CalVer cohort; peer openclaw >=<version>).
-# OpenClaw's doctor never does this (only `openclaw update` would, which the
-# add-on disables). `oc-upgrade plugins-sync` runs `openclaw plugins update
+# OpenClaw's doctor (`doctor --fix`, in the gate's doctor passes) updates the
+# enabled official catalog plugins itself, but a failed fetch there is only a
+# doctor warning; this step catches what it left behind (failed or deferred
+# fetches, records doctor does not treat as official npm installs, package-id
+# migrations). `oc-upgrade plugins-sync` runs `openclaw plugins update
 # <pkg>@<version>` for each enabled one that is older (never a downgrade,
 # disabled plugins and Brave untouched; Brave is ensure_brave_plugin's job),
 # prints one report line and writes the per-version marker only when every

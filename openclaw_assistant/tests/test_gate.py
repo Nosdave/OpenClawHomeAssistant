@@ -2852,6 +2852,15 @@ class Full5CodesTests(unittest.TestCase):
                                                     "(then restart the add-on)")
         self.assertTrue(G.advice_for(["sqlite-fk-violation", "voicewake-unimported"]).startswith(
             G.ADVICE["sqlite-fk-violation"]))
+        # 2026.10.4 imports these files only in a doctor run: going back to 0.5.94-full4 keeps nothing once its gate
+        # ran; --accept keeps the file in the quarantine; a rollback only to retry a transiently failed doctor run
+        adv = G.RETIRED_RUNTIME_ADVICE
+        self.assertNotIn("stay on it", adv)
+        self.assertIn("only in a doctor run", adv)
+        self.assertIn("keeps nothing", adv)
+        self.assertIn("/config/.openclaw-upgrade/gate/quarantine/<run>/", adv)
+        self.assertIn("transient reason", adv)
+        self.assertIn("oc-upgrade retry --doctor there, then update again", adv)
 
     def test_decisions_reflected(self):
         # agent-db-held is a precheck HOLD on the new image: never advise bypassing the wrapper's HOLD guard

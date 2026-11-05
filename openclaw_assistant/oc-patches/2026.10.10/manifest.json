@@ -8,7 +8,7 @@
       "stock_sha256": "325626bd3535f5071685ee9f984e3139d7842b5079847bc5620f766ff55471fc",
       "patched_sha256": "50410b6e5632d9776ef45fea3529ddfb6f04737d1f3b2fbbaeaf411dbed60cd7",
       "diff": "memory-search-half-life.patch",
-      "note": "Memory search temporal-decay half-life 365 days instead of the hard-coded 30 (see DOCS.md, \"Memory search recency\"). From 2026.10.10 minScore is checked before the decay (openclaw/openclaw#168692), so the half-life only sets the ranking."
+      "note": "Memory search temporal-decay half-life 365 days instead of the hard-coded 30 (see DOCS.md, \"Memory search recency\"). From 2026.10.10 minScore is checked before the decay (openclaw/openclaw#168692), so the half-life only sets the ranking (and with it which eligible hits fit into the returned maxResults, default 6)."
     },
     {
       "name": "telegram-voice-text-first",

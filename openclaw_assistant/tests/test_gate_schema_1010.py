@@ -440,8 +440,9 @@ class SchemaGate1010Tests(T.GateEnv):
             {"id": "codex", "package": "@openclaw/codex", "version": "2026.10.4", "enabled": True}])  # on-disk version
         self.assertEqual(self.run_gate(), 0, self.out)
         self.assertIn("[gate] 1/8 info: official plugins: @openclaw/acpx 2026.10.4 (disabled), "
-                      "@openclaw/brave-plugin 2026.10.4, @openclaw/codex 2026.10.4 (enabled); after the migration "
-                      "the add-on updates the enabled ones to 2026.10.10 (OpenClaw's doctor does not)", self.out)
+                      "@openclaw/brave-plugin 2026.10.4, @openclaw/codex 2026.10.4 (enabled); OpenClaw's doctor and "
+                      "then the add-on update the enabled ones to 2026.10.10", self.out)
+        self.assertNotIn("doctor does not", self.out)  # doctor --fix updates enabled official plugins itself
         self.assertEqual([x["id"] for x in self.journal()["plugins_official_before"]], ["acpx", "brave", "codex"])
         st = G.status_lines()
         line = next(x for x in st if x.startswith("Official plugins:"))
@@ -479,6 +480,48 @@ class CodesTests(unittest.TestCase):
         self.assertEqual(G.default_agent_id({"agents": {"list": [{"id": "solo"}]}}), "solo")
         self.assertEqual(G.default_agent_id({"agents": {"list": [{"id": "a"}, {"id": "b"}]}}), "main")
         self.assertEqual(C.runtime_caps("2026.10.10")["held_store_skip"], True)
+
+
+class DocsWordingTests(unittest.TestCase):
+    """User-facing claims that the review checked against the OpenClaw sources (2026.10.4 / 2026.10.10)."""
+
+    REPO = ADDON.parent
+
+    def text(self, rel):
+        return (self.REPO / rel).read_text(encoding="utf-8")
+
+    def test_doctor_updates_enabled_official_plugins(self):
+        # repair-sequencing.ts: doctor --fix runs repairMissingConfiguredPluginInstalls with repairVersionDrift, so
+        # it updates enabled official catalog plugins itself; the add-on only catches what it left behind
+        wrong = ("doctor never updates", "doctor does not update", "OpenClaw's doctor never",
+                 "OpenClaw's doctor does not", "doctor never does this", "doctor never brings",
+                 "doctor does not update them")
+        for rel in ("DOCS.md", "SECURITY.md", "openclaw_assistant/CHANGELOG.md", "openclaw_assistant/run.sh",
+                    "openclaw_assistant/oc_upgrade.py", "openclaw_assistant/oc_gate.py"):
+            body = self.text(rel)
+            for phrase in wrong:
+                with self.subTest(file=rel, phrase=phrase):
+                    self.assertNotIn(phrase, body)
+        sec = self.text("SECURITY.md")
+        self.assertIn("OpenClaw's own doctor, in the migration gate's doctor passes", sec)
+        self.assertIn("then neither doctor nor the add-on updates them", sec)
+
+    def test_hold_codes_version_scope(self):
+        docs = self.text("DOCS.md")
+        self.assertIn("`sqlite-fk-violation`, `orphan-agent-db` and `agent-db-held` apply with every OpenClaw\n"
+                      "version", docs)
+        nxt = docs.split("**Next OpenClaw line (in preparation).**", 1)[1].split("With OpenClaw 2026.10.4", 1)[0]
+        self.assertNotIn("agent databases outside the configured agents", nxt)
+
+    def test_memory_half_life_still_selects_the_returned_results(self):
+        # 2026.10.10 manager-search-orchestration.ts: minScore filter, decay, sort, slice(0, maxResults)
+        docs = self.text("DOCS.md")
+        section = docs.split("#### Memory search recency", 1)[1].split("\n#### ", 1)[0]
+        self.assertNotIn("only sets the order", section)
+        self.assertIn("`maxResults` (default 6)", section)
+        note = json.loads(self.text("openclaw_assistant/oc-patches/2026.10.10/manifest.json"))
+        half = next(e for e in note["patches"] if e["name"] == "memory-search-half-life")
+        self.assertIn("maxResults", half["note"])
 
 
 if __name__ == "__main__":

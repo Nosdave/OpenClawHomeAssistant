@@ -102,13 +102,14 @@ OpenClaw supports installing skills from the community (ClawHub) and via npm. Th
 - Monitor the add-on logs for unexpected activity
 - Keep the add-on updated to get security patches
 
-**Plugins the add-on itself downloads at start.** OpenClaw and the image's other npm packages are installed when the image is built, resolved as of a fixed date (`npm install --before`). Two start-up steps fetch from the npm registry while the add-on runs instead, with the gateway stopped, never during a HOLD, and once per OpenClaw version:
-- the Brave web-search plugin, `@openclaw/brave-plugin` in the bundled OpenClaw's version;
-- since the preparation for OpenClaw 2026.11.1: every **enabled** official plugin (`@openclaw/…`, for example `@openclaw/codex` or `@openclaw/acpx`) that is older than the bundled OpenClaw is updated to exactly that version (`openclaw plugins update <package>@<version>`, run by `oc-upgrade plugins-sync`). It never downgrades and leaves disabled plugins, bundled plugins and other npm scopes alone.
+**Plugins downloaded while the add-on runs.** OpenClaw and the image's other npm packages are installed when the image is built, resolved as of a fixed date (`npm install --before`). Three steps fetch from the npm registry while the add-on runs instead, always with the gateway stopped:
+- OpenClaw's own doctor, in the migration gate's doctor passes (`openclaw doctor --fix`; on every gate run, also `oc-upgrade retry --doctor`): it brings every **enabled** official plugin of OpenClaw's catalog (for example `@openclaw/codex`, `@openclaw/acpx`, `@openclaw/brave-plugin`) to exactly the bundled OpenClaw's version (a recorded pin newer than that is kept), the same plugin update `openclaw update` makes. It skips disabled plugins, and a failed fetch is only a warning in the doctor log. This is OpenClaw's behaviour (also with OpenClaw 2026.10.4); the add-on does not change it.
+- at start, after the gate, never during a HOLD and once per OpenClaw version: the Brave web-search plugin, `@openclaw/brave-plugin` in the bundled OpenClaw's version;
+- likewise, since the preparation for OpenClaw 2026.11.1: every **enabled** official plugin (`@openclaw/…`) that is still older than the bundled OpenClaw after the gate is updated to exactly that version (`openclaw plugins update <package>@<version>`, run by `oc-upgrade plugins-sync`). It never downgrades and leaves disabled plugins, bundled plugins and other npm scopes alone.
 
-**Risk**: these packages are not part of the image build and not limited by its date: what the npm registry serves for that name and version at that moment is installed, and it runs inside the gateway with its permissions. They come from OpenClaw's own npm scope, in the version OpenClaw released together with the bundled runtime (the image build checks that `@openclaw/brave-plugin`, `@openclaw/codex` and `@openclaw/acpx` exist in that version). A failed or blocked download leaves the installed version in place (`WARN`, retried at the next start).
+**Risk**: these packages are not part of the image build and not limited by its date: what the npm registry serves for that name and version at that moment is installed, and it runs inside the gateway with its permissions. They come from OpenClaw's own npm scope, in the version OpenClaw released together with the bundled runtime (the image build checks that `@openclaw/brave-plugin`, `@openclaw/codex` and `@openclaw/acpx` exist in that version). A failed or blocked download leaves the installed version in place (a doctor warning in the gate, a `WARN` at start; the add-on's step retries at the next start).
 
-**Mitigation**: disable official plugins you do not use (`openclaw plugins disable <id>`); the add-on then does not update them (the Brave plugin is installed with each new OpenClaw version either way).
+**Mitigation**: disable official plugins you do not use (`openclaw plugins disable <id>`); then neither doctor nor the add-on updates them (the Brave plugin is installed by the add-on with each new OpenClaw version either way).
 
 ### 6. Router SSH Access
 
@@ -203,7 +204,7 @@ The add-on's data contains secrets: tokens, OAuth logins, API keys. Rule: **no p
 | Keep the add-on updated | High |
 | Use only encrypted Home Assistant backups; never download or copy them elsewhere | High |
 | Use a dedicated HA user for the `homeassistant_token` | Medium |
-| Disable OpenClaw plugins you do not use (the add-on updates enabled official plugins from npm at start) | Medium |
+| Disable OpenClaw plugins you do not use (OpenClaw's doctor and the add-on update enabled official plugins from npm) | Medium |
 | Keep the Home Assistant Supervisor up to date (older versions show other add-ons' options to this add-on's token) | Medium |
 | Monitor add-on logs regularly | Medium |
 | Rotate gateway tokens periodically | Medium |

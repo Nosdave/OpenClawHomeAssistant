@@ -683,8 +683,9 @@ def cmd_cleanup(args):
 
 
 # --- official plugins (full5) -------------------------------------------------------------
-# OpenClaw's doctor never brings the official npm plugins to the core version (only `openclaw update` does, in its
-# post-core pass, which the add-on cannot run): the add-on does it after the gate, before the gateway starts.
+# OpenClaw's doctor (`doctor --fix`, in the gate's doctor passes) updates the enabled official catalog plugins to the
+# core version itself, but a failed or deferred fetch there is only a doctor warning: the add-on brings the enabled ones
+# it left behind after the gate, before the gateway starts.
 PLUGIN_LIST_TIMEOUT = 180
 PLUGIN_UPDATE_TIMEOUT = 300
 # No update starts later than this (s after the step began): the last one (300 s + 30 s kill grace) and the relist

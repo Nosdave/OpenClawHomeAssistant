@@ -207,7 +207,8 @@ RUN npm config set fund false && npm config set audit false \
 #    search at 30 days (dist/memory-search-*.mjs, //#region src/agents/memory-search.ts; no config
 #    key, doctor removes the old ones). 2026.10.4 checks minScore 0.35 after the decay, so dated
 #    memory notes older than ~45 days can never be found; from 2026.10.10 minScore is checked before
-#    the decay (openclaw/openclaw#168692) and the half-life only sets the ranking.
+#    the decay (openclaw/openclaw#168692) and the half-life only sets the ranking (and with it which
+#    eligible hits fit into the returned maxResults, default 6).
 #  - Telegram hotfix VOLT-TG-20261023 (send-, lifecycle-, execution-, fetch-*.mjs): long voice
 #    replies send their text first, no "couldn't confirm" notice while a reply is still being
 #    delivered, voice/audio uploads on a fresh connection without replay.

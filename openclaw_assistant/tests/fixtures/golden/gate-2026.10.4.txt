@@ -5,7 +5,7 @@ rc=0
 [gate] 1/8 info: agents/retired/agent/openclaw-agent.sqlite (agent retired, schema 20) is kept from a deleted agent (OpenClaw deletion journal); OpenClaw does not migrate or open it, and the gate leaves it out of the schema checks
 [gate] 1/8 auth profile main/anthropic:default provider=anthropic type=token expires=-
 [gate] 1/8 auth profile main/openai:default provider=openai type=oauth expires=<TS>
-[gate] 1/8 info: official plugins: @openclaw/brave-plugin 2026.10.2, @openclaw/codex 2026.10.2 (enabled); after the migration the add-on updates the enabled ones to 2026.10.4 (OpenClaw's doctor does not)
+[gate] 1/8 info: official plugins: @openclaw/brave-plugin 2026.10.2, @openclaw/codex 2026.10.2 (enabled); OpenClaw's doctor and then the add-on update the enabled ones to 2026.10.4
 [gate]   precheck: node 24.16.0 sqlite 3.50.4 ok; space check skipped (test hook); quick_check ok (2/2); foreign keys ok (2/2); network not checked; HA backup not checked (test hook); doctor budget <DUR>/pass (S=<N> MiB)
 [gate]   rollback point: the encrypted Home Assistant backup (no archive of the gate's own)
 [gate]   cleanup plan: nothing to move
@@ -61,7 +61,7 @@ oc-upgrade check — <TIME> (read-only)
 [gate] 1/8 info: agents/retired/agent/openclaw-agent.sqlite (agent retired, schema 20) is kept from a deleted agent (OpenClaw deletion journal); OpenClaw does not migrate or open it, and the gate leaves it out of the schema checks
 [gate] 1/8 auth profile main/anthropic:default provider=anthropic type=token expires=-
 [gate] 1/8 auth profile main/openai:default provider=openai type=oauth expires=<TS>
-[gate] 1/8 info: official plugins: @openclaw/brave-plugin 2026.10.2, @openclaw/codex 2026.10.2 (enabled); after the migration the add-on updates the enabled ones to 2026.10.4 (OpenClaw's doctor does not)
+[gate] 1/8 info: official plugins: @openclaw/brave-plugin 2026.10.2, @openclaw/codex 2026.10.2 (enabled); OpenClaw's doctor and then the add-on update the enabled ones to 2026.10.4
   precheck: node 24.16.0 sqlite 3.50.4 ok; space check skipped (test hook); quick_check ok (2/2); foreign keys ok (2/2); network not checked; HA backup not checked (test hook); doctor budget <DUR>/pass (S=<N> MiB)
   rollback point: the encrypted Home Assistant backup (no archive of the gate's own)
   cleanup plan: nothing to move
@@ -78,7 +78,7 @@ WARN [gate] test hooks active: doctor_cmd, skip_backup_check, skip_network_check
 [gate] 1/8 info: agents/retired/agent/openclaw-agent.sqlite (agent retired, schema 20) is kept from a deleted agent (OpenClaw deletion journal); OpenClaw does not migrate or open it, and the gate leaves it out of the schema checks
 [gate] 1/8 auth profile main/anthropic:default provider=anthropic type=token expires=-
 [gate] 1/8 auth profile main/openai:default provider=openai type=oauth expires=<TS>
-[gate] 1/8 info: official plugins: @openclaw/brave-plugin 2026.10.2, @openclaw/codex 2026.10.2 (enabled); after the migration the add-on updates the enabled ones to 2026.10.4 (OpenClaw's doctor does not)
+[gate] 1/8 info: official plugins: @openclaw/brave-plugin 2026.10.2, @openclaw/codex 2026.10.2 (enabled); OpenClaw's doctor and then the add-on update the enabled ones to 2026.10.4
 [gate] 1/8 precheck: node 24.16.0 sqlite 3.50.4 ok; mode bump; space check skipped (test hook); quick_check ok (2/2); foreign keys ok (2/2); network not checked; HA backup not checked (test hook); doctor budget <DUR>/pass (S=<N> MiB)
 [gate] 2/8 cleanup: quarantined 0 files (nothing to move) -> <TMP>/config/.openclaw-upgrade/gate/quarantine/<RUN>/
 WARN [gate] test hook doctor_cmd in use
@@ -107,7 +107,7 @@ WARN [gate] test hook doctor_cmd in use
 <TS> [gate] 1/8 info: agents/retired/agent/openclaw-agent.sqlite (agent retired, schema 20) is kept from a deleted agent (OpenClaw deletion journal); OpenClaw does not migrate or open it, and the gate leaves it out of the schema checks
 <TS> [gate] 1/8 auth profile main/anthropic:default provider=anthropic type=token expires=-
 <TS> [gate] 1/8 auth profile main/openai:default provider=openai type=oauth expires=<TS>
-<TS> [gate] 1/8 info: official plugins: @openclaw/brave-plugin 2026.10.2, @openclaw/codex 2026.10.2 (enabled); after the migration the add-on updates the enabled ones to 2026.10.4 (OpenClaw's doctor does not)
+<TS> [gate] 1/8 info: official plugins: @openclaw/brave-plugin 2026.10.2, @openclaw/codex 2026.10.2 (enabled); OpenClaw's doctor and then the add-on update the enabled ones to 2026.10.4
 <TS> [gate] 1/8 precheck: node 24.16.0 sqlite 3.50.4 ok; mode bump; space check skipped (test hook); quick_check ok (2/2); foreign keys ok (2/2); network not checked; HA backup not checked (test hook); doctor budget <DUR>/pass (S=<N> MiB)
 <TS> [gate] 2/8 cleanup: quarantined 0 files (nothing to move) -> <TMP>/config/.openclaw-upgrade/gate/quarantine/<RUN>/
 <TS> WARN [gate] test hook doctor_cmd in use
@@ -404,7 +404,7 @@ WARN [gate] test hooks active: doctor_cmd, skip_backup_check, skip_network_check
 [gate] 1/8 info: agents/retired/agent/openclaw-agent.sqlite (agent retired, schema 20) is kept from a deleted agent (OpenClaw deletion journal); OpenClaw does not migrate or open it, and the gate leaves it out of the schema checks
 [gate] 1/8 auth profile main/anthropic:default provider=anthropic type=token expires=-
 [gate] 1/8 auth profile main/openai:default provider=openai type=oauth expires=<TS>
-[gate] 1/8 info: official plugins: @openclaw/brave-plugin 2026.10.2, @openclaw/codex 2026.10.2 (enabled); after the migration the add-on updates the enabled ones to 2026.10.4 (OpenClaw's doctor does not)
+[gate] 1/8 info: official plugins: @openclaw/brave-plugin 2026.10.2, @openclaw/codex 2026.10.2 (enabled); OpenClaw's doctor and then the add-on update the enabled ones to 2026.10.4
 [gate] 1/8 precheck: node 24.16.0 sqlite 3.50.4 ok; mode maintenance; space check skipped (test hook); quick_check ok (2/2); foreign keys ok (2/2); network not checked; HA backup not checked (test hook); doctor budget <DUR>/pass (S=<N> MiB)
 [gate] 2/8 cleanup: quarantined 0 files (nothing to move) -> <TMP>/config/.openclaw-upgrade/gate/quarantine/<RUN>/
 WARN [gate] test hook doctor_cmd in use
@@ -432,7 +432,7 @@ WARN [gate] test hook doctor_cmd in use
 <TS> [gate] 1/8 info: agents/retired/agent/openclaw-agent.sqlite (agent retired, schema 20) is kept from a deleted agent (OpenClaw deletion journal); OpenClaw does not migrate or open it, and the gate leaves it out of the schema checks
 <TS> [gate] 1/8 auth profile main/anthropic:default provider=anthropic type=token expires=-
 <TS> [gate] 1/8 auth profile main/openai:default provider=openai type=oauth expires=<TS>
-<TS> [gate] 1/8 info: official plugins: @openclaw/brave-plugin 2026.10.2, @openclaw/codex 2026.10.2 (enabled); after the migration the add-on updates the enabled ones to 2026.10.4 (OpenClaw's doctor does not)
+<TS> [gate] 1/8 info: official plugins: @openclaw/brave-plugin 2026.10.2, @openclaw/codex 2026.10.2 (enabled); OpenClaw's doctor and then the add-on update the enabled ones to 2026.10.4
 <TS> [gate] 1/8 precheck: node 24.16.0 sqlite 3.50.4 ok; mode maintenance; space check skipped (test hook); quick_check ok (2/2); foreign keys ok (2/2); network not checked; HA backup not checked (test hook); doctor budget <DUR>/pass (S=<N> MiB)
 <TS> [gate] 2/8 cleanup: quarantined 0 files (nothing to move) -> <TMP>/config/.openclaw-upgrade/gate/quarantine/<RUN>/
 <TS> WARN [gate] test hook doctor_cmd in use

@@ -121,10 +121,12 @@ NODE_CAPABILITY_JS = (
 )
 
 # full5 prep: shared by the *-unimported codes (advice_for appends the accept hint)
-RETIRED_RUNTIME_ADVICE = ("OpenClaw 2026.10.4 (0.5.94-full4) is the last runtime of this add-on that imports this file; "
-                          "if its doctor left the file behind, it could not import it either (see its warning in the "
-                          "previous gate log). To keep the data, restore the encrypted backup of 0.5.94-full4 and "
-                          "stay on it")
+RETIRED_RUNTIME_ADVICE = ("OpenClaw 2026.10.4 (0.5.94-full4) imports this file only in a doctor run; if its gate ran "
+                          "on this state, that doctor could not import the file either (see its warning in the log of "
+                          "that gate run), so going back to 0.5.94-full4 keeps nothing. Accepting keeps the file in "
+                          "the gate's quarantine (/config/.openclaw-upgrade/gate/quarantine/<run>/) and it is in the "
+                          "encrypted backup. Only if that doctor run failed for a transient reason: restore the "
+                          "encrypted backup of 0.5.94-full4, run oc-upgrade retry --doctor there, then update again")
 
 ADVICE = {
     "runtime-schema-unknown": "the add-on image is broken (OpenClaw package lacks schema targets): reinstall or rebuild the add-on",
@@ -2404,16 +2406,16 @@ class Gate:
         if n:
             self.warn(f"{n} cron job(s) use openai-codex models: doctor may install the @openclaw/codex plugin "
                       "for them (it stays installed); the fixups revert doctor's codex runtime pins to openclaw")
-        # full5: official npm plugins follow the OpenClaw version; doctor does not update them, the add-on does
-        # after the gate (run.sh -> oc-upgrade plugins-sync, enabled ones only)
+        # full5: official npm plugins follow the OpenClaw version. doctor --fix updates the enabled official catalog
+        # plugins itself (repair-sequencing: version drift, only a warning when a fetch fails); after the gate the
+        # add-on brings the enabled ones it left behind (run.sh -> oc-upgrade plugins-sync)
         official = official_plugin_installs(state, self.cfg)
         if official:
             rt = self.pkg["version"]
             text = ", ".join(f"{x['package']} {x['version'] or '?'}"
                              + {True: " (enabled)", False: " (disabled)"}.get(x["enabled"], "") for x in official)
             if any(x["version"] != rt for x in official):
-                text += (f"; after the migration the add-on updates the enabled ones to {rt} (OpenClaw's doctor "
-                         "does not)")
+                text += f"; OpenClaw's doctor and then the add-on update the enabled ones to {rt}"
             self.say(f"{self.pn('precheck')} info: official plugins: {text}")
             if self.j is not None and not self.j.get("first_write_at"):
                 self.j["plugins_official_before"] = official
