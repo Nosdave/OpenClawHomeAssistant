@@ -153,7 +153,7 @@ configuration:
 
   gate_cleanup_hours:
     name: Usuń zrzuty doctor po (godzinach)
-    description: Liczba godzin od zakończonego przebiegu bramki migracji, po której dodatek usuwa zrzuty doctor OpenClaw z tego przebiegu (/config/.openclaw.update-captures/doctor-*). Kopie pozostawione przez wcześniejsze wersje dodatku (archiwa bramki w /share/openclaw-upgrade, eksporty próbne w /share/openclaw-rehearsal, nieszyfrowane archiwa z 2026.7 w /config/.openclaw/upgrade-backups) są usuwane po tym samym czasie od ich przebiegu, eksportu lub migracji. 0 = nigdy. Zmiana obowiązuje od następnego uruchomienia dodatku. Zakres 0-720, domyślnie 48.
+    description: Liczba godzin od zakończonego przebiegu bramki migracji, po której dodatek usuwa zrzuty doctor OpenClaw z tego przebiegu (/config/.openclaw.update-captures/doctor-*) oraz kopie SQLite, które doctor zapisał w nim obok baz danych (*.pre-startup-migration-*.bak, .scoped.bak), a także własne jawne kopie openclaw.json, które bramka zapisuje w katalogu przebiegu (/config/.openclaw-upgrade/gate/runs/<przebieg>/config.*.json, wraz z zapisanym wynikiem models status). Kopie pozostawione przez wcześniejsze wersje dodatku (archiwa bramki w /share/openclaw-upgrade, eksporty próbne w /share/openclaw-rehearsal, nieszyfrowane archiwa z 2026.7 w /config/.openclaw/upgrade-backups) są usuwane po tym samym czasie od ich przebiegu, eksportu lub migracji. 0 = nigdy. Zmiana obowiązuje od następnego uruchomienia dodatku. Zakres 0-720, domyślnie 48.
 
   gate_backup_max_age_hours:
     name: Wymagany wiek kopii zapasowej (godziny)

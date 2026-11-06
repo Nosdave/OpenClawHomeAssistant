@@ -36,15 +36,29 @@ Commands:
                  bundled runtime, 0 otherwise.
   gate --plan | gate | gate --hold-exit78 | gate --hold-crash-loop <rc>
                  Used by run.sh (internal).
+  plugins-sync   Used by run.sh after the migration gate, with the gateway
+                 down (internal): updates the enabled official npm plugins
+                 (@openclaw/codex, @openclaw/acpx, ...; not Brave, which run.sh
+                 installs itself) to the bundled OpenClaw version, once per
+                 version (marker /config/.openclaw/.plugin_cohort_<version>,
+                 written only when the plugin list confirms every enabled one
+                 at that version and shows every recorded npm install).
+                 Never downgrades, leaves disabled plugins alone, always exits 0.
+                 Skips the updates (no marker) when the npm registry does not
+                 answer within 30 s. No update starts after 600 s; SIGTERM
+                 stops the running one with its process group (no marker).
 """
 
 import json
 import os
 import re
 import shutil
+import signal
 import stat
 import subprocess
 import sys
+import threading
+import time
 from datetime import datetime, timezone
 
 _PYLIB = os.environ.get("OC_ADDON_PYLIB", "/usr/local/lib/oc-addon/python")
@@ -305,13 +319,24 @@ def cmd_check(_args):
     cls = None
     if G is not None and pkg is not None:
         try:
+            # full5: the stores OpenClaw holds back (deletion journal, this runtime's marker), as the gate plans
             cls = G.classify(state, cfg if isinstance(cfg, dict) else {}, pkg["schema_state"], pkg["schema_agent"],
-                             pkg["version"])
+                             pkg["version"], held=G.planning_held(state, G.load_marker(), pkg))
             why = cls["newer"] or cls["gate"] or cls["files"]
             print(f"  predicate: {cls['verdict']}" + (f" ({'; '.join(why[:4])})" if why else ""))
-            if cls["orphans"]:
-                print("  unconfigured agent databases (not migrated): "
-                      + ", ".join(f"{o['path']} (schema {o['uv']})" for o in cls["orphans"]))
+            orphans = [o for o in cls["orphans"] if not o.get("held")]
+            if orphans:
+                print("  agent databases of no configured or registered agent (doctor may migrate them one-way; "
+                      "the gateway does not open them): "
+                      + ", ".join(f"{o['path']} (schema {o['uv']})" for o in orphans))
+            held = [o for o in cls["orphans"] if o.get("held")] + list(cls.get("held") or [])
+            if held:
+                print("  held agent databases (kept from deleted agents; not migrated, not opened): "
+                      + ", ".join(f"{h['path']} (agent {h['id']}, schema {h['uv']}: {G.held_reason_text(h['reason'])})"
+                                  for h in held))
+            for h in cls.get("held_configured") or []:
+                print(f"  NOTE: agent {h['id']} is configured, but OpenClaw holds its database {h['path']} back "
+                      f"({G.held_reason_text(h['reason'])}); the gate holds (agent-db-held)")
         except Exception as exc:  # noqa: BLE001
             print(f"  predicate: n/a ({type(exc).__name__}: {exc})")
         try:
@@ -395,17 +420,23 @@ def cmd_check(_args):
     if M is not None:
         try:
             ccfg = cfg if isinstance(cfg, dict) else {}
-            keys, _bridge = M.retired_config_keys(ccfg)
+            try:  # the checks of the bundled OpenClaw (2026.10.5+: runtime files, API ids, cdpUrl)
+                caps = C.runtime_caps(C.runtime_package())
+            except Exception:  # noqa: BLE001 - unknown runtime: the 2026.10.4 checks
+                caps = None
+            keys, _bridge = M.retired_config_keys(ccfg, caps)
             for k in keys:
                 shown += 1
                 print(f"  openclaw.json {k}: retired setting"
                       + (" (removed by the gate when its records are in SQLite)" if k == "plugins.installs" else ""))
                 bump(RC_NOTES, info_only)
-            rs = M.classify_retired_state(str(state), ccfg, accepted=set(), home=str(p["CONFIG_ROOT"]))
+            rs = M.classify_retired_state(str(state), ccfg, accepted=set(), home=str(p["CONFIG_ROOT"]), caps=caps,
+                                          env=dict(os.environ, HOME=str(p["CONFIG_ROOT"])))
             for e in rs.get("plan", []):
                 shown += 1
                 print(f"  {e.get('rel')} ({e.get('size', 0)} B) {e.get('kind')}: {e.get('action')}"
-                      + (f" — {e['reason']}" if e.get("reason") else ""))
+                      + (f" — {e['reason']}" if e.get("reason") else "")
+                      + (f" (proof: {e['proof']})" if e.get("proof") else ""))
                 bump(RC_NOTES, info_only)
             for f in rs.get("findings", []):
                 shown += 1
@@ -654,6 +685,247 @@ def cmd_cleanup(args):
     return _gate().cleanup_cmd(args)
 
 
+# --- official plugins (full5) -------------------------------------------------------------
+# OpenClaw's doctor (`doctor --fix`, in the gate's doctor passes) updates the enabled official catalog plugins to the
+# core version itself, but a failed or deferred fetch there is only a doctor warning: the add-on brings the enabled ones
+# it left behind after the gate, before the gateway starts.
+PLUGIN_LIST_TIMEOUT = 180
+PLUGIN_UPDATE_TIMEOUT = 300
+# No update starts later than this (s after the step began): the last one (300 s + 30 s kill grace) and the relist
+# (180 s + 30 s) still end before run.sh's `timeout --kill-after=30 1200`; the rest waits for the next start.
+PLUGIN_SYNC_BUDGET = 600
+PLUGIN_STOP_GRACE = 10  # a stop request (SIGTERM from run.sh's shutdown trap via timeout): SIGTERM, then SIGKILL
+# Registry probe before the first update (`npm view <package>@<version> version`): offline, `openclaw plugins update`
+# waits out its 300 s limit per plugin (rehearsal: 334 s with no result) while the gateway is still down. 30 s leave
+# room for npm's start on slow hardware.
+PLUGIN_PROBE_TIMEOUT = 30
+_RUNTIME_VERSION_RE = re.compile(r"^\d{4}\.\d+\.\d+(?:-\d+)?$")
+# OpenClaw keeps loading a version-bound plugin from this release on (official-runtime-plugins.ts)
+PLUGIN_MIN_COMPATIBLE = {"@openclaw/codex": "2026.9.7"}
+
+
+def _sync_runtime_version():
+    """The version run.sh checks the marker for (its validated OPENCLAW_RUNTIME_VERSION), else the package's."""
+    env = os.environ.get("OPENCLAW_RUNTIME_VERSION", "").strip()
+    if _RUNTIME_VERSION_RE.match(env):
+        return env
+    try:
+        return C.runtime_package()["version"]
+    except C.RuntimePackageError:
+        return None
+
+
+def _oc_capture(args, timeout, tmp, tag, stop=None):
+    """Run the bundled OpenClaw CLI (never through the wrapper); (rc, stdout text, redacted tail). A set `stop`
+    event ends it (its whole process group, npm included)."""
+    out_p, err_p = os.path.join(tmp, f"{tag}.out"), os.path.join(tmp, f"{tag}.err")
+    res = C.run_oc(args, timeout=timeout, log_path=err_p, stdout_path=out_p, stop_event=stop,
+                   stop_grace=PLUGIN_STOP_GRACE)
+    texts = []
+    for f in (out_p, err_p):
+        try:
+            with open(f, encoding="utf-8", errors="replace") as fh:
+                texts.append(fh.read())
+        except OSError:
+            texts.append("")
+    lines = [x.strip() for x in (texts[1] + "\n" + texts[0]).splitlines() if x.strip()]
+    tail = C.redact_text(" | ".join(lines[-2:]))[:300]
+    rc = "timeout" if res.timed_out else res.rc
+    return rc, texts[0], tail
+
+
+def _registry_probe(pkg, version, tmp, stop=None, timeout=PLUGIN_PROBE_TIMEOUT):
+    """A1: None when the npm registry serves `pkg`@`version` (`npm view`, the npm OpenClaw runs, with OpenClaw's
+    environment and so its npm config and proxy; an empty cache in `tmp`, so that no cached registry data answers
+    offline), else why not, for the WARN (redacted). No npm on PATH: None (`openclaw plugins update` reports it)."""
+    env = C.openclaw_env()
+    npm = shutil.which("npm", path=env.get("PATH"))
+    if not npm:
+        return None
+    out_p, log_p = os.path.join(tmp, "probe.json"), os.path.join(tmp, "probe.log")
+    res = C.run_process([npm, "view", f"{pkg}@{version}", "version", "--json", "--cache",
+                         os.path.join(tmp, "probe-npm-cache")], timeout=timeout,
+                        log_path=log_p, stdout_path=out_p, stop_event=stop, kill_grace=5,
+                        stop_grace=PLUGIN_STOP_GRACE, env=env)
+    texts = []
+    for f in (out_p, log_p):
+        try:
+            with open(f, encoding="utf-8", errors="replace") as fh:
+                texts.append(fh.read())
+        except OSError:
+            texts.append("")
+    data = C.parse_json_output(texts[0])
+    if res.rc == 0 and data == version:
+        return None
+    if res.timed_out:
+        return f"npm view: no answer within {timeout:g} s"
+    lines = [x.strip() for x in texts[1].splitlines() if x.strip() and not x.startswith("[oc] ")]
+    tail = C.redact_text(" | ".join(lines[-2:]))[:200]
+    return (f"npm view: rc {res.rc}" + ("" if res.rc else f", version {str(data)[:40]!r}")
+            + (f": {tail}" if tail else ""))
+
+
+def _official_installs(p):
+    """oc_gate.official_plugin_installs of the state (OpenClaw's npm install records); [] when unreadable."""
+    G = _gate()
+    try:
+        return G.official_plugin_installs(p["STATE"], G._read_cfg_lenient())
+    except Exception:  # noqa: BLE001 - the plugin list still identifies the plugins (trust.installSpec, rootDir)
+        return []
+
+
+def _official_enabled(data, installs=()):
+    """{package: version or None} of the enabled official npm plugins in `openclaw plugins list --json` (not Brave,
+    not bundled ones), identified as the gate does (oc_gate.listed_official_plugins: the real output has no
+    packageName); None when the output has no plugin list."""
+    listed = _gate().listed_official_plugins(data, installs)
+    if listed is None:
+        return None
+    found = {}
+    for x in listed:
+        if x["enabled"] and x["package"] != _gate().BRAVE_PLUGIN_PACKAGE:
+            found.setdefault(x["package"], x["version"])
+    return found
+
+
+def cmd_plugins_sync(args):
+    """`oc-upgrade plugins-sync` (internal; run.sh after the gate, gateway down). Always returns 0.
+
+    SIGTERM/SIGINT (run.sh's shutdown trap, or its outer `timeout`) stop the running `openclaw plugins update` with
+    its process group (it runs in its own session, so it would otherwise outlive this process) and end the step
+    without the marker."""
+    if args:
+        print("usage: oc-upgrade plugins-sync")
+        return RC_OK
+    stop = threading.Event()
+
+    def _on_signal(_signum, _frame):
+        stop.set()
+
+    signal.signal(signal.SIGTERM, _on_signal)
+    signal.signal(signal.SIGINT, _on_signal)
+    try:
+        return _plugins_sync(stop)
+    except Exception as exc:  # noqa: BLE001 - best effort: never stops the add-on start
+        print(f"WARN: Official plugins not updated ({type(exc).__name__}: {C.redact_text(str(exc))[:200]}); the add-on "
+              "tries again at the next start.")
+        return RC_OK
+
+
+def _plugins_sync(stop=None):
+    stop = stop or threading.Event()
+    started = time.monotonic()
+    budget, probe_timeout = PLUGIN_SYNC_BUDGET, PLUGIN_PROBE_TIMEOUT
+    if os.environ.get("OC_GATE_TEST_HOOKS") == "1":  # tests only (oc_gate.load_hooks)
+        hooks = _gate().load_hooks()
+        budget = float(hooks.get("plugin_sync_budget_s", budget))
+        probe_timeout = float(hooks.get("plugin_probe_timeout_s", probe_timeout))
+    p = P()
+    rt = _sync_runtime_version()
+    if not rt:
+        print("WARN: Official plugins not updated: the OpenClaw version is unknown (non-fatal).")
+        return RC_OK
+    if (p["UPG_DIR"] / "hold.txt").exists():
+        print("INFO: Official plugins not updated: OpenClaw is held (oc-upgrade status).")
+        return RC_OK
+    marker = p["STATE"] / f".plugin_cohort_{rt}"
+    if marker.exists():
+        return RC_OK
+    import tempfile  # noqa: PLC0415
+    stopped_msg = ("INFO: Official plugins: update step stopped (add-on stop or time limit); the add-on tries again "
+                   "at the next start.")
+    with tempfile.TemporaryDirectory(prefix="oc-plugins-sync-") as tmp:
+        rc, text, tail = _oc_capture(["plugins", "list", "--json"], PLUGIN_LIST_TIMEOUT, tmp, "list", stop)
+        if stop.is_set():
+            print(stopped_msg)
+            return RC_OK
+        data = C.parse_json_output(text) if rc == 0 else None
+        installs = _official_installs(p)
+        found = _official_enabled(data, installs)
+        if found is None:
+            print(f"WARN: Official plugins not updated: openclaw plugins list failed (rc {rc}"
+                  + (f": {tail}" if tail else "") + "); the add-on tries again at the next start.")
+            return RC_OK
+        # D2: recorded npm installs the list does not show cannot be confirmed: no marker (see below)
+        unlisted = _gate().unlisted_official_installs(data, installs)
+        rtv = version_tuple(rt)
+        todo, newer = [], []
+        for pkg, ver in sorted(found.items()):
+            if ver == rt:
+                continue
+            if version_tuple(ver) and version_tuple(ver) > rtv:
+                print(f"WARN: {pkg} {ver} is newer than OpenClaw {rt}; left as is (no downgrade)")
+                newer.append(pkg)
+                continue
+            todo.append((pkg, ver))  # ver None: the list names no version; the update sets it
+        failed = []
+        if todo:  # A1: offline, every update would wait out its time limit before the gateway starts
+            why = _registry_probe(todo[0][0], rt, tmp, stop, probe_timeout)
+            if stop.is_set():
+                print(stopped_msg)
+                return RC_OK
+            if why:
+                print(f"WARN: Official plugins not updated: the npm registry did not confirm {todo[0][0]}@{rt} "
+                      f"({why}); "
+                      + ", ".join(f"{pkg} stays at {ver or 'an unknown version'}" for pkg, ver in todo)
+                      + ". The add-on tries again at the next start; by hand, once online: "
+                      + "; ".join(f"openclaw plugins update {pkg}@{rt}" for pkg, _v in todo))
+                return RC_OK
+        for i, (pkg, ver) in enumerate(todo):
+            if stop.is_set():
+                print(stopped_msg)
+                return RC_OK
+            if time.monotonic() - started > budget:
+                failed.append((pkg, ver, f"not started: the update step's time budget ({int(budget)} s) ran out"))
+                continue
+            print(f"INFO: Official plugins: updating {pkg} {ver or '?'} -> {rt} (OpenClaw {rt})...", flush=True)
+            urc, _text, utail = _oc_capture(["plugins", "update", f"{pkg}@{rt}"], PLUGIN_UPDATE_TIMEOUT, tmp,
+                                            f"update-{i}-{pkg.rsplit('/', 1)[-1]}", stop)
+            if stop.is_set():
+                print(stopped_msg)
+                return RC_OK
+            if urc != 0:
+                failed.append((pkg, ver, f"openclaw plugins update failed, rc {urc}" + (f": {utail}" if utail else "")))
+        if todo:
+            rc, text, tail = _oc_capture(["plugins", "list", "--json"], PLUGIN_LIST_TIMEOUT, tmp, "relist", stop)
+            if stop.is_set():
+                print(stopped_msg)
+                return RC_OK
+            now = _official_enabled(C.parse_json_output(text), _official_installs(p)) if rc == 0 else None
+            for pkg, ver in todo:
+                if any(f[0] == pkg for f in failed):
+                    continue
+                got = (now or {}).get(pkg)
+                if now is None:
+                    failed.append((pkg, ver, f"openclaw plugins list failed after the update, rc {rc}"))
+                elif got != rt:
+                    failed.append((pkg, got or ver, f"openclaw plugins update left version {got or 'unknown'}"))
+        for pkg, ver, why in failed:
+            floor = PLUGIN_MIN_COMPATIBLE.get(pkg)
+            loads = (f"; OpenClaw {rt} still loads it (minimum {floor})" if floor and version_tuple(ver)
+                     and version_tuple(ver) >= version_tuple(floor) else "")
+            print(f"WARN: {pkg} stays at {ver or 'an unknown version'} ({why}){loads}. The add-on tries again at the "
+                  f"next start; by hand: openclaw plugins update {pkg}@{rt}")
+        for x in unlisted:
+            print(f"WARN: OpenClaw recorded the npm install of {x['package']} {x['version'] or '?'} (plugin "
+                  f"{x['id']}), but openclaw plugins list does not show it, so its version is not confirmed (check: "
+                  "openclaw plugins doctor). The add-on looks again at the next start.")
+        # the marker only when every enabled official plugin is confirmed at the OpenClaw version (D2)
+        if failed or newer or unlisted:
+            return RC_OK
+    try:
+        C.atomic_write_text(marker, f"{rt}\n")
+    except OSError as exc:
+        print(f"WARN: could not record the official plugin update for OpenClaw {rt} ({exc}); it runs again at the "
+              "next start")
+    updated = dict(todo) if found else {}
+    print(f"INFO: Official plugins match OpenClaw {rt}: "
+          + ", ".join(f"{pkg} {updated[pkg] or '?'} -> {rt}" if pkg in updated else f"{pkg} {rt}"
+                      for pkg in sorted(found)) + "." if found else
+          f"INFO: Official plugins: none enabled besides Brave; nothing to update for OpenClaw {rt}.")
+    return RC_OK
+
+
 COMMANDS = {
     "check": cmd_check,
     "status": cmd_status,
@@ -662,6 +934,7 @@ COMMANDS = {
     "retry": cmd_retry,
     "log": cmd_log,
     "cleanup": cmd_cleanup,
+    "plugins-sync": cmd_plugins_sync,
 }
 
 

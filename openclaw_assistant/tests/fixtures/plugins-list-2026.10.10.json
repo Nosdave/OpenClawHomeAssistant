@@ -1,0 +1,477 @@
+{
+  "workspaceDir": "/config/clawd",
+  "workspaceScope": "selected",
+  "registry": {
+    "source": "persisted",
+    "diagnostics": []
+  },
+  "plugins": [
+    {
+      "id": "a2a",
+      "name": "A2A",
+      "version": "2026.10.10",
+      "description": "A2A v1.0 Agent-to-Agent protocol channel plugin.",
+      "format": "openclaw",
+      "source": "/usr/local/lib/node_modules/openclaw/dist/extensions/a2a/index.js",
+      "rootDir": "/usr/local/lib/node_modules/openclaw/dist/extensions/a2a",
+      "origin": "bundled",
+      "trust": {
+        "reason": "bundled",
+        "registryPath": "/config/.openclaw/state/openclaw.sqlite",
+        "origin": "bundled"
+      },
+      "enabled": false,
+      "compat": [],
+      "syntheticAuthRefs": [],
+      "status": "disabled",
+      "toolNames": [],
+      "hookNames": [],
+      "channelIds": [
+        "a2a"
+      ],
+      "cliBackendIds": [],
+      "providerIds": [],
+      "embeddingProviderIds": [],
+      "speechProviderIds": [],
+      "realtimeTranscriptionProviderIds": [],
+      "realtimeVoiceProviderIds": [],
+      "mediaUnderstandingProviderIds": [],
+      "transcriptSourceProviderIds": [],
+      "imageGenerationProviderIds": [],
+      "videoGenerationProviderIds": [],
+      "musicGenerationProviderIds": [],
+      "webFetchProviderIds": [],
+      "webSearchProviderIds": [],
+      "migrationProviderIds": [],
+      "cliCommands": [],
+      "services": [],
+      "gatewayDiscoveryServiceIds": [],
+      "commands": [],
+      "httpRoutes": 0,
+      "hookCount": 0,
+      "configSchema": true
+    },
+    {
+      "id": "alibaba",
+      "name": "@openclaw/alibaba-provider",
+      "version": "2026.10.10",
+      "description": "OpenClaw Alibaba Model Studio video provider plugin",
+      "format": "openclaw",
+      "source": "/usr/local/lib/node_modules/openclaw/dist/extensions/alibaba/index.js",
+      "rootDir": "/usr/local/lib/node_modules/openclaw/dist/extensions/alibaba",
+      "origin": "bundled",
+      "trust": {
+        "reason": "bundled",
+        "registryPath": "/config/.openclaw/state/openclaw.sqlite",
+        "origin": "bundled"
+      },
+      "enabled": true,
+      "compat": [],
+      "syntheticAuthRefs": [],
+      "status": "loaded",
+      "toolNames": [],
+      "hookNames": [],
+      "channelIds": [],
+      "cliBackendIds": [],
+      "providerIds": [],
+      "embeddingProviderIds": [],
+      "speechProviderIds": [],
+      "realtimeTranscriptionProviderIds": [],
+      "realtimeVoiceProviderIds": [],
+      "mediaUnderstandingProviderIds": [],
+      "transcriptSourceProviderIds": [],
+      "imageGenerationProviderIds": [],
+      "videoGenerationProviderIds": [
+        "alibaba"
+      ],
+      "musicGenerationProviderIds": [],
+      "webFetchProviderIds": [],
+      "webSearchProviderIds": [],
+      "migrationProviderIds": [],
+      "cliCommands": [],
+      "services": [],
+      "gatewayDiscoveryServiceIds": [],
+      "commands": [],
+      "httpRoutes": 0,
+      "hookCount": 0,
+      "configSchema": true,
+      "contracts": {
+        "videoGenerationProviders": [
+          "alibaba"
+        ]
+      }
+    },
+    {
+      "id": "memory-core",
+      "name": "OpenClaw Memory",
+      "version": "2026.10.10",
+      "description": "OpenClaw core memory search plugin",
+      "format": "openclaw",
+      "kind": "memory",
+      "source": "/usr/local/lib/node_modules/openclaw/dist/extensions/memory-core/index.js",
+      "rootDir": "/usr/local/lib/node_modules/openclaw/dist/extensions/memory-core",
+      "origin": "bundled",
+      "trust": {
+        "reason": "bundled",
+        "registryPath": "/config/.openclaw/state/openclaw.sqlite",
+        "origin": "bundled"
+      },
+      "enabled": true,
+      "compat": [],
+      "syntheticAuthRefs": [],
+      "status": "loaded",
+      "toolNames": [
+        "intent",
+        "memory_get",
+        "memory_search"
+      ],
+      "hookNames": [],
+      "channelIds": [],
+      "cliBackendIds": [],
+      "providerIds": [],
+      "embeddingProviderIds": [],
+      "speechProviderIds": [],
+      "realtimeTranscriptionProviderIds": [],
+      "realtimeVoiceProviderIds": [],
+      "mediaUnderstandingProviderIds": [],
+      "transcriptSourceProviderIds": [],
+      "imageGenerationProviderIds": [],
+      "videoGenerationProviderIds": [],
+      "musicGenerationProviderIds": [],
+      "webFetchProviderIds": [],
+      "webSearchProviderIds": [],
+      "migrationProviderIds": [],
+      "cliCommands": [],
+      "services": [],
+      "gatewayDiscoveryServiceIds": [],
+      "commands": [
+        "dreaming"
+      ],
+      "httpRoutes": 0,
+      "hookCount": 0,
+      "configSchema": true,
+      "contracts": {
+        "tools": [
+          "intent",
+          "memory_get",
+          "memory_search"
+        ]
+      }
+    },
+    {
+      "id": "acpx",
+      "name": "ACPX Runtime",
+      "version": "2026.10.10",
+      "description": "OpenClaw ACP runtime backend with plugin-owned session and transport management.",
+      "format": "openclaw",
+      "source": "/config/.openclaw/npm/projects/openclaw-acpx-0a1b2c3d4e__openclaw-generation__g-0123456789abcdef/node_modules/@openclaw/acpx/dist/index.js",
+      "rootDir": "/config/.openclaw/npm/projects/openclaw-acpx-0a1b2c3d4e__openclaw-generation__g-0123456789abcdef/node_modules/@openclaw/acpx",
+      "origin": "global",
+      "trustedOfficialInstall": true,
+      "trust": {
+        "reason": "trusted-official",
+        "registryPath": "/config/.openclaw/state/openclaw.sqlite",
+        "origin": "global",
+        "installSource": "npm",
+        "installSpec": "@openclaw/acpx"
+      },
+      "enabled": true,
+      "compat": [
+        "activation-agent-harness-hint"
+      ],
+      "syntheticAuthRefs": [],
+      "status": "loaded",
+      "toolNames": [],
+      "hookNames": [],
+      "channelIds": [],
+      "cliBackendIds": [],
+      "providerIds": [],
+      "embeddingProviderIds": [],
+      "speechProviderIds": [],
+      "realtimeTranscriptionProviderIds": [],
+      "realtimeVoiceProviderIds": [],
+      "mediaUnderstandingProviderIds": [],
+      "transcriptSourceProviderIds": [],
+      "imageGenerationProviderIds": [],
+      "videoGenerationProviderIds": [],
+      "musicGenerationProviderIds": [],
+      "webFetchProviderIds": [],
+      "webSearchProviderIds": [],
+      "migrationProviderIds": [],
+      "cliCommands": [],
+      "services": [],
+      "gatewayDiscoveryServiceIds": [],
+      "commands": [],
+      "httpRoutes": 0,
+      "hookCount": 0,
+      "configSchema": true,
+      "dependencyStatus": {
+        "hasDependencies": true,
+        "installed": true,
+        "requiredInstalled": true,
+        "optionalInstalled": true,
+        "missing": [],
+        "missingOptional": [],
+        "dependencies": [
+          {
+            "name": "@agentclientprotocol/claude-agent-acp",
+            "spec": "0.95.0",
+            "installed": true,
+            "optional": false,
+            "resolvedPath": "/config/.openclaw/npm/projects/openclaw-acpx-0a1b2c3d4e__openclaw-generation__g-0123456789abcdef/node_modules/@agentclientprotocol/claude-agent-acp"
+          },
+          {
+            "name": "@agentclientprotocol/codex-acp",
+            "spec": "2.1.1",
+            "installed": true,
+            "optional": false,
+            "resolvedPath": "/config/.openclaw/npm/projects/openclaw-acpx-0a1b2c3d4e__openclaw-generation__g-0123456789abcdef/node_modules/@agentclientprotocol/codex-acp"
+          },
+          {
+            "name": "@openclaw/fs-safe",
+            "spec": "0.26.5",
+            "installed": true,
+            "optional": false,
+            "resolvedPath": "/config/.openclaw/npm/projects/openclaw-acpx-0a1b2c3d4e__openclaw-generation__g-0123456789abcdef/node_modules/@openclaw/fs-safe"
+          },
+          {
+            "name": "acpx",
+            "spec": "0.19.4",
+            "installed": true,
+            "optional": false,
+            "resolvedPath": "/config/.openclaw/npm/projects/openclaw-acpx-0a1b2c3d4e__openclaw-generation__g-0123456789abcdef/node_modules/acpx"
+          },
+          {
+            "name": "smol-toml",
+            "spec": "1.9.0",
+            "installed": true,
+            "optional": false,
+            "resolvedPath": "/config/.openclaw/npm/projects/openclaw-acpx-0a1b2c3d4e__openclaw-generation__g-0123456789abcdef/node_modules/smol-toml"
+          },
+          {
+            "name": "zod",
+            "spec": "4.6.5",
+            "installed": true,
+            "optional": false,
+            "resolvedPath": "/config/.openclaw/npm/projects/openclaw-acpx-0a1b2c3d4e__openclaw-generation__g-0123456789abcdef/node_modules/zod"
+          }
+        ],
+        "optionalDependencies": []
+      }
+    },
+    {
+      "id": "brave",
+      "name": "Brave",
+      "version": "2026.10.10",
+      "description": "OpenClaw Brave Search provider plugin for web search.",
+      "format": "openclaw",
+      "source": "/config/.openclaw/npm/projects/openclaw-brave-plugin-1b2c3d4e5f__openclaw-generation__g-123456789abcdef0/node_modules/@openclaw/brave-plugin/dist/index.js",
+      "rootDir": "/config/.openclaw/npm/projects/openclaw-brave-plugin-1b2c3d4e5f__openclaw-generation__g-123456789abcdef0/node_modules/@openclaw/brave-plugin",
+      "origin": "global",
+      "trustedOfficialInstall": true,
+      "trust": {
+        "reason": "trusted-official",
+        "registryPath": "/config/.openclaw/state/openclaw.sqlite",
+        "origin": "global",
+        "installSource": "npm",
+        "installSpec": "@openclaw/brave-plugin@2026.10.10"
+      },
+      "enabled": true,
+      "compat": [],
+      "syntheticAuthRefs": [],
+      "status": "loaded",
+      "toolNames": [],
+      "hookNames": [],
+      "channelIds": [],
+      "cliBackendIds": [],
+      "providerIds": [],
+      "embeddingProviderIds": [],
+      "speechProviderIds": [],
+      "realtimeTranscriptionProviderIds": [],
+      "realtimeVoiceProviderIds": [],
+      "mediaUnderstandingProviderIds": [],
+      "transcriptSourceProviderIds": [],
+      "imageGenerationProviderIds": [],
+      "videoGenerationProviderIds": [],
+      "musicGenerationProviderIds": [],
+      "webFetchProviderIds": [],
+      "webSearchProviderIds": [
+        "brave"
+      ],
+      "migrationProviderIds": [],
+      "cliCommands": [],
+      "services": [],
+      "gatewayDiscoveryServiceIds": [],
+      "commands": [],
+      "httpRoutes": 0,
+      "hookCount": 0,
+      "configSchema": true,
+      "contracts": {
+        "webSearchProviders": [
+          "brave"
+        ]
+      },
+      "dependencyStatus": {
+        "hasDependencies": false,
+        "installed": true,
+        "requiredInstalled": true,
+        "optionalInstalled": true,
+        "missing": [],
+        "missingOptional": [],
+        "dependencies": [],
+        "optionalDependencies": []
+      }
+    },
+    {
+      "id": "codex",
+      "name": "Codex",
+      "version": "2026.10.10",
+      "description": "Codex app-server harness and native session catalog.",
+      "format": "openclaw",
+      "source": "/config/.openclaw/npm/projects/openclaw-codex-2c3d4e5f6a__openclaw-generation__g-23456789abcdef01/node_modules/@openclaw/codex/dist/index.js",
+      "rootDir": "/config/.openclaw/npm/projects/openclaw-codex-2c3d4e5f6a__openclaw-generation__g-23456789abcdef01/node_modules/@openclaw/codex",
+      "origin": "global",
+      "trustedOfficialInstall": true,
+      "trust": {
+        "reason": "trusted-official",
+        "registryPath": "/config/.openclaw/state/openclaw.sqlite",
+        "origin": "global",
+        "installSource": "npm",
+        "installSpec": "@openclaw/codex@2026.10.10"
+      },
+      "enabled": true,
+      "compat": [
+        "activation-agent-harness-hint",
+        "activation-command-hint",
+        "activation-config-path-hint"
+      ],
+      "syntheticAuthRefs": [
+        "codex"
+      ],
+      "status": "loaded",
+      "toolNames": [
+        "codex_threads",
+        "codex_plugins",
+        "codex_endpoint_probe",
+        "codex_sessions_list",
+        "codex_session_read",
+        "codex_session_send",
+        "codex_session_interrupt"
+      ],
+      "hookNames": [],
+      "channelIds": [],
+      "cliBackendIds": [],
+      "providerIds": [
+        "codex"
+      ],
+      "embeddingProviderIds": [],
+      "speechProviderIds": [],
+      "realtimeTranscriptionProviderIds": [],
+      "realtimeVoiceProviderIds": [],
+      "mediaUnderstandingProviderIds": [
+        "codex"
+      ],
+      "transcriptSourceProviderIds": [],
+      "imageGenerationProviderIds": [],
+      "videoGenerationProviderIds": [],
+      "musicGenerationProviderIds": [],
+      "webFetchProviderIds": [],
+      "webSearchProviderIds": [
+        "codex"
+      ],
+      "migrationProviderIds": [
+        "codex"
+      ],
+      "cliCommands": [],
+      "services": [],
+      "gatewayDiscoveryServiceIds": [],
+      "commands": [
+        "codex"
+      ],
+      "httpRoutes": 0,
+      "hookCount": 0,
+      "configSchema": true,
+      "contracts": {
+        "mediaUnderstandingProviders": [
+          "codex"
+        ],
+        "webSearchProviders": [
+          "codex"
+        ],
+        "migrationProviders": [
+          "codex"
+        ],
+        "tools": [
+          "codex_threads",
+          "codex_plugins",
+          "codex_endpoint_probe",
+          "codex_sessions_list",
+          "codex_session_read",
+          "codex_session_send",
+          "codex_session_interrupt"
+        ]
+      },
+      "dependencyStatus": {
+        "hasDependencies": true,
+        "installed": true,
+        "requiredInstalled": true,
+        "optionalInstalled": true,
+        "missing": [],
+        "missingOptional": [],
+        "dependencies": [
+          {
+            "name": "@openai/codex",
+            "spec": "0.164.0",
+            "installed": true,
+            "optional": false,
+            "resolvedPath": "/config/.openclaw/npm/projects/openclaw-codex-2c3d4e5f6a__openclaw-generation__g-23456789abcdef01/node_modules/@openai/codex"
+          },
+          {
+            "name": "@openclaw/fs-safe",
+            "spec": "0.26.5",
+            "installed": true,
+            "optional": false,
+            "resolvedPath": "/config/.openclaw/npm/projects/openclaw-codex-2c3d4e5f6a__openclaw-generation__g-23456789abcdef01/node_modules/@openclaw/fs-safe"
+          },
+          {
+            "name": "semver",
+            "spec": "7.8.5",
+            "installed": true,
+            "optional": false,
+            "resolvedPath": "/config/.openclaw/npm/projects/openclaw-codex-2c3d4e5f6a__openclaw-generation__g-23456789abcdef01/node_modules/semver"
+          },
+          {
+            "name": "smol-toml",
+            "spec": "1.9.0",
+            "installed": true,
+            "optional": false,
+            "resolvedPath": "/config/.openclaw/npm/projects/openclaw-codex-2c3d4e5f6a__openclaw-generation__g-23456789abcdef01/node_modules/smol-toml"
+          },
+          {
+            "name": "typebox",
+            "spec": "1.3.35",
+            "installed": true,
+            "optional": false,
+            "resolvedPath": "/config/.openclaw/npm/projects/openclaw-codex-2c3d4e5f6a__openclaw-generation__g-23456789abcdef01/node_modules/typebox"
+          },
+          {
+            "name": "ws",
+            "spec": "8.22.0",
+            "installed": true,
+            "optional": false,
+            "resolvedPath": "/config/.openclaw/npm/projects/openclaw-codex-2c3d4e5f6a__openclaw-generation__g-23456789abcdef01/node_modules/ws"
+          },
+          {
+            "name": "zod",
+            "spec": "4.6.5",
+            "installed": true,
+            "optional": false,
+            "resolvedPath": "/config/.openclaw/npm/projects/openclaw-codex-2c3d4e5f6a__openclaw-generation__g-23456789abcdef01/node_modules/zod"
+          }
+        ],
+        "optionalDependencies": []
+      }
+    }
+  ],
+  "diagnostics": []
+}

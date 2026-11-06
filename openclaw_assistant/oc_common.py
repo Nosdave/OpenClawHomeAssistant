@@ -637,6 +637,66 @@ def runtime_package():
             "schema_state": s, "schema_agent": a}
 
 
+# What the bundled OpenClaw does, by the first release with that behaviour. Every gate check for OpenClaw
+# 2026.10.5 and later asks runtime_caps() instead of comparing versions itself; on 2026.10.4 every capability is
+# off and the gate behaves as in 0.5.94-full4. Entries: (name, first runtime with the behaviour above it).
+RUNTIME_CAPS = (
+    # doctor refuses retired runtime JSON files it has not imported (openclaw/openclaw#165402)
+    ("runtime_files_retired", (2026, 10, 5, 0)),
+    # the sandbox container/browser registries are retired files too (#164669)
+    ("sandbox_registry_retired", (2026, 10, 5, 0)),
+    # config validation refuses api "openai-codex-responses" and the extension driver's cdpUrl (d7f9ebd8de66)
+    ("config_api_cdpurl_retired", (2026, 10, 5, 0)),
+    # an empty plugins.installs {} is no longer refused; doctor removes it (#173851, 10.6-10.9; main line 10.10)
+    ("empty_installs_tolerated", (2026, 10, 6, 0)),
+    # doctor retires the Skill Workshop proposal tables (keeps only pending/quarantined drafts as files)
+    ("retires_skill_proposals", (2026, 10, 10, 0)),
+    # a cron agent turn without a recorded inference account stops at a stored-profile fallback (#192195)
+    ("cron_refusal", (2026, 10, 10, 0)),
+    # the gateway skips held stores of agents that are not configured instead of failing on them
+    ("held_store_skip", (2026, 10, 10, 0)),
+    # open issue openclaw/openclaw#191847: the 512 MB SQLite worker runs out of memory on large sessions
+    # (precheck information only: largest agent database, biggest session)
+    ("large_session_oom_issue", (2026, 10, 10, 0)),
+    # doctor brings the enabled official plugins to its release (a new npm generation beside the old one, plus the npm
+    # cache) and copies their files into os.tmpdir() for its recovery set (plugin source capture, "temporary"
+    # placement: openclaw-plugin-captures-*, 1.1-1.4 GiB per pass with codex and acpx in the 2026.11.1 rehearsal);
+    # the precheck's space check counts both
+    ("doctor_plugin_space", (2026, 10, 10, 0)),
+    # doctor keeps an invalid heartbeat.activeHours window instead of removing it (#186305) and, with #187192,
+    # then exits 1 ("Doctor blocked; required repairs remain incomplete."): the precheck holds on it first
+    ("heartbeat_hours_kept", (2026, 11, 1, 0)),
+    # doctor records the cron inference accounts itself (#172792; 2026.11.5-beta.1 parses as 2026.11.5)
+    ("cron_doctor_migration", (2026, 11, 5, 0)),
+)
+CAP_NAMES = tuple(n for n, _v in RUNTIME_CAPS)
+# Build-time record (Dockerfile): {"openclaw_version": ..., <cap>: true|false} for capabilities the image can
+# prove by a dist grep (e.g. a backported doctor step the version table cannot know).
+FEATURES_FILE = "/usr/local/lib/oc-addon/openclaw-features.json"
+
+
+def runtime_features(version):
+    """The build-time capability record, only when it was written for exactly this OpenClaw `version`."""
+    data = load_json_or_none(os.environ.get("OC_ADDON_FEATURES_FILE") or FEATURES_FILE)
+    if not isinstance(data, dict) or not isinstance(version, str) or data.get("openclaw_version") != version:
+        return {}
+    return {k: v for k, v in data.items() if k in CAP_NAMES and isinstance(v, bool)}
+
+
+def runtime_caps(pkg):
+    """{capability: bool} of the bundled OpenClaw (`pkg`: runtime_package() or a version string).
+
+    The version table RUNTIME_CAPS is the floor; the image's record (runtime_features) can only switch a
+    capability on, so a reworded dist string never turns a check off. Unknown versions give all False.
+    Never raises."""
+    version = pkg.get("version") if isinstance(pkg, dict) else pkg
+    v = version_tuple(version)
+    caps = {name: bool(v and v >= since) for name, since in RUNTIME_CAPS}
+    for name, on in runtime_features(version).items():
+        caps[name] = caps[name] or on
+    return caps
+
+
 ENV_REMOVE = {
     "OPENCLAW_COMPATIBILITY_HOST_VERSION", "OPENCLAW_CONTAINER", "INVOCATION_ID", "JOURNAL_STREAM",
     "SYSTEMD_EXEC_PID", "OPENCLAW_SYSTEMD_UNIT", "OPENCLAW_SERVICE_MARKER", "OPENCLAW_SERVICE_KIND",
@@ -681,28 +741,151 @@ def openclaw_env():
 
 # --- redaction --------------------------------------------------------------------------
 
-_SECRET_KEY = r"[A-Za-z0-9_.-]*(?:token|secret|password|apikey|api_key|bottoken)[A-Za-z0-9_.-]*|[A-Za-z0-9_.-]*key"
-# a key that names a secret (token, botToken, apiKey, x-api-key, password ...), for "key: value" forms
-_SECRET_WORD = r"[A-Za-z0-9_.-]*?(?:token|secret|password|passwd|api[_-]?key)"
+# Every key pattern starts at the beginning of a run of word characters, "." and "-" (a lookbehind, not \b) and
+# reads the run once: with \b each "-" or "." of a long run (base64url, a dashed id) started a new scan of the rest
+# of the run, quadratic (15 kB took seconds; a 16 MiB Skill Workshop file never finished).
+# _SECRET_KEY: a key containing token/secret/password/apikey anywhere, or ending in "key" (JSON and key=value forms)
+_SECRET_KEY = (r"(?<![A-Za-z0-9_.-])(?=[A-Za-z0-9_.-]*?(?:token|secret|password|apikey|api_key)"
+               r"|[A-Za-z0-9_.-]*?key(?![A-Za-z0-9_.-]))[A-Za-z0-9_.-]*+")
+# A key that names a secret, for the "key: value" / "key = value" rule below. It ends in one of:
+# - token, secret, password, passwd, passphrase, passcode, "API key" (also api-key, x-api-key, botToken,
+#   db_password), Passwort, Kennwort, Schlüssel (API-Schlüssel, WLAN-Schlüssel, Netzwerkschlüssel), Zugang,
+#   Zugangscode, Zugangsdaten, wachtwoord, contraseña, and private, secret, access, signing, encryption, master or
+#   client key (AWS_SECRET_ACCESS_KEY, secret_key, PrivateKey), after any prefix (WLAN-Passwort, Routerkennwort);
+# - key after "_" or "-" (wifi_key, wlan-key: the "key: value" form of what the JSON and key=value rules hide);
+# - pwd, pw, senha, hasło, парола, пароль, "mot de passe" as a word of their own, after "_", "." or "-" (MYSQL_PWD)
+#   or in camelCase (dbPwd); never inside a word (OLDPWD, resenha);
+# - pass the same way (SMTP_PASS, smtp.pass, smtpPass, "pass: x", "user: a, pass: b", "smtp pass: x", "user=bob
+#   pass=x"), but not after the words of OpenClaw's own "<word> pass:" texts ("first pass: ...", "one more pass:
+#   ...", "convergence pass: ..."; _PASS_NOT_AFTER), and not in bypass or compass.
+# The keyword must end the key: maxTokens, passed, password_hint, pinned are no secret names.
+_LONG_SECRET_WORDS = (r"token|secret|password|passwd|passwort|kennwort|pass[ _-]?phrase|pass[ _-]?code|wachtwoord"
+                      r"|contrase(?:ñ|n)a|api[ _-]?key|schl(?:ü|ue)ssel|zugang(?:s(?:code|daten))?"
+                      r"|(?:private|secret|access|signing|encryption|master|client)[ _-]?key|(?<=[_-])key")
+_IN_KEY = r"(?<=[_.-])|(?<=(?-i:[a-z0-9]))(?=(?-i:P))"  # after a separator, or camelCase (dbPwd, simPin)
+_WORD_START = r"(?:" + _IN_KEY + r"|(?<![\w.-]))"
+# the words before "pass" in OpenClaw's own texts (2026.10.4 to 2026.11.1: "one more pass:", "would pass:",
+# "convergence pass:", "held pass:") and in the gate's ("doctor pass"), plus ordinals
+_PASS_NOT_AFTER = ("first", "second", "third", "fourth", "next", "last", "final", "more", "another", "would", "held",
+                   "convergence", "doctor", "deletion", "cleanup")
+_SECRET_WORD = (r"[\w.-]*?(?:" + _LONG_SECRET_WORDS
+                + r"|" + _WORD_START + r"(?:pwd|pw|senha|has[łl]o|парола(?:та)?|пароль|mot[ _-]de[ _-]passe)"
+                + r"|(?:" + _IN_KEY + r"|(?<![\w.-])" + "".join(f"(?<!{w} )" for w in _PASS_NOT_AFTER) + r")pass)")
+# a PIN (pin, PIN-Code, SIM-PIN, wifi_pin, simPin, PUK): only a value of 3 to 12 digits counts as one; OpenClaw's
+# logs use "pin" for version and TLS pins ("dependency pin: name@1.2.3", "pin=true")
+_PIN_WORD = r"[\w.-]*?" + _WORD_START + r"(?:pin(?:[ _-]?(?:code|nummer|number))?|puk)"
+# between key and value: ":" or "=" (not "==", "::"), blanks, a quote or Markdown emphasis that closes the key
+# (**Passwort:** x, `token`: x, "apiKey": x), and at most one line break (YAML "password:" + indented value)
+_KV_SEP = (r"(?:\*\*?|__?|`)?[\"']?[^\S\r\n]*+[:=](?![:=])[^\S\r\n]*+(?:(?:\*\*?|__?)(?=\s)[^\S\r\n]*+)?"
+           r"(?:\r?\n[^\S\r\n]*+)?")
+# The value of a secret key, hidden whole (before, only its first word: "*** horse battery"):
+# - a value in "double", 'single' or `back` quotes up to its closing quote (the quotes stay; YAML's '' inside
+#   'single' quotes is part of the value);
+# - else up to the end of the line, but not past: a comma or semicolon before a blank or a quote, a ")", "]" or "}"
+#   that closes a bracket opened before the value, a sentence-final "." (also before a blank, a closing bracket or
+#   a quote), a blank before "#" (comment) or "|" (table cell), "&name=" (next query parameter) or a blank before
+#   "name=", "Name: " or "--flag" (next field: "password=x reason=y", "Passwort: 4711 Benutzer: admin"); a bracket
+#   pair inside the value, also nested once, is part of it (abc(1), {{ ref }});
+# - the value of a command-line flag (--token=x, --passwort=x) is one word: a blank ends it;
+# - a bare true, false, null, undefined or none is no secret ("pass": true, apiKey: undefined stay readable).
+_KV_VALUE = (r"(?P<v>(?=\S)(?!(?:true|false|null|undefined|none)[^\S\r\n]*+(?:[,;)\]}#|\r\n]|\Z))"
+             r"(?:\"(?:[^\"\\\n]|\\.)++\"(?!\w)|'(?:[^'\\\n]|\\.|'')++'(?!\w)|`[^`\n]++`(?!\w)"
+             r"|(?:[^\s()\[\]{}.,;&\"']"
+             r"|(?:\.|[,;](?![\"'])|[\"'])++(?=[^\s.,;\"')\]}])"
+             r"|&(?![\w.-]++=)"
+             r"|\((?:(?:[^()\n]|\([^()\n]*+\))*+\))?|\[(?:(?:[^\[\]\n]|\[[^\[\]\n]*+\])*+\])?"
+             r"|\{(?:(?:[^{}\n]|\{[^{}\n]*+\})*+\})?"
+             r"|(?(flag)(?!)|[^\S\r\n]++(?![#|]|--\w|[\w.-]++(?:=|:\s|:\Z))))++))")
+# "Passwort ist 4711", "the password is 'correct horse'", "set the password to hunter2": a password word, a verb,
+# then a value in quotes, or one word that contains a digit ("password is configured", "password is required" stay
+# readable); with a colon after the verb ("Das Passwort lautet: Sommer 2024") the whole value (_KV_VALUE)
+_PROSE_WORD = (r"[\w.-]*?(?:password|passwd|passwort|kennwort|pass[ _-]?phrase|pass[ _-]?code|wachtwoord"
+               r"|contrase(?:ñ|n)a)|(?<![\w.-])(?:senha|has[łl]o|парола(?:та)?|пароль|mot de passe)")
+_PROSE_VERB = r"(?:is|was|ist|war|lautet|heißt|heisst|to|auf|est|es|é|jest|е)"
+_PROSE_VALUE = (r"(?P<v>\"[^\"\n]*\"|'[^'\n]*'|`[^`\n]*`|„[^“”\n]*[“”]|“[^”\n]*”|«[^»\n]*»"
+                r"|(?=[^\s,;()\[\]{}\"'`]*?\d)(?:[^\s,;()\[\]{}\"'`.!?:]|[.!?:]++(?=[^\s,;()\[\]{}\"'`.!?:]))++"
+                r"(?=[.!?:]*+(?:[\s,;)\]}\"'`]|\Z)))")
+
+
+def _pem_redact(m):
+    return f"-----BEGIN {m.group(1)}-----***" + (f"-----END {m.group(1)}-----" if m.group(2) else "")
+
+
+def _kv_redact(m):
+    """key + separator + *** in place of the value; quotes around it and blanks after it stay."""
+    v = m.group("v")
+    core = v.rstrip()
+    q = core[0] if len(core) > 1 and core[0] in "\"'`„“«" else ""
+    end = core[-1] if q and core[-1] in "\"'`“”»" else ""
+    return m.group("k") + m.group("s") + q + "***" + end + v[len(core):]
+
+
+# Long standalone tokens. A run next to "/" or "." (path segment, file name such as
+# openclaw.sqlite.<uuid>.bak or npm/projects/<hash>/) is not a token; a sentence-final "." is.
+_LONG_TOKEN_RULE = (re.compile(r"(?<![A-Za-z0-9_/.-])[A-Za-z0-9_-]{40,}(?![A-Za-z0-9_/-])(?!\.[A-Za-z0-9_-])"), "***")
 _REDACT_RES = [
     (re.compile(r"AGE-SECRET-KEY-1[0-9A-Za-z]{20,}"), "AGE-SECRET-KEY-***"),
-    (re.compile(r'("(?:' + _SECRET_KEY + r')"\s*:\s*)"(?:[^"\\]|\\.)*"', re.I), r'\1"***"'),
-    (re.compile(r"\b((?:" + _SECRET_KEY + r")=)[^\s&\"']+", re.I), r"\1***"),
-    # token: value / apiKey: 'value' / x-api-key: value (YAML, JS object inspection, HTTP headers)
-    (re.compile(r"\b(" + _SECRET_WORD + r")([\"']?\s*[:=]\s*[\"']?)[^\s'\",;&}]+", re.I), r"\1\2***"),
+    # the formats of OpenClaw's own literal-secret check (LITERAL_SECRET_PATTERN, skills/security/scan-evidence.ts),
+    # before the rules below cut them apart: PEM private keys (the whole body, also of a block without its END
+    # line; "+" and "/" split the base64 into runs too short for the long-token rule), Google API keys, Slack and
+    # GitHub tokens
+    # (the body up to the matching END line, but never past the next BEGIN line: each BEGIN without its END reads
+    # only up to the next one, linear; before, each read to the end of the text, quadratic)
+    (re.compile(r"-----BEGIN ([A-Z0-9 ]*PRIVATE KEY(?: BLOCK)?)-----"
+                r"(?:(?:(?!-----(?:BEGIN |END \1-----)).)*+(-----END \1-----)|[A-Za-z0-9+/=\s\\]*)", re.S),
+     _pem_redact),
+    (re.compile(r"\b(?:AIza[0-9A-Za-z_-]{35}|xox[baprs]-[A-Za-z0-9-]{10,}|gh[pousr]_[A-Za-z0-9]{20,}"
+                r"|github_pat_[A-Za-z0-9_]{20,})(?![A-Za-z0-9_-])"), "***"),
+    (re.compile(r'("' + _SECRET_KEY + r'"\s*:\s*)"(?:[^"\\]|\\.)*"', re.I), r'\1"***"'),
+    # key=value (URL query, env, logfmt): one word, not past "&", a quote, a closing bracket or a final "." or ","
+    (re.compile(r"(" + _SECRET_KEY + r"=)(?:[^\s()\[\]{}.,;&\"']|[.,;]++(?=[^\s()\[\]{}.,;&\"'])"
+                r"|\((?:[^()\s]*+\))?|\[(?:[^\[\]\s]*+\])?|\{(?:[^{}\s]*+\})?)++", re.I), r"\1***"),
+    # YAML block scalar under a secret key ("password: |", "private_key: >-" and the lines below it indented deeper
+    # than the key): the indicator and those lines become one "***" (before the next rule hides the indicator alone)
+    (re.compile(r"(?m)^(?P<h>(?P<i>[^\S\r\n]*+)(?:-[^\S\r\n]++)?[\"']?(?<![\w.-])" + _SECRET_WORD
+                + r"[\"']?[^\S\r\n]*+:[^\S\r\n]++)[|>][1-9+-]{0,2}+[^\S\r\n]*+(?:#[^\r\n]*+)?"
+                r"(?:\r?\n(?:(?P=i)[^\S\r\n]++\S[^\r\n]*+|[^\S\r\n]*+(?=\r?\n)))++", re.I),
+     lambda m: m.group("h") + "***"),
+    # token: value / apiKey: 'value' / x-api-key: value / Passwort: value (YAML, .env, JS object inspection, HTTP
+    # headers, Markdown, prose): the whole value (_KV_VALUE)
+    (re.compile(r"(?<![\w.-])(?P<k>(?P<flag>-)?" + _SECRET_WORD + r")(?P<s>" + _KV_SEP + r")" + _KV_VALUE, re.I),
+     _kv_redact),
+    # PIN: 1234, SIM-PIN = '0000', **PIN-Code:** 4711 (digits only)
+    (re.compile(r"(?<![\w.-])(?P<k>" + _PIN_WORD + r")(?P<s>" + _KV_SEP + r")"
+                r"(?P<v>(?P<q>[\"'`]?)\d{3,12}(?P=q)(?![.,:/@-]?\w))", re.I), _kv_redact),
+    # Das Passwort lautet: Sommer 2024 / the password is: correct horse (verb and colon): the whole value; the group
+    # "flag" never takes part (_KV_VALUE asks for it)
+    (re.compile(r"(?<![\w.-])(?P<flag>(?!))?(?P<k>" + _PROSE_WORD + r")(?P<s>[^\S\r\n]++" + _PROSE_VERB
+                + r":[^\S\r\n]*+)" + _KV_VALUE, re.I), _kv_redact),
+    # Das Passwort ist 4711 / the password is "correct horse" / set the password to hunter2
+    (re.compile(r"(?<![\w.-])(?P<k>" + _PROSE_WORD + r")(?P<s>[^\S\r\n]++" + _PROSE_VERB + r":?[^\S\r\n]++)"
+                + _PROSE_VALUE, re.I), _kv_redact),
+    # Passwort 4711 fuer den Router / password "correct horse" (no verb, no colon: a value in quotes or one word that
+    # contains a digit); PIN 1234 (3 to 12 digits)
+    (re.compile(r"(?<![\w.-])(?P<k>" + _PROSE_WORD + r")(?P<s>[^\S\r\n]++)" + _PROSE_VALUE, re.I), _kv_redact),
+    (re.compile(r"(?<![\w.-])(?P<k>" + _PIN_WORD + r")(?P<s>[^\S\r\n]++)(?P<v>\d{3,12}(?![.,:/@-]?\w))", re.I),
+     _kv_redact),
     # --token <value>, --password <value>, --api-key <value>
     (re.compile(r"(?i)(--(?:token|password|secret|api[-_]?key)\s+)(?!-)\S+"), r"\1***"),
-    # URL userinfo: scheme://user:password@host
-    (re.compile(r"://[^/\s:@]+:[^@\s/]+@"), "://***@"),
+    # URL userinfo: scheme://user:password@host, also with an empty user (redis://:password@host)
+    (re.compile(r"://[^/\s:@]*:[^@\s/]+@"), "://***@"),
     (re.compile(r"(?i)\b(Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{8,}"), r"\1 ***"),
+    # Authorization: <any other scheme> <credentials> (Token, Bot, Digest, ...; also Proxy-Authorization, "quoted")
+    (re.compile(r"(?i)(\bAuthorization[\"']?:[^\S\r\n]*+[\"']?[A-Za-z][\w-]*+)[^\S\r\n]++[^\s\"'`,;]{8,}"),
+     r"\1 ***"),
     (re.compile(r"sk-[A-Za-z0-9_-]{10,}"), "***"),
     (re.compile(r"(?i)\bbot\d{6,12}:[A-Za-z0-9_-]{30,}"), "bot***"),  # Telegram Bot API URL form
     (re.compile(r"\b\d{6,12}:[A-Za-z0-9_-]{30,}\b"), "***"),
     (re.compile(r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}"), "***"),  # JWT
-    # Long standalone tokens. A run next to "/" or "." (path segment, file name such as
-    # openclaw.sqlite.<uuid>.bak or npm/projects/<hash>/) is not a token; a sentence-final "." is.
-    (re.compile(r"(?<![A-Za-z0-9_/.-])[A-Za-z0-9_-]{40,}(?![A-Za-z0-9_/-])(?!\.[A-Za-z0-9_-])"), "***"),
+    _LONG_TOKEN_RULE,
 ]
+
+
+# the key names of the "key: value" and PIN rules, for a redaction per JSON value (the Skill Workshop export hides
+# the value under such a key whole: a fullmatch of SECRET_NAME_RE, or of PIN_NAME_RE with a value of 3 to 12 digits)
+SECRET_NAME_RE = re.compile(_SECRET_WORD, re.I)
+PIN_NAME_RE = re.compile(_PIN_WORD, re.I)
+PIN_VALUE_RE = re.compile(r"\d{3,12}")
 
 
 def redact_text(s):
@@ -713,16 +896,88 @@ def redact_text(s):
     return s
 
 
+def redact_text_counted(s, long_tokens=True):
+    """(redact_text(s), number of replacements): the same rules, for exports that report what they hid.
+    long_tokens=False leaves out the rule for long standalone tokens (an identifier such as a 121-character
+    Skill Workshop proposal id); every other rule still applies."""
+    if not s:
+        return s, 0
+    total = 0
+    for rule in _REDACT_RES:
+        if not long_tokens and rule is _LONG_TOKEN_RULE:
+            continue
+        s, n = rule[0].subn(rule[1], s)
+        total += n
+    return s, total
+
+
+_PEM_BEGIN_RE = re.compile(r"-----BEGIN ([A-Z0-9 ]*PRIVATE KEY(?: BLOCK)?)-----")
+_PEM_MAX_LINES = 200  # a PEM key of 16384 bits has about 200 lines; a BEGIN without END hides no more than that
+# a line that ends in a separator or a flag/scheme whose value may stand alone on the next line
+_OPEN_END_RE = re.compile(r"(?:[:=]|--[\w-]+|\b(?:Bearer|Basic))[\"'`*_]*+[^\S\r\n]*+$", re.I)
+_BLOCK_HEAD_RE = re.compile(r"^(?P<i>[^\S\r\n]*+)(?:-[^\S\r\n]++)?[\"']?(?<![\w.-])" + _SECRET_WORD
+                            + r"[\"']?[^\S\r\n]*+:[^\S\r\n]++[|>][1-9+-]{0,2}+[^\S\r\n]*+(?:#.*)?$", re.I)
+
+
+class LineRedactor:
+    """redact_text for a text read line by line (the [doctor] lines of the add-on log, `oc-upgrade log`), with the
+    rules that span lines: a PEM private key block (every line from BEGIN up to the matching END, at most
+    _PEM_MAX_LINES), a YAML block scalar under a secret key (the lines indented deeper than its key), and a value
+    alone on the line after its key ("password:" and the value below). Feed the lines in order to one instance."""
+
+    def __init__(self):
+        self.prev = None  # the previous line when it ends open (_OPEN_END_RE)
+        self.pem_end = None  # the END line of an open PEM block
+        self.pem_left = 0
+        self.block = None  # the indentation of an open block scalar's key
+
+    def line(self, s):
+        """One line (no line break), redacted."""
+        if self.pem_end is not None:
+            i = s.find(self.pem_end)
+            if i >= 0:
+                end, self.pem_end = self.pem_end, None
+                return ("***" if s[:i].strip() else s[:i]) + end + self._plain(s[i + len(end):])
+            self.pem_left -= 1
+            if self.pem_left >= 0:
+                return "***" if s.strip() else s
+            self.pem_end = None
+        if self.block is not None:
+            if not s.strip():
+                return s
+            ind = len(s) - len(s.lstrip())
+            if ind > self.block:
+                return s[:ind] + "***"
+            self.block = None
+        return self._plain(s)
+
+    def _plain(self, s):
+        if self.prev is not None and s.strip():
+            r = redact_text(self.prev + "\n" + s)
+            out = r.split("\n", 1)[1] if r.count("\n") == 1 else "***"
+        else:
+            out = redact_text(s)
+        self.prev = s if _OPEN_END_RE.search(s) else None
+        m = _BLOCK_HEAD_RE.match(s)
+        if m:
+            self.block, self.prev = len(m.group("i")), None
+        begins = list(_PEM_BEGIN_RE.finditer(s))
+        if begins and s.find(f"-----END {begins[-1].group(1)}-----", begins[-1].end()) < 0:
+            self.pem_end, self.pem_left, self.prev = f"-----END {begins[-1].group(1)}-----", _PEM_MAX_LINES, None
+        return out
+
+
 # --- subprocess runner -------------------------------------------------------------------
 
 class RunResult(tuple):
-    """(rc, duration_s) plus attributes timed_out / stopped / error."""
+    """(rc, duration_s) plus attributes timed_out / stopped / error / killed (SIGKILL after its grace period)."""
 
-    def __new__(cls, rc, duration, timed_out=False, stopped=False, error=None):
+    def __new__(cls, rc, duration, timed_out=False, stopped=False, error=None, killed=False):
         self = super().__new__(cls, (rc, duration))
         self.timed_out = timed_out
         self.stopped = stopped
         self.error = error
+        self.killed = killed
         return self
 
     @property
@@ -750,13 +1005,131 @@ def _group_alive(pgid):
         return False
 
 
+def _proc_stat(pid):
+    """(state, ppid, pgrp, session, starttime) from /proc/<pid>/stat, or None (gone, or no /proc)."""
+    try:
+        with open(f"/proc/{pid}/stat", "rb") as f:
+            data = f.read()
+    except OSError:
+        return None
+    try:
+        rest = data[data.rindex(b")") + 2:].split()  # the command name may hold spaces and parentheses
+        return rest[0].decode("ascii", "replace"), int(rest[1]), int(rest[2]), int(rest[3]), int(rest[19])
+    except (ValueError, IndexError):
+        return None
+
+
+def _proc_table():
+    """{pid: _proc_stat} of every process /proc shows ({} without /proc)."""
+    out = {}
+    try:
+        names = os.listdir("/proc")
+    except OSError:
+        return out
+    for n in names:
+        if n.isdigit():
+            st = _proc_stat(int(n))
+            if st is not None:
+                out[int(n)] = st
+    return out
+
+
+def _proc_live(st):
+    return st is not None and st[0] not in ("Z", "X")
+
+
+def _descendants(root, table):
+    """{pid: starttime} of the live descendants of `root` in a _proc_table, by parent-pid lineage."""
+    kids = {}
+    for pid, st in table.items():
+        kids.setdefault(st[1], []).append(pid)
+    out, todo = {}, list(kids.get(root, []))
+    while todo:
+        pid = todo.pop()
+        if pid in out or not _proc_live(table.get(pid)):
+            continue
+        out[pid] = table[pid][4]
+        todo.extend(kids.get(pid, []))
+    return out
+
+
+def _track_descendants(tracked, root):
+    """Add the live descendants of `root` to tracked {pid: starttime} (D10: a child in its own session, such as the
+    npm process OpenClaw's doctor starts detached, is reparented away when its parent dies, so the lineage is
+    recorded while the parent runs)."""
+    for pid, start in _descendants(root, _proc_table()).items():
+        tracked.setdefault(pid, start)
+
+
+def _term_strays(tracked, pgid):
+    """A2: SIGTERM, right away, the tracked descendants (same start time) that left the process group `pgid`, and
+    their own descendants outside it. killpg does not reach them, and the child may wait for them (OpenClaw's doctor
+    settles an admitted repair while its detached npm runs) until its grace period ends in SIGKILL; ended early, the
+    repair fails and the child exits by itself. Returns the pids signalled."""
+    if not tracked:
+        return []
+    table = _proc_table()
+    strays = {pid: start for pid, start in tracked.items()
+              if _proc_live(table.get(pid)) and table[pid][4] == start and table[pid][2] != pgid}
+    for pid in list(strays):
+        for d, start in _descendants(pid, table).items():
+            if table[d][2] != pgid:
+                strays.setdefault(d, start)
+    sent = []
+    for pid in sorted(strays):
+        try:
+            os.kill(pid, signal.SIGTERM)
+            sent.append(pid)
+        except (ProcessLookupError, PermissionError):
+            pass
+    return sent
+
+
+def _kill_strays(tracked, grace=5.0):
+    """D10: SIGTERM, then after `grace` s SIGKILL, every tracked descendant that still runs (the same start time:
+    a reused pid is left alone) and its own descendants; killpg of the child's group does not reach a descendant
+    that changed its session or group. Returns the pids signalled."""
+    if not tracked:
+        return []
+    table = _proc_table()
+    strays = {pid: start for pid, start in tracked.items()
+              if _proc_live(table.get(pid)) and table[pid][4] == start}
+    for pid in list(strays):
+        for d, start in _descendants(pid, table).items():
+            strays.setdefault(d, start)
+    if not strays:
+        return []
+
+    def alive(pid, start):
+        st = _proc_stat(pid)
+        return _proc_live(st) and st[4] == start
+
+    def signal_all(sig):
+        for pid, start in strays.items():
+            if alive(pid, start):
+                try:
+                    os.kill(pid, sig)
+                except (ProcessLookupError, PermissionError):
+                    pass
+    signal_all(signal.SIGTERM)
+    deadline = time.monotonic() + grace
+    while time.monotonic() < deadline and any(alive(p, s) for p, s in strays.items()):
+        time.sleep(0.1)
+    signal_all(signal.SIGKILL)
+    return sorted(strays)
+
+
 def run_process(argv, *, timeout, log_path, stop_event=None, kill_grace=30, stop_grace=None, env=None,
                 cwd=None, stdout_path=None, on_tick=None, tick=1.0):
     """Run argv in its own session; stdout/stderr appended to files (never a pipe).
 
     - timeout (s, None = unlimited): SIGTERM to the process group, `kill_grace` s, SIGKILL.
     - stop_event set: SIGTERM, `stop_grace` s (default kill_grace), SIGKILL.
+    - With either SIGTERM, the descendants seen outside the process group get SIGTERM too (A2); SIGKILL stays the
+      last step, for them after the process has ended. RunResult.killed: the grace period ended in SIGKILL.
     - on_tick(elapsed_s) is called about every `tick` seconds while the process runs.
+    - When it has ended (or was killed), whatever is left of its process group is killed, and so are the descendants
+      that left the group (another session, e.g. a detached npm child; seen in /proc while argv ran) (D10).
     Returns RunResult(rc, duration_s); rc < 0 means killed by a signal; rc 127 = could not start.
     """
     stop_grace = kill_grace if stop_grace is None else stop_grace
@@ -776,8 +1149,17 @@ def run_process(argv, *, timeout, log_path, stop_event=None, kill_grace=30, stop
                 log.write(f"[oc] could not start {argv[0]}: {exc}\n".encode())
                 return RunResult(127, 0.0, error=str(exc))
             pgid = proc.pid
-            timed_out = stopped = False
+            timed_out = stopped = killed = False
             kill_at = None
+
+            def term_outside():  # A2: the detached descendants get the SIGTERM at once, not only after the end
+                _track_descendants(tracked, proc.pid)
+                sent = _term_strays(tracked, pgid)
+                if sent:
+                    log.write(f"[oc] SIGTERM also to {len(sent)} descendant process(es) outside its process group "
+                              f"(pids {', '.join(map(str, sent[:10]))})\n".encode())
+                    log.flush()
+            tracked = {}  # D10: {pid: starttime} of its descendants, seen while it runs
             try:
                 while True:
                     try:
@@ -785,28 +1167,35 @@ def run_process(argv, *, timeout, log_path, stop_event=None, kill_grace=30, stop
                         break
                     except subprocess.TimeoutExpired:
                         pass
+                    _track_descendants(tracked, proc.pid)
                     now = time.monotonic()
                     if on_tick is not None:
                         on_tick(now - start)
                     if stop_event is not None and stop_event.is_set() and not stopped:
                         stopped = True
                         _killpg(pgid, signal.SIGTERM)
+                        term_outside()
                         deadline = now + stop_grace
                         kill_at = deadline if kill_at is None else min(kill_at, deadline)
                     elif kill_at is None and timeout is not None and now - start >= timeout:
                         timed_out = True
                         _killpg(pgid, signal.SIGTERM)
+                        term_outside()
                         kill_at = now + kill_grace
                     if kill_at is not None and now >= kill_at:
+                        _track_descendants(tracked, proc.pid)
                         _killpg(pgid, signal.SIGKILL)
+                        killed = True
                         kill_at = float("inf")
             except BaseException:
+                _track_descendants(tracked, proc.pid)
                 _killpg(pgid, signal.SIGTERM)
                 try:
                     proc.wait(timeout=5)
                 except subprocess.TimeoutExpired:
                     _killpg(pgid, signal.SIGKILL)
                     proc.wait()
+                _kill_strays(tracked)
                 raise
             # Leftover group members (e.g. npm children) must not keep writing state.
             if _group_alive(pgid):
@@ -816,7 +1205,12 @@ def run_process(argv, *, timeout, log_path, stop_event=None, kill_grace=30, stop
                         break
                     time.sleep(0.1)
                 _killpg(pgid, signal.SIGKILL)
-            return RunResult(rc, time.monotonic() - start, timed_out, stopped)
+            # ... nor descendants that left the group (D10: OpenClaw starts npm detached, in its own session)
+            strays = _kill_strays(tracked)
+            if strays:
+                log.write(f"[oc] stopped {len(strays)} leftover descendant process(es) outside its process group "
+                          f"(pids {', '.join(map(str, strays[:10]))})\n".encode())
+            return RunResult(rc, time.monotonic() - start, timed_out, stopped, killed=killed)
         finally:
             if out is not log:
                 out.close()

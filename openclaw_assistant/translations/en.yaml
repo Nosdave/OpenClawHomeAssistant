@@ -153,7 +153,7 @@ configuration:
 
   gate_cleanup_hours:
     name: Delete Doctor Captures After (Hours)
-    description: Hours after a finished migration gate run before the add-on deletes OpenClaw's doctor captures of that run (/config/.openclaw.update-captures/doctor-*). Copies left by earlier add-on versions (gate archives in /share/openclaw-upgrade, rehearsal exports in /share/openclaw-rehearsal, the plaintext 2026.7 archives in /config/.openclaw/upgrade-backups) are deleted the same number of hours after their run, export or migration. 0 = never. A change applies from the next add-on start. Range 0-720, default 48.
+    description: Hours after a finished migration gate run before the add-on deletes OpenClaw's doctor captures of that run (/config/.openclaw.update-captures/doctor-*) and the SQLite copies its doctor passes saved beside the databases (*.pre-startup-migration-*.bak, .scoped.bak), and the gate's own plaintext copies of openclaw.json in its run directory (/config/.openclaw-upgrade/gate/runs/<run>/config.*.json, with the saved models status output). Copies left by earlier add-on versions (gate archives in /share/openclaw-upgrade, rehearsal exports in /share/openclaw-rehearsal, the plaintext 2026.7 archives in /config/.openclaw/upgrade-backups) are deleted the same number of hours after their run, export or migration. 0 = never. A change applies from the next add-on start. Range 0-720, default 48.
 
   gate_backup_max_age_hours:
     name: Required Backup Age (Hours)

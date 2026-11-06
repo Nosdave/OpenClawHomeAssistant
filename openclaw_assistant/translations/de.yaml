@@ -153,7 +153,7 @@ configuration:
 
   gate_cleanup_hours:
     name: Doctor-Aufzeichnungen löschen nach (Stunden)
-    description: Stunden nach einem abgeschlossenen Lauf des Migrations-Gates, bis das Add-on die Doctor-Aufzeichnungen von OpenClaw aus diesem Lauf (/config/.openclaw.update-captures/doctor-*) löscht. Kopien früherer Add-on-Versionen (Gate-Archive in /share/openclaw-upgrade, Probe-Exporte in /share/openclaw-rehearsal, die Klartext-Archive von 2026.7 in /config/.openclaw/upgrade-backups) werden dieselbe Zeit nach ihrem Lauf, Export bzw. nach der Migration gelöscht. 0 = nie. Eine Änderung gilt ab dem nächsten Start des Add-ons. Bereich 0-720, Standard 48.
+    description: Stunden nach einem abgeschlossenen Lauf des Migrations-Gates, bis das Add-on die Doctor-Aufzeichnungen von OpenClaw aus diesem Lauf (/config/.openclaw.update-captures/doctor-*) und die SQLite-Kopien löscht, die Doctor in diesem Lauf neben den Datenbanken angelegt hat (*.pre-startup-migration-*.bak, .scoped.bak), sowie die eigenen Klartext-Kopien der openclaw.json im Laufverzeichnis des Gates (/config/.openclaw-upgrade/gate/runs/<Lauf>/config.*.json, mit der gespeicherten Ausgabe von models status). Kopien früherer Add-on-Versionen (Gate-Archive in /share/openclaw-upgrade, Probe-Exporte in /share/openclaw-rehearsal, die Klartext-Archive von 2026.7 in /config/.openclaw/upgrade-backups) werden dieselbe Zeit nach ihrem Lauf, Export bzw. nach der Migration gelöscht. 0 = nie. Eine Änderung gilt ab dem nächsten Start des Add-ons. Bereich 0-720, Standard 48.
 
   gate_backup_max_age_hours:
     name: Erforderliches Backup-Alter (Stunden)

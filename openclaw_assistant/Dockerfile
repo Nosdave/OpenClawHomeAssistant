@@ -35,11 +35,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Node.js 24 LTS from NodeSource.
-# OpenClaw 2026.10.4 requires Node >=24.16.0 <25 || >=26.1.0 (package.json
-# engines); on an older Node it refuses to run or tries to install another Node.
+# OpenClaw's package.json engines: >=24.16.0 <25 || >=26.1.0 for 2026.10.4 and
+# again from 2026.10.10 (also 2026.11.1), which only recommends the releases below
+# (openclaw/openclaw#186589); 2026.10.6 to 2026.10.9 required them.
+# On an older Node OpenClaw refuses to run or tries to install another Node.
 # The image requires >=24.22.1 <25 || >=26.12.1: the October 2026 Node security
 # releases, which reject TLS chains signed with the compromised certificate keys
-# (also the floor of OpenClaw 2026.10.6 and later).
+# (and the remedy OpenClaw 2026.10.10 and 2026.11.1 name when Node's SQLite fails
+# its WAL-safety check).
 # Use explicit keyring + apt source instead of setup_24.x pipe script for deterministic builds.
 RUN mkdir -p /etc/apt/keyrings \
     && curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key \
@@ -76,6 +79,21 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     chromium-driver \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
+
+# FFmpeg (Debian package; ffprobe exists only in it). OpenClaw runs ffmpeg/ffprobe
+# only from trusted system directories (/usr/bin, /bin, /usr/sbin, /sbin,
+# /usr/local/bin), never from PATH or Homebrew. Uses: duration of Telegram voice and
+# audio uploads (ffprobe, OpenClaw 2026.10.10+; without it Telegram can show 0:00),
+# video dimensions for Telegram video sends (ffprobe), Control UI playback
+# conversion, video understanding and the Opus voice-note conversion of Google
+# (Gemini) and MiniMax TTS replies (ffmpeg; already in 2026.10.4). Without it these
+# are skipped, or OpenClaw falls back to the next TTS provider (with ffmpeg, a
+# Google/MiniMax TTS setup answers Telegram voice replies with that provider).
+RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/* \
+    && test -x /usr/bin/ffmpeg && test -x /usr/bin/ffprobe \
+    && ffprobe -hide_banner -version | head -n 1
 
 # Install Homebrew (Linuxbrew) for OpenClaw skill dependencies
 # Homebrew is optional - some skills need CLI tools like gemini, aider, etc.
@@ -124,26 +142,46 @@ USER root
 # Bundle mcporter so Home Assistant MCP auto-configuration works out of the box.
 # The image now ships Node 24, so use the current mcporter line.
 #
-# Version pins — bump all three together (and re-verify the migration gate's
-# assumptions against the new dist, see the Stage B notes):
+# Version pins — bump them together (and re-verify the migration gate's
+# assumptions against the new dist, see the Stage B notes); OPENCLAW_VERSION needs
+# oc-patches/<version>/ (below) and tests/oc_patches/telegram_hotfix_<version>.test.mjs:
 #   OPENCLAW_VERSION      the bundled OpenClaw (the migration gate migrates the
-#                         persistent state to it, one-way).
-#   BRAVE_PLUGIN_VERSION  @openclaw/brave-plugin, CalVer lockstep with OpenClaw;
-#                         recorded in the image for run.sh (installed at runtime
-#                         into the persistent state, so it cannot be baked in).
+#                         persistent state to it, one-way). The official
+#                         @openclaw/codex and @openclaw/acpx plugins move with it
+#                         (CalVer lockstep); the build checks that both exist at
+#                         this version.
+#   BRAVE_PLUGIN_VERSION  @openclaw/brave-plugin, CalVer lockstep with OpenClaw
+#                         (defaults to OPENCLAW_VERSION; pass it only when no
+#                         plugin of that version exists); recorded in the image
+#                         for run.sh (installed at runtime into the persistent
+#                         state, so it cannot be baked in).
 #   NPM_BEFORE            npm resolves every dependency as of this UTC time.
 #                         openclaw ships no npm-shrinkwrap.json, so this limits
 #                         dependency drift between rebuilds. Must be after the
-#                         publish times of the pins (openclaw@2026.10.4
-#                         2026-10-15T23:58:28Z, its newest exact dependency
-#                         @openclaw/ai 23:43:35Z; @openclaw/brave-plugin@2026.10.4
-#                         2026-10-15T23:19:50Z is installed at runtime by run.sh
-#                         and checked here only for existence). Keep the exact
-#                         value the rehearsal image was built with: a different
-#                         cutoff can resolve a different transitive tree.
-ARG OPENCLAW_VERSION=2026.10.4
-ARG BRAVE_PLUGIN_VERSION=2026.10.4
-ARG NPM_BEFORE=2026-10-16T00:30:00Z
+#                         publish times of the pins (openclaw@2026.11.1, npm
+#                         latest, 2026-11-05T09:41:26Z, its newest exact
+#                         dependency @openclaw/ai@2026.11.1 09:16:05Z;
+#                         @openclaw/brave-plugin@2026.11.1 06:00:58Z is installed
+#                         at runtime by run.sh, @openclaw/codex@2026.11.1
+#                         05:59:04Z and @openclaw/acpx@2026.11.1 05:57:48Z by
+#                         OpenClaw's doctor or oc-upgrade plugins-sync; all three
+#                         are checked here only for existence). Keep the exact
+#                         value the release image is rehearsed and built with: a
+#                         different cutoff can resolve a different transitive tree.
+# Earlier pins, for rebuilding a previous image (e.g. to rehearse an update from it;
+# oc-patches/ keeps their patch sets until the release decides to drop them):
+#   2026.10.4 (0.5.94-full4): --build-arg OPENCLAW_VERSION=2026.10.4
+#     --build-arg NPM_BEFORE=2026-10-16T00:30:00Z (openclaw@2026.10.4
+#     2026-10-15T23:58:28Z, @openclaw/ai 23:43:35Z, @openclaw/brave-plugin
+#     23:19:50Z)
+#   2026.10.10 (rehearsal stand-in for the 2026.11.1 line, never shipped):
+#     --build-arg OPENCLAW_VERSION=2026.10.10 --build-arg NPM_BEFORE=2026-11-03T03:00:00Z
+#     (openclaw@2026.10.10 2026-11-03T02:26:08Z, @openclaw/ai@2026.10.10 02:11:11Z,
+#     @openclaw/brave-plugin@2026.10.10 01:52:47Z, @openclaw/codex@2026.10.10
+#     01:53:01Z, @openclaw/acpx@2026.10.10 01:53:22Z)
+ARG OPENCLAW_VERSION=2026.11.1
+ARG BRAVE_PLUGIN_VERSION=${OPENCLAW_VERSION}
+ARG NPM_BEFORE=2026-11-05T09:45:00Z
 # Repeated here (cheap) so this part of the build also checks the Node range
 # when it is built on top of another base.
 RUN node -e 'const[a,b,c]=process.versions.node.split(".").map(Number);if(!((a===24&&(b>22||b===22&&c>=1))||(a===26&&(b>12||b===12&&c>=1))||a>26)){console.error("Node "+process.versions.node+" does not satisfy >=24.22.1 <25 || >=26.12.1");process.exit(1)}'
@@ -152,7 +190,9 @@ RUN node -e 'const[a,b,c]=process.versions.node.split(".").map(Number);if(!((a==
 # when the installed package is not the pinned, fully installed version, when it
 # lacks the schema targets the migration gate reads, when Node's bundled SQLite
 # fails OpenClaw's own capability probe, when Node rejects the NODE_OPTIONS
-# flags run.sh sets, or when the pinned Brave plugin version does not exist.
+# flags run.sh sets, or when the pinned Brave plugin version or the official
+# @openclaw/codex / @openclaw/acpx plugins of this OpenClaw version do not exist
+# (existence only; they are installed into the persistent state at runtime).
 RUN npm config set fund false && npm config set audit false \
     && npm install -g --before="${NPM_BEFORE}" "openclaw@${OPENCLAW_VERSION}" node-llama-cpp@3.18.1 mcporter@0.12.3 \
     && pkg="$(npm root -g)/openclaw" \
@@ -162,7 +202,9 @@ RUN npm config set fund false && npm config set audit false \
     && jq -e '.openclaw.schemaVersions.state and .openclaw.schemaVersions.agent' "$pkg/package.json" >/dev/null \
     && OCQ_PKG="$pkg" node --input-type=module -e "const m=await import(process.env.OCQ_PKG+'/node-sqlite.mjs');const p=await m.detectCurrentSqliteCapabilities();const f=m.nodeRuntimeFailure(process.versions.node,p);if(f){console.error(f);process.exit(1)}console.log('node',process.versions.node,'sqlite',p.version)" \
     && NODE_OPTIONS="--disable-sigusr1 --disable-warning=ExperimentalWarning" node -e 0 \
-    && test "$(npm view "@openclaw/brave-plugin@${BRAVE_PLUGIN_VERSION}" version)" = "${BRAVE_PLUGIN_VERSION}"
+    && test "$(npm view "@openclaw/brave-plugin@${BRAVE_PLUGIN_VERSION}" version)" = "${BRAVE_PLUGIN_VERSION}" \
+    && test "$(npm view "@openclaw/codex@${OPENCLAW_VERSION}" version)" = "${OPENCLAW_VERSION}" \
+    && test "$(npm view "@openclaw/acpx@${OPENCLAW_VERSION}" version)" = "${OPENCLAW_VERSION}"
 
 # Patches to the installed OpenClaw dist (oc-patches/<OpenClaw version>/manifest.json, applied by
 # oc_dist_patch.py; DOCS: "Patches to OpenClaw's files"). Each patch is a unified diff for exactly one
@@ -170,13 +212,16 @@ RUN npm config set fund false && npm config set audit false \
 # re-packed file or a diff that does not apply at its stated lines fails the build (re-derive every
 # patch on each OpenClaw bump). OpenClaw's content inventory and runtime-dependency ownership hashes
 # are updated to match; every inventory entry is re-checked.
-#  - memory search half-life 365 days: 2026.10.4 hard-codes the temporal-decay half-life of memory
+#  - memory search half-life 365 days: OpenClaw hard-codes the temporal-decay half-life of memory
 #    search at 30 days (dist/memory-search-*.mjs, //#region src/agents/memory-search.ts; no config
-#    key, doctor removes the old ones). With minScore 0.35 checked after the decay, dated memory
-#    notes older than ~45 days can never be found.
+#    key, doctor removes the old ones; still so in 2026.11.1). 2026.10.4 checks minScore 0.35 after
+#    the decay, so dated memory notes older than ~45 days can never be found; from 2026.10.10
+#    minScore is checked before the decay (openclaw/openclaw#168692) and the half-life only sets the
+#    ranking (and with it which eligible hits fit into the returned maxResults, default 6).
 #  - Telegram hotfix VOLT-TG-20261023 (send-, lifecycle-, execution-, fetch-*.mjs): long voice
 #    replies send their text first, no "couldn't confirm" notice while a reply is still being
-#    delivered, voice/audio uploads on a fresh connection without replay.
+#    delivered, voice/audio uploads on a fresh connection without replay. Not fixed upstream in
+#    2026.11.1 (the patched sources are unchanged from 2026.10.10).
 COPY oc_dist_patch.py /usr/local/lib/oc-addon/oc_dist_patch.py
 COPY oc-patches/ /usr/local/lib/oc-addon/oc-patches/
 RUN set -eu; \
@@ -186,16 +231,39 @@ RUN set -eu; \
     python3 -I -B /usr/local/lib/oc-addon/oc_dist_patch.py \
       "$pkg" "/usr/local/lib/oc-addon/oc-patches/${OPENCLAW_VERSION}"
 
+# Build-time record of what this OpenClaw dist does (oc_common.runtime_caps; read only for exactly this
+# OpenClaw version). The migration gate decides by the version table in oc_common.RUNTIME_CAPS; this record
+# can only switch a capability on, e.g. a doctor step backported to a release the table does not know.
+# grep/find only: no OpenClaw code runs here.
+#  - cron_refusal: cron agent turns without a recorded inference account stop at a stored-profile fallback
+#    (openclaw/openclaw#192195, 2026.10.10)
+#  - cron_doctor_migration: doctor records those accounts itself (#172792, 2026.11.5-beta.1)
+#  - retires_skill_proposals: doctor retires the Skill Workshop proposal tables (2026.10.10)
+RUN set -eu; \
+    pkg="$(npm root -g)/openclaw"; \
+    has() { if grep -rqF -- "$1" "$pkg/dist"; then echo true; else echo false; fi; }; \
+    sw=false; \
+    if find "$pkg/dist" -maxdepth 1 -type f -name 'doctor-skill-workshop-retire-proposals-*.mjs' | grep -q .; then sw=true; fi; \
+    jq -n --arg v "$(jq -r .version "$pkg/package.json")" \
+      --argjson r "$(has 'Automation has no recorded inference account')" \
+      --argjson m "$(has 'Inference account migration requires offline Doctor maintenance')" \
+      --argjson s "$sw" \
+      '{openclaw_version: $v, cron_refusal: $r, cron_doctor_migration: $m, retires_skill_proposals: $s}' \
+      > /usr/local/lib/oc-addon/openclaw-features.json; \
+    cat /usr/local/lib/oc-addon/openclaw-features.json
+
 # ACP / ACPX harness: lets OpenClaw drive external coding agents (Codex, Claude Code)
 # via the Agent Client Protocol. Volt authenticates Anthropic + OpenAI via OAuth
 # (not API keys), so the harness must ship in the image. Codex is NOT bundled in
-# OpenClaw (2026.7.35 or 2026.10.4): it is the external @openclaw/codex plugin, and
+# OpenClaw (2026.7.35 to 2026.11.1): it is the external @openclaw/codex plugin, and
 # Brave and acpx are external plugins too; plugins live in the persistent state
 # (/config/.openclaw/npm/projects). acpx + the Claude Code CLI cover the
 # OAuth/ACP path. acpx auto-downloads the codex-acp / claude-agent-acp adapters
-# via npx on first use.
+# via npx on first use. OpenClaw's own ACP plugin (@openclaw/acpx) loads its own
+# pinned acpx library (2026.10.4: 0.19.1, 2026.10.10 and 2026.11.1: 0.19.4), not
+# this CLI; the CLI is aligned with it (0.19.4).
 # Pinned (not floating) so an image rebuild cannot silently change the harness.
-RUN npm install -g acpx@0.19.3 @anthropic-ai/claude-code@2.1.283
+RUN npm install -g acpx@0.19.4 @anthropic-ai/claude-code@2.1.283
 
 # Shell aliases and color options for interactive use
 RUN tee -a /etc/bash.bashrc <<'EOF'

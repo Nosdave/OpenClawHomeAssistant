@@ -161,6 +161,31 @@ class StateGuardCheckTests(CliEnv):
             self.assertIn(s, self.stdout)
         self.assertNotIn("SECRET", self.stdout)
 
+    def test_check_c2_lists_retired_runtime_files_for_1010(self):
+        """full5: C2 shows the 2026.10.5+ retired runtime files (with the proof) only for such a runtime."""
+        T.make_1004_state(self.state)
+        self.write_cfg({"meta": {"lastTouchedVersion": "2026.10.4"},
+                        "models": {"providers": {"p": {"api": "openai-codex-responses"}}}})
+        (self.state / "acp").mkdir()
+        (self.state / "acp" / "event-ledger.json").write_text('{"version": 1, "sessions": {"s": {}}}')
+        (self.state / "sandbox" / "browsers").mkdir(parents=True)
+        self.set_runtime("2026.10.10", 22, 27)
+        rc = self.cli("check", env={"OPENCLAW_RUNTIME_VERSION": "2026.10.10"})
+        self.assertIn(rc, (0, 4), self.stdout + self.stderr)
+        c2 = self.stdout.split("== C2 ", 1)[1].split("\n== ", 1)[0]
+        self.assertIn("acp/event-ledger.json (", c2)
+        self.assertIn("acp-replay-ledger: leave", c2)
+        self.assertIn("ACCEPTABLE acp-ledger-unimported", c2)
+        self.assertIn("sandbox/browsers (", c2)
+        self.assertIn("sandbox-registry: quarantine", c2)
+        self.assertIn("(proof: nothing to import)", c2)
+        self.assertIn("openclaw.json models.providers.p.api: retired setting", c2)
+        self.set_runtime("2026.10.4", 20, 24)
+        self.cli("check", env={"OPENCLAW_RUNTIME_VERSION": "2026.10.4"})
+        c2 = self.stdout.split("== C2 ", 1)[1].split("\n== ", 1)[0]
+        for s in ("acp/event-ledger.json", "sandbox/browsers", "models.providers.p.api"):
+            self.assertNotIn(s, c2)
+
     def test_check_wildcard_note_only_for_legacy_codex_wildcards(self):
         # live box: canonical wildcards only -> no "expanded" note (they stay as they are)
         self.build_735()
@@ -543,9 +568,9 @@ class Full2CliTests(CliEnv):
                 p.kill()
                 p.communicate()
         self.assertEqual(p.returncode, 143, out)
-        self.assertIn("[cleanup] doctor captures are deleted 48 h after their gate run; gate archives and rehearsal "
-                      "exports of earlier add-on versions and the 2026.7 plaintext archives the same time after "
-                      "their run, export or migration (checked hourly)\n", out)
+        self.assertIn("[cleanup] doctor captures, doctor's SQLite copies and the gate's config copies are deleted 48 h "
+                      "after their gate run; gate archives and rehearsal exports of earlier add-on versions and the 2026.7 plaintext "
+                      "archives the same time after their run, export or migration (checked hourly)\n", out)
         self.assertIn(f"[cleanup] run {rid}: deleted 2 item(s)", out)
         self.assertFalse(adir.exists())
         self.assertFalse(caps[0].exists())
@@ -569,22 +594,30 @@ class Full2CliTests(CliEnv):
         self.set_options({"gate_cleanup_hours": 12, "gate_backup_max_age_hours": 72})
         self.assertEqual(self.cli("status"), 0, self.stderr)
         self.assertEqual(self.gate_options_line(),
-                         "Gate options: delete doctor captures 12 h after a run (0 = never); backup max age 72 h")
+                         "Gate options: delete doctor captures, SQLite copies "
+                         "and the gate's config copies 12 h after a run "
+                         "(0 = never); backup max age 72 h")
 
         self.set_options({"gate_cleanup_hours": 0})
         self.assertEqual(self.cli("status"), 0)
         self.assertEqual(self.gate_options_line(),
-                         "Gate options: delete doctor captures 0 h after a run (0 = never); backup max age 24 h")
+                         "Gate options: delete doctor captures, SQLite copies "
+                         "and the gate's config copies 0 h after a run "
+                         "(0 = never); backup max age 24 h")
 
         (self.tmp / "options.json").unlink()
         self.assertEqual(self.cli("status"), 0)
         self.assertEqual(self.gate_options_line(),
-                         "Gate options: delete doctor captures 48 h after a run (0 = never); backup max age 24 h")
+                         "Gate options: delete doctor captures, SQLite copies "
+                         "and the gate's config copies 48 h after a run "
+                         "(0 = never); backup max age 24 h")
 
         self.set_options({"gate_cleanup_hours": "secret-ish-48", "gate_backup_max_age_hours": 9999})
         self.assertEqual(self.cli("status"), 0)
         self.assertEqual(self.gate_options_line(),
-                         "Gate options: delete doctor captures 48 h after a run (0 = never); backup max age 24 h")
+                         "Gate options: delete doctor captures, SQLite copies "
+                         "and the gate's config copies 48 h after a run "
+                         "(0 = never); backup max age 24 h")
         self.assertNotIn("secret-ish", self.stdout + self.stderr)
         self.assertNotIn("9999", self.stdout + self.stderr)
 
@@ -593,7 +626,9 @@ class Full2CliTests(CliEnv):
                           "gate_cleanup_hours": 12})
         self.assertEqual(self.cli("status"), 0)
         self.assertEqual(self.gate_options_line(),
-                         "Gate options: delete doctor captures 12 h after a run (0 = never); backup max age 24 h")
+                         "Gate options: delete doctor captures, SQLite copies "
+                         "and the gate's config copies 12 h after a run "
+                         "(0 = never); backup max age 24 h")
         self.assertNotIn("gate_archive", self.stdout)
         self.assertNotIn(FAKE_RECIPIENT[:9], self.stdout)
         self.assertNotIn("Export requested", self.stdout)
@@ -607,8 +642,9 @@ class Full2CliTests(CliEnv):
             with self.subTest(key=key.strip()[:18]):
                 self.set_options({"gate_archive": "encrypted", "gate_archive_age_recipient": key})
                 self.assertEqual(self.cli("status"), 0, self.stderr)
-                self.assertEqual(self.gate_options_line(), "Gate options: delete doctor captures 48 h after a run "
-                                                           "(0 = never); backup max age 24 h")
+                self.assertEqual(self.gate_options_line(), "Gate options: delete doctor captures, SQLite copies "
+                                                           "and the gate's config copies "
+                                                           "48 h after a run (0 = never); backup max age 24 h")
                 out = self.stdout + self.stderr
                 for args in (("cleanup",), ("cleanup", "--apply"), ("export",), ("help",)):
                     self.cli(*args)
@@ -641,6 +677,403 @@ class Full2CliTests(CliEnv):
         self.assertEqual(self.files_containing(FAKE_SECRET_BODY, skip=(self.tmp / "options.json",)), [])
         self.assertEqual(self.share_files(), [])
         self.assertFalse((self.upg / "gate" / "journal.json").exists())
+
+
+# --- full5: official plugins follow the OpenClaw version (oc-upgrade plugins-sync) ----------------------------------
+
+# Fake node for `plugins list --json` / `plugins update <spec>`: the plugin entries (real shape, T.listed_plugin) live
+# in $FAKE_PLUGINS and are printed inside the fixture's top level (T.plugins_list_output); every call is logged to
+# $FAKE_ARGV_LOG; FAKE_UPDATE_RC / FAKE_LIST_RC make the update / the list fail; an update writes its PID to
+# $FAKE_UPDATE_PIDFILE and takes $FAKE_UPDATE_SLEEP seconds. Like OpenClaw (plugins-update-selection.ts), an update
+# `<package>@<version>` changes the npm install of that package (here: the entry whose rootDir is
+# .../node_modules/<package>; a new generation project) and fails with rc 1 when there is none.
+PLUGINS_NODE = r'''#!/usr/bin/env python3
+import hashlib, json, os, re, sys, time
+args = sys.argv[2:]
+with open(os.environ["FAKE_ARGV_LOG"], "a") as f:
+    f.write(json.dumps(args) + "\n")
+with open(os.environ["FAKE_PLUGINS"]) as f:
+    plugins = json.load(f)
+if args[:2] == ["plugins", "list"]:
+    if os.environ.get("FAKE_LIST_RC"):
+        sys.stderr.write("plugin registry unreadable\n")
+        sys.exit(int(os.environ["FAKE_LIST_RC"]))
+    with open(os.environ["FAKE_PLUGINS_TOP"]) as f:
+        top = json.load(f)
+    top["plugins"] = plugins
+    print(json.dumps(top, indent=2))
+    sys.exit(0)
+if args[:2] == ["plugins", "update"]:
+    if os.environ.get("FAKE_UPDATE_PIDFILE"):
+        with open(os.environ["FAKE_UPDATE_PIDFILE"], "a") as f:
+            f.write(f"{os.getpid()}\n")
+    time.sleep(float(os.environ.get("FAKE_UPDATE_SLEEP") or 0))
+    if os.environ.get("FAKE_UPDATE_RC"):
+        sys.stderr.write("npm error 404 Not Found; npm_config_token=SECRET-NPM-TOKEN\n")
+        sys.exit(int(os.environ["FAKE_UPDATE_RC"]))
+    pkg, ver = args[2].rsplit("@", 1)
+    hit = [p for p in plugins if p.get("origin") != "bundled" and p.get("rootDir", "").endswith("/node_modules/" + pkg)]
+    if not hit:
+        sys.stderr.write(f"No tracked plugin or hook pack found for {args[2]}\n")
+        sys.exit(1)
+    for p in hit:
+        old = p["rootDir"]
+        gen = hashlib.sha256(args[2].encode()).hexdigest()[:16]
+        new = re.sub(r"__openclaw-generation__g-[0-9a-f]{16}/", f"__openclaw-generation__g-{gen}/", old)
+        p.update(json.loads(json.dumps(p).replace(old, new)))
+        p["version"] = ver
+    with open(os.environ["FAKE_PLUGINS"], "w") as f:
+        json.dump(plugins, f)
+    print("Updated " + pkg)
+    sys.exit(0)
+sys.exit(3)
+'''
+
+
+# Fake npm for plugins-sync's registry probe (`npm view <package>@<version> version --json`): logs its argv to
+# $FAKE_NPM_LOG; FAKE_NPM_RC makes it fail (offline), FAKE_NPM_SLEEP makes it hang.
+PLUGINS_NPM = r'''#!/usr/bin/env python3
+import json, os, sys, time
+if os.environ.get("FAKE_NPM_LOG"):
+    with open(os.environ["FAKE_NPM_LOG"], "a") as f:
+        f.write(json.dumps(sys.argv[1:]) + "\n")
+time.sleep(float(os.environ.get("FAKE_NPM_SLEEP") or 0))
+if os.environ.get("FAKE_NPM_RC"):
+    sys.stderr.write("npm error code ENOTFOUND\n")
+    sys.exit(int(os.environ["FAKE_NPM_RC"]))
+if sys.argv[1:2] == ["view"]:
+    print(json.dumps(sys.argv[2].rsplit("@", 1)[1]))
+    sys.exit(0)
+sys.exit(3)
+'''
+
+
+def plugin(pid, pkg, ver, enabled=True, origin="global", spec=None):
+    """A `plugins list --json` entry in the real shape (tests/fixtures/plugins-list-2026.10.10.json)."""
+    return T.listed_plugin(pid, pkg, ver, enabled=enabled, origin=origin, spec=spec)
+
+
+class PluginsSyncTests(CliEnv):
+    def setUp(self):
+        super().setUp()
+        (self.bin / "node").write_text(PLUGINS_NODE)
+        (self.bin / "npm").write_text(PLUGINS_NPM)
+        (self.bin / "npm").chmod(0o755)
+        self.npm_log = self.tmp / "npm.log"
+        self.plugins = self.tmp / "plugins.json"
+        self.top = self.tmp / "plugins-top.json"  # the output around the entries (workspaceDir, registry, ...)
+        self.top.write_text(json.dumps(T.plugins_list_output([])))
+        self.argv_log = self.tmp / "argv.log"
+        self.set_runtime("2026.10.10", 22, 27, doctor=False)
+        self.write_plugins([
+            plugin("codex", "@openclaw/codex", "2026.10.4"),
+            plugin("acpx", "@openclaw/acpx", "2026.10.4", enabled=False),
+            plugin("brave", "@openclaw/brave-plugin", "2026.10.4"),
+            plugin("thirdparty", "openclaw-plugin-x", "1.0.0"),
+            plugin("memory-core", "@openclaw/memory-core", "2026.10.10", origin="bundled")])
+
+    def write_plugins(self, plugins):
+        self.plugins.write_text(json.dumps(plugins))
+
+    def sync(self, **env):
+        if self.argv_log.exists():
+            self.argv_log.unlink()
+        rc = self.cli("plugins-sync", env={"FAKE_PLUGINS": str(self.plugins), "FAKE_ARGV_LOG": str(self.argv_log),
+                                           "FAKE_PLUGINS_TOP": str(self.top), "FAKE_NPM_LOG": str(self.npm_log),
+                                           **env})
+        self.assertEqual(rc, 0, self.stdout + self.stderr)
+        return [json.loads(x) for x in self.argv_log.read_text().splitlines()] if self.argv_log.exists() else []
+
+    def marker(self, ver="2026.10.10"):
+        return self.state / f".plugin_cohort_{ver}"
+
+    def test_plugins_sync_updates_enabled_official_only(self):
+        calls = self.sync()
+        self.assertEqual([c for c in calls if c[:2] == ["plugins", "update"]],
+                         [["plugins", "update", "@openclaw/codex@2026.10.10"]])
+        self.assertEqual(calls[0], ["plugins", "list", "--json"])
+        self.assertEqual(calls[-1], ["plugins", "list", "--json"])  # checked after the update
+        self.assertEqual(self.stdout.splitlines(), [
+            "INFO: Official plugins: updating @openclaw/codex 2026.10.4 -> 2026.10.10 (OpenClaw 2026.10.10)...",
+            "INFO: Official plugins match OpenClaw 2026.10.10: @openclaw/codex 2026.10.4 -> 2026.10.10."])
+        # A1: the registry was probed once, for the first plugin to update, before it
+        self.assertEqual([json.loads(x)[:4] for x in self.npm_log.read_text().splitlines()],
+                         [["view", "@openclaw/codex@2026.10.10", "version", "--json"]])
+        self.assertTrue(self.marker().is_file())
+        self.assertEqual(self.sync(), [])  # once per OpenClaw version
+        self.assertEqual(self.stdout, "")
+
+    def test_plugins_sync_failure_keeps_no_marker(self):
+        calls = self.sync(FAKE_UPDATE_RC="1")
+        self.assertIn(["plugins", "update", "@openclaw/codex@2026.10.10"], calls)
+        self.assertIn("WARN: @openclaw/codex stays at 2026.10.4 (openclaw plugins update failed, rc 1: ", self.stdout)
+        self.assertIn("OpenClaw 2026.10.10 still loads it (minimum 2026.9.7). The add-on tries again at the next start; "
+                      "by hand: openclaw plugins update @openclaw/codex@2026.10.10", self.stdout)
+        self.assertNotIn("SECRET", self.stdout + self.stderr)
+        self.assertFalse(self.marker().exists())
+        self.assertIn(["plugins", "update", "@openclaw/codex@2026.10.10"], self.sync())  # retried at the next start
+        self.assertTrue(self.marker().is_file())
+        # the list itself fails: WARN, nothing updated, no marker
+        self.marker().unlink()
+        self.assertEqual(self.sync(FAKE_LIST_RC="1"), [["plugins", "list", "--json"]])
+        self.assertIn("WARN: Official plugins not updated: openclaw plugins list failed (rc 1", self.stdout)
+        self.assertFalse(self.marker().exists())
+
+    def test_plugins_sync_no_downgrade_and_noop_on_1004(self):
+        self.write_plugins([plugin("codex", "@openclaw/codex", "2026.10.4"),
+                            plugin("next", "@openclaw/next", "2026.11.5-beta.1")])
+        calls = self.sync()
+        self.assertEqual([c[2] for c in calls if c[:2] == ["plugins", "update"]], ["@openclaw/codex@2026.10.10"])
+        self.assertIn("WARN: @openclaw/next 2026.11.5-beta.1 is newer than OpenClaw 2026.10.10; left as is "
+                      "(no downgrade)", self.stdout)
+        # D2: no marker while an enabled official plugin is not at the OpenClaw version, a newer one included: the
+        # next start reads the list again (no update) and repeats the WARN
+        self.assertFalse(self.marker().exists())
+        self.assertEqual(self.sync(), [["plugins", "list", "--json"]])
+        self.assertIn("WARN: @openclaw/next 2026.11.5-beta.1 is newer than OpenClaw 2026.10.10", self.stdout)
+        self.assertFalse(self.marker().exists())
+        # runtime 2026.10.4 with every plugin at 2026.10.4: nothing to update, the marker is written
+        self.set_runtime("2026.10.4", 20, 24, doctor=False)
+        self.write_plugins([plugin("codex", "@openclaw/codex", "2026.10.4"),
+                            plugin("acpx", "@openclaw/acpx", "2026.10.4")])
+        self.assertEqual(self.sync(), [["plugins", "list", "--json"]])
+        self.assertEqual(self.stdout.strip(),
+                         "INFO: Official plugins match OpenClaw 2026.10.4: @openclaw/acpx 2026.10.4, @openclaw/codex "
+                         "2026.10.4.")
+        self.assertTrue(self.marker("2026.10.4").is_file())
+        # run.sh's validated OPENCLAW_RUNTIME_VERSION names the version (and the marker)
+        self.assertEqual(self.sync(OPENCLAW_RUNTIME_VERSION="2026.10.4"), [])
+        self.sync(OPENCLAW_RUNTIME_VERSION="2026.10.10")  # the package still says 2026.10.4
+        self.assertIn("updating @openclaw/codex 2026.10.4 -> 2026.10.10", self.stdout)
+        # a HOLD: never touch the plugins
+        self.marker().unlink()
+        (self.upg / "hold.txt").write_text("OpenClaw is held\n")
+        self.assertEqual(self.sync(), [])
+        self.assertIn("OpenClaw is held", self.stdout)
+        self.assertFalse(self.marker().exists())
+
+    def test_plugins_sync_on_the_real_list_output(self):
+        """Rehearsal D2: OpenClaw's real output has no packageName (tests/fixtures/plugins-list-2026.10.10.json). The
+        official npm plugins are found by trust.installSpec / rootDir, the enabled older ones updated, and the marker
+        is written only after the list confirms them at the OpenClaw version."""
+        data = T.plugins_list_output()
+        self.assertFalse(any("packageName" in x or "packageVersion" in x for x in data["plugins"]))
+        self.write_plugins(data["plugins"])  # codex, acpx and Brave at 2026.10.10, three bundled ones
+        self.assertEqual(self.sync(), [["plugins", "list", "--json"]])
+        self.assertEqual(self.stdout.strip(), "INFO: Official plugins match OpenClaw 2026.10.10: @openclaw/acpx "
+                                              "2026.10.10, @openclaw/codex 2026.10.10.")
+        self.assertTrue(self.marker().is_file())
+        # the rehearsal's check: codex and acpx (and Brave) left at 2026.10.4
+        self.marker().unlink()
+        for x in data["plugins"]:
+            if x["origin"] == "global":
+                x["version"] = "2026.10.4"
+        self.write_plugins(data["plugins"])
+        calls = self.sync()
+        self.assertEqual([c[2] for c in calls if c[:2] == ["plugins", "update"]],
+                         ["@openclaw/acpx@2026.10.10", "@openclaw/codex@2026.10.10"])  # never Brave (run.sh's step)
+        self.assertEqual(calls[-1], ["plugins", "list", "--json"])
+        self.assertIn("INFO: Official plugins match OpenClaw 2026.10.10: @openclaw/acpx 2026.10.4 -> 2026.10.10, "
+                      "@openclaw/codex 2026.10.4 -> 2026.10.10.", self.stdout)
+        self.assertNotIn("none enabled besides Brave", self.stdout)
+        self.assertTrue(self.marker().is_file())
+        listed = {x["id"]: x["version"] for x in json.loads(self.plugins.read_text())}
+        self.assertEqual((listed["codex"], listed["acpx"], listed["brave"]), ("2026.10.10", "2026.10.10", "2026.10.4"))
+        # a disabled one stays as it is, and so does the marker logic: only enabled ones count
+        self.marker().unlink()
+        for x in data["plugins"]:
+            if x["id"] == "acpx":
+                x.update(enabled=False, status="disabled")
+        self.write_plugins(data["plugins"])
+        self.assertEqual([c[2] for c in self.sync() if c[:2] == ["plugins", "update"]], ["@openclaw/codex@2026.10.10"])
+        self.assertTrue(self.marker().is_file())
+        self.assertEqual({x["id"]: x["version"] for x in json.loads(self.plugins.read_text())}["acpx"], "2026.10.4")
+
+    def test_plugins_sync_identifies_plugins_like_the_gate(self):
+        """Package from OpenClaw's install record of the id, else trust.installSpec (npm), else the rootDir/source
+        path; an @openclaw/ checkout on a load path (no install record, not from npm) and third-party packages are
+        never updated."""
+        T.make_1004_state(self.state)
+        self.write_cfg({"plugins": {"entries": {"codex": {"enabled": True}}}})
+        T.write_install_records(self.state, {"codex": ("@openclaw/codex", "2026.10.4", "@openclaw/codex@2026.10.4")})
+        codex = plugin("codex", "@openclaw/codex", "2026.10.4")
+        codex["trust"] = {"reason": "record-missing", "registryPath": codex["trust"]["registryPath"],
+                          "origin": "global"}
+        acpx = plugin("acpx", "@openclaw/acpx", "2026.10.4")  # no install record: trust.installSpec names it
+        acpx["trust"]["installSpec"] = "npm:@openclaw/acpx@2026.10.4"
+        voice = plugin("voice", "@openclaw/voice-call", "2026.10.4")  # only its path names it
+        voice["trust"] = {"reason": "record-missing", "registryPath": voice["trust"]["registryPath"],
+                          "origin": "global"}
+        voice.pop("trustedOfficialInstall")
+        self.write_plugins([codex, acpx, voice, plugin("dev", "@openclaw/dev-tools", "2026.10.4", origin="config"),
+                            plugin("thirdparty", "openclaw-plugin-x", "1.0.0"),
+                            plugin("alibaba", "@openclaw/alibaba-provider", "2026.10.4", origin="bundled")])
+        calls = self.sync()
+        self.assertEqual(sorted(c[2] for c in calls if c[:2] == ["plugins", "update"]),
+                         ["@openclaw/acpx@2026.10.10", "@openclaw/codex@2026.10.10", "@openclaw/voice-call@2026.10.10"])
+        self.assertTrue(self.marker().is_file())
+
+    def test_plugins_sync_install_records_the_list_does_not_show_keep_no_marker(self):
+        """Rehearsal D2: a list that shows none of OpenClaw's recorded npm installs (or not an enabled one) cannot
+        confirm their version: a WARN per record, no marker, the next start looks again."""
+        T.make_1004_state(self.state)
+        self.write_cfg({"plugins": {"entries": {"codex": {"enabled": True}, "acpx": {"enabled": False}}}})
+        T.write_install_records(self.state, {
+            "codex": ("@openclaw/codex", "2026.10.4", "@openclaw/codex@2026.10.4"),
+            "acpx": ("@openclaw/acpx", "2026.10.4", None),
+            "brave": ("@openclaw/brave-plugin", "2026.10.4", "@openclaw/brave-plugin@2026.10.4")})
+        self.write_plugins([plugin("memory-core", "@openclaw/memory-core", "2026.10.10", origin="bundled")])
+        self.assertEqual(self.sync(), [["plugins", "list", "--json"]])
+        for pkg, pid in (("@openclaw/acpx", "acpx"), ("@openclaw/brave-plugin", "brave"), ("@openclaw/codex", "codex")):
+            self.assertIn(f"WARN: OpenClaw recorded the npm install of {pkg} 2026.10.4 (plugin {pid}), but openclaw "
+                          "plugins list does not show it, so its version is not confirmed (check: openclaw plugins "
+                          "doctor). The add-on looks again at the next start.", self.stdout)
+        self.assertNotIn("match OpenClaw", self.stdout)
+        self.assertNotIn("none enabled besides Brave", self.stdout)
+        self.assertFalse(self.marker().exists())
+        # the list shows Brave but not the enabled codex: still no marker (the disabled acpx does not count)
+        self.write_plugins([plugin("brave", "@openclaw/brave-plugin", "2026.10.4")])
+        self.sync()
+        self.assertIn("(plugin codex), but openclaw plugins list does not show it", self.stdout)
+        self.assertNotIn("(plugin acpx)", self.stdout)
+        self.assertFalse(self.marker().exists())
+        # once the list shows codex (updated here), the marker follows
+        self.write_plugins([plugin("brave", "@openclaw/brave-plugin", "2026.10.4"),
+                            plugin("codex", "@openclaw/codex", "2026.10.4", spec="@openclaw/codex@2026.10.4")])
+        self.assertIn(["plugins", "update", "@openclaw/codex@2026.10.10"], self.sync())
+        self.assertIn("INFO: Official plugins match OpenClaw 2026.10.10: @openclaw/codex 2026.10.4 -> 2026.10.10.",
+                      self.stdout)
+        self.assertTrue(self.marker().is_file())
+
+    def test_plugins_sync_offline_skips_the_updates_without_waiting(self):
+        """Rehearsal A1: offline, `openclaw plugins update` waited out its 300 s limit (334 s) while the gateway was
+        still down, at every start. A registry probe (npm view, 30 s at most) comes first: when it fails, one WARN
+        names the plugins and the command, nothing is updated, no marker; once online the next start updates."""
+        self.write_plugins([plugin("acpx", "@openclaw/acpx", "2026.10.4"),
+                            plugin("codex", "@openclaw/codex", "2026.10.4")])
+        calls = self.sync(FAKE_NPM_RC="1")
+        self.assertEqual(calls, [["plugins", "list", "--json"]])  # no update, no relist
+        self.assertEqual(self.stdout.splitlines(), [
+            "WARN: Official plugins not updated: the npm registry did not confirm @openclaw/acpx@2026.10.10 (npm view: "
+            "rc 1: npm error code ENOTFOUND); @openclaw/acpx stays at 2026.10.4, "
+            "@openclaw/codex stays at 2026.10.4. The add-on tries again at the next start; by hand, once online: "
+            "openclaw plugins update @openclaw/acpx@2026.10.10; openclaw plugins update @openclaw/codex@2026.10.10"])
+        self.assertFalse(self.marker().exists())
+        self.assertIn("PLUGIN_PROBE_TIMEOUT = 30\n", SCRIPT.read_text(encoding="utf-8"))
+        # the probe's own empty npm cache: no cached registry data answers offline
+        probe = [json.loads(x) for x in self.npm_log.read_text().splitlines()]
+        self.assertEqual(probe[0][:4], ["view", "@openclaw/acpx@2026.10.10", "version", "--json"])
+        self.assertEqual(probe[0][4], "--cache")
+        self.assertTrue(probe[0][5].endswith("/probe-npm-cache"), probe)
+        # online again: the updates run and the marker follows
+        calls = self.sync()
+        self.assertEqual([c[2] for c in calls if c[:2] == ["plugins", "update"]],
+                         ["@openclaw/acpx@2026.10.10", "@openclaw/codex@2026.10.10"])
+        self.assertTrue(self.marker().is_file())
+        # nothing to update: no probe at all
+        self.marker().unlink()
+        self.npm_log.unlink()
+        self.assertEqual(self.sync(FAKE_NPM_RC="1"), [["plugins", "list", "--json"]])
+        self.assertFalse(self.npm_log.exists())
+        self.assertTrue(self.marker().is_file())
+
+    def test_plugins_sync_probe_timeout(self):
+        """A registry probe that hangs ends after its time limit (PLUGIN_PROBE_TIMEOUT; here 1 s through the test
+        hook) and counts as offline: no update, no marker, long before the hanging npm would end."""
+        self.write_plugins([plugin("codex", "@openclaw/codex", "2026.10.4")])
+        self.hooks(plugin_probe_timeout_s=1)
+        start = time.monotonic()
+        calls = self.sync(FAKE_NPM_SLEEP="30")
+        self.assertLess(time.monotonic() - start, 20)
+        self.assertEqual(calls, [["plugins", "list", "--json"]])
+        self.assertIn("WARN: Official plugins not updated: the npm registry did not confirm @openclaw/codex@2026.10.10 "
+                      "(npm view: no answer within 1 s); @openclaw/codex stays at "
+                      "2026.10.4.", self.stdout)
+        self.assertFalse(self.marker().exists())
+
+    def test_plugins_sync_time_budget_leaves_the_rest_for_the_next_start(self):
+        """No update starts after the step's time budget (PLUGIN_SYNC_BUDGET; here 2 s through the test hook), so the
+        last update and the relist end before run.sh's outer `timeout 1200`; the skipped ones keep the marker away."""
+        self.write_plugins([plugin("acpx", "@openclaw/acpx", "2026.10.4"),
+                            plugin("codex", "@openclaw/codex", "2026.10.4")])
+        self.hooks(plugin_sync_budget_s=2)
+        calls = self.sync(FAKE_UPDATE_SLEEP="3")
+        self.assertEqual([c for c in calls if c[:2] == ["plugins", "update"]],
+                         [["plugins", "update", "@openclaw/acpx@2026.10.10"]])
+        self.assertEqual(calls[-1], ["plugins", "list", "--json"])
+        self.assertIn("WARN: @openclaw/codex stays at 2026.10.4 (not started: the update step's time budget (2 s) ran "
+                      "out); OpenClaw 2026.10.10 still loads it (minimum 2026.9.7). The add-on tries again at the next "
+                      "start", self.stdout)
+        self.assertNotIn("acpx stays", self.stdout)
+        self.assertFalse(self.marker().exists())
+        self.assertEqual([c for c in self.sync() if c[:2] == ["plugins", "update"]],
+                         [["plugins", "update", "@openclaw/codex@2026.10.10"]])  # the next start
+        self.assertTrue(self.marker().is_file())
+
+    def test_plugins_sync_sigterm_stops_the_update_and_its_process_group(self):
+        """run.sh's shutdown trap (or its outer `timeout`) sends SIGTERM: the running `openclaw plugins update` runs
+        in its own session, so it is stopped with its process group (it must not keep installing while the add-on
+        stops or the gateway starts); no marker, rc 0."""
+        pidfile = self.tmp / "update.pid"
+        e = dict(os.environ, PYTHONDONTWRITEBYTECODE="1", FAKE_PLUGINS=str(self.plugins),
+                 FAKE_PLUGINS_TOP=str(self.top), FAKE_ARGV_LOG=str(self.argv_log), FAKE_UPDATE_PIDFILE=str(pidfile),
+                 FAKE_UPDATE_SLEEP="120")
+        proc = subprocess.Popen([sys.executable, "-B", str(SCRIPT), "plugins-sync"], stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, text=True, env=e)
+        child = None
+        try:
+            for _ in range(200):
+                if pidfile.exists() and pidfile.read_text().strip():
+                    break
+                time.sleep(0.05)
+            child = int(pidfile.read_text().split()[0])
+            start = time.monotonic()
+            proc.send_signal(signal.SIGTERM)
+            out, err = proc.communicate(timeout=60)
+            self.assertLess(time.monotonic() - start, 20)
+            self.assertEqual(proc.returncode, 0, out + err)
+            self.assertIn("INFO: Official plugins: update step stopped (add-on stop or time limit); the add-on tries "
+                          "again at the next start.", out)
+            with self.assertRaises(ProcessLookupError):
+                os.kill(child, 0)
+            self.assertFalse(self.marker().exists())
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.communicate()
+            if child is not None:
+                try:
+                    os.kill(child, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+
+
+class HeldStoreCheckTests(CliEnv):
+    def test_check_prints_new_orphan_and_held_lines(self):
+        self.set_runtime("2026.10.10", 22, 27, doctor=False)
+        T.make_1004_state(self.state)
+        self.write_cfg({"meta": {"lastTouchedVersion": "2026.10.4"}, "agents": {"list": [{"id": "main"}]}})
+        T.make_1004_agent_db(self.state, "ghost")
+        T.make_1004_agent_db(self.state, "old")
+        con = sqlite3.connect(str(self.state / "state" / "openclaw.sqlite"))
+        con.execute("INSERT INTO agent_databases VALUES ('old', 'agents/old/agent/openclaw-agent.sqlite', 24, 0, NULL)")
+        con.execute("INSERT INTO agent_deletion_journal (agent_id, agent_dir, workspace_dir, sessions_dir, created_at, "
+                    "cleanup_completed, delete_files) VALUES ('old', ?, '/w', '/s', 0, 1, 0)",
+                    (str(self.state / "agents" / "old" / "agent"),))
+        con.commit()
+        con.close()
+        self.cli("check", env={"OPENCLAW_RUNTIME_VERSION": "2026.10.10"})
+        self.assertIn("  agent databases of no configured or registered agent (doctor may migrate them one-way; the "
+                      "gateway does not open them): agents/ghost/agent/openclaw-agent.sqlite (schema 24)", self.stdout)
+        self.assertIn("  held agent databases (kept from deleted agents; not migrated, not opened): "
+                      "agents/old/agent/openclaw-agent.sqlite (agent old, schema 24: kept from a deleted agent "
+                      "(deletion journal))", self.stdout)
+        # readiness (section I) uses the same held stores
+        self.assertIn("[gate] 1/8 info: agents/old/agent/openclaw-agent.sqlite (agent old, schema 24) is kept from a "
+                      "deleted agent", self.stdout)
+        # state, main and the orphan doctor would migrate; not the held store
+        self.assertIn("quick_check ok (3/3); foreign keys ok (3/3)", self.stdout)
+
 
 if __name__ == "__main__":
     unittest.main()

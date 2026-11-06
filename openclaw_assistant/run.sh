@@ -600,7 +600,8 @@ trap early_stop INT TERM
 # Upgrade-state backup (OpenClaw 2026.7.x runtimes only)
 #
 # OpenClaw 2026.8+ migrates the persistent databases one-way (2026.10.4: state
-# schema 20, agent schema 24); older OpenClaw builds cannot open them. For those
+# schema 20, agent schema 24; 2026.10.10 and 2026.11.1: 22/27); older OpenClaw
+# builds cannot open them. For those
 # runtimes the migration gate (`oc-upgrade gate`, below) requires a recent
 # encrypted Home Assistant backup with this add-on (the only rollback point; the
 # gate writes no archive) before it runs `openclaw doctor --fix`. The local archive below is kept for
@@ -1119,12 +1120,18 @@ heal_telegram_ingress_spool() {
 # Best-effort: never blocks startup (guarded, non-fatal). Runs after the
 # migration gate, so never against unmigrated state.
 # ------------------------------------------------------------------------------
-BRAVE_PLUGIN_VERSION="$(head -n 1 /usr/local/libexec/oc-addon/brave-plugin-version 2>/dev/null || true)"
+BRAVE_PLUGIN_VERSION="$(head -n 1 /usr/local/libexec/oc-addon/brave-plugin-version 2>/dev/null | grep -oE '^[0-9]{4}\.[0-9]+\.[0-9]+(-[0-9]+)?$' || true)"
 if [ -z "$BRAVE_PLUGIN_VERSION" ]; then
-  # Older image without the record: CalVer lockstep with the bundled runtime.
-  BRAVE_PLUGIN_VERSION="${OPENCLAW_RUNTIME_VERSION:-2026.10.4}"
+  # Image without a valid record: CalVer lockstep with the bundled runtime
+  # (OPENCLAW_RUNTIME_VERSION already falls back to the image's pinned version).
+  # No hard-coded version: it would pin a plugin built for another OpenClaw.
+  BRAVE_PLUGIN_VERSION="${OPENCLAW_RUNTIME_VERSION:-}"
 fi
 ensure_brave_plugin() {
+  if [ -z "$BRAVE_PLUGIN_VERSION" ]; then
+    echo "WARN: Brave web-search plugin not ensured: the OpenClaw version is unknown (non-fatal)."
+    return 0
+  fi
   local marker="/config/.openclaw/.brave_plugin_${BRAVE_PLUGIN_VERSION}"
   if [ -f "$marker" ]; then
     return 0
@@ -1145,6 +1152,60 @@ ensure_brave_plugin() {
     echo "INFO: Brave web-search plugin ensured (@${BRAVE_PLUGIN_VERSION})."
   else
     echo "WARN: Brave plugin install failed or timed out (non-fatal); web search may use a bundled provider (e.g. duckduckgo)."
+  fi
+  return 0
+}
+
+# ------------------------------------------------------------------------------
+# Bring the ENABLED official npm plugins (@openclaw/codex, @openclaw/acpx, ...)
+# to the bundled OpenClaw version (CalVer cohort; peer openclaw >=<version>).
+# OpenClaw's doctor (`doctor --fix`, in the gate's doctor passes) updates the
+# enabled official catalog plugins itself, but a failed fetch there is only a
+# doctor warning; this step catches what it left behind (failed or deferred
+# fetches, records doctor does not treat as official npm installs, package-id
+# migrations). `oc-upgrade plugins-sync` runs `openclaw plugins update
+# <pkg>@<version>` for each enabled one that is older (never a downgrade,
+# disabled plugins and Brave untouched; Brave is ensure_brave_plugin's job),
+# prints one report line and writes the per-version marker only when the
+# plugin list confirms every enabled one at that version (and shows every npm
+# install OpenClaw recorded), so a failed update is retried at the next start;
+# the gate deletes a marker its postconditions contradict. Shares
+# the validated OPENCLAW_RUNTIME_VERSION with the Brave step. Runs after the
+# migration gate with the gateway down; best-effort, never blocks startup:
+# it asks the npm registry first (`npm view`, 30 s at most) and updates
+# nothing offline, so an offline start does not wait for the update timeouts.
+# It runs in the background (PLUGINS_PID) so the shutdown trap can forward a
+# stop request: bash defers the trap while a foreground command runs, and npm
+# updates can take longer than the Supervisor's 300 s stop timeout. `timeout`
+# passes SIGTERM on; oc-upgrade then stops the update's process group.
+# ------------------------------------------------------------------------------
+PLUGINS_PID=""
+ensure_official_plugin_cohort() {
+  local rc=0
+  if [ -z "${OPENCLAW_RUNTIME_VERSION:-}" ]; then
+    echo "WARN: Official plugins not updated: the OpenClaw version is unknown (non-fatal)."
+    return 0
+  fi
+  runtime_at_least 2026.8.0 || return 0
+  if [ -f "/config/.openclaw/.plugin_cohort_${OPENCLAW_RUNTIME_VERSION}" ]; then
+    return 0
+  fi
+  [ "${SHUTTING_DOWN:-false}" != "true" ] || return 0
+  timeout --kill-after=30 1200 oc-upgrade plugins-sync &
+  PLUGINS_PID=$!
+  while :; do
+    if wait "$PLUGINS_PID" 2>/dev/null; then rc=0; else rc=$?; fi
+    # The shutdown trap interrupts `wait` (>128) while the step still runs: wait for its real end.
+    if [ "$rc" -gt 128 ] && [ "${SHUTTING_DOWN:-false}" = "true" ] && kill -0 "$PLUGINS_PID" 2>/dev/null; then
+      continue
+    fi
+    break
+  done
+  PLUGINS_PID=""
+  if [ "${SHUTTING_DOWN:-false}" = "true" ]; then
+    echo "INFO: Stop requested during the official plugin update step."
+  elif [ "$rc" -ne 0 ]; then
+    echo "WARN: Official plugin update step failed or timed out (non-fatal); it runs again at the next start."
   fi
   return 0
 }
@@ -1252,6 +1313,11 @@ SHUTTING_DOWN="${SHUTTING_DOWN:-false}"
 shutdown() {
   SHUTTING_DOWN="true"
   echo "Shutdown requested; stopping services..."
+
+  # The official plugin update step (before the gateway starts; ensure_official_plugin_cohort waits for it).
+  if [ -n "${PLUGINS_PID:-}" ] && kill -0 "${PLUGINS_PID}" 2>/dev/null; then
+    kill -TERM "${PLUGINS_PID}" 2>/dev/null || true
+  fi
 
   # The cleanup loop stops at its next check; it is reaped after the gateway (no wait here).
   if [ -n "${CLEANUP_PID:-}" ] && kill -0 "${CLEANUP_PID}" >/dev/null 2>&1; then
@@ -1402,6 +1468,8 @@ elif [ -f "$OPENCLAW_CONFIG_PATH" ]; then
   # Ensure Brave is present BEFORE repair-known-invalid-settings, so a persisted
   # tools.web.search.provider=brave is not stripped as "unavailable".
   ensure_brave_plugin || true
+  # Then the other enabled official plugins, to the same OpenClaw version (gateway still down).
+  ensure_official_plugin_cohort || true
   if [ -f "$HELPER_PATH" ]; then
     # Snapshot BEFORE the first mutation of this boot so `oc-config restore`
     # can always undo whatever the repair/apply steps below decide to change.

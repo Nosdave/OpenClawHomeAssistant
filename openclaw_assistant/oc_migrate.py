@@ -23,12 +23,13 @@ LedgerEntry = {"step", "file", "path", "before", "after"[, "note"]}  (raw values
 from __future__ import annotations
 
 import copy
+import ipaddress
 import json
 import os
 import re
 import sqlite3
 import stat
-from urllib.parse import quote as _urlquote
+from urllib.parse import quote as _urlquote, urlsplit as _urlsplit
 
 __all__ = [
     "EXPLICIT_DEFAULT_IDS", "PINS", "TRANSIENT_SQLITE_RE", "TELEGRAM_CACHE_RE", "EMPTY_BINDINGS_RES",
@@ -38,8 +39,12 @@ __all__ = [
     "retired_chain", "apply_retired",
     "legacy_key_context", "is_migrated_legacy_key",
     "check_legacy_refs", "check_codex_runtime", "check_runtime_pins", "apply_pins", "auth_order_adjust",
+    "split_trailing_auth_profile", "normalize_agent_id", "cron_job_agent", "cron_model_chain", "cron_model_ref",
+    "cron_ref_refusal", "cron_ref_uses_stored_profile", "cron_account_forecast", "is_secret_ref", "is_key_marker",
+    "doctor_copies", "doctor_key_copies", "config_path", "parse_model_catalog_json",
     "classify_state_files", "scan_sessions_files", "config_precheck", "flatten_paths",
-    "retired_config_keys", "retired_config_findings", "classify_retired_state", "retired_db_findings",
+    "retired_config_keys", "retired_config_rewrites", "retired_config_findings", "classify_retired_state",
+    "retired_db_findings", "heartbeat_hours_findings",
     "retired_tuning_dropped", "RETIRED_QUARANTINE_KINDS",
 ]
 
@@ -146,7 +151,8 @@ PINS = [
     {"path": ["tools", "toolSearch"], "value": False, "cond": None},
     {"path": ["tools", "swarm"], "value": False, "cond": None},
     {"path": ["gateway", "cliAgents", "enabled"], "value": False, "cond": None},
-    {"path": ["skills", "workshop", "approvalPolicy"], "value": "pending", "cond": None},
+    # gone with the Skill Workshop proposals in OpenClaw 2026.10.10 (strict skills.workshop schema; doctor removes it)
+    {"path": ["skills", "workshop", "approvalPolicy"], "value": "pending", "cond": "workshop-proposals"},
     {"path": ["skills", "workshop", "autonomous", "mode"], "value": "off", "cond": None},  # never .enabled
     {"path": ["plugins", "entries", "memory-core", "config", "dreaming", "enabled"], "value": False,
      "cond": "memory-slot"},
@@ -249,6 +255,19 @@ def _get(obj, parts, default=_MISSING):
         else:
             return default
     return cur
+
+
+def _url_origin(v):
+    """scheme://host[:port] of a URL for the transform ledger (user info, path and query may carry a token)."""
+    try:
+        u = _urlsplit(v) if isinstance(v, str) else None
+        port = u.port if u is not None else None
+    except ValueError:
+        return "***"
+    if u is None or not u.scheme or not u.hostname:
+        return "***"
+    host = "[%s]" % u.hostname if ":" in u.hostname else u.hostname
+    return "%s://%s%s" % (u.scheme, host, ":%d" % port if port else "")
 
 
 def _ensure_dict_path(root, parts):
@@ -693,9 +712,12 @@ def _pin_entry(mmap, key, parts, ledger, step):
     return True
 
 
-def premigrate_config(cfg, removals=()):
+def premigrate_config(cfg, removals=(), rewrites=()):
     """R0 (retired keys from classify_retired_state), R1 (wildcards), R2 (openclaw runtime pins),
     R3 (modelPolicy {}) -- §7.4.2. R4: nothing.
+
+    rewrites: retired_config_rewrites() (OpenClaw 2026.10.5+ targets): R0 also sets each API id that still holds
+    the retired value and deletes each listed extension-profile cdpUrl; a value changed by hand is left alone.
 
     Pass the run's write-once config.pre-gate.json (critique B2): R3 and EXPLICIT are evaluated on the
     input, so the result is the same on every re-run. `meta` is never touched.
@@ -714,6 +736,21 @@ def premigrate_config(cfg, removals=()):
             ledger.append({"step": "R0", "file": CONFIG_FILE, "path": fmt_path(list(parts)),
                            "before": copy.deepcopy(parent[parts[-1]]), "after": None})
             del parent[parts[-1]]
+    # R0 rewrites: what 2026.10.4 doctor did for settings 2026.10.5+ refuses (API id rename, extension cdpUrl)
+    for e in rewrites:
+        parts = list(e["parts"])
+        parent = _get(new, parts[:-1], None)
+        if not isinstance(parent, dict) or parts[-1] not in parent:
+            continue
+        old = parent[parts[-1]]
+        if e.get("op") == "set" and old == e.get("from"):
+            parent[parts[-1]] = e["value"]
+            ledger.append({"step": "R0", "file": CONFIG_FILE, "path": fmt_path(parts), "before": old,
+                           "after": e["value"]})
+        elif e.get("op") == "delete":
+            del parent[parts[-1]]
+            ledger.append({"step": "R0", "file": CONFIG_FILE, "path": fmt_path(parts),
+                           "before": _url_origin(old), "after": None})
     refs = scan_legacy_refs(cfg)
     legacy_slots = [{k: copy.deepcopy(r[k]) for k in ("path", "value", "where", "id", "profile", "parts", "agent_id")}
                     for r in refs if r["id"] != "*"]
@@ -1689,10 +1726,12 @@ def check_runtime_pins(cfg, legacy_slots, retired_map=None, *, skip_codex=False)
 # --- pins ---------------------------------------------------------------------------------
 
 
-def _pin_condition(cfg, cond):
+def _pin_condition(cfg, cond, retires_skill_proposals=False):
     """None if the condition holds, else a short reason text."""
     if cond is None:
         return None
+    if cond == "workshop-proposals":
+        return "Skill Workshop proposals were removed in this OpenClaw version" if retires_skill_proposals else None
     if cond == "memory-slot":
         slot = _get(cfg, ["plugins", "slots", "memory"], None)
         if slot is None or (isinstance(slot, str) and slot.strip() in ("", "memory-core")):
@@ -1737,9 +1776,11 @@ def _system_agent_id(cfg):
     return v.strip() if isinstance(v, str) and v.strip() else None
 
 
-def apply_pins(cfg, ledgered_paths):
+def apply_pins(cfg, ledgered_paths, retires_skill_proposals=False):
     """§7.9: write each pin only where its leaf key is absent; never re-apply a ledgered path.
 
+    retires_skill_proposals: the bundled OpenClaw has no Skill Workshop proposals any more (runtime_caps, 2026.10.10+),
+    so skills.workshop.approvalPolicy is not written (its strict schema refuses the key).
     Returns (new_cfg, written[{path, value}], skipped[{path, reason}]) with reasons
     "ledgered", "already-set", "parent-not-dict" or "condition:<text>".
     """
@@ -1754,7 +1795,7 @@ def apply_pins(cfg, ledgered_paths):
         if path in ledgered:
             skipped.append({"path": path, "reason": "ledgered"})
             continue
-        why = _pin_condition(new, pin["cond"])
+        why = _pin_condition(new, pin["cond"], retires_skill_proposals)
         if why is not None:
             skipped.append({"path": path, "reason": "condition:" + why})
             continue
@@ -1923,6 +1964,588 @@ def auth_order_adjust(cfg, profiles, store_order):
     ledger = [{"step": "auth-order", "file": CONFIG_FILE, "path": "auth.order.openai", "before": None,
                "after": list(value)}]
     return new, None, ledger
+
+
+# --- cron inference accounts (openclaw/openclaw#192195; report only) ---------------------------------
+# OpenClaw 2026.10.10 and 2026.11.1 (the cron/auth sources are unchanged between them) refuse a cron agent turn
+# that has no recorded inference account (job_json inferenceBinding, #172590) as soon as a prepared candidate
+# would run on a stored auth profile or a direct credential that is not a configured key
+# (embedded-agent-runner/run/auth-plan.ts), and
+# the refusal stops the fallback chain (recordModelFallbackStop). OpenClaw's own doctor migration (#172792)
+# ships with 2026.11.5; it records only the account of a job's own model (inference-binding-migration.ts), so a job
+# that only stops at a fallback stays refused there. The gate only forecasts which jobs are affected; it writes
+# nothing. The stored logins include
+# the ones OpenClaw's doctor creates during the migration from literal provider keys (doctor_key_copies; found in the
+# add-on's 10.10 rehearsal): a job on such a provider is refused unless the key is a SecretRef or has auth "api-key".
+
+_PROFILE_SUFFIX_NOT_PROFILE = (re.compile(r"[0-9]{8}(?:@|\Z)", re.A),
+                               re.compile(r"(?:i?q[0-9]+(?:_[a-z0-9]+)*|[0-9]+bit)(?:@|\Z)", re.A | re.I))
+# models.providers.<p>.apiKey values OpenClaw 2026.10.10 and 2026.11.1 do not take as a literal key (unchanged
+# between them):
+# - a SecretRef (config/types.secrets.ts parseSecretRef): an object of exactly source/provider/id, or an env template
+#   "${VAR}" or "$VAR" (VAR upper case, at most 128 characters; the value trimmed). "${lower}", "${_X}",
+#   "${X:-default}" or "prefix${X}" are no reference and count as a literal key;
+# - a non-secret marker (agents/model-auth-markers.ts isNonSecretApiKeyMarker; trimmed, case-sensitive): "oauth:..."
+#   and "secretref-env:..." prefixes, the core markers, the nonSecretAuthMarkers of the bundled plugins (equal in the
+#   2026.10.10 and 2026.11.1 npm packages), the AWS SDK names, and the env-var names OpenClaw knows (its core and
+#   legacy names and those of the bundled provider manifests). Any other value (also "EMPTY", "NONE",
+#   "MY_LOCAL_KEY", "openai_api_key") is a literal key. A marker of a plugin that is not bundled counts as a literal
+#   key here, so the forecast can only over-report it.
+_ENV_REF_RE = re.compile(r"\A(?:\$\{[A-Z][A-Z0-9_]{0,127}\}|\$[A-Z][A-Z0-9_]{0,127})\Z")
+_SECRET_REF_SOURCES = ("env", "file", "exec", "store")
+_KNOWN_ENV_KEY_MARKERS = frozenset((
+    "ANTHROPIC_ADMIN_API_KEY", "ANTHROPIC_ADMIN_KEY", "ANTHROPIC_API_KEY", "ANTHROPIC_OAUTH_TOKEN", "AZURE_API_KEY",
+    "AZURE_OPENAI_API_KEY", "AZURE_SPEECH_API_KEY", "AZURE_SPEECH_KEY", "AZURE_SPEECH_REGION", "CEREBRAS_API_KEY",
+    "CLAWROUTER_API_KEY", "CODEX_API_KEY", "COPILOT_GITHUB_TOKEN", "DASHSCOPE_API_KEY", "DEEPGRAM_API_KEY",
+    "DEEPSEEK_API_KEY", "ELEVENLABS_API_KEY", "FAL_API_KEY", "FAL_KEY", "FIREWORKS_API_KEY", "GEMINI_API_KEY",
+    "GOOGLE_API_KEY", "GOOGLE_CLOUD_API_KEY", "HF_TOKEN", "HUGGINGFACE_HUB_TOKEN", "KIE_API_KEY", "LITELLM_API_KEY",
+    "LM_API_TOKEN", "MINIMAX_API_KEY", "MINIMAX_CODE_PLAN_KEY", "MINIMAX_CODING_API_KEY", "MINIMAX_OAUTH_TOKEN",
+    "MODELSTUDIO_API_KEY", "NOVITA_API_KEY", "NVIDIA_API_KEY", "OLLAMA_API_KEY", "OPENAI_ADMIN_KEY", "OPENAI_API_KEY",
+    "OPENCODE_API_KEY", "OPENCODE_ZEN_API_KEY", "OPENROUTER_API_KEY", "PERPLEXITY_API_KEY", "QWEN_API_KEY",
+    "RUNWAYML_API_SECRET", "RUNWAY_API_KEY", "SENSEAUDIO_API_KEY", "SGLANG_API_KEY", "SPEECH_KEY", "SPEECH_REGION",
+    "TOGETHER_API_KEY", "VLLM_API_KEY", "VOYAGE_API_KEY", "XAI_API_KEY", "XI_API_KEY"))
+# AWS SDK markers are markers, but never a usable key: the stored profiles still come first
+_AWS_SDK_KEY_MARKERS = frozenset(("AWS_BEARER_TOKEN_BEDROCK", "AWS_ACCESS_KEY_ID", "AWS_PROFILE"))
+_CORE_KEY_MARKERS = frozenset(("custom-local", "codex-app-server", "gcp-vertex-credentials", "ollama-local",
+                               "secretref-managed"))
+_BUNDLED_KEY_MARKERS = frozenset(("openclaw:claude-cli-native-auth", "apple-fm-local", "lmstudio-local",
+                                  "minimax-oauth", "ollama-local"))
+_KEY_MARKERS = _KNOWN_ENV_KEY_MARKERS | _AWS_SDK_KEY_MARKERS | _CORE_KEY_MARKERS | _BUNDLED_KEY_MARKERS
+# model-auth-provider-config.ts MODEL_AUTH_LOCAL_HOST_ALIASES (with model-provider-local.ts isLocalProviderBaseUrl)
+_LOCAL_HOST_ALIASES = frozenset(("localhost", "0.0.0.0", "docker.orb.internal", "host.docker.internal",
+                                 "host.orb.internal"))
+_RFC1918 = tuple(ipaddress.ip_network(n) for n in ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"))
+
+
+def is_secret_ref(value):
+    """OpenClaw's parseSecretRef on an authored config value: an object of exactly source (env/file/exec/store),
+    provider and id (both non-blank strings), or an env template "${VAR}" / "$VAR" (VAR upper case)."""
+    if isinstance(value, dict):
+        return (len(value) == 3 and value.get("source") in _SECRET_REF_SOURCES
+                and isinstance(value.get("provider"), str) and bool(value["provider"].strip())
+                and isinstance(value.get("id"), str) and bool(value["id"].strip()))
+    return isinstance(value, str) and bool(_ENV_REF_RE.match(value.strip()))
+
+
+def is_key_marker(value):
+    """OpenClaw's isNonSecretApiKeyMarker (agents/model-auth-markers.ts): a placeholder, not a key."""
+    t = value.strip() if isinstance(value, str) else ""
+    return bool(t) and (t.startswith("oauth:") or t.startswith("secretref-env:") or t in _KEY_MARKERS)
+
+
+def _local_base_url(url):
+    """model-provider-local.ts isLocalProviderBaseUrl with the model-auth host aliases: localhost, 0.0.0.0, *.local,
+    the Docker/OrbStack host names, a loopback or an RFC 1918 IPv4 address."""
+    try:
+        host = (_urlsplit(url.strip()).hostname or "") if isinstance(url, str) else ""
+    except ValueError:
+        return False
+    if not host:
+        return False
+    if host in _LOCAL_HOST_ALIASES or host.endswith(".local"):
+        return True
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    ip = getattr(ip, "ipv4_mapped", None) or ip
+    return ip.is_loopback or (ip.version == 4 and any(ip in n for n in _RFC1918))
+
+
+_ENV_TEMPLATE_NAME_RE = re.compile(r"\A[A-Z_][A-Z0-9_]*\Z")  # env-substitution.ts ENV_VAR_NAME_PATTERN
+
+
+def env_substituted(value, env):
+    """OpenClaw's substituteString (config/env-substitution.ts, 2026.11.1) on one config string with the onMissing
+    behaviour of a snapshot read (pure): "${NAME}" and "${NAME:-default}" (NAME upper case or "_", the default without
+    "$" or "{") take the variable's value from `env`, an unset or empty one the default, without one the placeholder
+    stays; "$${NAME}" is the escaped placeholder "${NAME}". Anything else stays as written. The config OpenClaw's
+    doctor reads (sourceConfig) is substituted so, so its copy of a literal key holds this value."""
+    if not isinstance(value, str) or "$" not in value:
+        return value
+    out, end, i = [], 0, value.find("$")
+    while i != -1:
+        escaped = value[i + 1:i + 3] == "${"
+        if escaped or value[i + 1:i + 2] == "{":
+            start = i + (3 if escaped else 2)
+            close = value.find("}", start)
+            if close != -1:
+                body = value[start:close]
+                name, sep, default = body.partition(":-")
+                if _ENV_TEMPLATE_NAME_RE.match(name) and not (sep and ("$" in default or "{" in default)):
+                    out.append(value[end:i])
+                    end = close + 1
+                    token = "${" + body + "}"
+                    if escaped:
+                        out.append(token)
+                    elif (env or {}).get(name):
+                        out.append(env[name])
+                    else:
+                        out.append(default if sep else token)
+                    i = value.find("$", close + 1)
+                    continue
+        i = value.find("$", i + 1)
+    out.append(value[end:])
+    return "".join(out)
+
+
+def doctor_copies(value, cfg_entry=None, store_ids=()):
+    """True when OpenClaw's doctor copies this provider apiKey value into an auth store as an api_key profile (its
+    plaintext model-credential step since 2026.8.1, unchanged in 2026.10.10 and 2026.11.1 and run by
+    `doctor --fix` without a prompt: doctor-model-catalog-credentials.ts collectCredentials).
+
+    value: the apiKey of a models.providers entry in openclaw.json or of an agent's model catalog; cfg_entry: the
+    openclaw.json entry of the same provider (None without one); store_ids: ids of the profiles of the store the copy
+    would go to. Not copied: no string or a blank one, any value when the openclaw.json entry holds a SecretRef (also
+    a "${VAR}"/"$VAR" template there), a non-secret marker, a value that is the id of a stored profile. Not modelled:
+    a profile of that provider that already holds the same key (the gate never reads key values); that provider has
+    a stored login anyway. models.providers.<p>.auth plays no part ("api-key" does not stop the copy)."""
+    if not isinstance(value, str) or not value.strip():
+        return False
+    if isinstance(cfg_entry, dict) and is_secret_ref(cfg_entry.get("apiKey")):
+        return False
+    return not is_key_marker(value) and value not in store_ids
+
+
+_CATALOG_COMMENT_RE = re.compile(r'"(?:\\.|[^"\\])*"|//[^\n]*')
+_CATALOG_TRAILING_COMMA_RE = re.compile(r'"(?:\\.|[^"\\])*"|,(\s*[}\]])')
+
+
+def parse_model_catalog_json(text):
+    """OpenClaw's parseModelCatalogJson (agents/model-catalog-json.ts) for an agent's models.json: // comments
+    outside strings and trailing commas are dropped, then strict JSON. Raises ValueError like JSON.parse."""
+    text = _CATALOG_COMMENT_RE.sub(lambda m: m.group(0) if m.group(0)[0] == '"' else "", text)
+    text = _CATALOG_TRAILING_COMMA_RE.sub(lambda m: m.group(1) if m.group(1) is not None else m.group(0), text)
+    return json.loads(text, parse_constant=_reject_json_constant)
+
+
+def _reject_json_constant(name):
+    raise ValueError(f"not JSON: {name}")
+
+
+def config_path(provider_key):
+    """models.providers.<key> as OpenClaw prints and parses it (shared/dot-path.ts appendConfigPathSegment): a key
+    that is no identifier in brackets, JSON-quoted."""
+    if re.fullmatch(r"[A-Za-z_$][A-Za-z0-9_$:-]*", provider_key):
+        return f"models.providers.{provider_key}"
+    return f"models.providers[{json.dumps(provider_key, ensure_ascii=False)}]"
+
+
+def doctor_key_copies(cfg, catalogs=(), store_ids_for=None):
+    """The auth profiles OpenClaw's doctor creates from plaintext provider keys (pure; port of
+    maybeMigrateModelCatalogCredentials, 2026.10.10 = 2026.11.1): {"shared": [...], "agents": {agent id: [...]}},
+    each {"id", "provider", "copy"}, no key value.
+
+    copy "config": models.providers.<p>.apiKey of openclaw.json, into the shared store every agent inherits.
+    copy "catalog": a provider of an agent's model catalog (models.json, generated plugin catalogs); the main agent's
+    (agents/main/agent) go to the shared store, any other agent's to that agent's own store.
+    catalogs: [(agent id, is the main agent dir, {provider key: apiKey value})]; store_ids_for(agent id, or None for
+    the shared store) -> the ids of its stored profiles. The id is allocateProfileId's first choice,
+    "<provider>:default"; one entry per provider and store (doctor stores a second key as "<provider>:models-json")."""
+    cfg = cfg if isinstance(cfg, dict) else {}
+    ids = store_ids_for or (lambda _aid: ())
+    res = {"shared": [], "agents": {}}
+
+    def add(dest, key, how):
+        p = key.strip().lower()
+        if not any(x["provider"] == p for x in dest):
+            dest.append({"id": f"{p}:default", "provider": p, "copy": how})
+    provs = _get(cfg, ["models", "providers"], None)
+    shared_ids = set(ids(None))
+    for k, entry in provs.items() if isinstance(provs, dict) else []:
+        if isinstance(k, str) and k.strip() and isinstance(entry, dict) \
+                and doctor_copies(entry.get("apiKey"), entry, shared_ids):
+            add(res["shared"], k, "config")
+    for aid, is_main, providers in catalogs or ():
+        own = shared_ids if is_main else shared_ids | set(ids(aid))
+        for k, value in providers.items() if isinstance(providers, dict) else []:
+            if isinstance(k, str) and k.strip() and doctor_copies(value, _provider_cfg(cfg, k.strip().lower()), own):
+                add(res["shared"] if is_main else res["agents"].setdefault(str(aid).lower(), []), k, "catalog")
+    return res
+
+
+def split_trailing_auth_profile(raw):
+    """(model, profile or None) of a "provider/model@profile" ref: port of OpenClaw's splitTrailingAuthProfile
+    (agents/model-ref-profile.ts, identical in 2026.10.4 and 2026.10.10). An 8-digit version or a quantization
+    suffix after "@" is part of the model."""
+    trimmed = raw.strip() if isinstance(raw, str) else ""
+    if not trimmed:
+        return "", None
+    d = trimmed.find("@", trimmed.rfind("/") + 1)
+    if d <= 0:
+        return trimmed, None
+    for suffix in _PROFILE_SUFFIX_NOT_PROFILE:
+        if not suffix.match(trimmed, d + 1):
+            continue
+        nxt = trimmed.find("@", d + 1)
+        if nxt < 0:
+            return trimmed, None
+        d = nxt
+    model, profile = trimmed[:d].strip(), trimmed[d + 1:].strip()
+    if not model or not profile:
+        return trimmed, None
+    return model, profile
+
+
+_AGENT_ID_RE = re.compile(r"[a-z0-9][a-z0-9_-]{0,63}", re.I | re.A)  # VALID_ID_RE (ASCII only, as in JS)
+
+
+def normalize_agent_id(value):
+    """OpenClaw's normalizeAgentId (packages/normalization-core/src/agent-id.ts, 2026.11.1): trimmed and lower-cased;
+    an id that is not canonical has every run of other characters replaced by "-", leading and trailing "-" removed,
+    and is cut to 64 characters; "main" when nothing is left. Cron jobs and the gateway's agent check use this form
+    ("Haus Agent" -> "haus-agent")."""
+    t = value.strip() if isinstance(value, str) else ""
+    n = t.lower()
+    if _AGENT_ID_RE.fullmatch(t):
+        return n
+    return re.sub(r"[^a-z0-9_-]+", "-", n).strip("-")[:64] or "main"
+
+
+def _agent_cfg_entry(cfg, agent_id):
+    """The agents.list / agents.entries object of `agent_id` (ids compared normalised, normalize_agent_id), or
+    None."""
+    agents = cfg.get("agents") if isinstance(cfg, dict) else None
+    if not isinstance(agents, dict) or not isinstance(agent_id, str):
+        return None
+    want = normalize_agent_id(agent_id)
+    for e in agents.get("list") if isinstance(agents.get("list"), list) else []:
+        if isinstance(e, dict) and isinstance(e.get("id"), str) and normalize_agent_id(e["id"]) == want:
+            return e
+    ent = agents.get("entries")
+    for k, e in ent.items() if isinstance(ent, dict) else []:
+        if isinstance(k, str) and normalize_agent_id(k) == want and isinstance(e, dict):
+            return e
+    return None
+
+
+def _model_primary(v):
+    if isinstance(v, dict):
+        v = v.get("primary")
+    return v.strip() if isinstance(v, str) and v.strip() else None
+
+
+def _agent_fallbacks_override(v):
+    """OpenClaw's resolveSelectedModelFallbacksOverride (agents/agent-scope.ts): a primary of its own without
+    fallbacks means none; an explicit list (also []) replaces the defaults; otherwise None (inherit)."""
+    if isinstance(v, str):
+        return [] if v.strip() else None
+    if not isinstance(v, dict):
+        return None
+    if "fallbacks" not in v:
+        return [] if _model_primary(v) else None
+    return v["fallbacks"] if isinstance(v["fallbacks"], list) else None
+
+
+def cron_job_agent(job, default_agent="main"):
+    """The agent a cron job runs as (tryResolveCronJobEffectiveAgentId, cron/agent-id.ts): agentId, else the agent
+    of its sessionKey ("agent:<id>:..."), else the default agent; normalised as OpenClaw does (normalize_agent_id)."""
+    aid = job.get("agentId")
+    if isinstance(aid, str) and aid.strip():
+        return normalize_agent_id(aid)
+    sk = job.get("sessionKey")
+    if isinstance(sk, str):
+        parts = sk.strip().split(":")
+        if len(parts) >= 3 and parts[0].lower() == "agent" and parts[1].strip():
+            return normalize_agent_id(parts[1])
+    return normalize_agent_id(default_agent or "main")
+
+
+def _subagent_model_selection(cfg, entry):
+    """OpenClaw's resolveSubagentModelConfigSelectionResult (agents/agent-scope.ts): (model config, source) of the
+    first of the agent's subagents.model ("subagent"), agents.defaults.subagents.model ("default-subagent") and
+    the agent's model ("agent") that has a primary; None without one."""
+    sub = entry.get("subagents") if entry else None
+    for raw, src in ((sub.get("model") if isinstance(sub, dict) else None, "subagent"),
+                     (_get(cfg, ["agents", "defaults", "subagents", "model"], None), "default-subagent"),
+                     (entry.get("model") if entry else None, "agent")):
+        if _model_primary(raw):
+            return raw, src
+    return None
+
+
+def _subagent_fallbacks_override(cfg, entry):
+    """OpenClaw's resolveSubagentModelFallbacksOverride (agents/agent-scope.ts): the override of the agent's
+    subagents.model, else that of a selected default-subagent or agent model; None (inherit) otherwise."""
+    sub = entry.get("subagents") if entry else None
+    ov = _agent_fallbacks_override(sub.get("model") if isinstance(sub, dict) else None)
+    if ov is not None:
+        return ov
+    sel = _subagent_model_selection(cfg, entry)
+    return _agent_fallbacks_override(sel[0]) if sel and sel[1] in ("agent", "default-subagent") else None
+
+
+def cron_model_chain(job, cfg, agent_id):
+    """(primary ref or None, [fallback refs], fallbacks source) of a cron agent turn, as OpenClaw 2026.10.10 and
+    2026.11.1 resolve it (cron/isolated-agent/model-selection.ts, run-fallback-policy.ts).
+
+    Primary: payload.model, else the agent's subagents.model, else agents.defaults.subagents.model, else the
+    agent's model, else the defaults' primary (cron follows the sub-agent spawn rules). Fallbacks: payload.fallbacks
+    when it is a list (also []) -> "job"; for a subagents.model primary its override -> "subagent"; for an agent
+    whose model is a string equal to the defaults' primary, the defaults' fallbacks when there are any ->
+    "defaults"; else the agent's override -> "agent", else the defaults' -> "defaults". Not modelled: the model
+    allowlist, hooks.gmail.model and a session's model override (a "session:<key>" target), an ACP agent runtime."""
+    payload = job.get("payload") if isinstance(job.get("payload"), dict) else {}
+    defaults = _get(cfg, ["agents", "defaults", "model"], None)
+    dfbs = defaults.get("fallbacks") if isinstance(defaults, dict) else None
+    dfbs = dfbs if isinstance(dfbs, list) else []
+    entry = _agent_cfg_entry(cfg, agent_id)
+    amodel = entry.get("model") if entry else None
+    pm = payload.get("model")
+    pm = pm.strip() if isinstance(pm, str) and pm.strip() else None
+    sel = None if pm else _subagent_model_selection(cfg, entry)
+    if pm:
+        primary, msrc = pm, "payload"
+    elif sel:
+        primary, msrc = _model_primary(sel[0]), "agent" if sel[1] == "agent" else "subagent"
+    else:
+        primary, msrc = _model_primary(defaults), "default"
+    fbs = None
+    if isinstance(payload.get("fallbacks"), list):
+        fbs, src = payload["fallbacks"], "job"
+    if fbs is None and msrc == "subagent":
+        fbs, src = _subagent_fallbacks_override(cfg, entry), "subagent"
+    # run-prepare.ts inheritDefaultFallbacksForAgentStringModel: an agent model "provider/model" that repeats the
+    # defaults' primary keeps the defaults' fallbacks (resolveSelectedModelFallbacksOverride would give none)
+    if fbs is None and msrc in ("agent", "default") and dfbs and isinstance(amodel, str) \
+            and _model_primary(amodel) == _model_primary(defaults):
+        fbs, src = dfbs, "defaults"
+    if fbs is None:
+        fbs, src = _agent_fallbacks_override(amodel), "agent"
+    if fbs is None:
+        fbs, src = dfbs, "defaults"
+    return primary, [f.strip() for f in fbs if isinstance(f, str) and f.strip()], src
+
+
+def _model_alias_target(cfg, alias):
+    models = _get(cfg, ["agents", "defaults", "models"], None)
+    want = alias.strip().casefold()
+    for ref, v in models.items() if isinstance(models, dict) else []:
+        if isinstance(ref, str) and isinstance(v, dict) and isinstance(v.get("alias"), str) \
+                and v["alias"].strip().casefold() == want:
+            return ref
+    return None
+
+
+def cron_model_ref(cfg, raw):
+    """(provider lower-cased, model id, explicit profile or None) of a cron candidate ref; a bare id is looked
+    up as an alias of agents.defaults.models. None when it cannot be resolved."""
+    model, profile = split_trailing_auth_profile(raw)
+    if not model:
+        return None
+    prov, mid = _split_ref(model)
+    if prov is None:
+        target = _model_alias_target(cfg, model)
+        if target is None:
+            return None
+        target, tprof = split_trailing_auth_profile(target)
+        prov, mid = _split_ref(target)
+        profile = profile or tprof
+    if not prov or not mid:
+        return None
+    return prov, mid, profile
+
+
+def _provider_cfg(cfg, provider):
+    provs = _get(cfg, ["models", "providers"], None)
+    for k, v in provs.items() if isinstance(provs, dict) else []:
+        if isinstance(k, str) and k.strip().lower() == provider and isinstance(v, dict):
+            return v
+    return None
+
+
+def cron_ref_refusal(cfg, provider, explicit_profile, profiles):
+    """Why OpenClaw 2026.10.10 and 2026.11.1 refuse this candidate of a cron job without a recorded inference account
+    (prepare-auth.ts, auth-plan.ts): "profile" when it would run on a stored auth profile, "aws-sdk" when on AWS SDK
+    credentials (models.providers.<p>.auth "aws-sdk": no configured key, and no stored account that model@profile
+    could record either), None when it is not refused.
+
+    profiles: [{"id", "provider"}] the job's agent can use (its own store, the shared store, auth.profiles of
+    openclaw.json, and in a precheck forecast the copies doctor_key_copies predicts). A model@profile ref names a
+    stored account. models.providers.<p>.auth "aws-sdk" runs on AWS credentials, which are no configured key: refused.
+    models.providers.<p>.apiKey: a SecretRef (also "${VAR}"/"$VAR") is a configured key that suppresses the profiles;
+    a marker does only while usable (a known env-var name while its variable is set, which is assumed here; another
+    marker only on a local base URL with api "openai-completions" or "ollama"); a value that names a stored profile
+    pins it; a literal key (also an ALL_CAPS value OpenClaw does not know as a marker, such as "EMPTY") suppresses
+    them only with auth "api-key", otherwise the profiles come first. A provider without stored profiles
+    (configured key, environment, local or synthetic route) is not affected."""
+    if explicit_profile:
+        return "profile"
+    pcfg = _provider_cfg(cfg, provider) or {}
+    if pcfg.get("auth") == "aws-sdk":  # prepare-auth.ts: direct source with evidence "aws-sdk"
+        return "aws-sdk"
+    key = pcfg.get("apiKey")
+    if isinstance(key, dict) or is_secret_ref(key):
+        return None
+    if isinstance(key, str) and key.strip():
+        k = key.strip()
+        if is_key_marker(k):
+            if k in _KNOWN_ENV_KEY_MARKERS or (pcfg.get("api") in ("openai-completions", "ollama")
+                                               and _local_base_url(pcfg.get("baseUrl"))):
+                return None
+        elif any(p.get("id") == k for p in profiles):
+            return "profile"
+        elif pcfg.get("auth") == "api-key":
+            return None
+    return "profile" if any(str(p.get("provider") or "").strip().lower() == provider for p in profiles) else None
+
+
+def cron_ref_uses_stored_profile(cfg, provider, explicit_profile, profiles):
+    """True when OpenClaw 2026.10.10 refuses this candidate of a cron job without a recorded inference account,
+    on a stored auth profile or on AWS SDK credentials (cron_ref_refusal)."""
+    return cron_ref_refusal(cfg, provider, explicit_profile, profiles) is not None
+
+
+def cron_account_forecast(jobs, cfg, profiles_for, default_agent="main", copies_for=None, copies_pending=False,
+                          configured=None):
+    """Report-only forecast for openclaw/openclaw#192195 (no I/O).
+
+    jobs: [{"id", "name", "enabled", "runtime_authority", "job"}] in store order, "job" the parsed job_json
+    without its prompt (None when unparsable); profiles_for(agent_id) -> [{"id", "provider"}] (no secrets).
+    copies_for(agent_id) -> the profiles OpenClaw's doctor creates from the literal provider keys that agent's runs
+    see (doctor_key_copies); copies_pending: they are not in the stores yet (precheck, doctor has not run), so they
+    are added to profiles_for's; otherwise they only tell which refusals a key fix lifts.
+    Covers enabled agentTurn jobs with no recorded inference account (inferenceBinding), no scheduled runtime
+    authority and a session target other than "main". A job is affected when its primary or any fallback would
+    run on a stored auth profile or on AWS SDK credentials (cron_ref_refusal); a ref that names a profile
+    ("model@profile") does, also when its bare model id is no alias (OpenClaw gives it the default provider).
+    Returns {"checked": n, "bound": n, "affected": [{"id", "name", "agent", "primary", "primary_affected", "refs"}],
+    "key_fix": [...]}; primary and refs ("provider/model", or the bare model id) never carry the @profile; refs are
+    the affected ones in chain order. An entry with refs on AWS SDK credentials also has "aws_sdk": those refs (no
+    account can be recorded for them); one with refs refused only because of doctor's pending copy has "key_copy".
+    key_fix: one {"provider", "path", "auth", "where", "pending"} per provider whose refused refs (without an
+    explicit @profile) run on a literal key doctor copies or copied, so that auth "api-key" or a SecretRef lifts the
+    refusal: where "config" (models.providers.<p>.apiKey of openclaw.json holds the key) or "catalog" (only an agent's
+    model catalog does), path "models.providers.<p>" as OpenClaw writes it, auth the configured mode or None,
+    pending: the stored login is doctor's copy during this migration. No key value anywhere.
+    configured: the agent ids openclaw.json configures (normalize_agent_id), or None for no check. OpenClaw cancels every run
+    of a job whose agent is not configured ("cron job agent is unavailable", the gateway's isAgentAvailable), so such
+    a job is not checked; it is listed in "unconfigured": [{"id", "name", "agent"}]."""
+    cfg = cfg if isinstance(cfg, dict) else {}
+    res = {"checked": 0, "bound": 0, "affected": [], "key_fix": [], "unconfigured": []}
+    keyed = {}
+    for row in jobs or []:
+        job = row.get("job")
+        if not row.get("enabled") or not isinstance(job, dict) or row.get("runtime_authority"):
+            continue
+        payload = job.get("payload") if isinstance(job.get("payload"), dict) else {}
+        if payload.get("kind") != "agentTurn" or job.get("sessionTarget") == "main":
+            continue
+        agent = cron_job_agent(job, default_agent)
+        if configured is not None and agent not in configured:
+            res["unconfigured"].append({"id": row.get("id"), "name": row.get("name"), "agent": agent})
+            continue
+        if job.get("inferenceBinding") or job.get("authProfileBinding"):
+            res["bound"] += 1
+            continue
+        res["checked"] += 1
+        primary, fallbacks, _src = cron_model_chain(job, cfg, agent)
+        profiles = list(profiles_for(agent))
+        copies = list(copies_for(agent)) if copies_for else []
+        refs, aws, copied, primary_affected = [], [], [], False
+        for i, raw in enumerate([primary] + fallbacks):
+            r = cron_model_ref(cfg, raw) if raw else None
+            if r is None and raw:  # a bare id that is no alias: an explicit profile is still a stored login
+                m_, prof_ = split_trailing_auth_profile(raw)
+                r = (None, m_, prof_) if m_ and prof_ else None
+            if r is None:
+                continue
+            now = cron_ref_refusal(cfg, r[0], r[2], profiles)
+            why = cron_ref_refusal(cfg, r[0], r[2], profiles + copies) if copies_pending and copies else now
+            if why is None:
+                continue
+            ref = f"{r[0]}/{r[1]}" if r[0] else r[1]
+            primary_affected = primary_affected or i == 0
+            # the refusal is on a literal key doctor copies (or copied): auth "api-key" or a SecretRef lifts it
+            if why == "profile" and r[0] and not r[2] and cron_ref_refusal(cfg, r[0], None, copies) == "profile":
+                keyed[r[0]] = keyed.get(r[0], False) or now is None
+            if ref not in refs:
+                refs.append(ref)
+                if why == "aws-sdk":
+                    aws.append(ref)
+                elif now is None:
+                    copied.append(ref)
+        if refs:
+            p = cron_model_ref(cfg, primary) if primary else None
+            shown = f"{p[0]}/{p[1]}" if p else split_trailing_auth_profile(primary)[0] if primary else primary
+            res["affected"].append(dict({"id": row.get("id"), "name": row.get("name"), "agent": agent,
+                                         "primary": shown, "primary_affected": primary_affected, "refs": refs},
+                                        **({"aws_sdk": aws} if aws else {}),
+                                        **({"key_copy": copied} if copied else {})))
+    provs = _get(cfg, ["models", "providers"], None)
+    provs = provs if isinstance(provs, dict) else {}
+    for prov in sorted(keyed):
+        key = next((k for k, v in provs.items() if isinstance(k, str) and k.strip().lower() == prov
+                    and isinstance(v, dict)), None)
+        pcfg = _provider_cfg(cfg, prov) or {}
+        auth = pcfg.get("auth") if pcfg.get("auth") in ("api-key", "aws-sdk", "oauth", "token") else None
+        res["key_fix"].append({"provider": prov, "path": config_path(key.strip() if key else prov), "auth": auth,
+                               "where": "config" if doctor_copies(pcfg.get("apiKey"), pcfg) else "catalog",
+                               "pending": keyed[prov]})
+    return res
+
+
+# The automatic config fixup for openclaw/openclaw#192195 (decisions.md, addendum 2026-11-05): a literal key with
+# models.providers.<p>.auth "api-key" makes OpenClaw 2026.10.10 and 2026.11.1 run <p> on the configured key, with
+# evidence "provider-config", so a cron run without a recorded inference account is not refused even after doctor
+# copied the key into its auth store (prepare-auth.ts providerBindingSuppressesProfiles; rehearsal logs/85).
+# The value is in the provider schema of 2026.10.4, 2026.10.10 and 2026.11.1 (config/zod-schema.core.ts
+# ModelProviderSchema.auth); on 2026.10.4 the configured key is what such a provider runs on anyway.
+CRON_FIXUP_AUTH = "api-key"
+
+
+def cron_key_autofix(cfg, key_fix, own_logins=None, done=()):
+    """The providers the gate sets models.providers.<p>.auth "api-key" for before doctor pass 1 (pure): (fix, kept).
+
+    key_fix: the "key_fix" entries of cron_account_forecast (providers whose literal key, as doctor's copy, is what a
+    refused cron ref runs on). A provider is fixed when its literal key is in openclaw.json (where "config"; also
+    when doctor copied it already), its models.providers entry (the first whose key matches case-insensitively, the
+    one OpenClaw reads) has no "auth" key, it has no stored login of its own and this run did not set it before.
+    own_logins(candidates) -> the providers (lower case) with a stored login that is not an api_key profile holding
+    exactly that literal key; candidates: {provider: the literal apiKey} (values only for that comparison).
+    fix: [{"provider", "entry" (the models.providers key as written), "path" ("models.providers.<entry>.auth" as
+    OpenClaw writes it)}]; kept: [{"provider", "path", "why"}], why "auth" (set to another value), "catalog" (the key
+    is only in a model catalog: no entry is created), "login" (auth "api-key" would set that login aside for every
+    run) or "done" (set by this run already; a resume never repeats it). No key value in the result."""
+    provs = _get(cfg, ["models", "providers"], None)
+    provs = provs if isinstance(provs, dict) else {}
+    cand, kept = [], []
+    for k in key_fix or []:
+        if not isinstance(k, dict) or not isinstance(k.get("provider"), str) or not k["provider"]:
+            continue
+        p = k["provider"]
+        entry = next((x for x, v in provs.items() if isinstance(x, str) and x.strip().lower() == p
+                      and isinstance(v, dict)), None)
+        pcfg = provs[entry] if entry is not None else None
+        path = (config_path(entry) if entry is not None else str(k.get("path") or config_path(p))) + ".auth"
+        if p in done:
+            why = "done"
+        elif k.get("where") != "config" or pcfg is None or not doctor_copies(pcfg.get("apiKey"), pcfg):
+            why = "catalog"
+        elif "auth" in pcfg:
+            why = "auth"
+        else:
+            cand.append({"provider": p, "entry": entry, "path": path})
+            continue
+        kept.append({"provider": p, "path": path, "why": why})
+    own = set(own_logins({c["provider"]: provs[c["entry"]]["apiKey"] for c in cand})) if cand and own_logins else set()
+    kept += [{"provider": c["provider"], "path": c["path"], "why": "login"} for c in cand if c["provider"] in own]
+    return [c for c in cand if c["provider"] not in own], kept
+
+
+def set_provider_auth(cfg, fix):
+    """(new config, ledger) with models.providers.<entry>.auth = "api-key" for each cron_key_autofix entry that still
+    has no auth (pure; the input is not changed). Ledger entries: step C1, path, before None (absent), after."""
+    new = copy.deepcopy(cfg)
+    provs = _get(new, ["models", "providers"], None)
+    ledger = []
+    for f in fix or []:
+        entry = provs.get(f.get("entry")) if isinstance(provs, dict) else None
+        if isinstance(entry, dict) and "auth" not in entry:
+            entry["auth"] = CRON_FIXUP_AUTH
+            ledger.append({"step": "C1", "path": fmt_path(["models", "providers", f["entry"], "auth"]),
+                           "before": None, "after": CRON_FIXUP_AUTH})
+    return new, ledger
 
 
 # --- state files (§7.1 item 6.3, §7.3) --------------------------------------------------------
@@ -2235,7 +2858,25 @@ def classify_state_files(state_dir, cfg, *, from_checkpoint, accepted, mode, que
 RETIRED_FORMAT_BRIDGE = "2026.9.7"
 RETIRED_QUARANTINE_KINDS = ("cron-json", "cron-json-state", "cron-run-log", "delivery-queue-json",
                             "oauth-sidecar", "plugin-install-index", "device-pair-notify",
-                            "voice-call-log", "telegram-spool-invalid", "dreaming-json")
+                            "voice-call-log", "telegram-spool-invalid", "dreaming-json",
+                            # OpenClaw 2026.10.5+ (oc_common.runtime_caps runtime_files_retired /
+                            # sandbox_registry_retired): runtime files 2026.10.4 still imported
+                            "acp-replay-ledger", "voicewake-json", "conversation-bindings-json",
+                            "plugin-approvals-json", "restart-sentinel-json", "sandbox-registry")
+# Retired runtime files of OpenClaw 2026.10.5+ (#165402, #164669; 2026.10.10 state-migrations.retired-runtime-
+# files.ts, .restart-sentinel.ts, doctor-sandbox.ts). The proofs mirror the 2026.10.4 importers
+# (state-migrations.runtime-state.ts, .acp-replay.ts, .restart-sentinel*.ts, doctor-sandbox-legacy-registry.ts).
+_RESTART_SENTINEL_KIND = "legacy-restart-sentinel-json"
+_RESTART_DECISIONS = ("canonical-preserved", "canonical-advanced", "legacy-update-finalized",
+                      "invalid-canonical-repaired", "legacy-imported", "malformed-legacy-discarded",
+                      "receipt-authoritative")
+_RESTART_SENTINEL_MAX = 4 * 1024 * 1024  # MAX_LEGACY_RESTART_SENTINEL_BYTES
+_VOICEWAKE_DEFAULT_TRIGGERS = ["openclaw", "claude", "computer"]
+_CODEX_RESPONSES_API = "openai-codex-responses"  # renamed by 2026.10.4 doctor, refused from 2026.10.5
+_CHATGPT_RESPONSES_API = "openai-chatgpt-responses"
+# JavaScript String.prototype.trim(): WhiteSpace and LineTerminator (incl. U+FEFF)
+_JS_WS = ("\t\n\v\f\r              "
+          "    　﻿")
 # Memory Core dreaming JSON in <workspace>/memory/.dreams/ (label, file, plugin-state namespaces, meta key):
 # 2026.10 doctor stops on a file unless memory-core plugin state already holds that workspace's rows
 # (extensions/memory-core/doctor-contract-api.js:159-226; 7.35 uses the same keys, dreaming-state-DLMGVRgZ.js).
@@ -2265,6 +2906,15 @@ RETIRED_MEMORY_TUNING = (
 
 def _rec(v):
     return isinstance(v, dict)
+
+
+def _cap(caps, name):
+    """True when the bundled OpenClaw has capability `name` (oc_common.runtime_caps; None: 2026.10.4)."""
+    return bool(isinstance(caps, dict) and caps.get(name))
+
+
+def _js_trim(s):
+    return s.strip(_JS_WS)
 
 
 def _visit_agent_scopes(cfg, visitor):
@@ -2298,8 +2948,13 @@ def _visit_channel(cfg, channel_id, visitor):
                 visitor(acc, "channels.%s.accounts.%s" % (channel_id, acc_id))
 
 
-def retired_config_keys(cfg):
-    """Port of 10.2 findRetiredConfigUpgradeRequirement: ([paths], bridge version)."""
+def retired_config_keys(cfg, caps=None):
+    """Port of 10.2 findRetiredConfigUpgradeRequirement: ([paths], bridge version).
+
+    caps: oc_common.runtime_caps of the bundled OpenClaw (None: 2026.10.4). empty_installs_tolerated (2026.10.6+):
+    an empty plugins.installs object is not refused (doctor removes it); config_api_cdpurl_retired (2026.10.5+):
+    the "openai-codex-responses" API ids and the extension driver's cdpUrl are refused too (10.10
+    retired-config-formats.ts:34-70)."""
     if not _rec(cfg):
         return [], "2026.9.5"
     out = []
@@ -2321,7 +2976,11 @@ def retired_config_keys(cfg):
 
     check(cfg, "", ["heartbeat"])
     check(cfg.get("routing"), "routing", ["allowFrom", "groupChat"])
-    check(cfg.get("plugins"), "plugins", ["installs"])
+    installs = sub(cfg, "plugins", "installs")
+    if not (_cap(caps, "empty_installs_tolerated") and installs == {}):
+        check(cfg.get("plugins"), "plugins", ["installs"])
+    if _cap(caps, "config_api_cdpurl_retired"):
+        out.extend(fmt_path(e["parts"]) for e in _retired_api_cdpurl(cfg))
     check(cfg.get("browser"), "browser", ["relayBindHost"])
     check(sub(cfg, "browser", "ssrfPolicy"), "browser.ssrfPolicy", ["allowPrivateNetwork"])
     memory_store(cfg, "")
@@ -2394,6 +3053,42 @@ def retired_config_keys(cfg):
     check(sub(cfg, "session", "threadBindings"), "session.threadBindings", ["ttlHours"])
     check(sub(cfg, "agents", "defaults"), "agents.defaults", ["llm"])
     return out, bridge
+
+
+def _retired_api_cdpurl(cfg):
+    """The 2026.10.5+ refusals 2026.10.4 doctor still fixed itself, as rewrite entries (see retired_config_rewrites):
+    models.providers.<id>.api / .models[i].api exactly "openai-codex-responses", and a non-blank string cdpUrl on a
+    browser profile whose driver trims to "extension" (10.10 retired-config-formats.ts:38-70)."""
+    out = []
+    providers = _get(cfg, ["models", "providers"], None)
+    for pid, prov in (providers.items() if _rec(providers) else ()):
+        if not _rec(prov):
+            continue
+        if prov.get("api") == _CODEX_RESPONSES_API:
+            out.append({"parts": ["models", "providers", pid, "api"], "op": "set", "from": _CODEX_RESPONSES_API,
+                        "value": _CHATGPT_RESPONSES_API})
+        for i, model in enumerate(prov["models"] if isinstance(prov.get("models"), list) else ()):
+            if _rec(model) and model.get("api") == _CODEX_RESPONSES_API:
+                out.append({"parts": ["models", "providers", pid, "models", i, "api"], "op": "set",
+                            "from": _CODEX_RESPONSES_API, "value": _CHATGPT_RESPONSES_API})
+    profiles = _get(cfg, ["browser", "profiles"], None)
+    for name, prof in (profiles.items() if _rec(profiles) else ()):
+        if _rec(prof) and isinstance(prof.get("driver"), str) and _js_trim(prof["driver"]) == "extension" \
+                and isinstance(prof.get("cdpUrl"), str) and _js_trim(prof["cdpUrl"]):
+            out.append({"parts": ["browser", "profiles", name, "cdpUrl"], "op": "delete"})
+    return out
+
+
+def retired_config_rewrites(cfg, caps=None):
+    """Config fixes for the settings OpenClaw 2026.10.5+ refuses but 2026.10.4 doctor still migrated itself (pure).
+
+    [] unless caps has config_api_cdpurl_retired. Entries: {"parts", "op": "set", "from", "value"} (the API id
+    becomes "openai-chatgpt-responses") or {"parts", "op": "delete"} (the extension profile's cdpUrl), exactly
+    what 2026.10.4 doctor did (legacy-config-migrations.runtime.models.codex.ts:56-92, legacy-config-core-
+    normalizers.ts:35-70). The from-7x pre-migrate step applies them (premigrate_config rewrites=)."""
+    if not _cap(caps, "config_api_cdpurl_retired") or not _rec(cfg):
+        return []
+    return _retired_api_cdpurl(cfg)
 
 
 def _sql_str(s):
@@ -2558,14 +3253,416 @@ def _spool_entry_problem(path, file_id, failed):
     return None
 
 
+# --- retired runtime files of OpenClaw 2026.10.5+: proof that 2026.10.4 already imported them -------------------
+# Each proof returns (status, detail): "imported" (the content is in SQLite), "empty" (2026.10.4 would import
+# nothing) or "unproven". Read-only; a symlink is never followed and any query error means "unproven".
+_IMPORTED, _EMPTY, _UNPROVEN = "imported", "empty", "unproven"
+_NOTHING = "nothing to import"
+
+
+def _lstat_checked(path):
+    """(stat, None) when `path` exists (a broken link too), (None, None) when it does not, (None, error text) when
+    it cannot be inspected: 2026.10.10 refuses then ("Cannot inspect potentially retired state")."""
+    try:
+        return os.lstat(path), None
+    except FileNotFoundError:
+        return None, None
+    except OSError as exc:
+        return None, exc.strerror or type(exc).__name__
+
+
+def _read_regular_bytes(path, limit):
+    """Bytes of a regular file of at most `limit` bytes (O_NOFOLLOW, never a socket/FIFO); None otherwise."""
+    st = _lstat(path)
+    if st is None or not stat.S_ISREG(st.st_mode) or st.st_size > limit:
+        return None
+    try:
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0))
+    except OSError:
+        return None
+    try:
+        with os.fdopen(fd, "rb") as f:
+            data = f.read(limit + 1)
+    except OSError:
+        return None
+    return data if len(data) <= limit else None
+
+
+def _sha256_hex(data):
+    import hashlib
+    return hashlib.sha256(data).hexdigest()
+
+
+def _json_strict(data):
+    """JSON.parse of UTF-8 bytes (NaN/Infinity rejected like JavaScript); _MISSING when it does not parse."""
+    def no_const(name):
+        raise ValueError(name)
+    try:
+        return json.loads(data.decode("utf-8"), parse_constant=no_const)
+    except (UnicodeDecodeError, ValueError, RecursionError):
+        return _MISSING
+
+
+def _js_num(v):
+    import math
+    return isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
+
+
+def _js_int(v, minimum=None):
+    return _js_num(v) and float(v).is_integer() and (minimum is None or v >= minimum)
+
+
+def _same_json(a, b):
+    """node:util isDeepStrictEqual for JSON values (true is not 1, key order does not matter)."""
+    if isinstance(a, bool) or isinstance(b, bool):
+        return isinstance(a, bool) and isinstance(b, bool) and a == b
+    if _js_num(a) or _js_num(b):
+        return _js_num(a) and _js_num(b) and a == b
+    if isinstance(a, dict):
+        return isinstance(b, dict) and a.keys() == b.keys() and all(_same_json(a[k], b[k]) for k in a)
+    if isinstance(a, list):
+        return isinstance(b, list) and len(a) == len(b) and all(_same_json(x, y) for x, y in zip(a, b))
+    return type(a) is type(b) and a == b
+
+
+def _opt_str(v):
+    """normalizeOptionalString: a trimmed non-blank string, else None."""
+    if not isinstance(v, str):
+        return None
+    v = _js_trim(v)
+    return v or None
+
+
+def _archive_twin(path, sha, limit):
+    """Name of an identical `.migrated` copy 2026.10.4 left after importing `path` (it archives only after the SQLite
+    commit, and deletes a source whose twin is identical): .migrated, .migrated.2, ... until one is absent
+    (state-migrations.storage.ts:18-33)."""
+    for i in range(1, 1000):
+        twin = path + ".migrated" if i == 1 else "%s.migrated.%d" % (path, i)
+        if not os.path.exists(twin):
+            return None
+        data = _read_regular_bytes(twin, limit)
+        if data is not None and _sha256_hex(data) == sha:
+            return os.path.basename(twin)
+    return None
+
+
+def _openclaw_home(env, home):
+    """resolveRequiredHomeDir: OPENCLAW_HOME (a leading ~ is the OS home), else HOME/USERPROFILE, else `home`;
+    path.resolve semantics (absolute, normalized, symlinks not resolved)."""
+    def norm(v):
+        v = _js_trim(v) if isinstance(v, str) else ""
+        return v if v and v not in ("undefined", "null") else None
+    os_home = norm(env.get("HOME")) or norm(env.get("USERPROFILE")) or home
+    explicit = norm(env.get("OPENCLAW_HOME"))
+    if explicit and (explicit == "~" or explicit.startswith("~/")):
+        return os.path.abspath(os_home + explicit[1:])
+    return os.path.abspath(explicit or os_home)
+
+
+def _rows(q, db, sql):
+    """Rows of a read-only query, or None when it fails (no such table/column, unreadable database)."""
+    if _lstat(db) is None:
+        return None
+    try:
+        return list(q(db, sql))
+    except Exception:  # noqa: BLE001 - every failure leaves the file unproven
+        return None
+
+
+def _in_list(values):
+    return ", ".join(_sql_str(v) for v in values)
+
+
+def _acp_ledger_sessions(doc):
+    """The sessions of a version-1 ACP replay ledger by the 2026.10.4 parse rules (acp-replay.ts:40-146), or a
+    reason why 2026.10.4 could not import it."""
+    if not _rec(doc) or isinstance(doc.get("version"), bool) or doc.get("version") != 1 \
+            or not _rec(doc.get("sessions")):
+        return "not a version 1 ledger"
+    out = []
+    for sid, s in doc["sessions"].items():
+        if not _rec(s) or s.get("sessionId") != sid or not isinstance(s.get("sessionKey"), str) \
+                or not isinstance(s.get("cwd"), str) or not isinstance(s.get("complete"), bool) \
+                or not _js_num(s.get("createdAt")) or not _js_num(s.get("updatedAt")) \
+                or not _js_int(s.get("nextSeq"), 1) or not isinstance(s.get("events"), list):
+            return "invalid session"
+        events = []
+        for ev in s["events"]:
+            if not _rec(ev) or not _js_int(ev.get("seq"), 1) or not _js_num(ev.get("at")) \
+                    or ev.get("sessionId") != sid or not isinstance(ev.get("sessionKey"), str) \
+                    or not _rec(ev.get("update")) or not isinstance(ev["update"].get("sessionUpdate"), str):
+                return "invalid event"
+            if "runId" in ev and not (isinstance(ev["runId"], str) and ev["runId"]):
+                return "invalid run id"
+            events.append(ev)
+        seqs = [ev["seq"] for ev in events]
+        if len(set(seqs)) != len(seqs) or s["nextSeq"] <= max(seqs or [0]):
+            return "invalid sequencing"
+        out.append((sid, s, sorted(events, key=lambda e: e["seq"])))
+    return out
+
+
+def _acp_ledger_proof(path, state_db, q):
+    data = _read_regular_bytes(path, 64 * 1024 * 1024)
+    if data is None:
+        return _UNPROVEN, "not a regular file"
+    doc = _json_strict(data)
+    if doc is _MISSING:
+        return _UNPROVEN, "invalid JSON"
+    sessions = _acp_ledger_sessions(doc)
+    if isinstance(sessions, str):
+        return _UNPROVEN, sessions
+    if not sessions:
+        return _EMPTY, _NOTHING
+    by_id, evs = {}, {}
+    ids = [sid for sid, _s, _e in sessions]
+    for i in range(0, len(ids), 500):
+        chunk = _in_list(ids[i:i + 500])
+        srows = _rows(q, state_db, "SELECT session_id, session_key, cwd, complete, created_at, updated_at, next_seq "
+                                   "FROM acp_replay_sessions WHERE session_id IN (%s)" % chunk)
+        erows = _rows(q, state_db, "SELECT session_id, seq, at, session_key, run_id, update_json FROM "
+                                   "acp_replay_events WHERE session_id IN (%s) ORDER BY session_id, seq" % chunk)
+        if srows is None or erows is None:
+            return _UNPROVEN, "acp_replay_* tables not readable"
+        for r in srows:
+            by_id[_cell(r, 0)] = [_cell(r, k) for k in range(1, 7)]
+        for r in erows:
+            evs.setdefault(_cell(r, 0), []).append([_cell(r, k) for k in range(1, 6)])
+    def same_event(ev, stored):
+        seq, at, skey, run_id, upd = stored
+        upd = _json_strict(upd.encode("utf-8")) if isinstance(upd, str) else _MISSING
+        return _same_json(seq, ev["seq"]) and _same_json(at, ev["at"]) and skey == ev["sessionKey"] \
+            and run_id == ev.get("runId") and _same_json(upd, ev["update"])
+
+    missing, n_events = 0, 0
+    for sid, s, events in sessions:  # reconcileCanonicalSession (acp-replay.ts:158-216)
+        n_events += len(events)
+        row, stored = by_id.get(sid), evs.get(sid, [])
+        ok = row is not None and row[0] == s["sessionKey"] and row[1] == s["cwd"] \
+            and _same_json(row[2], 1 if s["complete"] else 0) and _same_json(row[3], s["createdAt"]) \
+            and _same_json(row[4], s["updatedAt"]) and _same_json(row[5], s["nextSeq"]) \
+            and len(stored) == len(events) and all(same_event(e, r) for e, r in zip(events, stored))
+        missing += not ok
+    if missing:
+        return _UNPROVEN, "%d of %d session(s) not in SQLite" % (missing, len(sessions))
+    return _IMPORTED, "%d session(s), %d event(s) in acp_replay_*" % (len(sessions), n_events)
+
+
+def _voicewake_proof(path, key, state_db, q):
+    data = _read_regular_bytes(path, 64 * 1024 * 1024)
+    if data is None:
+        return _UNPROVEN, "not a regular file"
+    twin = _archive_twin(path, _sha256_hex(data), 64 * 1024 * 1024)
+    if twin:
+        return _IMPORTED, "identical archived copy " + twin
+    doc = _json_strict(data)
+    if doc is _MISSING:
+        return _UNPROVEN, "invalid JSON"
+    rows = _rows(q, state_db, "SELECT value_json FROM config_machine_state WHERE state_key=%s" % _sql_str(key))
+    if rows is None:
+        return _UNPROVEN, "config_machine_state not readable"
+    stored = _json_strict(str(_cell(rows[0])).encode("utf-8")) if rows else _MISSING
+    if key == "voicewake.triggers":
+        # normalizeLegacyVoiceWakeTriggers: trimmed non-blank strings, else the defaults
+        raw = doc.get("triggers") if _rec(doc) else None
+        triggers = [_opt_str(t) for t in raw if _opt_str(t)] if isinstance(raw, list) else []
+        triggers = triggers or list(_VOICEWAKE_DEFAULT_TRIGGERS)
+        if stored is not _MISSING and _same_json(stored, triggers):
+            return _IMPORTED, "%s in SQLite" % key
+        if stored is _MISSING and triggers == _VOICEWAKE_DEFAULT_TRIGGERS:
+            return _EMPTY, _NOTHING + " (the default trigger words)"
+        return _UNPROVEN, "SQLite holds other trigger words" if stored is not _MISSING else "not in SQLite"
+    # voicewake.routing: compared with the raw file (stricter than 2026.10.4's normalized compare)
+    if _rec(stored) and _rec(doc) and _same_json(stored.get("defaultTarget"), doc.get("defaultTarget")) \
+            and _same_json(stored.get("routes"), doc.get("routes")):
+        return _IMPORTED, "%s in SQLite" % key
+    default = not _rec(doc) or (doc.get("defaultTarget") in (None, {"mode": "current"})
+                                and doc.get("routes") in (None, []))
+    if stored is _MISSING and default:
+        return _EMPTY, _NOTHING + " (the default routing)"
+    return _UNPROVEN, "SQLite holds other routing" if stored is not _MISSING else "not in SQLite"
+
+
+def _conversation_bindings_proof(path, state_db, q):
+    data = _read_regular_bytes(path, 64 * 1024 * 1024)
+    if data is None:
+        return _UNPROVEN, "not a regular file"
+    twin = _archive_twin(path, _sha256_hex(data), 64 * 1024 * 1024)
+    if twin:
+        return _IMPORTED, "identical archived copy " + twin
+    doc = _json_strict(data)
+    if doc is _MISSING:
+        return _UNPROVEN, "invalid JSON"
+    if not _rec(doc) or isinstance(doc.get("version"), bool) or doc.get("version") != 1 \
+            or not isinstance(doc.get("bindings"), list):
+        return _EMPTY, _NOTHING + " (no version 1 bindings)"
+    want = {}
+    for rec in doc["bindings"]:
+        conv = rec.get("conversation") if _rec(rec) else None
+        if not _rec(conv) or not conv.get("conversationId") or not _opt_str(rec.get("targetSessionKey")):
+            continue
+        acc = conv.get("accountId")
+        if acc is not None and not isinstance(acc, str):
+            return _UNPROVEN, "invalid account id"  # 2026.10.4 fails on it and leaves the file
+        cid = _opt_str(conv.get("conversationId")) or ""
+        parent = _opt_str(conv.get("parentConversationId"))
+        channel = (_opt_str(conv.get("channel")) or "").lower()
+        account = (_opt_str(acc) or "default").lower()  # approximates normalizeAccountId: a mismatch only HOLDs
+        k = (channel, account, parent if parent and parent != cid else "", cid)
+        want[k] = _opt_str(rec.get("targetSessionKey"))
+    if not want:
+        return _EMPTY, _NOTHING + " (no binding with a conversation and a target session)"
+    rows = _rows(q, state_db, "SELECT channel, account_id, COALESCE(parent_conversation_id, ''), conversation_id, "
+                              "target_session_key FROM current_conversation_bindings")
+    if rows is None:
+        return _UNPROVEN, "current_conversation_bindings not readable"
+    have = {tuple(_cell(r, k) for k in range(5)) for r in rows}
+    missing = sum(1 for k, target in want.items() if k + (target,) not in have)
+    if missing:
+        return _UNPROVEN, "%d of %d binding(s) not in SQLite" % (missing, len(want))
+    return _IMPORTED, "%d binding(s) in current_conversation_bindings" % len(want)
+
+
+def _plugin_approvals_proof(path, state_db, q):
+    data = _read_regular_bytes(path, 64 * 1024 * 1024)
+    if data is None:
+        return _UNPROVEN, "not a regular file"
+    twin = _archive_twin(path, _sha256_hex(data), 64 * 1024 * 1024)
+    if twin:
+        return _IMPORTED, "identical archived copy " + twin
+    doc = _json_strict(data)
+    if doc is _MISSING:
+        return _UNPROVEN, "invalid JSON"
+    if not _rec(doc) or isinstance(doc.get("version"), bool) or doc.get("version") != 1 \
+            or not isinstance(doc.get("approvals"), list):
+        return _EMPTY, _NOTHING + " (no version 1 approvals)"
+    want = {}
+    for item in doc["approvals"]:
+        e = item if _rec(item) else {}
+        root, pid = _opt_str(e.get("pluginRoot")), _opt_str(e.get("pluginId"))
+        channel = (_opt_str(e.get("channel")) or "").lower()
+        if root and pid and channel:
+            want[(root, channel, _opt_str(e.get("accountId")) or "default")] = pid
+    if not want:
+        return _EMPTY, _NOTHING + " (no complete approval)"
+    rows = _rows(q, state_db, "SELECT plugin_root, channel, account_id, plugin_id FROM plugin_binding_approvals")
+    if rows is None:
+        return _UNPROVEN, "plugin_binding_approvals not readable"
+    have = {tuple(_cell(r, k) for k in range(4)) for r in rows}
+    missing = sum(1 for k, pid in want.items() if k + (pid,) not in have)
+    if missing:
+        return _UNPROVEN, "%d of %d approval(s) not in SQLite" % (missing, len(want))
+    return _IMPORTED, "%d approval(s) in plugin_binding_approvals" % len(want)
+
+
+def _restart_receipt_decision(report_json, sha):
+    """The decision of a valid restart-sentinel migration report for exactly `sha` (readReceiptReport,
+    restart-sentinel-receipts.ts:29-50), else None."""
+    r = _json_strict(report_json.encode("utf-8")) if isinstance(report_json, str) else _MISSING
+    if not _rec(r) or r.get("source") != _RESTART_SENTINEL_KIND or r.get("target") != "gateway_restart_sentinel" \
+            or r.get("sourceSha256") != sha or not isinstance(r.get("sourceValid"), bool) \
+            or not all(_same_json(r.get(k), 0) or _same_json(r.get(k), 1)
+                       for k in ("importedRecordCount", "preservedSqliteRecordCount")) \
+            or r.get("decision") not in _RESTART_DECISIONS:
+        return None
+    return r["decision"]
+
+
+def _restart_sentinel_proof(path, state_db, q):
+    """Any recorded 2026.10.4 decision for exactly these bytes is proof (the receipt keys hash the absolute path;
+    matching on kind and sha256 alone also covers a copy of the state at another path)."""
+    data = _read_regular_bytes(path, _RESTART_SENTINEL_MAX)
+    if data is None:
+        st = _lstat(path)
+        return _UNPROVEN, ("larger than 4 MiB" if st is not None and stat.S_ISREG(st.st_mode)
+                           and st.st_size > _RESTART_SENTINEL_MAX else "not a regular file")
+    sha = _sha256_hex(data)
+    for sql in ("SELECT report_json FROM migration_sources WHERE migration_kind=%s AND source_sha256=%s"
+                % (_sql_str(_RESTART_SENTINEL_KIND), _sql_str(sha)),
+                "SELECT report_json FROM migration_runs WHERE id LIKE %s AND status='completed'"
+                % _sql_str("restart-sentinel-json:%:" + sha[:16])):
+        for r in _rows(q, state_db, sql) or ():
+            decision = _restart_receipt_decision(_cell(r), sha)
+            if decision:
+                return _IMPORTED, "receipt " + decision
+    return _UNPROVEN, "no receipt for sha256 %s..." % sha[:12]
+
+
+def _sandbox_registry_proof(path, registry_kind, sharded, state_db, q):
+    """Monolithic sandbox/<kind>s.json ({entries: [{containerName}]}) or sharded sandbox/<kind>s/*.json; strict:
+    an unreadable or invalid registry is unproven (2026.10.4 renamed it to .invalid-<time> without importing)."""
+    st = _lstat(path)
+    names = []
+    if not sharded:
+        if st is None or not stat.S_ISREG(st.st_mode):
+            return _UNPROVEN, "not a regular file"
+        data = _read_regular_bytes(path, 64 * 1024 * 1024)
+        doc = _json_strict(data) if data is not None else _MISSING
+        if not _rec(doc) or not isinstance(doc.get("entries"), list) \
+                or not all(_rec(e) and isinstance(e.get("containerName"), str) for e in doc["entries"]):
+            return _UNPROVEN, "not a valid registry file"
+        names = [e["containerName"] for e in doc["entries"]]
+    else:
+        if st is None or not stat.S_ISDIR(st.st_mode):
+            return _UNPROVEN, "not a directory"
+        try:
+            with os.scandir(path) as it:
+                shards = sorted(e.name for e in it if e.name.endswith(".json"))
+        except OSError:
+            return _UNPROVEN, "directory not readable"
+        for name in shards:
+            data = _read_regular_bytes(os.path.join(path, name), 64 * 1024 * 1024)
+            doc = _json_strict(data) if data is not None else _MISSING
+            if not _rec(doc) or not isinstance(doc.get("containerName"), str):
+                return _UNPROVEN, "invalid shard " + name
+            names.append(doc["containerName"])
+    if not names:
+        return _EMPTY, _NOTHING
+    rows = _rows(q, state_db, "SELECT container_name FROM sandbox_registry_entries WHERE registry_kind=%s"
+                 % _sql_str(registry_kind))
+    if rows is None:
+        return _UNPROVEN, "sandbox_registry_entries not readable"
+    have = {_cell(r) for r in rows}
+    missing = len({n for n in names if n not in have})
+    if missing:
+        return _UNPROVEN, "%d of %d entr(ies) not in SQLite" % (missing, len(set(names)))
+    return _IMPORTED, "%d entr(ies) in sandbox_registry_entries" % len(set(names))
+
+
+# (relative path(s), plan kind, HOLD code, label, proof(path, state_db, q)); fixed order, every 2026.10.5+ refusal
+_RUNTIME_FILE_FAMILIES = (
+    (("acp/event-ledger.json", "acp/event-ledger.json.doctor-import"), "acp-replay-ledger", "acp-ledger-unimported",
+     "ACP replay ledger", _acp_ledger_proof),
+    (("settings/voicewake.json",), "voicewake-json", "voicewake-unimported", "Voice Wake trigger words",
+     lambda p, db, q: _voicewake_proof(p, "voicewake.triggers", db, q)),
+    (("settings/voicewake-routing.json",), "voicewake-json", "voicewake-unimported", "Voice Wake routing",
+     lambda p, db, q: _voicewake_proof(p, "voicewake.routing", db, q)),
+    (("bindings/current-conversations.json",), "conversation-bindings-json", "conversation-bindings-unimported",
+     "conversation bindings", _conversation_bindings_proof),
+    (("plugin-binding-approvals.json",), "plugin-approvals-json", "plugin-approvals-unimported",
+     "plugin binding approvals", _plugin_approvals_proof),
+    (("restart-sentinel.json", "restart-sentinel.json.doctor-importing"), "restart-sentinel-json",
+     "restart-sentinel-unimported", "restart sentinel", _restart_sentinel_proof),
+)
+_SANDBOX_REGISTRIES = (("sandbox/containers.json", "container", False), ("sandbox/containers", "container", True),
+                       ("sandbox/browsers.json", "browser", False), ("sandbox/browsers", "browser", True))
+
+
 def classify_retired_state(state_dir, cfg, *, accepted, query=None, home="/config", env=None, mode="from-7x",
-                           workspaces=(), config_root=None):
+                           workspaces=(), config_root=None, caps=None):
     """Retired pre-July-2026 files and config keys that 10.2 doctor refuses (every gate mode).
 
     workspaces: absolute agent workspace dirs (dreaming JSON); config_root: the directory workspace files are
-    quarantined relative to (plan entries then carry "root": "config").
-    Returns {"plan": [{rel, kind, action, reason, size[, root]}], "findings": [...], "info": [...],
-    "config_removals": [path parts]} -- config_removals are applied by the from-7x pre-migrate step.
+    quarantined relative to (plan entries then carry "root": "config"). env: the environment OpenClaw runs with
+    (OPENCLAW_OAUTH_DIR; HOME/OPENCLAW_HOME for the default-home plugin-binding-approvals.json).
+    caps: oc_common.runtime_caps of the bundled OpenClaw (None: 2026.10.4). With runtime_files_retired /
+    sandbox_registry_retired (2026.10.5+) the runtime files 2026.10.4 still imported are checked too: quarantined
+    with proof that OpenClaw imported them (plan entry "proof") or when 2026.10.4 would import nothing, otherwise
+    an acceptable HOLD per file type.
+    Returns {"plan": [{rel, kind, action, reason, size[, root][, proof]}], "findings": [...], "info": [...],
+    "config_removals": [path parts], "config_rewrites": [...]} -- config_removals and config_rewrites
+    (retired_config_rewrites, from-7x only) are applied by the from-7x pre-migrate step.
     """
     q = query or _query_ro_local
     accepted = set(accepted or ())
@@ -2574,7 +3671,7 @@ def classify_retired_state(state_dir, cfg, *, accepted, query=None, home="/confi
     plan, info, removals = [], [], []
     by_code = {}
 
-    def add(abs_path, kind, action, reason, root="state"):
+    def add(abs_path, kind, action, reason, root="state", proof=None):
         rel = _within(config_root if root == "config" else state_dir, abs_path) \
             if root == "state" or config_root else None
         if rel is None:
@@ -2584,6 +3681,8 @@ def classify_retired_state(state_dir, cfg, *, accepted, query=None, home="/confi
         e = {"rel": rel, "kind": kind, "action": action, "reason": reason, "size": st.st_size if st is not None else 0}
         if root == "config":
             e["root"] = "config"
+        if proof:
+            e["proof"] = proof
         plan.append(e)
 
     def flag(code, item):
@@ -2720,7 +3819,10 @@ def classify_retired_state(state_dir, cfg, *, accepted, query=None, home="/confi
     if installs is not _MISSING:
         missing = sorted(str(x) for x in set(installs if _rec(installs) else ()) - index_ids)
         if mode != "from-7x":
-            pass  # reported by retired_config_findings as a hard config key
+            if installs == {} and _cap(caps, "empty_installs_tolerated"):
+                info.append("openclaw.json plugins.installs is an empty object; OpenClaw doctor removes it "
+                            "(install records stay in SQLite)")
+            # otherwise reported by retired_config_findings as a hard config key
         elif not missing or "plugins-installs-unindexed" in accepted:
             removals.append(["plugins", "installs"])
             if missing:
@@ -2798,6 +3900,36 @@ def classify_retired_state(state_dir, cfg, *, accepted, query=None, home="/confi
             info.append("telegram ingress spool: %d legacy Telegram update file(s); doctor imports them into the "
                         "SQLite ingress queue" % spool_ok)
 
+    # Runtime files OpenClaw 2026.10.5+ refuses (lstat existence like OpenClaw; 2026.10.4 still imported them):
+    # doctor's admission check (runtime JSON sidecars, restart sentinel) and its doctor:sandbox step.
+    families = list(_RUNTIME_FILE_FAMILIES) if _cap(caps, "runtime_files_retired") else []
+    # the retired approvals writer always used the default home (path.resolve compare, no symlink resolution)
+    if os.path.abspath(state_dir) != os.path.join(_openclaw_home(env, home), ".openclaw"):
+        families = [f for f in families if f[1] != "plugin-approvals-json"]
+    if _cap(caps, "sandbox_registry_retired"):
+        families += [((rel,), "sandbox-registry", "sandbox-registry-unimported", "sandbox registry",
+                      lambda p, db, qq, k=kind, s=sharded: _sandbox_registry_proof(p, k, s, db, qq))
+                     for rel, kind, sharded in _SANDBOX_REGISTRIES]
+    for rels, kind, code, label, proof in families:
+        for rel in rels:
+            path = os.path.join(state_dir, rel)
+            st, err = _lstat_checked(path)
+            if err:
+                flag("retired-state-uninspectable", "%s (%s)" % (path, err))
+                continue
+            if st is None:
+                continue
+            status, detail = proof(path, state_db, q)
+            if status == _IMPORTED:
+                add(path, kind, "quarantine", "retired pre-July-2026 %s; OpenClaw already imported it" % label,
+                    proof=detail)
+            elif status == _EMPTY:
+                add(path, kind, "quarantine", "retired pre-July-2026 %s with nothing OpenClaw 2026.10.4 would import"
+                    % label, proof=detail)
+            else:
+                acceptable(code, path, kind, "accepted: " + code, "retired pre-July-2026 %s (%s)" % (label, detail),
+                           "%s (%s)" % (rel, detail))
+
     messages = {
         "retired-state-outside": ("retired pre-July-2026 file(s) outside the state directory: %s; OpenClaw 2026.10 "
                                   "refuses them: move them away by hand (after a backup)"),
@@ -2827,20 +3959,60 @@ def classify_retired_state(state_dir, cfg, *, accepted, query=None, home="/confi
         "dreaming-json-unmigrated": ("pre-July-2026 dreaming file(s) whose state is not in SQLite: %s; OpenClaw 2026.10 "
                                      "stops on them. Accepting moves them to quarantine: dreaming starts its ingestion "
                                      "and short-term recall history afresh (MEMORY.md and memory notes are untouched)"),
+        # OpenClaw 2026.10.5+ (caps runtime_files_retired / sandbox_registry_retired)
+        "acp-ledger-unimported": ("pre-July-2026 ACP replay ledger(s) whose sessions are not in SQLite: %s; OpenClaw "
+                                  "2026.10.5 and later refuse them (doctor: \"Upgrade through OpenClaw 2026.9.7\"). "
+                                  "Accepting moves them to quarantine: ACP clients (IDE integrations) can no longer "
+                                  "replay those old sessions; nothing else uses the file"),
+        "voicewake-unimported": ("pre-July-2026 Voice Wake setting file(s) whose values are not in SQLite: %s; OpenClaw "
+                                 "2026.10.5 and later refuse them. Accepting moves them to quarantine: the Voice Wake "
+                                 "trigger words and routing of the macOS/iOS apps stay as SQLite holds them (default: "
+                                 "openclaw, claude, computer)"),
+        "conversation-bindings-unimported": ("pre-July-2026 bindings/current-conversations.json with bindings that are "
+                                             "not in SQLite: %s; OpenClaw 2026.10.5 and later refuse it. Accepting "
+                                             "moves it to quarantine: those chats lose their binding to a specific "
+                                             "session and use normal routing again"),
+        "plugin-approvals-unimported": ("pre-July-2026 plugin-binding-approvals.json with approvals that are not in "
+                                        "SQLite: %s; OpenClaw 2026.10.5 and later refuse it. Accepting moves it to "
+                                        "quarantine: those plugins ask again before binding a conversation"),
+        "restart-sentinel-unimported": ("pre-July-2026 restart-sentinel.json without an OpenClaw migration receipt for "
+                                        "its content: %s; OpenClaw 2026.10.5 and later refuse it. Accepting moves it "
+                                        "to quarantine: only the one-time restart/update notice of that old restart "
+                                        "is lost"),
+        "sandbox-registry-unimported": ("pre-July-2026 sandbox registry entries that are not in SQLite (or unreadable): "
+                                        "%s; OpenClaw 2026.10.5 and later refuse them (doctor reports its sandbox step "
+                                        "as failed on every run). Accepting moves them to quarantine: OpenClaw forgets "
+                                        "those Docker sandbox containers (they are recreated on demand; remove old "
+                                        "containers by hand if any exist)"),
     }
     hard = {"retired-state-outside", "retired-state-uninspectable", "telegram-spool-unsupported"}
     findings = [_finding(code, "hard" if code in hard else "acceptable", messages[code] % _brief(items), "precheck")
                 for code, items in by_code.items()]
-    return {"plan": plan, "findings": findings, "info": info, "config_removals": removals}
+    return {"plan": plan, "findings": findings, "info": info, "config_removals": removals,
+            "config_rewrites": retired_config_rewrites(cfg, caps) if mode == "from-7x" else []}
 
 
-def retired_config_findings(cfg, mode="from-7x"):
-    """Hard finding for retired config keys 10.2 doctor refuses (plugins.installs: see classify_retired_state)."""
-    paths, bridge = retired_config_keys(cfg)
+def retired_config_findings(cfg, mode="from-7x", caps=None, runtime=None):
+    """Hard finding for retired config keys 10.2 doctor refuses (plugins.installs: see classify_retired_state).
+
+    caps: oc_common.runtime_caps (None: 2026.10.4); runtime: the bundled OpenClaw version for the message. In from-7x
+    mode the keys the pre-migrate step rewrites (retired_config_rewrites) are left out; otherwise the message names
+    the exact fix for them."""
+    paths, bridge = retired_config_keys(cfg, caps)
+    fixes = {fmt_path(e["parts"]): e for e in retired_config_rewrites(cfg, caps)}
     if mode == "from-7x":
-        paths = [p for p in paths if p != "plugins.installs"]
+        paths = [p for p in paths if p != "plugins.installs" and p not in fixes]
     if not paths:
         return []
+    hints = [('set %s to "%s"' % (p, fixes[p]["value"])) if fixes[p]["op"] == "set" else
+             "delete %s (extension profiles find their relay themselves)" % p for p in paths if p in fixes]
+    if hints:  # bump/maintenance with a 2026.10.5+ runtime: name the exact fix
+        fix = "; ".join(hints[:10]) + (" (+%d more)" % (len(hints) - 10) if len(hints) > 10 else "")
+        if any(p not in fixes for p in paths):
+            fix += "; remove the others (or migrate them with OpenClaw %s)" % bridge
+        return [_finding("config-retired-keys", "hard",
+                         "openclaw.json contains settings OpenClaw %s refuses (retired before July 2026): %s. Fix: %s; "
+                         "then oc-upgrade retry" % (runtime or "2026.10", _brief(paths, 10), fix), "precheck")]
     return [_finding(
         "config-retired-keys", "hard",
         ("openclaw.json contains settings OpenClaw 2026.10 refuses (retired before July 2026): %s. OpenClaw "
@@ -2848,6 +4020,106 @@ def retired_config_findings(cfg, mode="from-7x"):
          "oc-upgrade retry" if mode == "from-7x" else
          "openclaw.json contains settings OpenClaw 2026.10 refuses (retired before July 2026): %s; remove them "
          "(or migrate them with OpenClaw %s), then oc-upgrade retry") % (_brief(paths, 10), bridge), "precheck")]
+
+
+# heartbeat.activeHours (2026.11.1 HeartbeatSchema, zod-schema.agent-runtime.ts:41-103): a strict object of optional
+# strings start/end/timezone; a non-empty start/end must be HH:MM 24h, 24:00 only as end. JS \d is ASCII and $ (no m
+# flag) is the end of the string: [0-9] and fullmatch.
+_HB_TIME_RE = re.compile(r"([01][0-9]|2[0-3]|24):([0-5][0-9])")
+_HB_ACTIVE_KEYS = ("start", "end", "timezone")
+
+
+def config_env_for_substitution(cfg, env):
+    """The variables OpenClaw substitutes ${NAME} with when it reads openclaw.json (io.read-helpers.ts
+    resolveConfigForRead: applyConfigEnvVars, then resolveConfigEnvVars): `env` (the process environment), where a
+    variable is unset or blank the config's own env.vars / env.<NAME> string values (collectConfigRuntimeEnvVars)."""
+    out = {}
+    block = cfg.get("env") if _rec(cfg) else None
+    if _rec(block):
+        cands = list(block["vars"].items()) if _rec(block.get("vars")) else []
+        cands += [(k, v) for k, v in block.items() if k not in ("shellEnv", "vars")]
+        out.update((k, v) for k, v in cands if isinstance(k, str) and isinstance(v, str))
+    out.update((k, v) for k, v in (env or {}).items() if isinstance(v, str) and v.strip())
+    return out
+
+
+def _heartbeat_hours_problems(heartbeat, parts, env=None):
+    """[(path, value, why)] for heartbeat.activeHours at `parts` (doctor: HeartbeatSchema.safeParse({activeHours})).
+
+    OpenClaw validates the config after its ${NAME} / ${NAME:-default} substitution (readConfigFileSnapshot ->
+    resolveConfigForRead; final config validation gates on that), so start/end are checked as substituted with `env`
+    (config_env_for_substitution): a template that yields a valid time passes, an unset variable without a default
+    stays as written and fails like OpenClaw's. The finding shows the value as written."""
+    if not _rec(heartbeat) or "activeHours" not in heartbeat:
+        return []
+    active, base = heartbeat["activeHours"], parts + ["activeHours"]
+    if not _rec(active):
+        return [(fmt_path(base), active, "expected an object with start/end (HH:MM) and optional timezone")]
+    out = [(fmt_path(base + [k]), active[k], "unknown key") for k in active if k not in _HB_ACTIVE_KEYS]
+    out += [(fmt_path(base + [k]), active[k], "expected a string") for k in _HB_ACTIVE_KEYS
+            if k in active and not isinstance(active[k], str)]
+    for k in ("start", "end"):
+        raw = active.get(k)
+        value = env_substituted(raw, env) if isinstance(raw, str) else raw
+        if not isinstance(value, str) or not value:
+            continue
+        m = _HB_TIME_RE.fullmatch(value)
+        if not m:
+            why = 'invalid time (use "HH:MM" 24h format)'
+        elif m.group(1) == "24" and m.group(2) != "00":
+            why = "invalid time (24:00 is the only allowed 24:xx value)"
+        elif m.group(1) == "24" and k == "start":
+            why = "invalid time (start cannot be 24:00)"
+        else:
+            continue
+        if value != raw or "${" in raw:
+            why += ", after OpenClaw's ${VAR} substitution"
+        out.append((fmt_path(base + [k]), raw, why))
+    return out
+
+
+def heartbeat_hours_findings(cfg, caps=None, runtime=None, env=None):
+    """Hard `config-heartbeat-hours` for invalid heartbeat.activeHours windows (caps heartbeat_hours_kept, 2026.11.1+).
+
+    OpenClaw 2026.10.4 and 2026.10.10 doctor removed an invalid window (unrestricted hours afterwards); from 2026.11.1
+    it keeps it and reports it (openclaw/openclaw#186305, legacy-config-core-migrate.ts:55-73), so the final config
+    stays invalid and `doctor --fix` exits 1 with "Doctor blocked" (#187192) after it has started migrating. Port of
+    reportInvalidHeartbeatActiveHours: agents.defaults.heartbeat, then every record of the agent roster
+    (readAgentRosterProperty: agents.entries if present, else agents.list). env: the environment OpenClaw's doctor
+    gets (None: os.environ), for its ${VAR} substitution (_heartbeat_hours_problems). Read-only; [] without the
+    capability."""
+    if not _cap(caps, "heartbeat_hours_kept") or not _rec(cfg) or not _rec(cfg.get("agents")):
+        return []
+    agents = cfg["agents"]
+    env = config_env_for_substitution(cfg, os.environ if env is None else env)
+    probs = _heartbeat_hours_problems(_get(agents, ["defaults", "heartbeat"], None),
+                                      ["agents", "defaults", "heartbeat"], env)
+    kind = "entries" if "entries" in agents else "list" if "list" in agents else None
+    roster = agents.get(kind) if kind else None
+    if kind == "entries" and _rec(roster):
+        for key, agent in roster.items():
+            if _rec(agent):
+                probs += _heartbeat_hours_problems(agent.get("heartbeat"), ["agents", "entries", key, "heartbeat"],
+                                                   env)
+    elif kind == "list" and isinstance(roster, list):
+        for i, agent in enumerate(roster):
+            if _rec(agent):
+                probs += _heartbeat_hours_problems(agent.get("heartbeat"), ["agents", "list", i, "heartbeat"], env)
+    if not probs:
+        return []
+
+    def show(value):
+        text = json.dumps(value, ensure_ascii=False)
+        return text if len(text) <= 60 else text[:57] + "..."
+
+    items = ["%s=%s (%s)" % (path, show(value), why) for path, value, why in probs]
+    return [_finding(
+        "config-heartbeat-hours", "hard",
+        "openclaw.json has heartbeat windows that OpenClaw %s refuses: %s. Its doctor no longer removes them "
+        "(openclaw/openclaw#186305) and would stop with \"Doctor blocked\" after the migration has started. Fix: "
+        "set each to HH:MM (00:00-23:59, 24:00 only as end) or remove that activeHours (an agent then uses "
+        "agents.defaults.heartbeat.activeHours; without one, heartbeats run at any hour), then oc-upgrade retry"
+        % (runtime or "2026.11.1+", _brief(items, 6)), "precheck")]
 
 
 def _exact_cols(cols, expected):
@@ -3008,6 +4280,14 @@ def _find_key_paths(node, key, parts=None):
     return out
 
 
+def include_paths(cfg, raw_text=None):
+    """fmt_path of each $include key of openclaw.json; ["(raw text)"] when only its text has one."""
+    inc = [fmt_path(p) for p in _find_key_paths(cfg, "$include")] if isinstance(cfg, (dict, list)) else []
+    if not inc and isinstance(raw_text, str) and re.search(r'"\$include"\s*:', raw_text):
+        inc = ["(raw text)"]
+    return inc
+
+
 def config_precheck(cfg, raw_text):
     """Hard config findings: config-unreadable (not an object), config-includes ($include, B14),
     custom-session-store (non-empty session.store)."""
@@ -3016,9 +4296,7 @@ def config_precheck(cfg, raw_text):
         return [_finding("config-unreadable", "hard",
                          "openclaw.json must be a strict JSON object (JSON5 comments are unsupported)", phase)]
     findings = []
-    inc = [fmt_path(p) for p in _find_key_paths(cfg, "$include")]
-    if not inc and isinstance(raw_text, str) and re.search(r'"\$include"\s*:', raw_text):
-        inc = ["(raw text)"]
+    inc = include_paths(cfg, raw_text)
     if inc:
         findings.append(_finding(
             "config-includes", "hard",

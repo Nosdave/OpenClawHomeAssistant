@@ -224,11 +224,15 @@ options:
   glm_thinking_levels: true
   # Hours after a finished gate run ([gate] done, or when a hold after it was
   # cleared, if later) before the add-on deletes OpenClaw's doctor captures of
-  # that run (/config/.openclaw.update-captures/doctor-*). Copies earlier add-on
-  # versions left (gate archives in /share/openclaw-upgrade/, rehearsal exports in
-  # /share/openclaw-rehearsal/, the plaintext 2026.7 archives in
-  # /config/.openclaw/upgrade-backups/) go after the same hours, counted from
-  # their own time. 0 = never delete. A change applies from the next add-on start.
+  # that run (/config/.openclaw.update-captures/doctor-*) and the SQLite copies
+  # its doctor passes saved beside the databases (*.pre-startup-migration-*.bak,
+  # .scoped.bak), and the gate's own plaintext copies of openclaw.json in the
+  # run directory (/config/.openclaw-upgrade/gate/runs/<run>/config.*.json, with
+  # the saved models status output). Copies earlier add-on versions left (gate archives in
+  # /share/openclaw-upgrade/, rehearsal exports in /share/openclaw-rehearsal/,
+  # the plaintext 2026.7 archives in /config/.openclaw/upgrade-backups/) go after
+  # the same hours, counted from their own time. 0 = never delete. A change
+  # applies from the next add-on start.
   gate_cleanup_hours: 48
   # Before it changes the state, the gate requires an encrypted Home Assistant
   # backup that contains this add-on (taken before the update) and is at most
