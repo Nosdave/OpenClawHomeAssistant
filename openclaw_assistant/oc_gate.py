@@ -1527,16 +1527,18 @@ def _snippet(norm, idx, width=160):
 
 def blocked_message(rc, norm, idx):
     """HOLD reason of doctor-blocked: the [error] findings doctor listed before "Doctor blocked" (path and message,
-    redacted, at most 5), else the text around the marker."""
+    each redacted on its own, at most 5), else the text around the marker. The path and the message are redacted
+    apart: joined, a path that ends in a secret-like key (…apiKey, …botToken) reads as "key: value" and the
+    redaction would hide doctor's message (its zod messages do not echo config values)."""
     found = []
     for m in _BLOCKED_FINDING_RE.finditer(norm[:idx]):
         where = m.group(2).strip()
-        item = (f"{where}: " if where else f"{m.group(1)}: ") + m.group(3).strip()
+        item = f"{C.redact_text(where or m.group(1))}: {C.redact_text(m.group(3).strip())}"
         if item not in found:
             found.append(item)
     if not found:
         return f"doctor rc {rc}: ...{_snippet(norm, idx)}..."
-    shown = "; ".join(C.redact_text(f)[:200] for f in found[:5])  # redact first: a cut never exposes more
+    shown = "; ".join(f[:200] for f in found[:5])  # redacted before the cut: a cut never exposes more
     more = f" (+{len(found) - 5} more in oc-upgrade log)" if len(found) > 5 else ""
     return f"doctor rc {rc}: doctor blocked, required repairs remain incomplete: {shown}{more}"
 
@@ -2154,10 +2156,15 @@ class Gate:
         if not (self.j or {}).get("first_write_at"):
             F += self.retired_format_findings(mode, cfg_ok)
         # 6c every gate mode (also on a resume): heartbeat windows that OpenClaw 2026.11.1+ doctor keeps invalid and
-        # then stops on ("Doctor blocked"); runtime_caps heartbeat_hours_kept, so nothing on 2026.10.4/2026.10.10
+        # then stops on ("Doctor blocked"); runtime_caps heartbeat_hours_kept, so nothing on 2026.10.4/2026.10.10.
+        # Checked after ${VAR} substitution with the environment the gate gives doctor (OpenClaw validates that)
         if cfg_ok:
+            try:
+                denv = C.openclaw_env()
+            except Exception:  # noqa: BLE001 - only the substitution depends on it
+                denv = dict(os.environ)
             F += [dict(f) for f in mig().heartbeat_hours_findings(self.cfg, caps=self.caps(),
-                                                                  runtime=self.pkg["version"])]
+                                                                  runtime=self.pkg["version"], env=denv)]
         # 7 sizes (and F1: a backup stores a symlinked state/agent directory or workspace root as a bare link)
         links = state_symlinks(p["STATE"], self.cls) + self.workspace_symlinks()
         if links:
@@ -5787,12 +5794,61 @@ def _npm_name(spec):
     return s.split("@", 1)[0] or None
 
 
+def _slot_value(value):
+    """OpenClaw's normalizeSlotValue (plugins/slots.ts): a trimmed string, None for "none", "" when unset/blank."""
+    t = value.strip() if isinstance(value, str) else ""
+    return None if t.lower() == "none" else t
+
+
+def plugin_config_off(cfg, pid, channel_ids=()):
+    """OpenClaw's "disabled" verdict from openclaw.json alone for an installed npm plugin (not bundled, not a
+    workspace plugin): resolvePluginActivationStateShared (plugins/config-activation-shared.ts, the same in 2026.10.4
+    and 2026.11.1) in its order: plugins.enabled false, plugins.deny, plugins.entries.<id>.enabled false, every
+    channel it owns disabled (channels.<channel>.enabled false; channel_ids: its manifest's channels, else its id),
+    a non-empty plugins.allow without it (unless it holds the memory or context engine slot). OpenClaw's reason, or
+    None (enabled or OpenClaw's default: `openclaw plugins list` and plugins-sync count it). allow/deny compare in
+    lower case (normalizePluginPolicyId)."""
+    plugins = _cfg_get(cfg if isinstance(cfg, dict) else {}, "plugins")
+    plugins = plugins if isinstance(plugins, dict) else {}
+
+    def ids(key):
+        v = plugins.get(key)
+        return {x.strip().lower() for x in v if isinstance(x, str) and x.strip()} if isinstance(v, list) else set()
+
+    policy = pid.strip().lower()
+    if plugins.get("enabled") is False:
+        return "plugins disabled"
+    if policy in ids("deny"):
+        return "blocked by denylist"
+    entries = plugins.get("entries") if isinstance(plugins.get("entries"), dict) else {}
+    ent = entries.get(pid)
+    if isinstance(ent, dict) and ent.get("enabled") is False:
+        return "disabled in config"
+    channels = _cfg_get(cfg if isinstance(cfg, dict) else {}, "channels")
+    if isinstance(channels, dict):
+        cands = [c.strip().lower() for c in channel_ids if isinstance(c, str) and c.strip()] or [policy]
+        states = [channels[c].get("enabled") if isinstance(channels.get(c), dict) else None for c in cands]
+        if all(x is False for x in states):
+            return "channel disabled in config"
+    slots = plugins.get("slots") if isinstance(plugins.get("slots"), dict) else {}
+    memory = _slot_value(slots.get("memory"))
+    if pid in ("memory-core" if memory == "" else memory, _slot_value(slots.get("contextEngine"))):
+        return None  # a selected slot passes the allowlist (unset memory slot: its default owner memory-core)
+    allow = ids("allow")
+    if allow and policy not in allow:
+        return "not in allowlist"
+    return None
+
+
 def official_plugin_installs(state_dir, cfg):
     """[{id, package, version, enabled}] of the official npm plugins (@openclaw/*) OpenClaw installed, sorted by id.
 
     Read-only: the install records in config_machine_state 'plugins.installedIndex' (index.installRecords; the
     7.x installed_plugin_index table as a fallback), the version from <installPath>/package.json when readable,
-    enabled from openclaw.json plugins.entries.<id>.enabled (None: OpenClaw's default). Never raises."""
+    enabled from openclaw.json plugins.entries.<id>.enabled (None: OpenClaw's default), False also when OpenClaw
+    disables it through plugins.enabled, plugins.deny, plugins.allow or its channel (plugin_config_off; channels from
+    <installPath>/openclaw.plugin.json): `openclaw plugins list` then lists it as disabled and plugins-sync leaves it
+    alone. Never raises."""
     state_dir = Path(state_dir)
     sdb = state_dir / "state" / "openclaw.sqlite"
     records = {}
@@ -5823,13 +5879,16 @@ def official_plugin_installs(state_dir, cfg):
         pkg_name = pkg_name or _npm_name(rec.get("spec")) or _npm_name(rec.get("resolvedSpec"))
         if not pkg_name or not pkg_name.startswith(OFFICIAL_PLUGIN_SCOPE):
             continue
-        version = None
+        version, channel_ids = None, ()
         ip = rec.get("installPath")
         if isinstance(ip, str) and ip:
             ipp = Path(ip) if os.path.isabs(ip) else state_dir / ip
             data = C.load_json_or_none(ipp / "package.json")
             if isinstance(data, dict) and isinstance(data.get("version"), str):
                 version = data["version"]
+            manifest = C.load_json_or_none(ipp / "openclaw.plugin.json")
+            if isinstance(manifest, dict) and isinstance(manifest.get("channels"), list):
+                channel_ids = tuple(manifest["channels"])
         if version is None:
             for k in ("resolvedVersion", "version"):
                 if isinstance(rec.get(k), str) and rec[k]:
@@ -5837,6 +5896,8 @@ def official_plugin_installs(state_dir, cfg):
                     break
         ent = entries.get(pid)
         enabled = ent.get("enabled") if isinstance(ent, dict) and isinstance(ent.get("enabled"), bool) else None
+        if plugin_config_off(cfg, pid, channel_ids):
+            enabled = False
         out_.append({"id": pid, "package": pkg_name, "version": version, "enabled": enabled})
     return sorted(out_, key=lambda x: x["id"])
 

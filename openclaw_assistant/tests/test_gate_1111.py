@@ -12,6 +12,7 @@ doctor-health-contribution.ts renderStructuredHealthFindings, legacy-config-core
 
 import json
 import shutil
+import sqlite3
 import sys
 import unittest
 from pathlib import Path
@@ -98,6 +99,37 @@ class HeartbeatHoursFindingTests(unittest.TestCase):
         f = self.codes({"agents": {"defaults": {"heartbeat": {"activeHours": "08:00-22:00"}}}})
         self.assertIn('agents.defaults.heartbeat.activeHours="08:00-22:00"', f[0]["message"])
 
+    def test_env_templates_checked_as_openclaw_substitutes_them(self):
+        """OpenClaw validates the config after its ${NAME} / ${NAME:-default} substitution (resolveConfigForRead), so
+        a template that yields a valid time is no finding; an unset variable without a default stays as written."""
+        def codes(cfg, env):
+            return M.heartbeat_hours_findings(cfg, caps=CAPS_1111, runtime="2026.11.1", env=env)
+
+        ok = [("${QUIET_END:-07:00}", {}), ("${QUIET_END:-07:00}", {"QUIET_END": ""}),  # empty: the default
+              ("${QUIET_END}", {"QUIET_END": "06:30"}), ("${QUIET_END:-7am}", {"QUIET_END": "07:15"}),
+              ("${QUIET_END:-}", {})]  # empty after substitution: no window bound
+        for start, env in ok:
+            with self.subTest(start=start, env=env):
+                self.assertEqual(codes(self.hb(start=start, end="22:00"), env), [])
+        bad = [("${QUIET_END}", {}), ("${QUIET_END:-7am}", {}), ("${QUIET_END}", {"QUIET_END": "25:00"}),
+               ("$${QUIET_END}", {"QUIET_END": "07:00"}),  # escaped: the literal "${QUIET_END}"
+               ("$QUIET_END", {"QUIET_END": "07:00"})]  # no ${...}: OpenClaw does not substitute it
+        for start, env in bad:
+            with self.subTest(start=start, env=env):
+                f = codes(self.hb(start=start, end="22:00"), env)
+                self.assertEqual([x["code"] for x in f], ["config-heartbeat-hours"])
+                self.assertIn(f"agents.defaults.heartbeat.activeHours.start={json.dumps(start)}", f[0]["message"])
+        f = codes(self.hb(start="${QUIET_END}"), {"QUIET_END": "25:00"})
+        self.assertIn(", after OpenClaw's ${VAR} substitution)", f[0]["message"])
+        self.assertNotIn("25:00", f[0]["message"])  # the value as written, not the variable's value
+        # the config's own env.vars / env.<NAME> when the process has none (applyConfigEnvVars)
+        for block in ({"vars": {"QUIET_END": "06:00"}}, {"QUIET_END": "06:00"}):
+            with self.subTest(block=block):
+                cfg = dict(self.hb(start="${QUIET_END}", end="22:00"), env=block)
+                self.assertEqual(codes(cfg, {}), [])
+                self.assertEqual(codes(cfg, {"QUIET_END": " "}), [])  # a blank process value does not win
+                self.assertEqual(len(codes(cfg, {"QUIET_END": "25:00"})), 1)  # the process value wins
+
     def test_agent_roster_like_read_agent_roster_property(self):
         bad = {"heartbeat": {"activeHours": {"start": "7:30", "end": "22:00"}}}
         f = self.codes({"agents": {"list": [{"id": "main"}, dict(bad, id="ops")]}})
@@ -164,6 +196,25 @@ class DoctorBlockedTests(unittest.TestCase):
         self.assertEqual(ev["code"], "doctor-blocked")
         self.assertIn("Doctor blocked; required repairs remain incomplete", ev["message"])
 
+    def test_secret_named_path_keeps_doctor_message(self):
+        # the path and doctor's message are redacted apart: "<…apiKey>: <message>" joined reads as key: value
+        cases = [("plugins.entries.brave.config.webSearch.apiKey", 'SecretRef provider "vault" is not configured'),
+                 ("channels.telegram.botToken", "Invalid input: expected string, received object"),
+                 ("gateway.auth.token", "Too small: expected string to have >=16 characters"),
+                 ("models.providers.glm.apiKey", "Invalid input: expected string, received number")]
+        for path, msg in cases:
+            with self.subTest(path=path):
+                ev = G.evaluate_doctor(1, blocked_text(("core/doctor/final-config-validation", path, msg,
+                                                        FIX_CONFIG)))
+                self.assertEqual(ev["code"], "doctor-blocked")
+                self.assertTrue(ev["message"].endswith(f"remain incomplete: {path}: {msg}"), ev["message"])
+                self.assertNotIn("***", ev["message"])
+        # a secret in doctor's message itself is still hidden
+        ev = G.evaluate_doctor(1, blocked_text(("core/doctor/final-config-validation", "models.providers.x.apiKey",
+                                                "apiKey: sk-AAAAAAAAAAAAAAAAAAAA is not accepted", FIX_CONFIG)))
+        self.assertNotIn("sk-AAAAAAAAAAAAAAAAAAAA", ev["message"])
+        self.assertIn("models.providers.x.apiKey: apiKey: ***", ev["message"])
+
     def test_rc0_and_older_doctor_texts_unchanged(self):
         # only a failing doctor is classified by markers (2026.11.1 exits 1 when blocked)
         self.assertIsNone(G.evaluate_doctor(0, "Doctor complete.\n")["code"])
@@ -213,6 +264,26 @@ class Gate1111Tests(T.GateEnv):
         self.assertEqual(self.run_gate(), 0, self.out)
         self.assertEqual(self.state_uv(), 22)
 
+    def test_env_template_window_as_doctor_reads_it(self):
+        # a ${VAR:-default} that yields a valid time: OpenClaw's final validation passes, so no HOLD
+        cfg = json.loads(json.dumps(self.cfg))
+        cfg["agents"]["defaults"]["heartbeat"]["activeHours"] = {"start": "${OC_TEST_HB_UNSET_7F3:-07:00}",
+                                                                 "end": "22:00"}
+        self.write_cfg(cfg)
+        self.assertEqual(self.run_gate(), 0, self.out)
+        self.assertNotIn("config-heartbeat-hours", self.out)
+        self.assertEqual(self.state_uv(), 22)
+
+    def test_env_template_without_value_holds(self):
+        # unset and no default: OpenClaw keeps the placeholder and its validation fails ("Doctor blocked")
+        cfg = json.loads(json.dumps(self.cfg))
+        cfg["agents"]["defaults"]["heartbeat"]["activeHours"] = {"start": "${OC_TEST_HB_UNSET_7F3}", "end": "22:00"}
+        self.write_cfg(cfg)
+        self.assertEqual(self.run_gate(), 20, self.out)
+        self.assertEqual(self.journal()["hold"]["codes"], ["config-heartbeat-hours"])
+        self.assertIn('activeHours.start="${OC_TEST_HB_UNSET_7F3}" (invalid time (use "HH:MM" 24h format), after '
+                      "OpenClaw's ${VAR} substitution)", (self.upg / "hold.txt").read_text())
+
     def test_no_hold_before_2026_11_1(self):
         # 2026.10.10 doctor removes the invalid window itself (unrestricted hours afterwards)
         self.set_runtime("2026.10.10", 22, 27)
@@ -242,6 +313,86 @@ class Gate1111Tests(T.GateEnv):
         self.assertIn("doctor blocked, required repairs remain incomplete: channels.telegram.streaming: Invalid "
                       "option: expected one of off|partial|block", hold)
         self.assertIn(G.ADVICE["doctor-blocked"], hold)
+
+
+class PluginConfigOffTests(unittest.TestCase):
+    """plugin_config_off: OpenClaw's resolvePluginActivationStateShared for an npm (global) plugin from openclaw.json
+    (config-activation-shared.ts, the same order in 2026.10.4 and 2026.11.1)."""
+
+    def off(self, plugins=None, channels=None, pid="acpx", channel_ids=()):
+        cfg = {}
+        if plugins is not None:
+            cfg["plugins"] = plugins
+        if channels is not None:
+            cfg["channels"] = channels
+        return G.plugin_config_off(cfg, pid, channel_ids)
+
+    def test_rules_in_openclaws_order(self):
+        on = {"entries": {"acpx": {"enabled": True}}}
+        self.assertIsNone(self.off())
+        self.assertIsNone(self.off(on))
+        self.assertEqual(self.off(dict(on, enabled=False)), "plugins disabled")
+        self.assertEqual(self.off(dict(on, deny=["ACPX "])), "blocked by denylist")
+        self.assertEqual(self.off({"entries": {"acpx": {"enabled": False}}}), "disabled in config")
+        # a non-empty allowlist without it wins over entries.<id>.enabled true; an empty one allows everything
+        self.assertEqual(self.off(dict(on, allow=["brave", "codex"])), "not in allowlist")
+        self.assertIsNone(self.off(dict(on, allow=[])))
+        self.assertIsNone(self.off({"allow": ["Acpx"]}))
+        # a selected slot passes the allowlist (unset memory slot: memory-core)
+        self.assertIsNone(self.off({"allow": ["brave"], "slots": {"contextEngine": " acpx "}}))
+        self.assertIsNone(self.off({"allow": ["brave"], "slots": {"memory": "acpx"}}))
+        self.assertEqual(self.off({"allow": ["brave"], "slots": {"memory": "none"}}), "not in allowlist")
+        self.assertIsNone(self.off({"allow": ["brave"]}, pid="memory-core"))
+        # its channels (manifest channels, else its id): all disabled -> disabled; one enabled or unset -> not
+        self.assertEqual(self.off(on, {"matrix": {"enabled": False}}, pid="matrix"), "channel disabled in config")
+        self.assertEqual(self.off(on, {"a": {"enabled": False}, "b": {"enabled": False}}, pid="x",
+                                  channel_ids=["a", "b"]), "channel disabled in config")
+        self.assertIsNone(self.off(on, {"a": {"enabled": False}, "b": {}}, pid="x", channel_ids=["a", "b"]))
+        self.assertIsNone(self.off(on, {"a": {"enabled": False}, "b": {"enabled": True}}, pid="x",
+                                   channel_ids=["a", "b"]))
+
+
+class PluginStatus1111Tests(T.GateEnv):
+    """oc-upgrade status says to delete the plugin marker only for plugins plugins-sync updates: OpenClaw's own verdict
+    (plugins.enabled, plugins.deny, plugins.allow), not only plugins.entries.<id>.enabled."""
+
+    def setUp(self):
+        super().setUp()
+        T.make_1004_state(self.state)
+        self.set_runtime("2026.11.1", 22, 27)
+        idx = {"index": {"installRecords": {
+            "acpx": {"source": "npm", "spec": "@openclaw/acpx@2026.10.4", "resolvedVersion": "2026.10.4"},
+            "codex": {"source": "npm", "spec": "@openclaw/codex@2026.11.1", "resolvedVersion": "2026.11.1"}}}}
+        con = sqlite3.connect(str(self.state / "state" / "openclaw.sqlite"))
+        con.execute("INSERT INTO config_machine_state VALUES ('plugins.installedIndex', ?, 0)", (json.dumps(idx),))
+        con.commit()
+        con.close()
+        self.marker = G.plugin_cohort_marker(self.state, "2026.11.1")
+        self.marker.write_text("2026.11.1\n")
+
+    def status_line(self, plugins):
+        self.write_cfg({"meta": {"lastTouchedVersion": "2026.11.1"}, "gateway": {"mode": "local"},
+                        "plugins": plugins})
+        return next(x for x in G.status_lines() if x.startswith("Official plugins:"))
+
+    def test_plugins_openclaw_disables_get_no_marker_advice(self):
+        for plugins in ({"allow": ["brave", "codex"]}, {"deny": ["acpx"]}, {"enabled": False},
+                        {"allow": ["brave", "codex"], "entries": {"acpx": {"enabled": True}}}):
+            with self.subTest(plugins=plugins):
+                line = self.status_line(plugins)
+                self.assertIn("@openclaw/acpx 2026.10.4 (disabled)", line)
+                self.assertNotIn(".plugin_cohort_", line)
+                self.assertNotIn("not at OpenClaw", line)
+                # plugins-sync agrees: a list without the disabled acpx does not keep the marker away
+                installs = G.official_plugin_installs(self.state, G._read_cfg_lenient())
+                listed = T.plugins_list_output([T.listed_plugin("codex", "@openclaw/codex", "2026.11.1")])
+                self.assertEqual(G.unlisted_official_installs(listed, installs), [])
+        # enabled by OpenClaw's rules (allowlisted, or no allowlist): the advice stays
+        for plugins in ({"allow": ["acpx", "codex"]}, {}):
+            with self.subTest(plugins=plugins):
+                line = self.status_line(plugins)
+                self.assertIn(f"not at OpenClaw 2026.11.1: @openclaw/acpx (enabled or changed after the add-on's "
+                              f"update step for 2026.11.1; to update: delete {self.marker}", line)
 
 
 class Docs1111Tests(unittest.TestCase):

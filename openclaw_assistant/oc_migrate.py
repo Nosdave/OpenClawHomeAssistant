@@ -4013,8 +4013,27 @@ _HB_TIME_RE = re.compile(r"([01][0-9]|2[0-3]|24):([0-5][0-9])")
 _HB_ACTIVE_KEYS = ("start", "end", "timezone")
 
 
-def _heartbeat_hours_problems(heartbeat, parts):
-    """[(path, value, why)] for heartbeat.activeHours at `parts` (doctor: HeartbeatSchema.safeParse({activeHours}))."""
+def config_env_for_substitution(cfg, env):
+    """The variables OpenClaw substitutes ${NAME} with when it reads openclaw.json (io.read-helpers.ts
+    resolveConfigForRead: applyConfigEnvVars, then resolveConfigEnvVars): `env` (the process environment), where a
+    variable is unset or blank the config's own env.vars / env.<NAME> string values (collectConfigRuntimeEnvVars)."""
+    out = {}
+    block = cfg.get("env") if _rec(cfg) else None
+    if _rec(block):
+        cands = list(block["vars"].items()) if _rec(block.get("vars")) else []
+        cands += [(k, v) for k, v in block.items() if k not in ("shellEnv", "vars")]
+        out.update((k, v) for k, v in cands if isinstance(k, str) and isinstance(v, str))
+    out.update((k, v) for k, v in (env or {}).items() if isinstance(v, str) and v.strip())
+    return out
+
+
+def _heartbeat_hours_problems(heartbeat, parts, env=None):
+    """[(path, value, why)] for heartbeat.activeHours at `parts` (doctor: HeartbeatSchema.safeParse({activeHours})).
+
+    OpenClaw validates the config after its ${NAME} / ${NAME:-default} substitution (readConfigFileSnapshot ->
+    resolveConfigForRead; final config validation gates on that), so start/end are checked as substituted with `env`
+    (config_env_for_substitution): a template that yields a valid time passes, an unset variable without a default
+    stays as written and fails like OpenClaw's. The finding shows the value as written."""
     if not _rec(heartbeat) or "activeHours" not in heartbeat:
         return []
     active, base = heartbeat["activeHours"], parts + ["activeHours"]
@@ -4025,9 +4044,10 @@ def _heartbeat_hours_problems(heartbeat, parts):
             if k in active and not isinstance(active[k], str)]
     for k in ("start", "end"):
         raw = active.get(k)
-        if not isinstance(raw, str) or not raw:
+        value = env_substituted(raw, env) if isinstance(raw, str) else raw
+        if not isinstance(value, str) or not value:
             continue
-        m = _HB_TIME_RE.fullmatch(raw)
+        m = _HB_TIME_RE.fullmatch(value)
         if not m:
             why = 'invalid time (use "HH:MM" 24h format)'
         elif m.group(1) == "24" and m.group(2) != "00":
@@ -4036,33 +4056,39 @@ def _heartbeat_hours_problems(heartbeat, parts):
             why = "invalid time (start cannot be 24:00)"
         else:
             continue
+        if value != raw or "${" in raw:
+            why += ", after OpenClaw's ${VAR} substitution"
         out.append((fmt_path(base + [k]), raw, why))
     return out
 
 
-def heartbeat_hours_findings(cfg, caps=None, runtime=None):
+def heartbeat_hours_findings(cfg, caps=None, runtime=None, env=None):
     """Hard `config-heartbeat-hours` for invalid heartbeat.activeHours windows (caps heartbeat_hours_kept, 2026.11.1+).
 
     OpenClaw 2026.10.4 and 2026.10.10 doctor removed an invalid window (unrestricted hours afterwards); from 2026.11.1
     it keeps it and reports it (openclaw/openclaw#186305, legacy-config-core-migrate.ts:55-73), so the final config
     stays invalid and `doctor --fix` exits 1 with "Doctor blocked" (#187192) after it has started migrating. Port of
     reportInvalidHeartbeatActiveHours: agents.defaults.heartbeat, then every record of the agent roster
-    (readAgentRosterProperty: agents.entries if present, else agents.list). Read-only; [] without the capability."""
+    (readAgentRosterProperty: agents.entries if present, else agents.list). env: the environment OpenClaw's doctor
+    gets (None: os.environ), for its ${VAR} substitution (_heartbeat_hours_problems). Read-only; [] without the
+    capability."""
     if not _cap(caps, "heartbeat_hours_kept") or not _rec(cfg) or not _rec(cfg.get("agents")):
         return []
     agents = cfg["agents"]
+    env = config_env_for_substitution(cfg, os.environ if env is None else env)
     probs = _heartbeat_hours_problems(_get(agents, ["defaults", "heartbeat"], None),
-                                      ["agents", "defaults", "heartbeat"])
+                                      ["agents", "defaults", "heartbeat"], env)
     kind = "entries" if "entries" in agents else "list" if "list" in agents else None
     roster = agents.get(kind) if kind else None
     if kind == "entries" and _rec(roster):
         for key, agent in roster.items():
             if _rec(agent):
-                probs += _heartbeat_hours_problems(agent.get("heartbeat"), ["agents", "entries", key, "heartbeat"])
+                probs += _heartbeat_hours_problems(agent.get("heartbeat"), ["agents", "entries", key, "heartbeat"],
+                                                   env)
     elif kind == "list" and isinstance(roster, list):
         for i, agent in enumerate(roster):
             if _rec(agent):
-                probs += _heartbeat_hours_problems(agent.get("heartbeat"), ["agents", "list", i, "heartbeat"])
+                probs += _heartbeat_hours_problems(agent.get("heartbeat"), ["agents", "list", i, "heartbeat"], env)
     if not probs:
         return []
 
