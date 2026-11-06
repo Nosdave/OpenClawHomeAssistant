@@ -665,6 +665,42 @@ class CronKeyCopyGateTests(T.GateEnv):
         self.assertNotIn("\n", "".join(lines))  # a provider key cannot add a log line
         self.assertEqual(G.cron_key_fix_lines({"key_fix": [{"provider": ""}, "x", None]}), [])
 
+    def test_key_fix_line_variants_while_held(self):
+        """held (oc-upgrade status during a HOLD): no bare command the wrapper refuses (config set, automations);
+        a catalog key (a hand edit) and a forecast's "after the start" stay as they are."""
+        ref = G.CRON_ENV_REF
+        rec = {"runtime": "2026.11.1", "affected": [{"primary_affected": True, "refs": ["own/m"]}], "key_fix": [
+            {"provider": "cat", "path": "models.providers.cat", "auth": None, "where": "catalog", "pending": False},
+            {"provider": "tok", "path": "models.providers.tok", "auth": "token", "where": "config", "pending": False},
+            {"provider": "fc", "path": "models.providers.fc", "auth": None, "where": "config", "pending": True},
+            {"provider": "own", "path": "models.providers.own", "auth": None, "where": "config", "pending": True,
+             "own_login": True}]}
+        plain, held = G.cron_key_fix_lines(rec), G.cron_key_fix_lines(rec, held=True)
+        self.assertEqual((held[0], held[2]), (plain[0], plain[2]))
+        self.assertIn("after the start, run: openclaw config set models.providers.fc.auth api-key", held[2])
+        self.assertTrue(held[1].endswith(
+            "give the key as an env SecretRef: a gateway_env_vars entry and " + ref + " as models.providers.tok.apiKey"
+            ", set in openclaw.json by hand (while OpenClaw is held the wrapper refuses openclaw config set) or after "
+            "the HOLD is cleared: openclaw config set models.providers.tok.apiKey '" + ref + "' --strict-json "
+            "(models.providers.tok.auth \"token\" stays)"), held[1])
+        self.assertEqual(held[3], "provider own: OpenClaw 2026.11.1 runs own on a stored login of its own (a "
+                         "subscription login, a token or another API key), not on the literal key in "
+                         "models.providers.own.apiKey. To keep them and their fallbacks, set models.providers.own.auth "
+                         "to \"api-key\" in openclaw.json by hand (while OpenClaw is held the wrapper refuses openclaw "
+                         "config set), or after the HOLD is cleared run: openclaw config set models.providers.own.auth "
+                         "api-key (OpenClaw then uses the configured key for own, not the stored copy; no restart "
+                         "needed), or give the key as an env SecretRef (a gateway_env_vars entry and " + ref + " as "
+                         "models.providers.own.apiKey in openclaw.json); this makes every run of own, not only cron, "
+                         "use the configured key instead of that login. To keep the login, after the HOLD is cleared: "
+                         "drop own from the job's fallbacks (openclaw automations edit <id> --fallbacks <list> without "
+                         "it), and for a job whose own model is on own the last resort below")
+        self.assertEqual(held[3].replace(
+            "set models.providers.own.auth to \"api-key\" in openclaw.json by hand (while OpenClaw is held the wrapper "
+            "refuses openclaw config set), or after the HOLD is cleared run: ", "run: ").replace(
+            "a gateway_env_vars entry and " + ref + " as models.providers.own.apiKey in openclaw.json",
+            "a gateway_env_vars entry, then openclaw config set models.providers.own.apiKey '" + ref + "' "
+            "--strict-json").replace("To keep the login, after the HOLD is cleared:", "To keep the login:"), plain[3])
+
     def test_bracket_path_for_a_provider_key_that_is_no_identifier(self):
         cfg = json.loads(json.dumps(CFG_GLM))
         cfg["models"]["providers"]["my.glm"] = cfg["models"]["providers"].pop("glm")
@@ -981,6 +1017,46 @@ class CronConfigFixupTests(T.GateEnv):
         self.assertIn("job-glm-haus", [a["id"] for a in j["cron_binding"]["affected"]])
         self.assertTrue([ln for ln in self.out.splitlines() if ln.startswith("WARN [gate] provider glm:")
                          and "openclaw config set models.providers.glm.auth api-key" in ln])
+
+    def test_status_key_fix_line_during_a_postconditions_hold(self):
+        """As test_resume_does_not_repeat_it, but the resumed run HOLDs in postconditions after the cron report
+        (pc-legacy-state). Status during that HOLD words the key fix line like the drift WARN above it (the wrapper
+        refuses openclaw config set while OpenClaw is held); once the HOLD is cleared, the plain command again."""
+        self.doctor_copies_key("2026.11.1", rc=1)
+        self.assertEqual(self.run_gate(), 20, self.out)
+        cfg = self.cfg_now()
+        del cfg["models"]["providers"]["glm"]["auth"]
+        self.write_cfg(cfg)
+        self.doctor_copies_key("2026.11.1")
+        self.assertEqual(self.quiet(G.retry_cmd, []), 0)
+        os.environ["FAKE_OC_MODE"] = "lint-legacy"
+        self.assertEqual(self.run_gate(), 20, self.out)
+        j = self.journal()
+        self.assertEqual((j["hold"]["code"], j["hold"]["phase"]), ("pc-legacy-state", "postconditions"))
+        self.assertIn("job-glm-haus", [a["id"] for a in j["cron_binding"]["affected"]])
+        self.assertTrue((self.upg / "hold.txt").exists())
+        head = ("    provider glm: OpenClaw 2026.11.1 runs glm on a stored login although models.providers.glm.apiKey "
+                "holds a key (a literal value, which OpenClaw's doctor copies into its auth store). To lift the "
+                "refusal for the cron jobs above that use glm and keep their fallbacks, ")
+        cmd = ("openclaw config set models.providers.glm.auth api-key (OpenClaw then uses the configured key for glm, "
+               "not the stored login; no restart needed), or give the key as an env SecretRef (")
+        st = G.status_lines()
+        self.assertTrue([x for x in st if x.startswith("  WARN: openclaw.json no longer holds this run's config "
+                                                       "fixup") and "after the HOLD is cleared" in x], st)
+        self.assertIn(head + "set models.providers.glm.auth to \"api-key\" in openclaw.json by hand (while OpenClaw is "
+                      "held the wrapper refuses openclaw config set), or after the HOLD is cleared run: " + cmd
+                      + f"a gateway_env_vars entry and {G.CRON_ENV_REF} as models.providers.glm.apiKey in "
+                      "openclaw.json)", st)
+        self.assertFalse([x for x in st if x.startswith("    provider glm:") and "run: openclaw config set" in x
+                          and "after the HOLD is cleared" not in x], st)
+        # accepted: finalize (hold.txt removed) and status give the plain command
+        self.assertEqual(self.quiet(G.retry_cmd, ["--accept", "pc-legacy-state"]), 0)
+        self.assertEqual(self.run_gate(), 0, self.out)
+        self.assertFalse((self.upg / "hold.txt").exists())
+        plain = (head + "run: " + cmd + "a gateway_env_vars entry, then openclaw config set "
+                 f"models.providers.glm.apiKey '{G.CRON_ENV_REF}' --strict-json)")
+        self.assertIn("WARN [gate] " + plain.strip(), self.out.splitlines())
+        self.assertIn(plain, G.status_lines())
 
     def test_interrupted_write_and_idempotence(self):
         """A write cut off before its journal record ("pending") counts as applied when openclaw.json has it; one

@@ -600,6 +600,20 @@ def configured_agent_ids(cfg):
     return out_ids
 
 
+_AGENT_ID_RE = re.compile(r"[a-z0-9][a-z0-9_-]{0,63}", re.I | re.A)  # as oc_migrate._AGENT_ID_RE
+
+
+def norm_agent_id(value):
+    """oc_migrate.normalize_agent_id (OpenClaw's normalizeAgentId: "Haus Agent" -> "haus-agent"; listAgentIds and
+    resolveDefaultAgentId give configured ids in this form), copied because classify runs at plan time, which must
+    not import oc_migrate (mig()); a test keeps both the same."""
+    t = value.strip() if isinstance(value, str) else ""
+    n = t.lower()
+    if _AGENT_ID_RE.fullmatch(t):
+        return n
+    return re.sub(r"[^a-z0-9_-]+", "-", n).strip("-")[:64] or "main"
+
+
 def agent_databases(state_dir, cfg, state_tables):
     """(targets, orphans): targets = configured ∪ registered agent DBs [(id, Path)], orphans = other globbed DBs."""
     state_dir = Path(state_dir)
@@ -810,7 +824,8 @@ def classify(state_dir, cfg, s_target, a_target, runtime, held=None):
         if eff >= s_target and "cron_run_logs" in tables:
             res["gate"].append("legacy cron_run_logs table present")
     targets, orphans = agent_databases(state_dir, cfg, tables)
-    configured = set(configured_agent_ids(cfg)) if held else set()
+    # ids compared as OpenClaw compares them: the store of "Haus Agent" is registered as haus-agent
+    configured = {norm_agent_id(a) for a in configured_agent_ids(cfg)} if held else set()
     skip_held = bool(held) and C.runtime_caps(runtime)["held_store_skip"]
     for aid, pth in targets:
         v = agent_db_version(pth)
@@ -819,7 +834,7 @@ def classify(state_dir, cfg, s_target, a_target, runtime, held=None):
         h = held.get(os.path.realpath(pth)) if v < a_target else None
         if h is not None:
             entry = {"id": aid, "path": C.rel(pth, state_dir), "uv": v, "reason": h[1]}
-            if aid in configured or aid.lower() in configured:
+            if norm_agent_id(aid) in configured:
                 # a pending deletion is not held from doctor: 2026.10.10 prepares (migrates) its store for the
                 # deletion recovery (openclaw-agent-db-maintenance.ts preparePendingAgentDeletionDatabases...)
                 if h[1] != HELD_PENDING:
@@ -3773,19 +3788,19 @@ class Gate:
         held_store_skip) each configured agent store below the target says what OpenClaw does with it."""
         if not self.caps()["held_store_skip"]:
             return list(cls["gate"])
-        configured = set(configured_agent_ids(cfg))
-        default = default_agent_id(cfg)
+        configured = {norm_agent_id(a) for a in configured_agent_ids(cfg)}  # as OpenClaw compares them
+        default = norm_agent_id(default_agent_id(cfg))
         held_cfg = {h["path"]: h["reason"] for h in cls.get("held_configured") or []}
         notes = {}
         for key, relp in (cls.get("agent_paths") or {}).items():
             uv = (cls.get("agents") or {}).get(key)
             if uv is None or uv >= cls["targets"]["agent"]:
                 continue
-            aid = (cls.get("agent_ids") or {}).get(key, key)
+            aid = norm_agent_id((cls.get("agent_ids") or {}).get(key, key))
             bits = []
             if aid == default:
                 bits.append("configured default agent: the gateway refuses to start (exit 78) or stays not ready")
-            elif aid in configured or aid.lower() in configured:
+            elif aid in configured:
                 bits.append("configured agent: OpenClaw refuses this agent")
             if relp in held_cfg:
                 bits.append(f"held back by doctor: {held_cfg[relp]}")
@@ -4492,19 +4507,22 @@ def _cron_outlook(aff, rec):
     return out
 
 
-def cron_key_fix_lines(rec, indent=""):
+def cron_key_fix_lines(rec, indent="", held=False):
     """One line per provider of a cron_account_report record's key_fix: OpenClaw's doctor copies (copied) the
     provider's literal key into its auth store, a stored login on which the cron jobs above are refused; the fix
     keeps them and their fallbacks: auth "api-key" (accepted by 2026.10.4 too) or an env SecretRef (the only one
     offered with auth "oauth"/"token"; for a key only in a model catalog: declare it in openclaw.json). Provider ids
-    and config paths only, never a key value."""
+    and config paths only, never a key value. held (`oc-upgrade status`): OpenClaw is held (hold.txt), so the wrapper
+    refuses `openclaw config set` and `openclaw automations` until the HOLD is cleared; a command not already
+    deferred to "after the start" is worded like the drift line (cron_fixup_drift_lines): the hand edit of
+    openclaw.json, or the command after the HOLD is cleared."""
     rt = (rec or {}).get("runtime") or "2026.10.10+"
     lines = []
     for p_, k in _cron_key_fix(rec).items():
         p, base = printable(p_), printable(k.get("path") or f"models.providers.{p_}")
         pending = bool(k.get("pending"))
-        env_ref = (f"a gateway_env_vars entry, then openclaw config set {shlex.quote(base + '.apiKey')} "
-                   f"'{CRON_ENV_REF}' --strict-json")
+        env_cmd = f"openclaw config set {shlex.quote(base + '.apiKey')} '{CRON_ENV_REF}' --strict-json"
+        env_ref = f"a gateway_env_vars entry, then {env_cmd}"
         how = ("To keep them and their fallbacks, " if pending else
                f"To lift the refusal for the cron jobs above that use {p} and keep their fallbacks, ")
         if k.get("where") == "catalog":
@@ -4529,18 +4547,28 @@ def cron_key_fix_lines(rec, indent=""):
             else:
                 head = (f"provider {p}: OpenClaw {rt} runs {p} on a stored login although {base}.apiKey holds a key (a "
                         "literal value, which OpenClaw's doctor copies into its auth store)")
+            # "after the start" (pending, no login of its own) already defers the commands past a HOLD
+            by_hand = held and (own or not pending)
+            refused = "while OpenClaw is held the wrapper refuses openclaw config set"
             if k.get("auth") in ("oauth", "token"):
-                fix = how + f"give the key as an env SecretRef: {env_ref} ({base}.auth \"{k['auth']}\" stays)"
+                ref = (f"a gateway_env_vars entry and {CRON_ENV_REF} as {base}.apiKey, set in openclaw.json by hand "
+                       f"({refused}) or after the HOLD is cleared: {env_cmd}" if by_hand else env_ref)
+                fix = how + f"give the key as an env SecretRef: {ref} ({base}.auth \"{k['auth']}\" stays)"
             else:
-                fix = (how + f"run: openclaw config set {shlex.quote(base + '.auth')} api-key (OpenClaw then uses the "
+                fix = (how + (f"set {base}.auth to \"api-key\" in openclaw.json by hand ({refused}), or after the "
+                              "HOLD is cleared run: " if by_hand else "run: ")
+                       + f"openclaw config set {shlex.quote(base + '.auth')} api-key (OpenClaw then uses the "
                        f"configured key for {p}, not the stored {'copy' if pending else 'login'}; no restart needed"
                        + ("; 2026.10.4 accepts this setting and runs the same" if pending and not own else "")
-                       + f"), or give the key as an env SecretRef ({env_ref})")
+                       + "), or give the key as an env SecretRef ("
+                       + (f"a gateway_env_vars entry and {CRON_ENV_REF} as {base}.apiKey in openclaw.json" if by_hand
+                          else env_ref) + ")")
             if own:  # prepare-auth.ts providerBindingSuppressesProfiles: for every run of the provider, not only cron
                 prim = any(a.get("primary_affected") and str((a.get("refs") or [""])[0]).split("/", 1)[0] == p_
                            for a in (rec or {}).get("affected") or [] if isinstance(a, dict))
                 fix += (f"; this makes every run of {p}, not only cron, use the configured key instead of that login. "
-                        f"To keep the login: drop {p} from the job's fallbacks (openclaw automations edit <id> "
+                        "To keep the login" + (", after the HOLD is cleared" if by_hand else "")
+                        + f": drop {p} from the job's fallbacks (openclaw automations edit <id> "
                         "--fallbacks <list> without it)"
                         + (f", and for a job whose own model is on {p} the last resort below" if prim else ""))
         lines.append(f"{indent}{head}. {fix}")
@@ -7372,7 +7400,7 @@ def _status_cron(j):
         L.append(f"    {cron_job_label(a)}: {what}; {shown}")
     if len(aff) > CRON_REPORT_MAX:
         L.append(f"    and {len(aff) - CRON_REPORT_MAX} more")
-    L += cron_key_fix_lines(rec, "    ")
+    L += cron_key_fix_lines(rec, "    ", held=gpaths()["HOLD"].exists())  # the wrapper refuses config set while held
     L.append("    " + "".join(x + ". " for x in _cron_outlook(aff, rec)) + _cron_remedy(aff, bool(_cron_key_fix(rec))))
     if un:
         L.append(f"  {un}")

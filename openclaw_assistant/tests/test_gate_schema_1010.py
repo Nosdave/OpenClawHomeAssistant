@@ -157,6 +157,36 @@ class HeldClassifyTests(T.GateEnv):
         self.assertEqual(c["held_configured"], [])
         self.assertIn(f"{AGENT.format('old')}: agent schema 24 < 27", c["gate"])
 
+    def test_agent_ids_compared_as_openclaw_compares_them(self):
+        """OpenClaw lists configured agent ids normalised (agent-roster.ts listAgentIds, resolveDefaultAgentId:
+        normalizeAgentId): "Haus Agent" configures the store registered as haus-agent. Its retained store is
+        held_configured (hard agent-db-held), and pc-schema names it as the configured (default) agent."""
+        T.make_1004_agent_db(self.state, "haus-agent")
+        register(self.state, "haus-agent", 24)
+        journal_row(self.state, "haus-agent", 1, 0)
+        entry = {"id": "haus-agent", "path": AGENT.format("haus-agent"), "uv": 24, "reason": G.HELD_RETAINED}
+        for ident in ("haus-agent", "Haus Agent", " HAUS.AGENT "):
+            with self.subTest(ident=ident):
+                cfg = dict(CFG_1004, agents={"list": [{"id": "main", "default": True}, {"id": ident}]})
+                c = G.classify(self.state, cfg, 22, 27, "2026.10.10", held=G.deletion_journal_held(self.state))
+                self.assertEqual((c["held_configured"], c["held"]), ([entry], []))
+        self.set_runtime("2026.10.10", 22, 27)
+        g = G.Gate(emit=lambda s: None)
+        g.pkg = C.runtime_package()
+        held = (f"{AGENT.format('haus-agent')}: agent schema 24 < 27 ({{}}; held back by doctor: "
+                f"{G.HELD_RETAINED})")
+        main = f"{AGENT.format('main')}: agent schema 24 < 27 ({{}})"
+        dflt = "configured default agent: the gateway refuses to start (exit 78) or stays not ready"
+        conf = "configured agent: OpenClaw refuses this agent"
+        for default in ("Haus Agent", "Main"):
+            with self.subTest(default=default):
+                cfg = dict(CFG_1004, agents={"list": [{"id": x, "default": x == default}
+                                                      for x in ("Main", "Haus Agent")]})
+                c = G.classify(self.state, cfg, 22, 27, "2026.10.10", held=G.deletion_journal_held(self.state))
+                items = g.pc_schema_items(c, cfg)
+                self.assertIn(held.format(dflt if default == "Haus Agent" else conf), items)
+                self.assertIn(main.format(conf if default == "Haus Agent" else dflt), items)
+
     def test_held_orphan_is_flagged(self):
         T.make_1004_agent_db(self.state, "ghost")
         journal_row(self.state, "ghost", 1, 0)
@@ -185,6 +215,17 @@ class HeldClassifyTests(T.GateEnv):
         probs = G.schema_meta_problems(self.state, cls, pkg)
         self.assertIn("agent_databases[other].schema_version 24", probs)
         self.assertNotIn("agent_databases[old].schema_version 24", probs)
+
+
+class AgentIdTests(unittest.TestCase):
+    def test_norm_agent_id_is_oc_migrate_normalize_agent_id(self):
+        """classify runs at plan time without oc_migrate: its copy of normalize_agent_id must stay the same."""
+        import oc_migrate as M  # noqa: PLC0415
+        self.assertEqual((G._AGENT_ID_RE.pattern, G._AGENT_ID_RE.flags), (M._AGENT_ID_RE.pattern, M._AGENT_ID_RE.flags))
+        for raw in ("main", "Ops", " Haus Agent ", "a.b", "---", "", None, 5, "x" * 64, "x" * 70, "X" * 65,
+                    "Ünïcode Agent", "mail_bot-2", "-lead", "_lead", "a b\tc", "MAIN", "İstanbul", "a" + "é" * 70):
+            with self.subTest(raw=raw):
+                self.assertEqual(G.norm_agent_id(raw), M.normalize_agent_id(raw))
 
 
 class DoctorHeldTests(unittest.TestCase):
