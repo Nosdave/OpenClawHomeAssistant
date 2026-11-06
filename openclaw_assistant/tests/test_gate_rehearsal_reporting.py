@@ -22,6 +22,7 @@ import signal
 import sys
 import tempfile
 import textwrap
+import time
 import unittest
 from datetime import timedelta
 from pathlib import Path
@@ -196,6 +197,18 @@ DETACHING_PARENT = textwrap.dedent('''
 ''')
 
 
+# A2: like OpenClaw's doctor on SIGTERM ("settling admitted repairs"): it keeps waiting for its detached npm child
+SETTLING_PARENT = textwrap.dedent('''
+    import signal, subprocess, sys
+    signal.signal(signal.SIGTERM, lambda *_a: None)
+    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"], start_new_session=True,
+                             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    open(sys.argv[1], "w").write(str(child.pid))
+    child.wait()
+    sys.exit(3)
+''')
+
+
 @unittest.skipUnless(os.path.isdir("/proc/self"), "needs /proc")
 class DetachedDescendantTests(unittest.TestCase):
     def setUp(self):
@@ -243,6 +256,43 @@ class DetachedDescendantTests(unittest.TestCase):
         res = self.run_parent(60, timeout=None, stop_event=ev, kill_grace=1, tick=0.2)
         self.assertTrue(res.stopped)
         self.assertFalse(self.alive(self.child))
+
+    def test_stop_request_reaches_the_detached_child_at_once(self):
+        """Rehearsal A2: on a stop request doctor waited for its detached npm (own session), which killpg did not
+        reach, so the gate waited the whole grace period (240 s) and killed doctor (rc -9). The detached descendants
+        now get the SIGTERM at once: the child ends, the parent exits by itself long before its grace period."""
+        import threading
+        (self.tmp / "settling.py").write_text(SETTLING_PARENT)
+        ev = threading.Event()
+        timer = threading.Timer(1.5, ev.set)
+        timer.start()
+        self.addCleanup(timer.cancel)
+        start = time.monotonic()
+        res = C.run_process([sys.executable, str(self.tmp / "settling.py"), str(self.pidfile)], timeout=None,
+                            stop_event=ev, stop_grace=30, log_path=self.tmp / "log", cwd=str(self.tmp), tick=0.2)
+        self.child = int(self.pidfile.read_text())
+        self.assertLess(time.monotonic() - start, 15)
+        self.assertTrue(res.stopped)
+        self.assertFalse(res.killed)
+        self.assertEqual(res.rc, 3)  # it ended by itself
+        self.assertFalse(self.alive(self.child))
+        self.assertIn("[oc] SIGTERM also to 1 descendant process(es) outside its process group",
+                      (self.tmp / "log").read_text())
+
+    def test_killed_after_the_grace_period_is_reported(self):
+        res = self.run_parent(60, timeout=1.0, kill_grace=0.5, tick=0.2)
+        self.assertTrue(res.timed_out)
+        self.assertEqual(res.rc, -signal.SIGTERM)  # the parent ends on SIGTERM: no SIGKILL needed
+        self.assertFalse(res.killed)
+        import threading
+        (self.tmp / "stubborn.py").write_text("import signal, time\nsignal.signal(signal.SIGTERM, lambda *a: None)\n"
+                                              "time.sleep(60)\n")
+        ev = threading.Event()
+        ev.set()
+        res = C.run_process([sys.executable, str(self.tmp / "stubborn.py")], timeout=None, stop_event=ev,
+                            stop_grace=1, log_path=self.tmp / "log2", cwd=str(self.tmp), tick=0.2)
+        self.assertTrue(res.stopped and res.killed)
+        self.assertEqual(res.rc, -signal.SIGKILL)
 
     def test_proc_helpers(self):
         st = C._proc_stat(os.getpid())

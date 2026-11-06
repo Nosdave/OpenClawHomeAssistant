@@ -881,11 +881,15 @@ class DoctorCopiesTests(Base):
         lines = []
         self.assertEqual(G.cleanup_pass(now=finished + timedelta(hours=47), hours=48, emit=lines.append), 0)
         self.assertTrue((self.state / self.full).exists())
-        self.assertEqual(G.cleanup_pass(now=finished + timedelta(hours=48), hours=48, emit=lines.append), 2)
+        plain = G.run_plaintext_copies(G.gpaths(), j["run_id"])  # A5: the run's config copies go at the same time
+        self.assertTrue(plain)
+        self.assertEqual(G.cleanup_pass(now=finished + timedelta(hours=48), hours=48, emit=lines.append),
+                         2 + len(plain))
         self.assertFalse((self.state / self.full).exists() or (self.state / self.scoped).exists())
+        self.assertFalse([p for p in plain if os.path.lexists(p)])
         self.assertTrue(self.old.exists())
         self.assertTrue(self.sdb.exists())
-        self.assertIn(f"[cleanup] run {j['run_id']}: deleted 2 item(s)", "\n".join(lines))
+        self.assertIn(f"[cleanup] run {j['run_id']}: deleted {2 + len(plain)} item(s)", "\n".join(lines))
 
     def test_later_pass_copy_warns(self):
         self.doctor_script(passes=[self.step_1010(retire=False), dict(self.step_1010(retire=False), write={
@@ -1020,7 +1024,9 @@ class DoctorCopiesTests(Base):
             (str(made), f"beside an agent database outside {self.state}: not deleted by the add-on, delete it "
                         "yourself")])
         lines = []
-        self.assertEqual(G.cleanup_pass(now=finished + timedelta(hours=48), hours=48, emit=lines.append), 1, lines)
+        plain = G.run_plaintext_copies(G.gpaths(), j["run_id"])  # A5: the run's config copies go at the same time
+        self.assertEqual(G.cleanup_pass(now=finished + timedelta(hours=48), hours=48, emit=lines.append),
+                         1 + len(plain), lines)
         self.assertEqual(G.cleanup_pass(now=finished + timedelta(hours=49), hours=48, emit=lines.append), 0, lines)
         self.assertFalse((self.state / self.full).exists())
         self.assertTrue(made.exists() and older.exists())

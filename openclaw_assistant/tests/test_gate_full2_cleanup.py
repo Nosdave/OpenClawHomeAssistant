@@ -257,7 +257,7 @@ class CleanupTests(CleanupEnv):
         self.assertEqual(G.run_due_base(j), datetime.strptime(j["finished_at"], "%Y-%m-%dT%H:%M:%SZ")
                          .replace(tzinfo=timezone.utc))
         # finalize names the same due time the cleanup uses (computed a moment after finished_at)
-        said = [x for x in self.out.splitlines() if "info: the doctor captures of this run are deleted after " in x]
+        said = [x for x in self.out.splitlines() if "info: the doctor captures of this run and the gate's plaintext copies " in x]
         self.assertEqual(len(said), 1, self.out)
         self.assertTrue(said[0].endswith(" (gate_cleanup_hours=48)"), said[0])
         announced = datetime.strptime(said[0].split(" deleted after ")[1].split(" ")[0], "%Y-%m-%dT%H:%M:%SZ") \
@@ -266,33 +266,47 @@ class CleanupTests(CleanupEnv):
 
         keep, refused = G.run_captures(self.gp, j)
         self.assertEqual((sorted(keep), refused), (caps, []))
-        self.assertEqual([t[2:4] for t in G.cleanup_targets(self.gp, due, 48) if t[0] == rid], [(due, caps)])
+        # A5/A7: the run's plaintext copies of openclaw.json and the saved models status output go with them
+        rd = self.gp["RUNS"] / rid
+        copies = G.run_plaintext_copies(self.gp, rid)
+        names = {c.name for c in copies}
+        self.assertTrue({"config.pre-gate.json", "config.pre-pass1.json", "config.post-pass1.json",
+                         "config.post-pass2.json", "config.final.json", "pc-models-status.json"} <= names, names)
+        self.assertTrue(all(G.RUN_PLAINTEXT_RE.match(n) and n.endswith(".json") for n in names))
+        self.assertEqual({p.name for p in rd.iterdir() if G.RUN_PLAINTEXT_RE.match(p.name)}, names)
+        self.assertEqual([t[2:4] for t in G.cleanup_targets(self.gp, due, 48) if t[0] == rid], [(due, caps + copies)])
+        n = len(caps) + len(copies)
 
         # one second before: nothing deleted, announced once
         self.assertEqual(self.cleanup(due - SEC), 0)
-        self.assertEqual(self.lines, [f"[cleanup] run {rid}: 2 item(s) (doctor captures, doctor SQLite copies / "
-                                      f"archive) will be deleted at {iso(due)}"])
+        self.assertEqual(self.lines, [f"[cleanup] run {rid}: {n} item(s) (doctor captures, doctor SQLite copies, "
+                                      f"plaintext config copies / archive) will be deleted at {iso(due)}"])
         rec = self.record(rid)
         self.assertEqual((rec["due_at"], rec["announced_at"]), (iso(due), iso(due - SEC)))
         self.assertTrue(all(c.is_dir() for c in caps))
+        self.assertTrue(all(c.is_file() for c in copies))
         self.assertEqual(self.cleanup(due - SEC), 0)
         self.assertEqual(self.lines, [])  # repeated passes are silent
 
-        # at the due time: both captures go, nothing else
-        self.assertEqual(self.cleanup(due), 2)
+        # at the due time: both captures and the plaintext copies go, nothing else
+        self.assertEqual(self.cleanup(due), n)
         self.assertEqual(len(self.lines), 1, self.text)
-        self.assertTrue(self.lines[0].startswith(f"[cleanup] run {rid}: deleted 2 item(s), "), self.text)
-        for c in caps:
+        self.assertTrue(self.lines[0].startswith(f"[cleanup] run {rid}: deleted {n} item(s), "), self.text)
+        for c in caps + copies:
             self.assertFalse(os.path.lexists(c), c)
         self.assertTrue(stray.is_dir())
         self.assertTrue(self.caps.is_dir())
         self.assertEqual([p.name for p in self.caps.iterdir()], [stray.name])  # no tombstone left behind
         rec = self.record(rid)
         self.assertEqual(rec["deleted_at"], iso(due))
-        self.assertEqual(sorted(d["path"] for d in rec["deleted"]), sorted(str(c) for c in caps))
+        self.assertEqual(sorted(d["path"] for d in rec["deleted"]), sorted(str(c) for c in caps + copies))
         self.assertTrue(all(d["bytes"] > 0 for d in rec["deleted"]), rec)
-        # the gate's own records survive (only the captures are deleted)
+        # the gate's own records survive (only the captures and the plaintext copies are deleted)
         self.assertTrue((self.gp["RUNS"] / rid / "doctor-pass1.log").exists())
+        for keep_name in ("journal.json", "transform-ledger.json", "events.log", "cleanup.json"):
+            if keep_name != "journal.json" or (rd / keep_name).exists():
+                self.assertTrue((rd / keep_name).exists(), keep_name)
+        self.assertEqual(G.run_plaintext_copies(self.gp, rid), [])
         self.assertTrue((self.upg / "gate" / "migrated.json").exists())
 
         # idempotent: a later pass is a silent no-op and leaves the record alone
@@ -301,20 +315,51 @@ class CleanupTests(CleanupEnv):
         self.assertEqual(self.record(rid), rec)
         self.assertNotIn("SECRET", self.out)
 
+    def test_run_plaintext_copies_only_regular_files_of_a_real_run_dir(self):
+        """A5/A7: only regular files named like the gate's config copies / models status output, in a real run
+        directory; links (to a file or as the run directory) and other names are never listed or deleted."""
+        r = self.make_run(finished=T0, archive=None, captures=1)
+        outside = self.tmp / "outside.json"
+        outside.write_text('{"gateway": {"auth": {"token": "SECRET-OUTSIDE"}}}')
+        for name in ("config.pre-pass1.json", "pc-models-status.json"):
+            (r.rd / name).write_text("{}")
+        (r.rd / "config.post-pass1.json").symlink_to(outside)
+        for name in ("transform-ledger.json", "pc-sessions.json", "config.pre-pass1.json.tmp", "doctor-pass1.log"):
+            (r.rd / name).write_text("{}") if not (r.rd / name).exists() else None
+        self.assertEqual([p.name for p in G.run_plaintext_copies(self.gp, r.rid)],
+                         ["config.pre-pass1.json", "pc-models-status.json"])
+        self.assertEqual(self.cleanup(T0 + H48), 3)  # the capture and the two copies
+        self.assertTrue(outside.exists())
+        self.assertTrue(os.path.islink(r.rd / "config.post-pass1.json"))
+        for name in ("transform-ledger.json", "pc-sessions.json", "config.pre-pass1.json.tmp", "doctor-pass1.log"):
+            self.assertTrue((r.rd / name).exists(), name)
+        # a run directory that is a link is never read through
+        rid2 = self.new_rid()
+        real = self.tmp / "real-run"
+        real.mkdir()
+        (real / "config.pre-pass1.json").write_text("{}")
+        (self.gp["RUNS"] / rid2).symlink_to(real, target_is_directory=True)
+        self.assertEqual(G.run_plaintext_copies(self.gp, rid2), [])
+        self.assertEqual(G.run_plaintext_copies(self.gp, "../x"), [])
+        with self.assertRaises(OSError):
+            G._safe_delete(self.gp, r.rd / "transform-ledger.json")
+        self.assertTrue((real / "config.pre-pass1.json").exists())
+
     def test_real_gate_run_with_stale_archive_options_deletes_only_the_captures(self):
         # options.json of an earlier add-on version may still hold gate_archive / gate_archive_age_recipient
         self.base_options = {"gate_archive": "encrypted", "gate_archive_age_recipient": FAKE_PUB}
         self.options()
         j, caps = self.real_gate_with_captures()
         self.assertNotIn("archive", j)
-        self.assertIn("info: the doctor captures of this run are deleted after", self.out)
+        self.assertIn("info: the doctor captures of this run and the gate's plaintext copies", self.out)
         self.assertFalse(os.path.lexists(self.arch / j["run_id"]))
         self.assertNotIn(FAKE_PUB, self.out + self.err)
         fin = G.run_due_base(j)
+        copies = G.run_plaintext_copies(self.gp, j["run_id"])
         self.assertEqual(self.cleanup(fin + H48 - SEC), 0)
-        self.assertIn("2 item(s)", self.text)
-        self.assertEqual(self.cleanup(fin + H48), 2)
-        for c in caps:
+        self.assertIn(f"{2 + len(copies)} item(s)", self.text)
+        self.assertEqual(self.cleanup(fin + H48), 2 + len(copies))
+        for c in caps + copies:
             self.assertFalse(os.path.lexists(c))
 
     def test_full3_run_journal_without_archive_key_due_time_and_hours_option(self):
@@ -328,8 +373,8 @@ class CleanupTests(CleanupEnv):
                          [(f"run {r.rid}", due, sorted(r.caps), [])])
         lines = []
         self.assertEqual(G.cleanup_pass(now=due - SEC, emit=lines.append), 0)
-        self.assertEqual(lines, [f"[cleanup] run {r.rid}: 2 item(s) (doctor captures, doctor SQLite copies / "
-                                 f"archive) will be deleted at {iso(due)}"])
+        self.assertEqual(lines, [f"[cleanup] run {r.rid}: 2 item(s) (doctor captures, doctor SQLite copies, "
+                                 f"plaintext config copies / archive) will be deleted at {iso(due)}"])
         self.assertEqual(self.cmd(), 0)
         self.assertEqual(self.lines[0], "gate_cleanup_hours=6")
         self.assertIn(f"  run {r.rid}: " + ("due now" if C.utc_now() >= due else f"due {iso(due)}"), self.lines)
@@ -1047,8 +1092,8 @@ class CleanupTests(CleanupEnv):
             timer.join()
         self.assertLess(time.monotonic() - t, 10)
         self.assertEqual(rc, 143)
-        self.assertEqual(lines[0], "[cleanup] doctor captures and doctor's SQLite copies are deleted 48 h after their "
-                                   "gate run; gate archives and rehearsal exports of earlier add-on versions and the "
+        self.assertEqual(lines[0], "[cleanup] doctor captures, doctor's SQLite copies and the gate's config copies are "
+                                   "deleted 48 h after their gate run; gate archives and rehearsal exports of earlier add-on versions and the "
                                    "2026.7 plaintext archives the same time after their run, export or migration "
                                    "(checked hourly)")
         self.assertFalse(os.path.lexists(r.adir))  # the first pass runs at once
@@ -1201,7 +1246,7 @@ class CleanupTests(CleanupEnv):
 
 
 class StatusTests(CleanupEnv):
-    OPTIONS_LINE = ("Gate options: delete doctor captures and SQLite copies 48 h after a run "
+    OPTIONS_LINE = ("Gate options: delete doctor captures, SQLite copies and the gate's config copies 48 h after a run "
                     "(0 = never); backup max age 24 h")
 
     def status(self):
@@ -1331,7 +1376,8 @@ class StatusTests(CleanupEnv):
         self.options(gate_cleanup_hours=0, gate_backup_max_age_hours=72)
         self.status()
         self.assertEqual(self.line("Gate options: "),
-                         "Gate options: delete doctor captures and SQLite copies 0 h after a run "
+                         "Gate options: delete doctor captures, SQLite copies "
+                         "and the gate's config copies 0 h after a run "
                          "(0 = never); backup max age 72 h")
         # out of range / not an integer: the defaults (the precheck warns about it, never with the value)
         self.options(gate_cleanup_hours=721, gate_backup_max_age_hours="72")

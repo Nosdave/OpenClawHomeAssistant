@@ -17,6 +17,7 @@ import sqlite3
 import sys
 import unittest
 import unittest.mock
+from datetime import timedelta
 from pathlib import Path
 
 TESTS = Path(__file__).resolve().parent
@@ -789,8 +790,9 @@ class CronConfigFixupTests(T.GateEnv):
                               "doctor pass 1 (keeps 3 enabled cron job(s) on glm working; openclaw/openclaw#192195)",
                               lines)
                 self.assertIn(f"[gate]   cron inference accounts: 3 enabled cron job(s) stop at a stored login on "
-                              f"OpenClaw {rt} (the WARN lines above, openclaw/openclaw#192195); report only; apart "
-                              "from the config fixup above, the gate changes nothing for cron", lines)
+                              f"OpenClaw {rt} (the WARN lines above, openclaw/openclaw#192195); apart from the config "
+                              "fixup above, the gate changes nothing for cron", lines)
+                self.assertFalse([x for x in lines if "cron inference accounts" in x and "report only" in x])
                 self.assertIn("[gate] dry-run: the precheck would pass", lines)
                 d = self.plan()
                 self.assertEqual(d["rc"], 10)
@@ -800,6 +802,41 @@ class CronConfigFixupTests(T.GateEnv):
                 self.assertFalse((self.upg / "gate" / "journal.json").exists())
                 self.assertFalse(list((self.upg / "gate").rglob("transform-ledger.json")))
                 self.assertNotIn(GLM_KEY, "\n".join(lines) + self.out)
+
+    def test_retired_skill_collection_review_jobs_are_left_out(self):
+        """Rehearsal finding: OpenClaw 2026.10.10+ deletes Skill Workshop's retired weekly curator jobs when doctor
+        loads the cron store (cron/store/load.kernel.ts isRetiredCollectionReview: payload kind
+        skillCollectionReview, or a declaration key skill-collection-review:*), so the forecast named jobs that no
+        longer exist after the gate as "kept working" and WARNed about them. They get one info line instead; the fix
+        and its count stay those of the other jobs. On 2026.10.4 nothing changes."""
+        add_jobs(self.state, [
+            ("skill-collection-review-main", {"agentId": "main", "sessionTarget": "isolated",
+                                              "declarationKey": "skill-collection-review:main",
+                                              "payload": {"kind": "agentTurn", "message": PROMPT,
+                                                          "model": "glm/glm-5", "fallbacks": ["openai/gpt-5.5"]}}),
+            ("old-review", {"agentId": "main", "sessionTarget": "isolated",
+                            "payload": {"kind": "skillCollectionReview", "model": "openai/gpt-5.5"}})], start=40)
+        lines = self.dry()
+        self.assertIn("[gate] 1/8 " + FIXUP_KEPT.format(rt="2026.11.1"), lines)
+        self.assertIn("[gate] 1/8 info: 2 enabled cron job(s) of Skill Workshop's retired weekly curator: OpenClaw "
+                      "2026.11.1 doctor deletes them during the migration (no replacement), so the inference-account "
+                      "report and the config fixup leave them out: 'Skill Collection Review Main' "
+                      "(skill-collection-review-main), 'Old Review' (old-review)", lines)
+        self.assertFalse([x for x in lines if x.startswith("WARN") and "review" in x.lower()], lines)
+        self.assertIn("[gate]   cron inference accounts: 3 enabled cron job(s) stop at a stored login on OpenClaw "
+                      "2026.11.1 (the WARN lines above, openclaw/openclaw#192195); apart from the config fixup above, "
+                      "the gate changes nothing for cron", lines)
+        # the inventory marks them as OpenClaw does; the report keeps them out of checked/affected
+        inv = {x["id"]: x["retired_review"] for x in G.cron_jobs_inventory(self.sdb)}
+        self.assertEqual((inv["skill-collection-review-main"], inv["old-review"], inv["job-lan-fb"]),
+                         (True, True, False))
+        rec = G.cron_account_report(self.state, self.cfg_now(), "2026.11.1", pending_copies=True)
+        self.assertEqual(rec["retired_review_count"], 2)
+        self.assertFalse([a for a in rec["affected"] if "review" in a["id"]])
+        # 2026.10.4 (no Skill Workshop retirement, no cron refusal): no line
+        self.set_runtime("2026.10.4", 20, 24)
+        self.assertFalse([x for x in self.dry() if "retired weekly curator" in x])
+        self.assertNotIn("retired_review", G.cron_account_report(self.state, self.cfg_now(), "2026.10.4"))
 
     def check_gate_run(self, rt):
         self.set_runtime(rt, 22, 27)
@@ -870,6 +907,41 @@ class CronConfigFixupTests(T.GateEnv):
 
     def test_gate_run_sets_auth_before_doctor_pass_1_on_1010(self):
         self.check_gate_run("2026.10.10")
+
+    def test_status_warns_when_the_fixup_is_gone_and_cleanup_removes_the_config_copies(self):
+        """Rehearsal A4: `oc-upgrade status` re-reads openclaw.json for each config fixup of the run and WARNs, with
+        the command, when models.providers.<p>.auth is no longer "api-key". A5: gate_cleanup_hours after the run the
+        cleanup deletes the run's plaintext config copies; the key is then only in openclaw.json and doctor's copy."""
+        self.doctor_copies_key("2026.11.1")
+        self.assertEqual(self.run_gate(), 0, self.out)
+        warn = ("  WARN: openclaw.json no longer holds this run's config fixup models.providers.glm.auth = \"api-key\" "
+                "({}): OpenClaw 2026.11.1 then runs glm on the copy of its key that doctor stored and refuses its "
+                "unbound cron runs again (openclaw/openclaw#192195), unless the key now comes from the environment (env "
+                "SecretRef). To restore: openclaw config set models.providers.glm.auth api-key")
+        self.assertFalse([x for x in G.status_lines() if "no longer holds" in x])
+        cfg = self.cfg_now()
+        cfg["models"]["providers"]["glm"]["auth"] = "token"
+        self.write_cfg(cfg)
+        st = G.status_lines()
+        self.assertIn(warn.format('now "token"'), st)
+        del cfg["models"]["providers"]["glm"]["auth"]
+        self.write_cfg(cfg)
+        st = G.status_lines()
+        i = st.index(warn.format("the setting is removed"))
+        self.assertTrue(st[i - 1].startswith("  config fixup of this run: models.providers.glm.auth"), st[i - 1])
+        self.assertNotIn(GLM_KEY, "\n".join(st))
+        del cfg["models"]["providers"]["glm"]
+        self.write_cfg(cfg)
+        self.assertIn(warn.format("the provider entry is gone"), G.status_lines())
+        (self.state / "openclaw.json").write_text("{not json")  # unreadable: no guess
+        self.assertFalse([x for x in G.status_lines() if "no longer holds" in x])
+        # A5: the plaintext copies go with the doctor captures
+        j = self.journal()
+        rid = j["run_id"]
+        self.assertTrue([h for h in self.key_holders() if h.startswith(f".openclaw-upgrade/gate/runs/{rid}/")])
+        G.cleanup_pass(now=G.run_due_base(j) + timedelta(hours=48), hours=48, emit=lambda _s: None)
+        self.assertEqual([h for h in self.key_holders() if h.startswith(".openclaw-upgrade/")], [])
+        self.assertTrue((self.upg / "gate" / "runs" / rid / "transform-ledger.json").exists())
 
     def test_resume_does_not_repeat_it(self):
         """Doctor pass 1 fails after the fixup (HOLD); the user even removes the setting by hand; `oc-upgrade retry`

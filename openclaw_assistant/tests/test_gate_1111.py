@@ -11,10 +11,12 @@ doctor-health-contribution.ts renderStructuredHealthFindings, legacy-config-core
 """
 
 import json
+import os
 import shutil
 import sqlite3
 import sys
 import unittest
+import unittest.mock
 from pathlib import Path
 
 TESTS = Path(__file__).resolve().parent
@@ -396,6 +398,105 @@ class PluginStatus1111Tests(T.GateEnv):
                 line = self.status_line(plugins)
                 self.assertIn(f"not at OpenClaw 2026.11.1: @openclaw/acpx (enabled or changed after the add-on's "
                               f"update step for 2026.11.1; to update: delete {self.marker}", line)
+
+
+    def test_status_during_a_hold_does_not_promise_the_next_start(self):
+        """Rehearsal finding: during a HOLD the status said the plugins are retried "at the next start", but
+        plugins-sync skips while OpenClaw is held; it now says when they are updated."""
+        self.marker.unlink()
+        line = self.status_line({})
+        self.assertIn("not yet at OpenClaw 2026.11.1: @openclaw/acpx (the add-on retries at the next start: "
+                      "oc-upgrade plugins-sync)", line)
+        (self.upg / "hold.txt").write_text("HOLD\n")
+        line = self.status_line({})
+        self.assertIn("not yet at OpenClaw 2026.11.1: @openclaw/acpx (not while OpenClaw is held: the add-on updates "
+                      "them at the first start after the HOLD is cleared, after the migration gate, whose doctor passes "
+                      "update them too: oc-upgrade plugins-sync)", line)
+        self.assertNotIn("next start", line)
+
+
+class PluginSpace1111Tests(T.GateEnv):
+    """Rehearsal A3: OpenClaw 2026.10.10+ doctor brings the enabled official plugins to its release (a new npm
+    generation beside the old one, plus the npm cache, in /config) and copies their files into os.tmpdir()
+    (openclaw-plugin-captures-*, 1.1-1.4 GiB per pass in the 2026.11.1 rehearsal). The precheck's space check counts
+    the installed size of the enabled ones twice on /config and once in the temporary directory; disabled plugins
+    and 2026.10.4 count nothing."""
+
+    def setUp(self):
+        super().setUp()
+        T.make_1004_state(self.state)
+        self.write_cfg({"meta": {"lastTouchedVersion": "2026.10.4"}, "gateway": {"mode": "local"},
+                        "plugins": {"entries": {"acpx": {"enabled": False}}}})
+        (self.upg / "gate").mkdir(parents=True, exist_ok=True)
+        (self.upg / "gate" / "migrated.json").write_text(json.dumps({"runtime": "2026.10.4", "mode": "bump"}))
+        self.set_runtime("2026.11.1", 22, 27)
+        self.hooks(skip_space_check=False)
+        projects = self.state / "npm" / "projects"
+        recs = {}
+        self.sizes = {}
+        for pid, blob in (("codex", 300_000), ("acpx", 500_000)):
+            proj = projects / f"openclaw-{pid}-0123456789__openclaw-generation__g-0123456789abcdef"
+            ip = proj / "node_modules" / "@openclaw" / pid
+            ip.mkdir(parents=True)
+            (ip / "package.json").write_text(json.dumps({"name": f"@openclaw/{pid}", "version": "2026.10.4"}))
+            dep = proj / "node_modules" / "dep"
+            dep.mkdir()
+            (dep / "native.node").write_bytes(b"\0" * blob)
+            (proj / "package-lock.json").write_text("{}")
+            (dep / "link").symlink_to(self.root)  # never followed
+            self.sizes[pid] = sum(f.stat().st_size for f in proj.rglob("*") if f.is_file() and not f.is_symlink())
+            recs[pid] = {"source": "npm", "spec": f"@openclaw/{pid}@2026.10.4", "installPath": str(ip)}
+        con = sqlite3.connect(str(self.state / "state" / "openclaw.sqlite"))
+        con.execute("INSERT INTO config_machine_state VALUES ('plugins.installedIndex', ?, 0)",
+                    (json.dumps({"index": {"installRecords": recs}}),))
+        con.commit()
+        con.close()
+
+    def needs(self, rt):
+        self.set_runtime(rt, 22, 27)
+        seen = []
+
+        def space(needs, **_kw):
+            seen.append(needs)
+            return [], "mocked"
+        fixed = {"sqlite_total": 10 * C.MIB, "transcripts_total": 0, "max_db": 5 * C.MIB, "largest_agent": 0,
+                 "s_mib": 10}
+
+        def measure(gate):
+            gate.sizes = dict(fixed)
+            return gate.sizes
+        with unittest.mock.patch.object(G, "space_check", side_effect=space), \
+                unittest.mock.patch.object(G.Gate, "measure", measure), \
+                unittest.mock.patch.object(G.Gate, "skill_workshop_precheck", lambda g: 0), \
+                unittest.mock.patch.dict(os.environ, {"TMPDIR": str(self.tmp)}):
+            self.quiet(G.dry_run, emit=lambda _s: None)
+        self.assertEqual(len(seen), 1, self.out)
+        return {label: (str(path), need, code) for label, path, need, code in seen[0]}
+
+    def test_enabled_official_plugins_count_on_config_and_in_tmp(self):
+        base = 2 * 10 * C.MIB + 2 * C.GIB
+        n = self.needs("2026.11.1")
+        codex = self.sizes["codex"]
+        self.assertGreater(codex, 300_000)
+        self.assertEqual(n["/config"][1:], (base + 2 * codex, "low-disk-config"))  # acpx is disabled
+        self.assertEqual(n["sqlite-tmp"][1:], (5 * C.MIB + C.GIB, "low-disk-tmp"))
+        self.assertEqual(n["plugin-tmp"], (str(self.tmp), codex, "low-disk-tmp"))
+        # 2026.10.4 (runtime_caps doctor_plugin_space off): nothing added, so no plugin-tmp need either
+        g = G.Gate(emit=lambda _s: None)
+        g.cfg = {}
+        for rt, want in (("2026.10.4", 0), ("2026.10.10", self.sizes["codex"] + self.sizes["acpx"])):
+            g.pkg = {"version": rt}
+            self.assertEqual(g.plugin_space_bytes(), want, rt)
+
+    def test_helpers(self):
+        installs = G.official_plugin_installs(self.state, {}, with_path=True)
+        self.assertEqual([(x["id"], x["install_path"].name) for x in installs], [("acpx", "acpx"), ("codex", "codex")])
+        self.assertNotIn("install_path", G.official_plugin_installs(self.state, {})[0])
+        self.assertEqual(G.plugin_install_bytes(self.state, installs), self.sizes["codex"] + self.sizes["acpx"])
+        self.assertEqual(G.plugin_install_bytes(self.state, [{"install_path": None}]), 0)
+        self.assertEqual(G.node_tmpdir({"TMPDIR": "/var/tmp/x/"}), "/var/tmp/x")
+        self.assertEqual(G.node_tmpdir({"TMP": "/t"}), "/t")
+        self.assertEqual(G.node_tmpdir({}), "/tmp")
 
 
 class Docs1111Tests(unittest.TestCase):

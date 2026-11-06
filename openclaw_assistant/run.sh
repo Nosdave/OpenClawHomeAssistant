@@ -1171,7 +1171,9 @@ ensure_brave_plugin() {
 # install OpenClaw recorded), so a failed update is retried at the next start;
 # the gate deletes a marker its postconditions contradict. Shares
 # the validated OPENCLAW_RUNTIME_VERSION with the Brave step. Runs after the
-# migration gate with the gateway down; best-effort, never blocks startup.
+# migration gate with the gateway down; best-effort, never blocks startup:
+# it asks the npm registry first (`npm view`, 30 s at most) and updates
+# nothing offline, so an offline start does not wait for the update timeouts.
 # It runs in the background (PLUGINS_PID) so the shutdown trap can forward a
 # stop request: bash defers the trap while a foreground command runs, and npm
 # updates can take longer than the Supervisor's 300 s stop timeout. `timeout`

@@ -375,8 +375,9 @@ class FakeRuntimeE2E(unittest.TestCase):
         self.assertIn("6/8 doctor pass 2 rc=0", out)
         self.assertIn("config unchanged", out)
         self.assertIn("7/8 postconditions OK", out)
-        self.assertRegex(out, r"\[gate\] info: the doctor captures of this run are deleted after \S+ "
-                              r"\(gate_cleanup_hours=48\)\n")
+        self.assertRegex(out, r"\[gate\] info: the doctor captures of this run and the gate's plaintext copies of "
+                              r"openclaw.json in its run directory \(config.\*.json, with the saved models status "
+                              r"output\) are deleted after \S+ \(gate_cleanup_hours=48\)\n")
         j = json.loads((self.upg / "gate" / "journal.json").read_text())
         self.assertEqual(j["status"], "done")
         self.assertEqual([d["pass"] for d in j["doctor"]], [1, 2])

@@ -22,7 +22,9 @@ line, the journal's plugins_official_before and the status line "Official plugin
 agent that a retained deletion keeps (CHANGELOG "agent databases outside the configured agents"; OpenClaw 2026.10.4
 reads retained deletions too): an "info: ... is kept from a deleted agent" line instead of the acceptable HOLD
 orphan-agent-db, `oc-upgrade check` lists it under "held agent databases", the journal's orphans entry has
-held/reason.
+held/reason; the gate's own plaintext copies of openclaw.json (CHANGELOG "The gate's plaintext copies of
+`openclaw.json` are deleted", 11.1 host rehearsal A5): finalize says they are deleted with the doctor captures and the
+status line "Gate options: delete doctor captures, SQLite copies and the gate's config copies".
 Not in the fixture because each one is a HOLD (DOCS "Upgrading to OpenClaw 2026.10"); Holds1004Tests pins them
 instead: the reworded orphan-agent-db text (reworded again after the host rehearsal, D11: doctor sets a copy of
 another agent's database aside instead of migrating it; CHANGELOG "orphan agent databases"), quick_check and the foreign-key check on such a store below the target

@@ -44,8 +44,9 @@ Commands:
                  written only when the plugin list confirms every enabled one
                  at that version and shows every recorded npm install).
                  Never downgrades, leaves disabled plugins alone, always exits 0.
-                 No update starts after 600 s; SIGTERM stops the running one
-                 with its process group (no marker).
+                 Skips the updates (no marker) when the npm registry does not
+                 answer within 30 s. No update starts after 600 s; SIGTERM
+                 stops the running one with its process group (no marker).
 """
 
 import json
@@ -694,6 +695,10 @@ PLUGIN_UPDATE_TIMEOUT = 300
 # (180 s + 30 s) still end before run.sh's `timeout --kill-after=30 1200`; the rest waits for the next start.
 PLUGIN_SYNC_BUDGET = 600
 PLUGIN_STOP_GRACE = 10  # a stop request (SIGTERM from run.sh's shutdown trap via timeout): SIGTERM, then SIGKILL
+# Registry probe before the first update (`npm view <package>@<version> version`): offline, `openclaw plugins update`
+# waits out its 300 s limit per plugin (rehearsal: 334 s with no result) while the gateway is still down. 30 s leave
+# room for npm's start on slow hardware.
+PLUGIN_PROBE_TIMEOUT = 30
 _RUNTIME_VERSION_RE = re.compile(r"^\d{4}\.\d+\.\d+(?:-\d+)?$")
 # OpenClaw keeps loading a version-bound plugin from this release on (official-runtime-plugins.ts)
 PLUGIN_MIN_COMPATIBLE = {"@openclaw/codex": "2026.9.7"}
@@ -727,6 +732,37 @@ def _oc_capture(args, timeout, tmp, tag, stop=None):
     tail = C.redact_text(" | ".join(lines[-2:]))[:300]
     rc = "timeout" if res.timed_out else res.rc
     return rc, texts[0], tail
+
+
+def _registry_probe(pkg, version, tmp, stop=None, timeout=PLUGIN_PROBE_TIMEOUT):
+    """A1: None when the npm registry serves `pkg`@`version` (`npm view`, the npm OpenClaw runs, with OpenClaw's
+    environment and so its npm config and proxy; an empty cache in `tmp`, so that no cached registry data answers
+    offline), else why not, for the WARN (redacted). No npm on PATH: None (`openclaw plugins update` reports it)."""
+    env = C.openclaw_env()
+    npm = shutil.which("npm", path=env.get("PATH"))
+    if not npm:
+        return None
+    out_p, log_p = os.path.join(tmp, "probe.json"), os.path.join(tmp, "probe.log")
+    res = C.run_process([npm, "view", f"{pkg}@{version}", "version", "--json", "--cache",
+                         os.path.join(tmp, "probe-npm-cache")], timeout=timeout,
+                        log_path=log_p, stdout_path=out_p, stop_event=stop, kill_grace=5,
+                        stop_grace=PLUGIN_STOP_GRACE, env=env)
+    texts = []
+    for f in (out_p, log_p):
+        try:
+            with open(f, encoding="utf-8", errors="replace") as fh:
+                texts.append(fh.read())
+        except OSError:
+            texts.append("")
+    data = C.parse_json_output(texts[0])
+    if res.rc == 0 and data == version:
+        return None
+    if res.timed_out:
+        return f"npm view: no answer within {timeout:g} s"
+    lines = [x.strip() for x in texts[1].splitlines() if x.strip() and not x.startswith("[oc] ")]
+    tail = C.redact_text(" | ".join(lines[-2:]))[:200]
+    return (f"npm view: rc {res.rc}" + ("" if res.rc else f", version {str(data)[:40]!r}")
+            + (f": {tail}" if tail else ""))
 
 
 def _official_installs(p):
@@ -779,9 +815,11 @@ def cmd_plugins_sync(args):
 def _plugins_sync(stop=None):
     stop = stop or threading.Event()
     started = time.monotonic()
-    budget = PLUGIN_SYNC_BUDGET
+    budget, probe_timeout = PLUGIN_SYNC_BUDGET, PLUGIN_PROBE_TIMEOUT
     if os.environ.get("OC_GATE_TEST_HOOKS") == "1":  # tests only (oc_gate.load_hooks)
-        budget = float(_gate().load_hooks().get("plugin_sync_budget_s", budget))
+        hooks = _gate().load_hooks()
+        budget = float(hooks.get("plugin_sync_budget_s", budget))
+        probe_timeout = float(hooks.get("plugin_probe_timeout_s", probe_timeout))
     p = P()
     rt = _sync_runtime_version()
     if not rt:
@@ -821,6 +859,18 @@ def _plugins_sync(stop=None):
                 continue
             todo.append((pkg, ver))  # ver None: the list names no version; the update sets it
         failed = []
+        if todo:  # A1: offline, every update would wait out its time limit before the gateway starts
+            why = _registry_probe(todo[0][0], rt, tmp, stop, probe_timeout)
+            if stop.is_set():
+                print(stopped_msg)
+                return RC_OK
+            if why:
+                print(f"WARN: Official plugins not updated: the npm registry did not confirm {todo[0][0]}@{rt} "
+                      f"({why}); "
+                      + ", ".join(f"{pkg} stays at {ver or 'an unknown version'}" for pkg, ver in todo)
+                      + ". The add-on tries again at the next start; by hand, once online: "
+                      + "; ".join(f"openclaw plugins update {pkg}@{rt}" for pkg, _v in todo))
+                return RC_OK
         for i, (pkg, ver) in enumerate(todo):
             if stop.is_set():
                 print(stopped_msg)
@@ -868,7 +918,10 @@ def _plugins_sync(stop=None):
     except OSError as exc:
         print(f"WARN: could not record the official plugin update for OpenClaw {rt} ({exc}); it runs again at the "
               "next start")
-    print(f"INFO: Official plugins match OpenClaw {rt}." if found else
+    updated = dict(todo) if found else {}
+    print(f"INFO: Official plugins match OpenClaw {rt}: "
+          + ", ".join(f"{pkg} {updated[pkg] or '?'} -> {rt}" if pkg in updated else f"{pkg} {rt}"
+                      for pkg in sorted(found)) + "." if found else
           f"INFO: Official plugins: none enabled besides Brave; nothing to update for OpenClaw {rt}.")
     return RC_OK
 

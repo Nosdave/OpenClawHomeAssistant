@@ -280,7 +280,7 @@ class RuntimeCapsTests(TmpCase):
     AT_1005 = dict(ALL_OFF, runtime_files_retired=True, sandbox_registry_retired=True, config_api_cdpurl_retired=True)
     AT_1006 = dict(AT_1005, empty_installs_tolerated=True)
     AT_1010 = dict(AT_1006, retires_skill_proposals=True, cron_refusal=True, held_store_skip=True,
-                   large_session_oom_issue=True)
+                   large_session_oom_issue=True, doctor_plugin_space=True)
     AT_1111 = dict(AT_1010, heartbeat_hours_kept=True)
 
     def setUp(self):
@@ -773,7 +773,8 @@ class Full2RedactTests(unittest.TestCase):
     def test_plain_words_untouched(self):
         for line in ("gate_archive_age_recipient holds an age PRIVATE key (AGE-SECRET-KEY-…): remove it",
                      "never the AGE-SECRET-KEY private key",
-                     "Gate options: delete doctor captures and SQLite copies 48 h after a run "
+                     "Gate options: delete doctor captures, SQLite copies "
+                     "and the gate's config copies 48 h after a run "
                      "(0 = never); backup max age 24 h"):
             with self.subTest(line=line[:30]):
                 self.assertEqual(C.redact_text(line), line)
@@ -933,6 +934,30 @@ class KeyValueRedactTests(unittest.TestCase):
             ("Kennwort lautet: geheim1", "Kennwort lautet: ***"), ("la contraseña es abc123", "la contraseña es ***"),
             ("a senha é 9876", "a senha é ***"),
             ("Das WLAN-Passwort heißt „Sommer 2026“", "Das WLAN-Passwort heißt „***“")))
+
+    def test_german_yaml_and_bare_value_forms(self):
+        """11.1 rehearsal checker: synthetic notes as the owner writes them came back unchanged (Schlüssel after a
+        prefix, *_key in the YAML form, Zugang*, pw, PIN or Passwort followed by the value without a colon)."""
+        self.check((
+            ("WLAN-Schlüssel: HundKatzeMaus", "WLAN-Schlüssel: ***"),
+            ("Netzwerkschlüssel: HundKatze7", "Netzwerkschlüssel: ***"),
+            ("netzwerkschluessel = HundKatze7", "netzwerkschluessel = ***"),
+            ("wifi_key: HundKatze7", "wifi_key: ***"), ("wlan-key: HundKatze7", "wlan-key: ***"),
+            ("  wifi_key: 'HundKatze7'", "  wifi_key: '***'"),
+            ("Authorization: Token abc123def456ghi", "Authorization: Token ***"),
+            ("PIN 1234", "PIN ***"), ("SIM-PIN 0000 bitte merken", "SIM-PIN *** bitte merken"),
+            ("Passwort 4711 fuer den Router", "Passwort *** fuer den Router"),
+            ('password "correct horse" for the NAS', 'password "***" for the NAS'),
+            ("pw: Sommer2024", "pw: ***"), ("router_pw = Sommer2024", "router_pw = ***"),
+            ("Zugangscode: 8812", "Zugangscode: ***"), ("Zugangsdaten: admin / Sommer2024", "Zugangsdaten: ***"),
+            ("WLAN-Zugang: HundKatze7", "WLAN-Zugang: ***")))
+        for line in ("Schlüsselwort: Haus", "Zugangspunkt: Wohnzimmer", "sessionKey: agent:main:main",
+                     "pin 2026.11.1", "PIN 12", "Passwort ist geheim", "password reset done", "spin 1234",
+                     "pw_hint: dog", "pwm: 50"):
+            with self.subTest(line=line):
+                self.assertEqual(C.redact_text_counted(line), (line, 0))
+        for key in ("WLAN-Schlüssel", "wifi_key", "Zugangsdaten", "pw"):
+            self.assertIsNotNone(C.SECRET_NAME_RE.fullmatch(key), key)
 
     def test_normal_words_and_openclaw_log_lines_untouched(self):
         for line in (

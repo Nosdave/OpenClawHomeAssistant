@@ -68,7 +68,7 @@ EXTRA_ENV=()
 # Run the wrapper with a controlled environment; sets OUT, ERR, RC and
 # DIR_WARNED (the OC_UPGRADE_DIR override warning, which is not part of ERR:
 # every test points OC_UPGRADE_DIR at its own HOLD directory).
-DIR_WARNING="— add-on safety checks bypassed (HOLD marker not read from /config/.openclaw-upgrade)"
+DIR_WARNING=", not from /config/.openclaw-upgrade"
 invoke() {
   OUT="$(env -u OC_ADDON_UNSAFE PATH="$T/brewbin:/usr/bin:/bin" OC_UPGRADE_DIR="$T/upg" \
            ${EXTRA_ENV[@]+"${EXTRA_ENV[@]}"} "$OC" "$@" 2>"$T/stderr")"
@@ -277,7 +277,8 @@ printf '%s\n' "$T/fakebin/node" > "$T/oc-addon/openclaw-node"
 # --- OC_UPGRADE_DIR override: warned like OC_ADDON_UNSAFE (F14) ---------------
 invoke status
 check "upgrade dir: override not warned (err='$(cat "$T/stderr")')" [ "$DIR_WARNED" = "true" ]
-check "upgrade dir: warning lacks the directory" grep -qF "openclaw: OC_UPGRADE_DIR=$T/upg $DIR_WARNING" "$T/stderr"
+check "upgrade dir: warning lacks the directory" grep -qF "openclaw: OC_UPGRADE_DIR=$T/upg — HOLD marker read from $T/upg$DIR_WARNING" "$T/stderr"
+check "upgrade dir: warning still says the checks are bypassed" bash -c "! grep -qF 'safety checks bypassed (HOLD' \"\$1\"" _ "$T/stderr"
 for d in /config/.openclaw-upgrade /config/.openclaw-upgrade/; do
   EXTRA_ENV=(OC_UPGRADE_DIR="$d")
   allow status

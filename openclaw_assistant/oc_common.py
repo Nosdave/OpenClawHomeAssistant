@@ -658,6 +658,11 @@ RUNTIME_CAPS = (
     # open issue openclaw/openclaw#191847: the 512 MB SQLite worker runs out of memory on large sessions
     # (precheck information only: largest agent database, biggest session)
     ("large_session_oom_issue", (2026, 10, 10, 0)),
+    # doctor brings the enabled official plugins to its release (a new npm generation beside the old one, plus the npm
+    # cache) and copies their files into os.tmpdir() for its recovery set (plugin source capture, "temporary"
+    # placement: openclaw-plugin-captures-*, 1.1-1.4 GiB per pass with codex and acpx in the 2026.11.1 rehearsal);
+    # the precheck's space check counts both
+    ("doctor_plugin_space", (2026, 10, 10, 0)),
     # doctor keeps an invalid heartbeat.activeHours window instead of removing it (#186305) and, with #187192,
     # then exits 1 ("Doctor blocked; required repairs remain incomplete."): the precheck holds on it first
     ("heartbeat_hours_kept", (2026, 11, 1, 0)),
@@ -744,18 +749,19 @@ _SECRET_KEY = (r"(?<![A-Za-z0-9_.-])(?=[A-Za-z0-9_.-]*?(?:token|secret|password|
                r"|[A-Za-z0-9_.-]*?key(?![A-Za-z0-9_.-]))[A-Za-z0-9_.-]*+")
 # A key that names a secret, for the "key: value" / "key = value" rule below. It ends in one of:
 # - token, secret, password, passwd, passphrase, passcode, "API key" (also api-key, x-api-key, botToken,
-#   db_password), Passwort, Kennwort, API-Schlüssel, wachtwoord, contraseña, and private, secret, access, signing,
-#   encryption, master or client key (AWS_SECRET_ACCESS_KEY, secret_key, PrivateKey), after any prefix
-#   (WLAN-Passwort, Routerkennwort);
-# - pwd, senha, hasło, парола, пароль, "mot de passe" as a word of their own, after "_", "." or "-" (MYSQL_PWD) or
-#   in camelCase (dbPwd); never inside a word (OLDPWD, resenha);
+#   db_password), Passwort, Kennwort, Schlüssel (API-Schlüssel, WLAN-Schlüssel, Netzwerkschlüssel), Zugang,
+#   Zugangscode, Zugangsdaten, wachtwoord, contraseña, and private, secret, access, signing, encryption, master or
+#   client key (AWS_SECRET_ACCESS_KEY, secret_key, PrivateKey), after any prefix (WLAN-Passwort, Routerkennwort);
+# - key after "_" or "-" (wifi_key, wlan-key: the "key: value" form of what the JSON and key=value rules hide);
+# - pwd, pw, senha, hasło, парола, пароль, "mot de passe" as a word of their own, after "_", "." or "-" (MYSQL_PWD)
+#   or in camelCase (dbPwd); never inside a word (OLDPWD, resenha);
 # - pass the same way (SMTP_PASS, smtp.pass, smtpPass, "pass: x", "user: a, pass: b", "smtp pass: x", "user=bob
 #   pass=x"), but not after the words of OpenClaw's own "<word> pass:" texts ("first pass: ...", "one more pass:
 #   ...", "convergence pass: ..."; _PASS_NOT_AFTER), and not in bypass or compass.
 # The keyword must end the key: maxTokens, passed, password_hint, pinned are no secret names.
 _LONG_SECRET_WORDS = (r"token|secret|password|passwd|passwort|kennwort|pass[ _-]?phrase|pass[ _-]?code|wachtwoord"
-                      r"|contrase(?:ñ|n)a|api[ _-]?key|api[ _-]?schl(?:ü|ue)ssel"
-                      r"|(?:private|secret|access|signing|encryption|master|client)[ _-]?key")
+                      r"|contrase(?:ñ|n)a|api[ _-]?key|schl(?:ü|ue)ssel|zugang(?:s(?:code|daten))?"
+                      r"|(?:private|secret|access|signing|encryption|master|client)[ _-]?key|(?<=[_-])key")
 _IN_KEY = r"(?<=[_.-])|(?<=(?-i:[a-z0-9]))(?=(?-i:P))"  # after a separator, or camelCase (dbPwd, simPin)
 _WORD_START = r"(?:" + _IN_KEY + r"|(?<![\w.-]))"
 # the words before "pass" in OpenClaw's own texts (2026.10.4 to 2026.11.1: "one more pass:", "would pass:",
@@ -763,7 +769,7 @@ _WORD_START = r"(?:" + _IN_KEY + r"|(?<![\w.-]))"
 _PASS_NOT_AFTER = ("first", "second", "third", "fourth", "next", "last", "final", "more", "another", "would", "held",
                    "convergence", "doctor", "deletion", "cleanup")
 _SECRET_WORD = (r"[\w.-]*?(?:" + _LONG_SECRET_WORDS
-                + r"|" + _WORD_START + r"(?:pwd|senha|has[łl]o|парола(?:та)?|пароль|mot[ _-]de[ _-]passe)"
+                + r"|" + _WORD_START + r"(?:pwd|pw|senha|has[łl]o|парола(?:та)?|пароль|mot[ _-]de[ _-]passe)"
                 + r"|(?:" + _IN_KEY + r"|(?<![\w.-])" + "".join(f"(?<!{w} )" for w in _PASS_NOT_AFTER) + r")pass)")
 # a PIN (pin, PIN-Code, SIM-PIN, wifi_pin, simPin, PUK): only a value of 3 to 12 digits counts as one; OpenClaw's
 # logs use "pin" for version and TLS pins ("dependency pin: name@1.2.3", "pin=true")
@@ -854,6 +860,11 @@ _REDACT_RES = [
     # Das Passwort ist 4711 / the password is "correct horse" / set the password to hunter2
     (re.compile(r"(?<![\w.-])(?P<k>" + _PROSE_WORD + r")(?P<s>[^\S\r\n]++" + _PROSE_VERB + r":?[^\S\r\n]++)"
                 + _PROSE_VALUE, re.I), _kv_redact),
+    # Passwort 4711 fuer den Router / password "correct horse" (no verb, no colon: a value in quotes or one word that
+    # contains a digit); PIN 1234 (3 to 12 digits)
+    (re.compile(r"(?<![\w.-])(?P<k>" + _PROSE_WORD + r")(?P<s>[^\S\r\n]++)" + _PROSE_VALUE, re.I), _kv_redact),
+    (re.compile(r"(?<![\w.-])(?P<k>" + _PIN_WORD + r")(?P<s>[^\S\r\n]++)(?P<v>\d{3,12}(?![.,:/@-]?\w))", re.I),
+     _kv_redact),
     # --token <value>, --password <value>, --api-key <value>
     (re.compile(r"(?i)(--(?:token|password|secret|api[-_]?key)\s+)(?!-)\S+"), r"\1***"),
     # URL userinfo: scheme://user:password@host, also with an empty user (redis://:password@host)
@@ -959,13 +970,14 @@ class LineRedactor:
 # --- subprocess runner -------------------------------------------------------------------
 
 class RunResult(tuple):
-    """(rc, duration_s) plus attributes timed_out / stopped / error."""
+    """(rc, duration_s) plus attributes timed_out / stopped / error / killed (SIGKILL after its grace period)."""
 
-    def __new__(cls, rc, duration, timed_out=False, stopped=False, error=None):
+    def __new__(cls, rc, duration, timed_out=False, stopped=False, error=None, killed=False):
         self = super().__new__(cls, (rc, duration))
         self.timed_out = timed_out
         self.stopped = stopped
         self.error = error
+        self.killed = killed
         return self
 
     @property
@@ -1049,6 +1061,30 @@ def _track_descendants(tracked, root):
         tracked.setdefault(pid, start)
 
 
+def _term_strays(tracked, pgid):
+    """A2: SIGTERM, right away, the tracked descendants (same start time) that left the process group `pgid`, and
+    their own descendants outside it. killpg does not reach them, and the child may wait for them (OpenClaw's doctor
+    settles an admitted repair while its detached npm runs) until its grace period ends in SIGKILL; ended early, the
+    repair fails and the child exits by itself. Returns the pids signalled."""
+    if not tracked:
+        return []
+    table = _proc_table()
+    strays = {pid: start for pid, start in tracked.items()
+              if _proc_live(table.get(pid)) and table[pid][4] == start and table[pid][2] != pgid}
+    for pid in list(strays):
+        for d, start in _descendants(pid, table).items():
+            if table[d][2] != pgid:
+                strays.setdefault(d, start)
+    sent = []
+    for pid in sorted(strays):
+        try:
+            os.kill(pid, signal.SIGTERM)
+            sent.append(pid)
+        except (ProcessLookupError, PermissionError):
+            pass
+    return sent
+
+
 def _kill_strays(tracked, grace=5.0):
     """D10: SIGTERM, then after `grace` s SIGKILL, every tracked descendant that still runs (the same start time:
     a reused pid is left alone) and its own descendants; killpg of the child's group does not reach a descendant
@@ -1089,6 +1125,8 @@ def run_process(argv, *, timeout, log_path, stop_event=None, kill_grace=30, stop
 
     - timeout (s, None = unlimited): SIGTERM to the process group, `kill_grace` s, SIGKILL.
     - stop_event set: SIGTERM, `stop_grace` s (default kill_grace), SIGKILL.
+    - With either SIGTERM, the descendants seen outside the process group get SIGTERM too (A2); SIGKILL stays the
+      last step, for them after the process has ended. RunResult.killed: the grace period ended in SIGKILL.
     - on_tick(elapsed_s) is called about every `tick` seconds while the process runs.
     - When it has ended (or was killed), whatever is left of its process group is killed, and so are the descendants
       that left the group (another session, e.g. a detached npm child; seen in /proc while argv ran) (D10).
@@ -1111,8 +1149,16 @@ def run_process(argv, *, timeout, log_path, stop_event=None, kill_grace=30, stop
                 log.write(f"[oc] could not start {argv[0]}: {exc}\n".encode())
                 return RunResult(127, 0.0, error=str(exc))
             pgid = proc.pid
-            timed_out = stopped = False
+            timed_out = stopped = killed = False
             kill_at = None
+
+            def term_outside():  # A2: the detached descendants get the SIGTERM at once, not only after the end
+                _track_descendants(tracked, proc.pid)
+                sent = _term_strays(tracked, pgid)
+                if sent:
+                    log.write(f"[oc] SIGTERM also to {len(sent)} descendant process(es) outside its process group "
+                              f"(pids {', '.join(map(str, sent[:10]))})\n".encode())
+                    log.flush()
             tracked = {}  # D10: {pid: starttime} of its descendants, seen while it runs
             try:
                 while True:
@@ -1128,15 +1174,18 @@ def run_process(argv, *, timeout, log_path, stop_event=None, kill_grace=30, stop
                     if stop_event is not None and stop_event.is_set() and not stopped:
                         stopped = True
                         _killpg(pgid, signal.SIGTERM)
+                        term_outside()
                         deadline = now + stop_grace
                         kill_at = deadline if kill_at is None else min(kill_at, deadline)
                     elif kill_at is None and timeout is not None and now - start >= timeout:
                         timed_out = True
                         _killpg(pgid, signal.SIGTERM)
+                        term_outside()
                         kill_at = now + kill_grace
                     if kill_at is not None and now >= kill_at:
                         _track_descendants(tracked, proc.pid)
                         _killpg(pgid, signal.SIGKILL)
+                        killed = True
                         kill_at = float("inf")
             except BaseException:
                 _track_descendants(tracked, proc.pid)
@@ -1161,7 +1210,7 @@ def run_process(argv, *, timeout, log_path, stop_event=None, kill_grace=30, stop
             if strays:
                 log.write(f"[oc] stopped {len(strays)} leftover descendant process(es) outside its process group "
                           f"(pids {', '.join(map(str, strays[:10]))})\n".encode())
-            return RunResult(rc, time.monotonic() - start, timed_out, stopped)
+            return RunResult(rc, time.monotonic() - start, timed_out, stopped, killed=killed)
         finally:
             if out is not log:
                 out.close()

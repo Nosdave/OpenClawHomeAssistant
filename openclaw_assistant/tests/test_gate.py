@@ -1617,6 +1617,21 @@ class GateRunTests(GateEnv):
         self.assertEqual([d["pass"] for d in self.journal()["doctor"]], [1, 1, 2])
         self.assertFalse((self.share / "openclaw-upgrade").exists())  # no gate archive, not even on a retry
 
+    def test_interrupt_doctor_killed_after_the_grace_period_says_so(self):
+        """Rehearsal A2: a doctor that does not stop within DOCTOR_STOP_GRACE is killed (rc -9); the line says so
+        instead of "doctor was asked to stop"."""
+        self.build_735()
+        stubborn = self.bin / "stubborn-doctor"
+        stubborn.write_text("#!/bin/sh\ntrap '' TERM\nsleep 30\n")
+        stubborn.chmod(0o755)
+        self.hooks(doctor_cmd=[str(stubborn)])
+        threading.Timer(3.0, lambda: os.kill(os.getpid(), 15)).start()
+        with mock.patch.object(G, "DOCTOR_STOP_GRACE", 1):
+            self.assertEqual(self.run_gate(), 143, self.out)
+        self.assertIn("4/8 doctor pass 1: stop requested; doctor did not stop within ", self.out)
+        self.assertIn(" and was killed (rc -9)\n", self.out)
+        self.assertNotIn("doctor was asked to stop", self.out)
+
     def test_interrupt_resume_once_then_interrupted_twice(self):
         self.build_735()
         slow = self.bin / "slow-doctor"
@@ -1626,6 +1641,7 @@ class GateRunTests(GateEnv):
         threading.Timer(3.0, lambda: os.kill(os.getpid(), 15)).start()
         rc = self.run_gate()
         self.assertEqual(rc, 143, self.out)
+        self.assertIn("4/8 doctor pass 1: stop requested; doctor was asked to stop and stopped (rc -15)", self.out)
         j = self.journal()
         self.assertEqual((j["status"], j["phase"]), ("interrupted", "doctor1"))
         d = self.plan()
@@ -2507,11 +2523,13 @@ class NoGateArchiveTests(GateEnv):
         self.assertEqual((m["mode"], m["run_id"]), ("from-7x", j["run_id"]))
         self.assertNotIn("archive", self.out)
         self.assertNotIn("sha256", self.out)
-        self.assertRegex(self.out, r"\[gate\] info: the doctor captures of this run are deleted after \S+ "
-                                   r"\(gate_cleanup_hours=48\)\n")
+        self.assertRegex(self.out, r"\[gate\] info: the doctor captures of this run and the gate's plaintext copies "
+                                   r"of openclaw.json in its run directory \(config.\*.json, with the saved models "
+                                   r"status output\) are deleted after \S+ \(gate_cleanup_hours=48\)\n")
         self.assertNotIn("archive", (self.upg / "gate" / "runs" / j["run_id"] / "events.log").read_text())
         st = G.status_lines()
-        self.assertIn("Gate options: delete doctor captures and SQLite copies 48 h after a run "
+        self.assertIn("Gate options: delete doctor captures, SQLite copies "
+                      "and the gate's config copies 48 h after a run "
                       "(0 = never); backup max age 24 h", st)
         self.assertEqual([x for x in st if "archive" in x.lower()], [])
 
@@ -2520,8 +2538,9 @@ class NoGateArchiveTests(GateEnv):
         self.hooks()
         self.options(gate_cleanup_hours=0)
         self.assertEqual(self.run_gate(), 0, self.out)
-        self.assertIn("[gate] info: the doctor captures of this run are kept (gate_cleanup_hours=0): delete them "
-                      "yourself", self.out)
+        self.assertIn("[gate] info: the doctor captures of this run and the gate's plaintext copies of openclaw.json "
+                      "in its run directory (config.*.json, with the saved models status output) are kept "
+                      "(gate_cleanup_hours=0): delete them yourself", self.out)
         self.assertEqual(list(self.share.iterdir()), [])
 
     def test_precheck_space_check_needs_no_share(self):
