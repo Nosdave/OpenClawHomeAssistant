@@ -945,7 +945,9 @@ class CronConfigFixupTests(T.GateEnv):
 
     def test_resume_does_not_repeat_it(self):
         """Doctor pass 1 fails after the fixup (HOLD); the user even removes the setting by hand; `oc-upgrade retry`
-        resumes before pass 1 and leaves it to the report: one journal entry, one config fixup line in all."""
+        resumes before pass 1 and leaves it to the report: one journal entry, one config fixup line in all. Status
+        during the HOLD and the end of the resumed run read openclaw.json again: the drift WARN instead of the
+        fixup's info line (during the HOLD without a command the wrapper refuses), no closing note excepting it."""
         self.doctor_copies_key("2026.11.1", rc=1)
         self.assertEqual(self.run_gate(), 20, self.out)
         first = self.out
@@ -955,11 +957,23 @@ class CronConfigFixupTests(T.GateEnv):
         self.assertEqual(cfg["models"]["providers"]["glm"]["auth"], "api-key")
         del cfg["models"]["providers"]["glm"]["auth"]
         self.write_cfg(cfg)
+        drift = ("openclaw.json no longer holds this run's config fixup models.providers.glm.auth = \"api-key\" (the "
+                 "setting is removed): OpenClaw 2026.11.1 then runs glm on the copy of its key that doctor stored and "
+                 "refuses its unbound cron runs again (openclaw/openclaw#192195), unless the key now comes from the "
+                 "environment (env SecretRef). To restore: ")
+        cmd = "openclaw config set models.providers.glm.auth api-key"
+        self.assertTrue((self.upg / "hold.txt").exists())
+        self.assertIn(f"  WARN: {drift}set it in openclaw.json by hand (while OpenClaw is held the wrapper refuses "
+                      f"openclaw config set), or after the HOLD is cleared: {cmd}", G.status_lines())
         self.doctor_copies_key("2026.11.1")
         self.assertEqual(self.quiet(G.retry_cmd, []), 0)
         self.assertEqual(self.run_gate(), 0, self.out)
-        self.assertNotIn("config fixup", self.out.replace("config fixup of this run", "")
-                         .replace("apart from the config fixup above", ""))
+        warn = f"WARN [gate] {drift}{cmd}"
+        out = self.out.splitlines()
+        self.assertIn(warn, out)
+        self.assertLess(out.index(warn), next(i for i, ln in enumerate(out) if ln.startswith("[gate] done: MIGRATED")))
+        self.assertNotIn("config fixup", self.out.replace(warn, ""))  # no info line, no "apart from the config fixup"
+        self.assertIn(f"  WARN: {drift}{cmd}", G.status_lines())  # the HOLD is cleared: the plain command
         self.assertNotIn("auth", self.cfg_now()["models"]["providers"]["glm"])
         j = self.journal()
         self.assertEqual([a["provider"] for a in j["cron_autofix"]["applied"]], ["glm"])

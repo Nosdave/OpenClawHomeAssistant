@@ -144,6 +144,23 @@ class UnconfiguredAgentTests(Bump1010):
         self.assertIn("job-old", [a["id"] for a in rec["affected"]])
 
 
+class UnconfiguredAgentIdTests(Bump1010):
+    AGENTS = ("main", "haus-agent")  # OpenClaw registers the store of "Haus Agent" as haus-agent (normalizeAgentId)
+
+    def test_a_configured_agent_whose_id_is_not_canonical_gets_no_line(self):
+        """D6 compares ids as OpenClaw (and the cron report) does: "Haus Agent" in agents.list is haus-agent."""
+        rc, text = self.dry()
+        self.assertEqual(rc, 0, text)
+        self.assertIn(f"[gate] 1/8 info: {AGENT.format('haus-agent')} (agent haus-agent, schema 24) is registered in "
+                      "OpenClaw's state, but the agent is not configured", text)
+        cfg = json.loads(json.dumps(CFG))
+        cfg["agents"]["list"].append({"id": "Haus Agent"})
+        self.write_cfg(cfg)
+        rc, text = self.dry()
+        self.assertEqual(rc, 0, text)
+        self.assertNotIn("is registered in OpenClaw's state", text)
+
+
 # --- D8 ---------------------------------------------------------------------------------------------------------
 
 class InstallLeftoverTests(Bump1010):

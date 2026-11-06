@@ -2301,11 +2301,12 @@ class Gate:
             self.say(f"{self.pn('precheck')} info: {h['path']} (agent {h['id']}, schema {h['uv']}) {what}, and the "
                      "gate leaves it out of the schema checks")
         # D6: a store OpenClaw registered for an agent that openclaw.json no longer configures
-        configured = set(configured_agent_ids(self.cfg))
+        # ids compared as OpenClaw compares them: it registers the store of "Haus Agent" as haus-agent
+        configured = {mig().normalize_agent_id(a) for a in configured_agent_ids(self.cfg)}
         held = self.held_map(False)
         for key, relp in sorted((cls.get("agent_paths") or {}).items()):
             aid = (cls.get("agent_ids") or {}).get(key, key)
-            if aid in configured or aid.lower() in configured \
+            if mig().normalize_agent_id(aid) in configured \
                     or os.path.realpath(self.gp["STATE"] / relp) in held:
                 continue
             self.say(f"{self.pn('precheck')} info: {relp} (agent {aid}, schema {(cls.get('agents') or {}).get(key)}) "
@@ -3001,10 +3002,15 @@ class Gate:
 
     def _finalize_cron_lines(self):
         """Finalize, after the Skill Workshop lines (cron): an info line per config fixup of this run (journal
-        cron_autofix), then WARN lines per affected job of the postconditions' report (journal cron_binding)."""
-        done = cron_fixup_done_lines(self.j)
+        cron_autofix), then WARN lines per affected job of the postconditions' report (journal cron_binding).
+        openclaw.json is read again: a fixup it no longer holds (removed or changed by hand, e.g. during a HOLD)
+        gets the WARN of oc-upgrade status instead of its info line."""
+        cfg = _read_cfg_lenient()
+        done = cron_fixup_done_lines(self.j, cfg)
         for line in done:
             self.say(f"info: {line}")
+        for line in cron_fixup_drift_lines(self.j, cfg, held=self.gp["HOLD"].exists()):
+            self.warn(line.removeprefix("WARN: "))
         for line in cron_job_lines(self.j.get("cron_binding"), fixup=bool(done)):
             self.warn(line)
         un = cron_unconfigured_line(self.j.get("cron_binding"))
@@ -5011,39 +5017,56 @@ def _fixup_pass(phase):
     return {"doctor1": 1, "doctor2": 2}.get(phase, 1)
 
 
-def cron_fixup_drift_lines(j, cfg):
-    """A4, `oc-upgrade status`: a config fixup of gate run `j` that openclaw.json (`cfg`, read now) no longer holds:
-    models.providers.<p>.auth is not "api-key" any more (removed or changed by hand), so OpenClaw refuses the unbound
-    cron runs on <p> again. One WARN line per provider, with the command; [] when `cfg` is unreadable ({})."""
-    rec = (j or {}).get("cron_autofix")
-    if not isinstance(cfg, dict) or not cfg:
-        return []
+def _cron_fixup_drift(a, cfg):
+    """What openclaw.json (`cfg`, read now) shows instead of the applied config fixup `a` (journal cron_autofix
+    "applied" entry): "the provider entry is gone", "the setting is removed" or "now <value>"; None while it holds
+    models.providers.<entry>.auth = "api-key", and for an entry without its fields or an unreadable `cfg` ({})."""
+    if not (isinstance(cfg, dict) and cfg and isinstance(a, dict) and isinstance(a.get("entry"), str)
+            and a.get("provider") and a.get("path")):
+        return None
     provs = _cfg_get(cfg, "models", "providers")
+    ent = provs.get(a["entry"]) if isinstance(provs, dict) else None
+    now = ent.get("auth") if isinstance(ent, dict) else None
+    if now == mig().CRON_FIXUP_AUTH:
+        return None
+    return ("the provider entry is gone" if not isinstance(ent, dict) else
+            "the setting is removed" if now is None else f"now {printable(json.dumps(now))[:40]}")
+
+
+def cron_fixup_drift_lines(j, cfg, held=False):
+    """A4, `oc-upgrade status` and finalize: a config fixup of gate run `j` that openclaw.json (`cfg`, read now) no
+    longer holds: models.providers.<p>.auth is not "api-key" any more (removed or changed by hand), so OpenClaw
+    refuses the unbound cron runs on <p> again. One WARN line per provider, with the command; [] when `cfg` is
+    unreadable ({}). held: OpenClaw is held (hold.txt), so the wrapper refuses `openclaw config set` until the HOLD
+    is cleared; the line says so and names the hand edit of openclaw.json."""
+    rec = (j or {}).get("cron_autofix")
     rt = printable((j or {}).get("runtime") or "2026.10.10+")
     out = []
     for a in rec.get("applied") or [] if isinstance(rec, dict) else []:
-        if not (isinstance(a, dict) and isinstance(a.get("entry"), str) and a.get("provider") and a.get("path")):
-            continue
-        ent = provs.get(a["entry"]) if isinstance(provs, dict) else None
-        now = ent.get("auth") if isinstance(ent, dict) else None
-        if now == mig().CRON_FIXUP_AUTH:
+        state = _cron_fixup_drift(a, cfg)
+        if state is None:
             continue
         p, path = printable(a["provider"]), str(a["path"])
-        state = ("the provider entry is gone" if not isinstance(ent, dict) else
-                 "the setting is removed" if now is None else f"now {printable(json.dumps(now))[:40]}")
+        cmd = f"openclaw config set {shlex.quote(path)} api-key"
+        how = (f"To restore: set it in openclaw.json by hand (while OpenClaw is held the wrapper refuses openclaw "
+               f"config set), or after the HOLD is cleared: {cmd}" if held else f"To restore: {cmd}")
         out.append(f"WARN: openclaw.json no longer holds this run's config fixup {printable(path)} = \"api-key\" "
                    f"({state}): OpenClaw {rt} then runs {p} on the copy of its key that doctor stored and refuses its "
                    f"unbound cron runs again ({CRON_FIXUP_ISSUE}), unless the key now comes from the environment (env "
-                   f"SecretRef). To restore: openclaw config set {shlex.quote(path)} api-key")
+                   f"SecretRef). {how}")
     return out
 
 
-def cron_fixup_done_lines(j):
-    """The config fixups gate run `j` made (journal cron_autofix "applied"), for finalize and `oc-upgrade status`."""
+def cron_fixup_done_lines(j, cfg=None):
+    """The config fixups gate run `j` made (journal cron_autofix "applied"), for finalize and `oc-upgrade status`.
+    cfg (finalize: openclaw.json read now): only those it still holds (_cron_fixup_drift; all when it is unreadable),
+    the others get cron_fixup_drift_lines instead."""
     rec = (j or {}).get("cron_autofix")
     rt = printable((j or {}).get("runtime") or "2026.10.10+")
     out = []
     for a in rec.get("applied") or [] if isinstance(rec, dict) else []:
+        if cfg is not None and _cron_fixup_drift(a, cfg) is not None:
+            continue
         if isinstance(a, dict) and a.get("provider") and a.get("path"):
             p = printable(a["provider"])
             out.append(f"config fixup of this run: {printable(a['path'])} = \"{printable(a.get('new') or 'api-key')}\" "
@@ -7315,7 +7338,7 @@ def _status_cron(j):
     postconditions' report, else the precheck forecast of a run that stopped before."""
     fix = ["  " + x for x in cron_fixup_done_lines(j)]  # the config fixups this run made
     if fix:  # A4: the journal says what the run set; openclaw.json says whether it is still there
-        fix += ["  " + x for x in cron_fixup_drift_lines(j, _read_cfg_lenient())]
+        fix += ["  " + x for x in cron_fixup_drift_lines(j, _read_cfg_lenient(), held=gpaths()["HOLD"].exists())]
     rec, when = j.get("cron_binding"), "after the migration"
     if not isinstance(rec, dict):
         rec, when = j.get("cron_binding_forecast"), "precheck forecast"
@@ -7474,11 +7497,13 @@ def _status_held_and_plugins(gp, marker):
             newer = [x for x in mine if rtv and C.version_tuple(x["version"]) and C.version_tuple(x["version"]) > rtv]
             behind = [x["package"] for x in mine if x["version"] != rt and x not in newer]
             cohort = plugin_cohort_marker(gp["STATE"], rt)
+            held = gp["HOLD"].exists()  # plugins-sync skips and the wrapper refuses `plugins` while OpenClaw is held
             if behind and cohort.exists():
+                how = f"delete {cohort} and restart the add-on, or by hand: openclaw plugins update <package>@{rt}"
                 text += (f"; not at OpenClaw {rt}: {', '.join(behind)} (enabled or changed after the add-on's update "
-                         f"step for {rt}; to update: delete {cohort} and restart the add-on, or by hand: openclaw "
-                         f"plugins update <package>@{rt})")
-            elif behind and gp["HOLD"].exists():  # plugins-sync skips while OpenClaw is held
+                         f"step for {rt}; " + (f"not while OpenClaw is held: once the HOLD is cleared, {how}" if held
+                                               else f"to update: {how}") + ")")
+            elif behind and held:
                 text += (f"; not yet at OpenClaw {rt}: {', '.join(behind)} (not while OpenClaw is held: the add-on "
                          "updates them at the first start after the HOLD is cleared, after the migration gate, whose "
                          "doctor passes update them too: oc-upgrade plugins-sync)")

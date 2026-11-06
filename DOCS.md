@@ -1434,11 +1434,14 @@ What you see:
   refused is not counted: an info line names it (`… only after a fallback that stays
   refused …`). `oc-upgrade gate --dry-run`, `oc-upgrade gate --plan` and
   `oc-upgrade check` say `would set` and write nothing.
-- The end of the run and `oc-upgrade status` repeat the line. `oc-upgrade status` also
-  reads `openclaw.json` again: if the setting is gone or changed later (by hand, or a
-  restored file), it warns `WARN: openclaw.json no longer holds this run's config fixup …`
-  with the command that restores it (`openclaw config set models.providers.<p>.auth
-  api-key`); without it OpenClaw refuses the unbound cron runs on `<p>` again.
+- The end of the run and `oc-upgrade status` repeat the line. Both also read
+  `openclaw.json` again: if the setting is gone or changed later (by hand, for example
+  during a HOLD, or a restored file), they warn `WARN: openclaw.json no longer holds this
+  run's config fixup …` (the end of the run instead of the line) with the command that
+  restores it (`openclaw config set models.providers.<p>.auth api-key`; during a HOLD the
+  wrapper refuses it, so the line says to set it in `openclaw.json` by hand or to run it
+  after the HOLD is cleared); without it OpenClaw refuses the unbound cron runs on `<p>`
+  again.
 
 How the gate writes it:
 
@@ -1614,7 +1617,8 @@ bundled OpenClaw (not only the marker): `enabled ones synced to OpenClaw <versio
 them; during a HOLD the line says that they are updated at the first start after the HOLD
 is cleared, after the gate, whose doctor passes update them too), `newer than OpenClaw <version>, left as is: …`, or `not at OpenClaw <version>: …`
 for a plugin you enabled after the step ran for that version: delete the marker file the
-line names and restart the add-on, or update it by hand. When the postconditions of a
+line names and restart the add-on, or update it by hand (during a HOLD the line says to do
+that once the HOLD is cleared). When the postconditions of a
 gate run find an enabled official plugin older than the bundled OpenClaw (`WARN: plugin
 <id> is …`), the gate deletes that marker, so the step after the gate updates it. The image build checks that `@openclaw/brave-plugin`, `@openclaw/codex` and
 `@openclaw/acpx` exist on npm in the pinned OpenClaw version. These updates, doctor's and

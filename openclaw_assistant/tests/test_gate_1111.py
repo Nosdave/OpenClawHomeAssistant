@@ -414,6 +414,17 @@ class PluginStatus1111Tests(T.GateEnv):
                       "update them too: oc-upgrade plugins-sync)", line)
         self.assertNotIn("next start", line)
 
+    def test_status_during_a_hold_with_the_marker_waits_for_the_hold(self):
+        """Recheck finding: a plugin enabled after the update step (marker present) during a HOLD: deleting the
+        marker and restarting, or `openclaw plugins update`, works only once the HOLD is cleared (plugins-sync skips
+        and the wrapper refuses `plugins` while OpenClaw is held)."""
+        (self.upg / "hold.txt").write_text("HOLD\n")
+        line = self.status_line({})
+        self.assertIn(f"not at OpenClaw 2026.11.1: @openclaw/acpx (enabled or changed after the add-on's update step "
+                      f"for 2026.11.1; not while OpenClaw is held: once the HOLD is cleared, delete {self.marker} and "
+                      "restart the add-on, or by hand: openclaw plugins update <package>@2026.11.1)", line)
+        self.assertNotIn("to update:", line)
+
 
 class PluginSpace1111Tests(T.GateEnv):
     """Rehearsal A3: OpenClaw 2026.10.10+ doctor brings the enabled official plugins to its release (a new npm
