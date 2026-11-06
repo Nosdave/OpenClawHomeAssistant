@@ -296,8 +296,10 @@ class OrphanOutcomeTests(Bump1010):
         hold = (self.upg / "hold.txt").read_text()
         self.assertIn("unless its deletion history holds it back, migrates it one-way to schema 27; a store that "
                       "records another agent as its owner is not migrated: doctor moves it aside as "
-                      "<file>.corrupt-<time> when it is a byte-identical copy of that agent's database (a plaintext "
-                      "copy that is kept) and refuses it otherwise", hold)
+                      "<file>.corrupt-<time> only when it and its -wal/-shm files are byte-identical to that agent's "
+                      "database (a plaintext copy that is kept), and otherwise refuses it, which stops doctor after "
+                      "the other databases are migrated (hard HOLD doctor-migration-refused): move such a folder out "
+                      "of agents/ instead of accepting", hold)
         self.assertIn("what doctor did is in the gate's final lines and oc-upgrade status", hold)
 
     def test_outcomes_in_finalize_journal_marker_and_status(self):

@@ -1041,8 +1041,13 @@ listed instead of holding with `orphan-agent-db`, a configured agent whose store
 that way holds with `agent-db-held`, the `orphan-agent-db` reason is reworded, and an
 orphan store below the target is part of `quick_check` and the foreign-key check, so a
 damaged one holds with `sqlite-corrupt` or `sqlite-fk-violation`; see
-[HOLD codes added for the OpenClaw 2026.10.10 line](#hold-codes-added-for-the-openclaw-20261010-line))
-and a few reworded messages.
+[HOLD codes added for the OpenClaw 2026.10.10 line](#hold-codes-added-for-the-openclaw-20261010-line)),
+the reports added after the rehearsal (the precheck line for a store registered for an
+agent that `openclaw.json` does not configure, plugin install leftovers, what doctor did
+with orphan stores, databases OpenClaw set aside and plugin captures in `oc-upgrade
+status`, the `no-network` reason, the stop of a stopped doctor's npm processes), the
+log redaction rules and a few reworded messages (the changelog marks their entries "with
+every OpenClaw version").
 
 **Rule for backups:** no plaintext secrets in archives or backups. Home Assistant
 backups stay inside the Home Assistant backup system and are encrypted. The add-on's
@@ -1051,8 +1056,58 @@ encrypted Home Assistant backup, and restoring it is the only rollback: the gate
 writes no archive of its own, and the add-on keeps no copy of the state outside the
 Home Assistant backup system.
 
-**Runbook** (from `0.5.93-full2` to `0.5.94-full3` or later, currently `0.5.94-full4`;
-coming from `0.5.94-full1`, `0.5.94-full2` or `0.5.94-full3`, see the note after the steps)
+**Runbook from `0.5.94-full1` … `0.5.94-full4` (OpenClaw 2026.10.4) to this version
+(OpenClaw 2026.11.1).** The gate runs its shorter update form (mode `bump`); the
+databases change one-way (state 20 → 22, agent 24 → 27). Steps 2–4 and 6 are those of
+the runbook from `0.5.93-full2` below.
+
+1. On the version you run now: `oc-upgrade check` → exit code `0` or `4`, and
+   `migrated: 2026.10.4 (…)`. Exit code `2` or `3`: do not update, ask first. This
+   check does not know the checks of the new version yet; they run in its precheck,
+   before anything is written ([Known limits](#known-limits-with-openclaw-20261010-and-2026111)).
+   Check the browsers and devices you open the Control UI with: OpenClaw 2026.11.1 needs
+   Safari 26.2+, Chrome 147+ or Firefox 150+, and in apps Android System WebView 147+ or
+   iOS/iPadOS 26.2+ (same section).
+2. Turn auto-update off and pause automatic backups (step 2 below).
+3. Stop the add-on and create the encrypted Home Assistant backup (step 3 below). It must
+   hold the add-on version you update from, for example `0.5.94-full4`.
+4. Update with the add-on still stopped, start it and leave the log open (step 4 below).
+5. The precheck line names
+   `HA backup ok ('<name>', … old, encrypted, add-on 0.5.94-full4)` (the version you
+   update from). If an enabled cron job uses a provider whose literal key doctor would
+   store as a login, the precheck also says `1/8 config fixup: will set
+   models.providers.<p>.auth = "api-key" …`, and the gate writes it before doctor pass 1
+   (`[gate] 4/8 config fixup: …`; see
+   [Cron jobs without a recorded inference account](#cron-jobs-without-a-recorded-inference-account-openclaw-20261010)).
+   Success ends with `[gate] done: MIGRATED 2026.11.1 …`, then the gateway starts. Read
+   the `WARN` lines of the run (for example cron jobs that stop at a fallback, Skill
+   Workshop proposals); `oc-upgrade status` repeats them. Then test the Control UI
+   (if a browser asks for pairing: `openclaw devices list`, `openclaw devices approve
+   <id>`), Telegram, your models, MCP and cron jobs.
+6. Keep the encrypted Home Assistant backup until you are sure (step 6 below): restoring
+   it is the rollback ([Safe rollback](#safe-rollback-after-an-openclaw-database-upgrade)).
+
+**Coming from `0.5.94-full1`, `0.5.94-full2` or `0.5.94-full3`.** Follow the runbook
+above: this update changes the OpenClaw version (2026.10.4 → 2026.11.1), so the gate
+runs, with the backup check (step 3). There is nothing to set: the archive options of
+0.5.94-full2 no longer exist (the Supervisor ignores a stored value with a warning).
+The add-on deletes what these versions left, each `gate_cleanup_hours` after its own
+time, so at once if that was longer ago: the gate archive in
+`/share/openclaw-upgrade/<run>/` (plaintext with full1, encrypted with full2) and that
+run's doctor captures after the run ended (or after a hold that followed it was
+cleared), rehearsal exports in `/share/openclaw-rehearsal/` after they were written,
+and the plaintext 2026.7 archives in `/config/.openclaw/upgrade-backups/` after the
+2026.10 migration completed. A return to OpenClaw 2026.7.35 is only possible with the
+Home Assistant backup of `0.5.93-full2`. If a full2 gate wrote an encrypted archive and
+you have no encrypted Home Assistant backup from before that migration, keep the full2
+private key until that archive is deleted (`oc-upgrade cleanup` shows when; never with
+`gate_cleanup_hours: 0`); otherwise the key pair is no longer needed. If you downloaded
+a backup for the full1 update, delete that copy, and delete unencrypted backups of this
+add-on in **Settings → System → Backups** (the gate names up to three in a `WARN` at
+its next run and counts the rest).
+
+**Runbook from `0.5.93-full2` (OpenClaw 2026.7.35)** to `0.5.94-full3` or later (the full
+migration gate; to this version it ends with `MIGRATED 2026.11.1`)
 
 1. On `0.5.93-full2`: `oc-upgrade check` → exit code `0` or `4`, and
    `startup-migrations checkpoint: 2026.7.35`. Exit code `2` or `3`: do not update, ask first.
@@ -1103,26 +1158,6 @@ coming from `0.5.94-full1`, `0.5.94-full2` or `0.5.94-full3`, see the note after
    (see [Automatic deletion](#automatic-deletion-gate_cleanup_hours); `oc-upgrade cleanup`
    shows the times). The rollback needs neither.
 
-**Coming from `0.5.94-full1`, `0.5.94-full2` or `0.5.94-full3`.** The OpenClaw version does not change
-(2026.10.4), so no gate runs on this update: nothing is checked now. Create the
-encrypted backup before updating anyway (step 3; a rollback to the earlier add-on
-version then only needs a restore). There is nothing to set: the archive options of
-0.5.94-full2 no longer exist (the Supervisor ignores a stored value with a warning).
-The add-on deletes what these versions left, each `gate_cleanup_hours` after its own
-time, so at once if that was longer ago: the gate archive in
-`/share/openclaw-upgrade/<run>/` (plaintext with full1, encrypted with full2) and that
-run's doctor captures after the run ended (or after a hold that followed it was
-cleared), rehearsal exports in `/share/openclaw-rehearsal/` after they were written,
-and the plaintext 2026.7 archives in `/config/.openclaw/upgrade-backups/` after the
-2026.10 migration completed. A return to OpenClaw 2026.7.35 is only possible with the
-Home Assistant backup of `0.5.93-full2`. If a full2 gate wrote an encrypted archive and
-you have no encrypted Home Assistant backup from before that migration, keep the full2
-private key until that archive is deleted (`oc-upgrade cleanup` shows when; never with
-`gate_cleanup_hours: 0`); otherwise the key pair is no longer needed. If you downloaded
-a backup for the full1 update, delete that copy, and delete unencrypted backups of this
-add-on in **Settings → System → Backups** (the gate names up to three in a `WARN` at
-its next run and counts the rest).
-
 **What the gate does**
 
 | Phase | What happens |
@@ -1134,8 +1169,8 @@ its next run and counts the rest).
 | 7 postconditions | Schema versions (with OpenClaw 2026.10.10+ the stores OpenClaw keeps from deleted agents that are not configured are listed, not required: the gateway does not open them), `config validate`, `doctor --lint`, no legacy refs, runtime of migrated refs, `models status`, sessions. With 2026.10.10+ also: the migrated cron jobs are read again for the cron report, and a `WARN` if doctor kept the Skill Workshop proposal storage. |
 | 8 pins | Keeps 2026.7 defaults where you have not set the key (see the 0.5.94-full1 changelog), recorded in `/config/.openclaw-upgrade/gate/pins-ledger.json` and never re-applied (`skills.workshop.approvalPolicy` only with OpenClaw versions that still have Skill Workshop proposals, before 2026.10.10). |
 
-Later OpenClaw updates (for example 2026.10.x → 2026.10.y) run the same gate in a
-shorter form: precheck with the backup check, cleanup, doctor twice,
+Later OpenClaw updates (for example 2026.10.4 → 2026.11.1, the update to this version)
+run the same gate in a shorter form: precheck with the backup check, cleanup, doctor twice,
 postconditions; no pre-migration and no pins. Create the encrypted Home Assistant
 backup right before each of these updates (runbook step 3). Doctor updates the enabled
 official plugins to the bundled OpenClaw version; after the gate, before the gateway
@@ -1236,10 +1271,14 @@ database of every agent folder it finds under `/config/.openclaw/agents/`, also 
 that are neither configured nor registered, one-way, unless its deletion history holds
 the store back; the gateway opens only the configured agents' databases. A store that
 records another agent as its owner (for example a copied agent folder) is not migrated:
-if it is a byte-identical copy of that agent's database, doctor renames it to
-`<file>.corrupt-<time>` ("Preserved the copy at …"), otherwise it refuses it with a
-repair hint. The gate holds once with the acceptable code `orphan-agent-db`, so you can
-move unused folders away first; it checks such a store with `quick_check` and the
+if it is a byte-identical copy of that agent's database (with its `-wal`/`-shm` files
+and transcript archives), doctor renames it to `<file>.corrupt-<time>` ("Preserved the
+copy at …"); otherwise it refuses it, which stops doctor after the other databases are
+migrated (hard HOLD `doctor-migration-refused`, with doctor's repair hint in
+`oc-upgrade log`). The gate holds once with the acceptable code `orphan-agent-db`, so you
+can move unused folders away first; its reason names the owner such a store records
+(`(schema 24; records agent main as its owner)`, read-only): move that folder out of
+`agents/` instead of accepting. The gate checks such a store with `quick_check` and the
 foreign-key check, but not its schema afterwards. After doctor it looks at each such
 store again and reports what happened (`doctor migrated it to schema 27`, `set it aside
 as …corrupt-…`, `still at schema …`, `gone after doctor`) at the end of the run and in
@@ -1379,7 +1418,8 @@ that meets all of these:
   after OpenClaw's `${NAME}` / `${NAME:-default}` substitution from the environment.
 
 OpenClaw then runs `<p>` on the configured key instead of doctor's copy, and the jobs
-keep running with their fallbacks. The rehearsal on 2026.10.10 verified this. `auth` is
+are no longer refused on `<p>`. The rehearsal on 2026.10.10 verified this. A fallback on
+a stored login still ends a job's chain (the `WARN` lines below stay). `auth` is
 part of the provider schema in 2026.10.4, 2026.10.10 and 2026.11.1.
 
 What you see:
@@ -1612,8 +1652,10 @@ them.
   job that only stops at a fallback stays so, and a job it binds has its fallbacks to
   other providers refused. A literal key in
   `models.providers.<provider>.apiKey` (also a placeholder such as `EMPTY`) becomes a
-  stored login during the migration: set `models.providers.<provider>.auth: "api-key"`
-  or use an env SecretRef. For AWS SDK credentials (`auth: "aws-sdk"`)
+  stored login during the migration: the gate sets `models.providers.<provider>.auth`
+  to `"api-key"` itself where it can; act only on a remaining
+  `WARN [gate] provider <provider>: …` line (`auth: "api-key"` or an env SecretRef). For
+  AWS SDK credentials (`auth: "aws-sdk"`)
   this stays so after 2026.11.5 too: no account can be recorded for them. Apart from its
   `auth: "api-key"` fixup the gate only reports the affected jobs; see
   [Cron jobs without a recorded inference account](#cron-jobs-without-a-recorded-inference-account-openclaw-20261010).
@@ -2327,7 +2369,8 @@ The gateway's own log is `/tmp/openclaw/openclaw-<date>.log`.
 
 ### Safe rollback after an OpenClaw database upgrade
 
-OpenClaw database migrations are one-way: 2026.7 cannot open a 2026.10 state.
+OpenClaw database migrations are one-way: 2026.7 cannot open a 2026.10 state, and
+2026.10.4 cannot open a state that 2026.11.1 migrated (state 22, agent 27).
 The only rollback point is **the encrypted Home Assistant backup** you made with the
 add-on stopped, right before updating (`oc-upgrade status` shows the one the gate
 checked under "HA backup checked"). Restoring the add-on from it brings back both the
@@ -2336,12 +2379,14 @@ previous add-on version and its `/config` data:
 1. Stop the add-on.
 2. In **Settings → System → Backups**, restore only the add-on from that backup (you
    need the backup encryption key).
-3. Check that the add-on page shows **0.5.93-full2**, then start it. The log must show
-   `OpenClaw runtime version: 2026.7.35`. A Codex/ChatGPT login may have to be
-   repeated, because 2026.10 refreshes tokens.
+3. Check that the add-on page shows **the add-on version you updated from**, then start
+   it. The log must show that version's OpenClaw: `0.5.94-full1` to `0.5.94-full4` →
+   `OpenClaw runtime version: 2026.10.4`; `0.5.93-full2` →
+   `OpenClaw runtime version: 2026.7.35` (then a Codex/ChatGPT login may have to be
+   repeated, because 2026.10 refreshes tokens).
 
 Work created after the backup is not present after a rollback, and Telegram messages
-that 2026.10 already processed are not delivered again. Do not download the backup or
+that the newer OpenClaw already processed are not delivered again. Do not download the backup or
 copy it, or `/config` paths, elsewhere as a second rollback point: the add-on needs
 none.
 

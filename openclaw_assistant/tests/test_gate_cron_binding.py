@@ -886,7 +886,8 @@ class CronConfigFixupTests(T.GateEnv):
         self.doctor_copies_key("2026.11.1")
         self.assertEqual(self.quiet(G.retry_cmd, []), 0)
         self.assertEqual(self.run_gate(), 0, self.out)
-        self.assertNotIn("config fixup", self.out.replace("config fixup of this run", ""))
+        self.assertNotIn("config fixup", self.out.replace("config fixup of this run", "")
+                         .replace("apart from the config fixup above", ""))
         self.assertNotIn("auth", self.cfg_now()["models"]["providers"]["glm"])
         j = self.journal()
         self.assertEqual([a["provider"] for a in j["cron_autofix"]["applied"]], ["glm"])
@@ -1105,8 +1106,9 @@ class CronConfigFixupTests(T.GateEnv):
         con.execute("UPDATE cron_jobs SET enabled=0 WHERE job_id='job-morning'")
         con.commit()
         con.close()
-        close = ("2 cron job(s) above: the add-on changes nothing for these jobs; " + OUTLOOK_FB_ALONE + ". "
-                 + G.CRON_FALLBACK)
+        # review 11.1 (regress-docs): the closing note excepts the config fixup named above it
+        close = ("2 cron job(s) above: the add-on changes nothing for these jobs apart from the config fixup above; "
+                 + OUTLOOK_FB_ALONE + ". " + G.CRON_FALLBACK)
         lines = self.dry()
         self.assertIn("WARN [gate] " + close, lines)
         self.doctor_copies_key("2026.11.1")

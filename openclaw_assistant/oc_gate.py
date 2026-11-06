@@ -2244,15 +2244,22 @@ class Gate:
         cls, a_target, ver = self.cls, self.pkg["schema_agent"], self.pkg["version"]
         orphans = [o for o in cls["orphans"] if not o.get("held") and (o.get("uv") is None or o["uv"] < a_target)]
         if orphans:
+            owners = {o["path"]: orphan_recorded_owner(self.gp["STATE"], o) for o in orphans}
+
+            def label(o):
+                own = f"; records agent {printable(owners[o['path']])} as its owner" if owners[o["path"]] else ""
+                return f"{o['path']} (schema {o['uv'] if o.get('uv') is not None else 'unreadable'}{own})"
             F.append(finding("orphan-agent-db", "acceptable",
                              "agent database(s) of agents that are neither configured nor registered: "
-                             + ", ".join(f"{o['path']} (schema {o['uv'] if o.get('uv') is not None else 'unreadable'})"
-                                         for o in orphans)
+                             + ", ".join(label(o) for o in orphans)
                              + f". Doctor of OpenClaw {ver} finds such a store under agents/ and, unless its "
                                f"deletion history holds it back, migrates it one-way to schema {a_target}; a store "
                                "that records another agent as its owner is not migrated: doctor moves it aside as "
-                               "<file>.corrupt-<time> when it is a byte-identical copy of that agent's database (a "
-                               "plaintext copy that is kept) and refuses it otherwise. The gateway does not open it. "
+                               "<file>.corrupt-<time> only when it and its -wal/-shm files are byte-identical to "
+                               "that agent's database (a plaintext copy that is kept), and otherwise refuses it, "
+                               "which stops doctor after the other databases are migrated (hard HOLD "
+                               "doctor-migration-refused): move such a folder out of agents/ instead of accepting. "
+                               "The gateway does not open it. "
                                "The gate checks that it is readable (quick_check, foreign keys) but not its schema "
                                "afterwards; what doctor did is in the gate's final lines and oc-upgrade status",
                              "precheck"))
@@ -2740,7 +2747,7 @@ class Gate:
                      + " (openclaw/openclaw#172792); the gate reports the "
                      "jobs it leaves after the migration")
         elif n:
-            for line in cron_job_lines(rec):
+            for line in cron_job_lines(rec, fixup=bool(rec.get("autofix"))):
                 self.warn(line)
         un = cron_unconfigured_line(rec)
         if un:
@@ -2963,9 +2970,10 @@ class Gate:
     def _finalize_cron_lines(self):
         """Finalize, after the Skill Workshop lines (cron): an info line per config fixup of this run (journal
         cron_autofix), then WARN lines per affected job of the postconditions' report (journal cron_binding)."""
-        for line in cron_fixup_done_lines(self.j):
+        done = cron_fixup_done_lines(self.j)
+        for line in done:
             self.say(f"info: {line}")
-        for line in cron_job_lines(self.j.get("cron_binding")):
+        for line in cron_job_lines(self.j.get("cron_binding"), fixup=bool(done)):
             self.warn(line)
         un = cron_unconfigured_line(self.j.get("cron_binding"))
         if un:
@@ -4733,9 +4741,10 @@ def cron_include_line(rec):
             "stored login of its own this sets that login aside for every run, not only for cron)")
 
 
-def cron_job_lines(rec):
+def cron_job_lines(rec, fixup=False):
     """Per-job WARN texts of a cron_account_report record, the key fix lines, then the closing note (empty when
-    none)."""
+    none). fixup: the lines above name a config fixup of this run (planned or made), which the closing note
+    excepts."""
     aff = (rec or {}).get("affected") or []
     if not aff:
         return []
@@ -4790,6 +4799,7 @@ def cron_job_lines(rec):
                      f"OpenClaw {rt} doctor left them (its warnings are in oc-upgrade log). {remedy}")
     else:
         lines.append(f"{len(aff)} cron job(s) above: the add-on changes nothing for these jobs"
+                     + (" apart from the config fixup above" if fixup else "")
                      + "".join("; " + x for x in _cron_outlook(aff, rec)) + ". " + remedy)
     return lines
 
@@ -5545,6 +5555,26 @@ def sqlite_set_aside(state_dir, cfg=None):
             if stat.S_ISREG(st.st_mode):
                 found[C.rel(path, state_dir)] = st.st_size
     return found
+
+
+def orphan_recorded_owner(state_dir, o):
+    """The agent an orphan store records as its owner when that is another agent (read-only, schema_meta 'primary'),
+    else None. OpenClaw's doctor (state-migrations.agent-owner-recovery.ts, 2026.10.4 to 2026.11.1) does not migrate
+    such a store: it sets it aside only as a byte-identical copy of that agent's database (with -wal/-shm and the
+    transcript archives) and otherwise refuses it, and the refusal stops doctor (doctor-migration-refused) after the
+    other databases are migrated. As there: role 'agent', ids compared normalised (normalize_agent_id; the folder
+    name gives the store's own id). An unreadable store gives None (doctor reports it in the normal migration)."""
+    if not isinstance(o, dict) or o.get("error") or not isinstance(o.get("path"), str) or not o["path"]:
+        return None
+    try:
+        meta = schema_meta_primary(Path(state_dir) / o["path"])
+    except (sqlite3.Error, C.SchemaUnknown, C.NodeQueryError, OSError):
+        return None
+    owner = (meta or {}).get("agent_id")
+    if (meta or {}).get("role") != "agent" or not isinstance(owner, str) or not owner.strip():
+        return None
+    norm = mig().normalize_agent_id
+    return None if norm(owner) == norm(str(o.get("id") or "")) else norm(owner)
 
 
 def orphan_outcomes(state_dir, orphans, a_target, since=None):

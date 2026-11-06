@@ -203,14 +203,20 @@ class Holds1004Tests(T.GateEnv):
     GHOST = "agents/ghost/agent/openclaw-agent.sqlite"
     # rehearsal D11: 2026.10.4 doctor (like 2026.10.10 and 2026.11.1, state-migrations.agent-owner-recovery.ts) does
     # not migrate a store that records another agent as its owner; it sets a byte-identical copy aside as
-    # <file>.corrupt-<time> and refuses any other, so the text no longer promises the one-way migration for every store
+    # <file>.corrupt-<time> and refuses any other, so the text no longer promises the one-way migration for every store.
+    # Review 11.1 (regress-docs): the refusal stops doctor after the other databases are migrated
+    # (DoctorStateMigrationRefusalError -> the hard doctor-migration-refused), so the text says so and advises moving
+    # such a folder away instead of accepting; a store that records another agent is named with that owner.
+    ORPHAN_TAIL = ("Doctor of OpenClaw 2026.10.4 finds such a store under agents/ and, unless its deletion history holds "
+                   "it back, migrates it one-way to schema 24; a store that records another agent as its owner is not "
+                   "migrated: doctor moves it aside as <file>.corrupt-<time> only when it and its -wal/-shm files are "
+                   "byte-identical to that agent's database (a plaintext copy that is kept), and otherwise refuses "
+                   "it, which stops doctor after the other databases are migrated (hard HOLD "
+                   "doctor-migration-refused): move such a folder out of agents/ instead of accepting. The gateway "
+                   "does not open it. The gate checks that it is readable (quick_check, foreign keys) but not its "
+                   "schema afterwards; what doctor did is in the gate's final lines and oc-upgrade status")
     ORPHAN = ("agent database(s) of agents that are neither configured nor registered: " + GHOST + " (schema 20). "
-              "Doctor of OpenClaw 2026.10.4 finds such a store under agents/ and, unless its deletion history holds "
-              "it back, migrates it one-way to schema 24; a store that records another agent as its owner is not "
-              "migrated: doctor moves it aside as <file>.corrupt-<time> when it is a byte-identical copy of that "
-              "agent's database (a plaintext copy that is kept) and refuses it otherwise. The gateway does not open "
-              "it. The gate checks that it is readable (quick_check, foreign keys) but not its schema afterwards; "
-              "what doctor did is in the gate's final lines and oc-upgrade status")
+              + ORPHAN_TAIL)
 
     def setUp(self):
         super().setUp()
@@ -242,6 +248,29 @@ class Holds1004Tests(T.GateEnv):
             "backup), then oc-upgrade retry, or accept: oc-upgrade retry --accept orphan-agent-db (then restart the "
             "add-on)",
             "Accept (only if you understand the consequence): oc-upgrade retry --accept orphan-agent-db"]))
+
+    def test_orphan_store_that_records_another_agent_names_that_owner(self):
+        """A copied agent folder: agents/copy holds a store whose schema_meta names agent main. Doctor sets it aside only
+        as a byte-identical copy of main's database and otherwise refuses it, which stops doctor after the other
+        databases are migrated: the reason names the recorded owner (read-only) so the owner moves the folder away. A
+        store that records its own id (also in another letter case, as OpenClaw normalises ids) is not flagged."""
+        T.make_1004_agent_db(self.state, "ghost", uv=20, app="2026.9.9")
+        T.make_1004_agent_db(self.state, "copy", uv=20, app="2026.9.9")
+        T.make_1004_agent_db(self.state, "Upper", uv=20, app="2026.9.9")
+        for aid, owner in (("copy", "main"), ("Upper", "upper")):
+            con = sqlite3.connect(str(self.state / f"agents/{aid}/agent/openclaw-agent.sqlite"))
+            con.execute("UPDATE schema_meta SET agent_id=? WHERE meta_key='primary'", (owner,))
+            con.commit()
+            con.close()
+        before = {p.name: p.read_bytes() for p in (self.state / "agents" / "copy" / "agent").iterdir()}
+        codes, acceptable, lines = self.hold()
+        self.assertEqual((codes, acceptable), (["orphan-agent-db"], True))
+        self.assertEqual(lines[0], "Reason [orphan-agent-db]: agent database(s) of agents that are neither configured "
+                         "nor registered: agents/Upper/agent/openclaw-agent.sqlite (schema 20), "
+                         "agents/copy/agent/openclaw-agent.sqlite (schema 20; records agent main as its owner), "
+                         + self.GHOST + " (schema 20). " + self.ORPHAN_TAIL)
+        self.assertEqual({p.name: p.read_bytes() for p in (self.state / "agents" / "copy" / "agent").iterdir()},
+                         before)  # read-only: no -wal/-shm left behind, nothing changed
 
     def test_damaged_orphan_store_is_hard(self):
         T.make_1004_agent_db(self.state, "ghost", uv=20, app="2026.9.9")
