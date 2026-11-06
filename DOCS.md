@@ -1302,7 +1302,8 @@ behaviour pin for `approvalPolicy` is not written on these versions). With OpenC
   digits, …) is hidden whole: in quotes up to the closing quote, else to the end of the
   line or a delimiter such as `, `, a closing bracket or a sentence-final `.`
   (`Passwort: correct horse battery` → `Passwort: ***`). In `proposals.json` a value under
-  such a key (also any `…Key`) is hidden whatever it holds; ids and OpenClaw's session and
+  such a key (also any `…Key`, and a key of several words that ends in one, such as
+  `WLAN Passwort` or `SIM PIN`) is hidden whatever it holds; ids and OpenClaw's session and
   skill keys stay readable. A
   hash that could confirm a guess of a redacted value is not exported either: a redacted
   file has no source sha256; once a draft or an undo record of a skill was redacted,
@@ -1438,10 +1439,11 @@ never holds. With OpenClaw 2026.10.4 it prints and changes nothing.
   the first such fallback when that model fails (with `$include`: as far as `openclaw.json`
   itself shows). Then one `WARN [gate] provider <p>: …`
   line per provider whose literal key is the reason, with the fix (below). Only the job
-  id, its name, model names, provider ids and config paths are shown, no prompt, no
-  account and no key.
+  id, its name (redacted like the log), model names, provider ids and config paths are
+  shown, no prompt, no account and no key.
 - **Jobs of an agent that `openclaw.json` does not configure** are left out: OpenClaw
-  cancels their runs anyway ("cron job agent is unavailable"). One `1/8 info: N enabled
+  cancels their runs anyway ("cron job agent is unavailable"). Agent ids are compared as
+  OpenClaw compares them (`Haus Agent` in `agents.list` owns the jobs of `haus-agent`). One `1/8 info: N enabled
   cron job(s) belong to agent(s) not configured in openclaw.json …` line names them (again
   at the end of the run and in `oc-upgrade status`). With `$include` the line says that an
   included file may configure them (it is not checked).

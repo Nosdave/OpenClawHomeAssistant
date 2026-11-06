@@ -201,7 +201,10 @@ class DoctorBlockedTests(unittest.TestCase):
         cases = [("plugins.entries.brave.config.webSearch.apiKey", 'SecretRef provider "vault" is not configured'),
                  ("channels.telegram.botToken", "Invalid input: expected string, received object"),
                  ("gateway.auth.token", "Too small: expected string to have >=16 characters"),
-                 ("models.providers.glm.apiKey", "Invalid input: expected string, received number")]
+                 ("models.providers.glm.apiKey", "Invalid input: expected string, received number"),
+                 # 2026.11.1 doctor-gateway-auth findings (security review)
+                 ("gateway.auth.token", "Gateway token is a known redaction sentinel, not a usable secret."),
+                 ("gateway.auth.token", "Gateway token is managed via SecretRef and is currently unavailable.")]
         for path, msg in cases:
             with self.subTest(path=path):
                 ev = G.evaluate_doctor(1, blocked_text(("core/doctor/final-config-validation", path, msg,

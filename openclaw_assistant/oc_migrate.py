@@ -39,7 +39,7 @@ __all__ = [
     "retired_chain", "apply_retired",
     "legacy_key_context", "is_migrated_legacy_key",
     "check_legacy_refs", "check_codex_runtime", "check_runtime_pins", "apply_pins", "auth_order_adjust",
-    "split_trailing_auth_profile", "cron_job_agent", "cron_model_chain", "cron_model_ref",
+    "split_trailing_auth_profile", "normalize_agent_id", "cron_job_agent", "cron_model_chain", "cron_model_ref",
     "cron_ref_refusal", "cron_ref_uses_stored_profile", "cron_account_forecast", "is_secret_ref", "is_key_marker",
     "doctor_copies", "doctor_key_copies", "config_path", "parse_model_catalog_json",
     "classify_state_files", "scan_sessions_files", "config_precheck", "flatten_paths",
@@ -2187,18 +2187,34 @@ def split_trailing_auth_profile(raw):
     return model, profile
 
 
+_AGENT_ID_RE = re.compile(r"[a-z0-9][a-z0-9_-]{0,63}", re.I | re.A)  # VALID_ID_RE (ASCII only, as in JS)
+
+
+def normalize_agent_id(value):
+    """OpenClaw's normalizeAgentId (packages/normalization-core/src/agent-id.ts, 2026.11.1): trimmed and lower-cased;
+    an id that is not canonical has every run of other characters replaced by "-", leading and trailing "-" removed,
+    and is cut to 64 characters; "main" when nothing is left. Cron jobs and the gateway's agent check use this form
+    ("Haus Agent" -> "haus-agent")."""
+    t = value.strip() if isinstance(value, str) else ""
+    n = t.lower()
+    if _AGENT_ID_RE.fullmatch(t):
+        return n
+    return re.sub(r"[^a-z0-9_-]+", "-", n).strip("-")[:64] or "main"
+
+
 def _agent_cfg_entry(cfg, agent_id):
-    """The agents.list / agents.entries object of `agent_id` (ids compared lower-cased), or None."""
+    """The agents.list / agents.entries object of `agent_id` (ids compared normalised, normalize_agent_id), or
+    None."""
     agents = cfg.get("agents") if isinstance(cfg, dict) else None
     if not isinstance(agents, dict) or not isinstance(agent_id, str):
         return None
-    want = agent_id.strip().lower()
+    want = normalize_agent_id(agent_id)
     for e in agents.get("list") if isinstance(agents.get("list"), list) else []:
-        if isinstance(e, dict) and isinstance(e.get("id"), str) and e["id"].strip().lower() == want:
+        if isinstance(e, dict) and isinstance(e.get("id"), str) and normalize_agent_id(e["id"]) == want:
             return e
     ent = agents.get("entries")
     for k, e in ent.items() if isinstance(ent, dict) else []:
-        if isinstance(k, str) and k.strip().lower() == want and isinstance(e, dict):
+        if isinstance(k, str) and normalize_agent_id(k) == want and isinstance(e, dict):
             return e
     return None
 
@@ -2222,17 +2238,17 @@ def _agent_fallbacks_override(v):
 
 
 def cron_job_agent(job, default_agent="main"):
-    """The agent a cron job runs as: agentId, else the agent of its sessionKey ("agent:<id>:..."), else the
-    default agent."""
+    """The agent a cron job runs as (tryResolveCronJobEffectiveAgentId, cron/agent-id.ts): agentId, else the agent
+    of its sessionKey ("agent:<id>:..."), else the default agent; normalised as OpenClaw does (normalize_agent_id)."""
     aid = job.get("agentId")
     if isinstance(aid, str) and aid.strip():
-        return aid.strip().lower()
+        return normalize_agent_id(aid)
     sk = job.get("sessionKey")
     if isinstance(sk, str):
         parts = sk.strip().split(":")
         if len(parts) >= 3 and parts[0].lower() == "agent" and parts[1].strip():
-            return parts[1].strip().lower()
-    return (default_agent or "main").strip().lower()
+            return normalize_agent_id(parts[1])
+    return normalize_agent_id(default_agent or "main")
 
 
 def _subagent_model_selection(cfg, entry):
@@ -2402,7 +2418,7 @@ def cron_account_forecast(jobs, cfg, profiles_for, default_agent="main", copies_
     refusal: where "config" (models.providers.<p>.apiKey of openclaw.json holds the key) or "catalog" (only an agent's
     model catalog does), path "models.providers.<p>" as OpenClaw writes it, auth the configured mode or None,
     pending: the stored login is doctor's copy during this migration. No key value anywhere.
-    configured: the agent ids openclaw.json configures (lower case), or None for no check. OpenClaw cancels every run
+    configured: the agent ids openclaw.json configures (normalize_agent_id), or None for no check. OpenClaw cancels every run
     of a job whose agent is not configured ("cron job agent is unavailable", the gateway's isAgentAvailable), so such
     a job is not checked; it is listed in "unconfigured": [{"id", "name", "agent"}]."""
     cfg = cfg if isinstance(cfg, dict) else {}

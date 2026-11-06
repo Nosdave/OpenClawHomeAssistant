@@ -1521,8 +1521,12 @@ def normalize_doctor_text(text):
 
 
 def _snippet(norm, idx, width=160):
-    s = norm[max(0, idx - 40): idx + width]
-    return C.redact_text(s)
+    """The text around idx (40 characters before, width from it), redacted before the cut: each side is redacted
+    with 400 more characters, so a cut never leaves a secret whose key word it cut off ("...ken: <value>"); the
+    joined cut once more (a token on both sides of idx)."""
+    pre = C.redact_text(norm[max(0, idx - 440): idx])
+    post = C.redact_text(norm[idx: idx + width + 400])
+    return C.redact_text(pre[-40:] + post[:width])
 
 
 def blocked_message(rc, norm, idx):
@@ -1618,8 +1622,8 @@ def evaluate_doctor(rc, text, *, timed_out=False, stopping=False, final=False, r
                 res.update(code=code, cls="hard", markers=[m.group(0)[:60]],
                            message=f"doctor rc {rc}: ...{_snippet(norm, m.start())}...")
                 return res
-    last = norm[-160:]
-    res.update(code="doctor-failed", cls="hard", message=f"doctor rc {rc}: ...{C.redact_text(last)}")
+    last = C.redact_text(norm[-560:])[-160:]  # redacted before the cut (_snippet)
+    res.update(code="doctor-failed", cls="hard", message=f"doctor rc {rc}: ...{last}")
     return res
 
 
@@ -1781,6 +1785,7 @@ class LogMirror:
     def __init__(self, path, offset, cap, emit, label):
         self.path, self.offset, self.cap, self.emit, self.label = Path(path), offset, cap, emit, label
         self.lines, self.partial, self.last, self.capped = 0, b"", "", False
+        self.redactor = C.LineRedactor()  # PEM blocks and values on the next line span lines
 
     def pump(self, final=False):
         try:
@@ -1795,12 +1800,13 @@ class LogMirror:
         self.partial = b"" if final else parts.pop()
         for raw in parts:
             line = ANSI_RE.sub("", raw.decode("utf-8", "replace")).rstrip("\r")
+            shown = self.redactor.line(line)  # every line, also blank ones: they end a value-on-the-next-line
             if not line.strip():
                 continue
             self.lines += 1
-            self.last = C.redact_text(line.strip())
+            self.last = shown.strip()
             if self.lines <= self.cap:
-                self.emit(f"[doctor] {C.redact_text(line)}")
+                self.emit(f"[doctor] {shown}")
             elif not self.capped:
                 self.capped = True
                 self.emit(f"[gate] (doctor output continues in {self.path})")
@@ -4650,14 +4656,16 @@ def cron_account_report(state_dir, cfg, runtime=None, doctor_migration=False, pe
 
     def copies_for(aid):
         return copies["shared"] + copies["agents"].get(aid, [])
-    configured = {a.lower() for a in configured_agent_ids(cfg)}
+    configured = {mig().normalize_agent_id(a) for a in configured_agent_ids(cfg)}  # as OpenClaw compares them
     fc = mig().cron_account_forecast(jobs, cfg, profiles_for, default_agent_id(cfg), copies_for, pending_copies,
                                      configured=configured)
+    # job names are free text (an agent may name a reminder from the conversation): redacted, then cut
     rec.update(checked=fc["checked"], bound=fc["bound"],
-               affected=[dict(a, id=str(a["id"])[:120], name=str(a["name"])[:120]) for a in fc["affected"]],
+               affected=[dict(a, id=str(a["id"])[:120], name=C.redact_text(str(a["name"]))[:120])
+                         for a in fc["affected"]],
                key_fix=fc["key_fix"])
     if fc["unconfigured"]:  # D6: only when there are any (a record of an earlier add-on version has none)
-        rec["unconfigured"] = [dict(a, id=str(a["id"])[:120], name=str(a["name"])[:120])
+        rec["unconfigured"] = [dict(a, id=str(a["id"])[:120], name=C.redact_text(str(a["name"]))[:120])
                                for a in fc["unconfigured"]]
     # a key fix provider with a stored login of its own: auth "api-key" or a SecretRef sets that login aside for every
     # run of it (cron_key_fix_lines says so); only an unreadable store leaves the entries unmarked
@@ -4683,6 +4691,12 @@ def cron_account_report(state_dir, cfg, runtime=None, doctor_migration=False, pe
     return rec
 
 
+def cron_job_label(a):
+    """'<name>' (<id>) of a cron job in a log or status line: the name redacted before the cut (a record of an earlier
+    add-on version kept it as stored), control characters escaped."""
+    return f"'{C.redact_text(printable(a.get('name')))[:80]}' ({printable(a.get('id'))[:80]})"
+
+
 def cron_unconfigured_line(rec):
     """D6: the info text for the enabled agentTurn jobs of a cron_account_report record whose agent openclaw.json
     does not configure (OpenClaw cancels their runs), or None. With $include in openclaw.json an included file may
@@ -4691,8 +4705,7 @@ def cron_unconfigured_line(rec):
     if not un:
         return None
     agents = ", ".join(dict.fromkeys(printable(a.get("agent")) for a in un))
-    jobs = ", ".join(f"'{printable(a.get('name'))[:80]}' ({printable(a.get('id'))[:80]})"
-                     for a in un[:CRON_REPORT_MAX])
+    jobs = ", ".join(cron_job_label(a) for a in un[:CRON_REPORT_MAX])
     more = f" and {len(un) - CRON_REPORT_MAX} more" if len(un) > CRON_REPORT_MAX else ""
     if rec.get("include"):
         return (f"{len(un)} enabled cron job(s) belong to agent(s) that openclaw.json itself does not configure "
@@ -4733,7 +4746,7 @@ def cron_job_lines(rec):
         refs = [printable(r) for r in a.get("refs") or []]
         aws = {printable(r) for r in a.get("aws_sdk") or []}
         copied = {printable(r) for r in a.get("key_copy") or []}
-        head = f"cron job '{printable(a.get('name'))[:80]}' ({printable(a.get('id'))[:80]}): "
+        head = f"cron job {cron_job_label(a)}: "
         more = "".join(f"; also on {on}: {', '.join(x)}" for on, x in (
             ("a stored login", [r for r in refs[1:] if r not in aws]),
             ("AWS SDK credentials", [r for r in refs[1:] if r in aws])) if x)
@@ -4896,8 +4909,7 @@ def cron_fixup_kept_text(kept, fix, runtime):
     provs = {r.split("/", 1)[0] for _a, refs in kept for r in refs}
     paths = ", ".join(printable(f["path"]) for f in fix if f["provider"] in provs)
     models = ", ".join(dict.fromkeys(printable(r) for _a, refs in kept for r in refs))
-    jobs = ", ".join(f"'{printable(a.get('name'))[:80]}' ({printable(a.get('id'))[:80]})"
-                     for a, _r in kept[:CRON_REPORT_MAX])
+    jobs = ", ".join(cron_job_label(a) for a, _r in kept[:CRON_REPORT_MAX])
     more = f" and {len(kept) - CRON_REPORT_MAX} more" if len(kept) > CRON_REPORT_MAX else ""
     return (f"{len(kept)} enabled cron job(s) kept working by the automatic fix ({paths} = \"api-key\" before doctor "
             f"pass 1; otherwise OpenClaw {runtime} refuses {models} on doctor's copy of the literal key): {jobs}{more}")
@@ -4907,8 +4919,7 @@ def cron_fixup_behind_text(behind):
     """Info text: the cron jobs that reach a model the automatic fix covers only after a fallback that stays refused,
     so the fix does not keep them working (job id, name and model refs only)."""
     models = ", ".join(dict.fromkeys(printable(r) for _a, refs in behind for r in refs))
-    jobs = ", ".join(f"'{printable(a.get('name'))[:80]}' ({printable(a.get('id'))[:80]})"
-                     for a, _r in behind[:CRON_REPORT_MAX])
+    jobs = ", ".join(cron_job_label(a) for a, _r in behind[:CRON_REPORT_MAX])
     more = f" and {len(behind) - CRON_REPORT_MAX} more" if len(behind) > CRON_REPORT_MAX else ""
     return (f"{len(behind)} enabled cron job(s) reach {models} only after a fallback that stays refused (the WARN "
             f"lines below): the automatic fix covers that model, but the job stops before it: {jobs}{more}")
@@ -5134,15 +5145,22 @@ def _sw_mkdir(path, root=None):
         os.chmod(str(d), 0o700)
 
 
+def _name_at_end(rx, key):
+    """True when rx (oc_common.SECRET_NAME_RE, PIN_NAME_RE) matches the whole key or its end from the start of a word
+    ("WLAN Passwort", "SIM PIN", "Mein Kennwort"), as the log rules read "<key>: value" in the JSON text; their
+    lookbehinds still see the words before ("first pass" stays no secret name)."""
+    return any(rx.fullmatch(key, i) is not None for i in [0] + [m.end() for m in re.finditer(r"\s+", key)])
+
+
 def _sw_secret_key(key):
-    return (bool(key) and (SW_SECRET_KEY_RE.search(key) is not None or C.SECRET_NAME_RE.fullmatch(key) is not None)
+    return (bool(key) and (SW_SECRET_KEY_RE.search(key) is not None or _name_at_end(C.SECRET_NAME_RE, key))
             and key.lower() not in SW_KEY_KEEP)
 
 
 def _sw_pin(key, obj):
     """True for a PIN the log rules hide in the JSON text too: 3 to 12 digits (a number or a string) under a PIN key
-    (pin, PIN-Code, simPin, wifi_pin, puk)."""
-    if not key or C.PIN_NAME_RE.fullmatch(key) is None or isinstance(obj, bool):
+    (pin, PIN-Code, simPin, wifi_pin, puk, SIM PIN)."""
+    if not key or not _name_at_end(C.PIN_NAME_RE, key) or isinstance(obj, bool):
         return False
     return ((isinstance(obj, int) and obj >= 0 and C.PIN_VALUE_RE.fullmatch(str(obj)) is not None)
             or (isinstance(obj, str) and C.PIN_VALUE_RE.fullmatch(obj) is not None))
@@ -6549,8 +6567,10 @@ def log_cmd(args, emit=out):
             return 0
     data = path.read_bytes().decode("utf-8", "replace").splitlines()
     emit(f"== {path} (last {min(lines, len(data))} of {len(data)} lines, redacted)")
-    for ln in data[-lines:]:
-        emit(C.redact_text(ANSI_RE.sub("", ln)))
+    red = C.LineRedactor()  # from the first line: a PEM block or a key above the tail still hides its lines
+    shown = [red.line(ANSI_RE.sub("", ln)) for ln in data]
+    for ln in shown[-lines:]:
+        emit(ln)
     return 0
 
 
@@ -7131,7 +7151,7 @@ def _status_cron(j):
         what = "every run refused" if a.get("primary_affected") else f"stops at the fallback {refs[0] if refs else '?'}"
         shown = ", ".join(r + (" (AWS SDK credentials)" if r in aws else
                                " (literal key that doctor copies)" if r in copied else "") for r in refs)
-        L.append(f"    '{printable(a.get('name'))[:80]}' ({printable(a.get('id'))[:80]}): {what}; {shown}")
+        L.append(f"    {cron_job_label(a)}: {what}; {shown}")
     if len(aff) > CRON_REPORT_MAX:
         L.append(f"    and {len(aff) - CRON_REPORT_MAX} more")
     L += cron_key_fix_lines(rec, "    ")

@@ -488,7 +488,13 @@ class ExportUnitTests(Base):
             {"Passwort": "hv-0017"}, {"WLAN-Kennwort": "hv-0018 hv-0019"}, {"smtp": {"pass": "hv-0020"}},
             {"MYSQL_PWD": "hv-0021"}, {"dbPwd": 47110815}, {"senha": "hv-0022"}, {"pin": 4711}, {"wifi_pin": "0815"},
             {"PIN-Code": "123456"}, {"note": "ssh admin@192.168.1.1, Passwort: hv-0023 hv-0024"},
-            {"note": 'passphrase: "hv-0025 hv-0026" # home'}, {"note": "Das Kennwort ist hv-0027."}]
+            {"note": 'passphrase: "hv-0025 hv-0026" # home'}, {"note": "Das Kennwort ist hv-0027."},
+            # 11.1 security review: keys with blanks, a YAML block scalar in a string, *_KEY names
+            {"WLAN Passwort": "hv-0028 hv-0029"}, {"SIM PIN": "1234"}, {"Mein Kennwort": "hv-0030 hv-0031"},
+            {"WLAN API key": "hv-0032"}, {"mot de passe": "hv-0033"}, {"SMTP pass": "hv-0034"},
+            {"content": "password: |\n  hv-0035 hv-0036\n  hv-0037\n"}, {"AWS_SECRET_ACCESS_KEY": "hv-0038"},
+            {"note": "AWS_SECRET_ACCESS_KEY: hv-0039/hv-0040"}, {"note": "redis://:hv-0041@redis.local:6379/0"},
+            {"note": "Authorization: Bot hv-0042.hv-0043.hv-0044"}, {"note": "Das Passwort lautet: hv-0045 hv-0046"}]
         for x in cases:
             with self.subTest(x=json.dumps(x)[:50]):
                 logged = C.redact_text(json.dumps(x))
@@ -518,7 +524,8 @@ class ExportUnitTests(Base):
                 "note": "plain words", "enabled": True, "count": 3, "empty_token": "",
                 # no secret names: a pin that is no PIN, words that only contain a keyword
                 "pin": True, "pinned": True, "pin_count": 4711, "passed": 3, "bypass": "first pass: plain words",
-                "compass": "north", "resenha": "um livro", "pinVersion": "2026.11.1"}
+                "compass": "north", "resenha": "um livro", "pinVersion": "2026.11.1",
+                "Passwort Hinweis": "der Name des Hundes", "first pass": "plain words"}
         counter = [0]
         self.assertEqual(G._sw_redact(keep, "", counter), keep)
         self.assertEqual(counter[0], 0)

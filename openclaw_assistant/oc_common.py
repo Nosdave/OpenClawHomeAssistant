@@ -744,20 +744,27 @@ _SECRET_KEY = (r"(?<![A-Za-z0-9_.-])(?=[A-Za-z0-9_.-]*?(?:token|secret|password|
                r"|[A-Za-z0-9_.-]*?key(?![A-Za-z0-9_.-]))[A-Za-z0-9_.-]*+")
 # A key that names a secret, for the "key: value" / "key = value" rule below. It ends in one of:
 # - token, secret, password, passwd, passphrase, passcode, "API key" (also api-key, x-api-key, botToken,
-#   db_password), Passwort, Kennwort, API-Schlüssel, wachtwoord, contraseña, after any prefix (WLAN-Passwort,
-#   Routerkennwort);
+#   db_password), Passwort, Kennwort, API-Schlüssel, wachtwoord, contraseña, and private, secret, access, signing,
+#   encryption, master or client key (AWS_SECRET_ACCESS_KEY, secret_key, PrivateKey), after any prefix
+#   (WLAN-Passwort, Routerkennwort);
 # - pwd, senha, hasło, парола, пароль, "mot de passe" as a word of their own, after "_", "." or "-" (MYSQL_PWD) or
 #   in camelCase (dbPwd); never inside a word (OLDPWD, resenha);
-# - pass the same way (SMTP_PASS, smtp.pass, smtpPass, "pass: x", "user: a, pass: b"), but a bare "pass" not right
-#   after a word ("first pass: ...", "one more pass: ..." in OpenClaw's own logs), and not in bypass or compass.
+# - pass the same way (SMTP_PASS, smtp.pass, smtpPass, "pass: x", "user: a, pass: b", "smtp pass: x", "user=bob
+#   pass=x"), but not after the words of OpenClaw's own "<word> pass:" texts ("first pass: ...", "one more pass:
+#   ...", "convergence pass: ..."; _PASS_NOT_AFTER), and not in bypass or compass.
 # The keyword must end the key: maxTokens, passed, password_hint, pinned are no secret names.
 _LONG_SECRET_WORDS = (r"token|secret|password|passwd|passwort|kennwort|pass[ _-]?phrase|pass[ _-]?code|wachtwoord"
-                      r"|contrase(?:ñ|n)a|api[ _-]?key|api[ _-]?schl(?:ü|ue)ssel")
+                      r"|contrase(?:ñ|n)a|api[ _-]?key|api[ _-]?schl(?:ü|ue)ssel"
+                      r"|(?:private|secret|access|signing|encryption|master|client)[ _-]?key")
 _IN_KEY = r"(?<=[_.-])|(?<=(?-i:[a-z0-9]))(?=(?-i:P))"  # after a separator, or camelCase (dbPwd, simPin)
 _WORD_START = r"(?:" + _IN_KEY + r"|(?<![\w.-]))"
+# the words before "pass" in OpenClaw's own texts (2026.10.4 to 2026.11.1: "one more pass:", "would pass:",
+# "convergence pass:", "held pass:") and in the gate's ("doctor pass"), plus ordinals
+_PASS_NOT_AFTER = ("first", "second", "third", "fourth", "next", "last", "final", "more", "another", "would", "held",
+                   "convergence", "doctor", "deletion", "cleanup")
 _SECRET_WORD = (r"[\w.-]*?(?:" + _LONG_SECRET_WORDS
                 + r"|" + _WORD_START + r"(?:pwd|senha|has[łl]o|парола(?:та)?|пароль|mot[ _-]de[ _-]passe)"
-                + r"|(?:" + _IN_KEY + r"|(?<![\w.-])(?<!\w\s)(?<!\w\s\s))pass)")
+                + r"|(?:" + _IN_KEY + r"|(?<![\w.-])" + "".join(f"(?<!{w} )" for w in _PASS_NOT_AFTER) + r")pass)")
 # a PIN (pin, PIN-Code, SIM-PIN, wifi_pin, simPin, PUK): only a value of 3 to 12 digits counts as one; OpenClaw's
 # logs use "pin" for version and TLS pins ("dependency pin: name@1.2.3", "pin=true")
 _PIN_WORD = r"[\w.-]*?" + _WORD_START + r"(?:pin(?:[ _-]?(?:code|nummer|number))?|puk)"
@@ -766,7 +773,8 @@ _PIN_WORD = r"[\w.-]*?" + _WORD_START + r"(?:pin(?:[ _-]?(?:code|nummer|number))
 _KV_SEP = (r"(?:\*\*?|__?|`)?[\"']?[^\S\r\n]*+[:=](?![:=])[^\S\r\n]*+(?:(?:\*\*?|__?)(?=\s)[^\S\r\n]*+)?"
            r"(?:\r?\n[^\S\r\n]*+)?")
 # The value of a secret key, hidden whole (before, only its first word: "*** horse battery"):
-# - a value in "double", 'single' or `back` quotes up to its closing quote (the quotes stay);
+# - a value in "double", 'single' or `back` quotes up to its closing quote (the quotes stay; YAML's '' inside
+#   'single' quotes is part of the value);
 # - else up to the end of the line, but not past: a comma or semicolon before a blank or a quote, a ")", "]" or "}"
 #   that closes a bracket opened before the value, a sentence-final "." (also before a blank, a closing bracket or
 #   a quote), a blank before "#" (comment) or "|" (table cell), "&name=" (next query parameter) or a blank before
@@ -775,15 +783,19 @@ _KV_SEP = (r"(?:\*\*?|__?|`)?[\"']?[^\S\r\n]*+[:=](?![:=])[^\S\r\n]*+(?:(?:\*\*?
 # - the value of a command-line flag (--token=x, --passwort=x) is one word: a blank ends it;
 # - a bare true, false, null, undefined or none is no secret ("pass": true, apiKey: undefined stay readable).
 _KV_VALUE = (r"(?P<v>(?=\S)(?!(?:true|false|null|undefined|none)[^\S\r\n]*+(?:[,;)\]}#|\r\n]|\Z))"
-             r"(?:\"(?:[^\"\\\n]|\\.)++\"(?!\w)|'(?:[^'\\\n]|\\.)++'(?!\w)|`[^`\n]++`(?!\w)"
+             r"(?:\"(?:[^\"\\\n]|\\.)++\"(?!\w)|'(?:[^'\\\n]|\\.|'')++'(?!\w)|`[^`\n]++`(?!\w)"
              r"|(?:[^\s()\[\]{}.,;&\"']"
              r"|(?:\.|[,;](?![\"'])|[\"'])++(?=[^\s.,;\"')\]}])"
              r"|&(?![\w.-]++=)"
              r"|\((?:(?:[^()\n]|\([^()\n]*+\))*+\))?|\[(?:(?:[^\[\]\n]|\[[^\[\]\n]*+\])*+\])?"
              r"|\{(?:(?:[^{}\n]|\{[^{}\n]*+\})*+\})?"
              r"|(?(flag)(?!)|[^\S\r\n]++(?![#|]|--\w|[\w.-]++(?:=|:\s|:\Z))))++))")
-# "Passwort ist 4711", "the password is 'correct horse'", "set the password to hunter2": a value in quotes, or one
-# word that contains a digit ("password is configured", "password is required" stay readable)
+# "Passwort ist 4711", "the password is 'correct horse'", "set the password to hunter2": a password word, a verb,
+# then a value in quotes, or one word that contains a digit ("password is configured", "password is required" stay
+# readable); with a colon after the verb ("Das Passwort lautet: Sommer 2024") the whole value (_KV_VALUE)
+_PROSE_WORD = (r"[\w.-]*?(?:password|passwd|passwort|kennwort|pass[ _-]?phrase|pass[ _-]?code|wachtwoord"
+               r"|contrase(?:ñ|n)a)|(?<![\w.-])(?:senha|has[łl]o|парола(?:та)?|пароль|mot de passe)")
+_PROSE_VERB = r"(?:is|was|ist|war|lautet|heißt|heisst|to|auf|est|es|é|jest|е)"
 _PROSE_VALUE = (r"(?P<v>\"[^\"\n]*\"|'[^'\n]*'|`[^`\n]*`|„[^“”\n]*[“”]|“[^”\n]*”|«[^»\n]*»"
                 r"|(?=[^\s,;()\[\]{}\"'`]*?\d)(?:[^\s,;()\[\]{}\"'`.!?:]|[.!?:]++(?=[^\s,;()\[\]{}\"'`.!?:]))++"
                 r"(?=[.!?:]*+(?:[\s,;)\]}\"'`]|\Z)))")
@@ -811,14 +823,23 @@ _REDACT_RES = [
     # before the rules below cut them apart: PEM private keys (the whole body, also of a block without its END
     # line; "+" and "/" split the base64 into runs too short for the long-token rule), Google API keys, Slack and
     # GitHub tokens
-    (re.compile(r"-----BEGIN ([A-Z0-9 ]*PRIVATE KEY(?: BLOCK)?)-----(?:.*?(-----END \1-----)|[A-Za-z0-9+/=\s\\]*)",
-                re.S), _pem_redact),
+    # (the body up to the matching END line, but never past the next BEGIN line: each BEGIN without its END reads
+    # only up to the next one, linear; before, each read to the end of the text, quadratic)
+    (re.compile(r"-----BEGIN ([A-Z0-9 ]*PRIVATE KEY(?: BLOCK)?)-----"
+                r"(?:(?:(?!-----(?:BEGIN |END \1-----)).)*+(-----END \1-----)|[A-Za-z0-9+/=\s\\]*)", re.S),
+     _pem_redact),
     (re.compile(r"\b(?:AIza[0-9A-Za-z_-]{35}|xox[baprs]-[A-Za-z0-9-]{10,}|gh[pousr]_[A-Za-z0-9]{20,}"
                 r"|github_pat_[A-Za-z0-9_]{20,})(?![A-Za-z0-9_-])"), "***"),
     (re.compile(r'("' + _SECRET_KEY + r'"\s*:\s*)"(?:[^"\\]|\\.)*"', re.I), r'\1"***"'),
     # key=value (URL query, env, logfmt): one word, not past "&", a quote, a closing bracket or a final "." or ","
     (re.compile(r"(" + _SECRET_KEY + r"=)(?:[^\s()\[\]{}.,;&\"']|[.,;]++(?=[^\s()\[\]{}.,;&\"'])"
                 r"|\((?:[^()\s]*+\))?|\[(?:[^\[\]\s]*+\])?|\{(?:[^{}\s]*+\})?)++", re.I), r"\1***"),
+    # YAML block scalar under a secret key ("password: |", "private_key: >-" and the lines below it indented deeper
+    # than the key): the indicator and those lines become one "***" (before the next rule hides the indicator alone)
+    (re.compile(r"(?m)^(?P<h>(?P<i>[^\S\r\n]*+)(?:-[^\S\r\n]++)?[\"']?(?<![\w.-])" + _SECRET_WORD
+                + r"[\"']?[^\S\r\n]*+:[^\S\r\n]++)[|>][1-9+-]{0,2}+[^\S\r\n]*+(?:#[^\r\n]*+)?"
+                r"(?:\r?\n(?:(?P=i)[^\S\r\n]++\S[^\r\n]*+|[^\S\r\n]*+(?=\r?\n)))++", re.I),
+     lambda m: m.group("h") + "***"),
     # token: value / apiKey: 'value' / x-api-key: value / Passwort: value (YAML, .env, JS object inspection, HTTP
     # headers, Markdown, prose): the whole value (_KV_VALUE)
     (re.compile(r"(?<![\w.-])(?P<k>(?P<flag>-)?" + _SECRET_WORD + r")(?P<s>" + _KV_SEP + r")" + _KV_VALUE, re.I),
@@ -826,16 +847,21 @@ _REDACT_RES = [
     # PIN: 1234, SIM-PIN = '0000', **PIN-Code:** 4711 (digits only)
     (re.compile(r"(?<![\w.-])(?P<k>" + _PIN_WORD + r")(?P<s>" + _KV_SEP + r")"
                 r"(?P<v>(?P<q>[\"'`]?)\d{3,12}(?P=q)(?![.,:/@-]?\w))", re.I), _kv_redact),
-    # Das Passwort ist 4711 / the password is "correct horse" / Kennwort lautet: geheim1
-    (re.compile(r"(?<![\w.-])(?P<k>[\w.-]*?(?:password|passwd|passwort|kennwort|pass[ _-]?phrase|pass[ _-]?code"
-                r"|wachtwoord|contrase(?:ñ|n)a)|(?<![\w.-])(?:senha|has[łl]o|парола(?:та)?|пароль|mot de passe))"
-                r"(?P<s>[^\S\r\n]++(?:is|was|ist|war|lautet|heißt|heisst|to|auf|est|es|é|jest|е):?[^\S\r\n]++)"
+    # Das Passwort lautet: Sommer 2024 / the password is: correct horse (verb and colon): the whole value; the group
+    # "flag" never takes part (_KV_VALUE asks for it)
+    (re.compile(r"(?<![\w.-])(?P<flag>(?!))?(?P<k>" + _PROSE_WORD + r")(?P<s>[^\S\r\n]++" + _PROSE_VERB
+                + r":[^\S\r\n]*+)" + _KV_VALUE, re.I), _kv_redact),
+    # Das Passwort ist 4711 / the password is "correct horse" / set the password to hunter2
+    (re.compile(r"(?<![\w.-])(?P<k>" + _PROSE_WORD + r")(?P<s>[^\S\r\n]++" + _PROSE_VERB + r":?[^\S\r\n]++)"
                 + _PROSE_VALUE, re.I), _kv_redact),
     # --token <value>, --password <value>, --api-key <value>
     (re.compile(r"(?i)(--(?:token|password|secret|api[-_]?key)\s+)(?!-)\S+"), r"\1***"),
-    # URL userinfo: scheme://user:password@host
-    (re.compile(r"://[^/\s:@]+:[^@\s/]+@"), "://***@"),
+    # URL userinfo: scheme://user:password@host, also with an empty user (redis://:password@host)
+    (re.compile(r"://[^/\s:@]*:[^@\s/]+@"), "://***@"),
     (re.compile(r"(?i)\b(Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{8,}"), r"\1 ***"),
+    # Authorization: <any other scheme> <credentials> (Token, Bot, Digest, ...; also Proxy-Authorization, "quoted")
+    (re.compile(r"(?i)(\bAuthorization[\"']?:[^\S\r\n]*+[\"']?[A-Za-z][\w-]*+)[^\S\r\n]++[^\s\"'`,;]{8,}"),
+     r"\1 ***"),
     (re.compile(r"sk-[A-Za-z0-9_-]{10,}"), "***"),
     (re.compile(r"(?i)\bbot\d{6,12}:[A-Za-z0-9_-]{30,}"), "bot***"),  # Telegram Bot API URL form
     (re.compile(r"\b\d{6,12}:[A-Za-z0-9_-]{30,}\b"), "***"),
@@ -872,6 +898,62 @@ def redact_text_counted(s, long_tokens=True):
         s, n = rule[0].subn(rule[1], s)
         total += n
     return s, total
+
+
+_PEM_BEGIN_RE = re.compile(r"-----BEGIN ([A-Z0-9 ]*PRIVATE KEY(?: BLOCK)?)-----")
+_PEM_MAX_LINES = 200  # a PEM key of 16384 bits has about 200 lines; a BEGIN without END hides no more than that
+# a line that ends in a separator or a flag/scheme whose value may stand alone on the next line
+_OPEN_END_RE = re.compile(r"(?:[:=]|--[\w-]+|\b(?:Bearer|Basic))[\"'`*_]*+[^\S\r\n]*+$", re.I)
+_BLOCK_HEAD_RE = re.compile(r"^(?P<i>[^\S\r\n]*+)(?:-[^\S\r\n]++)?[\"']?(?<![\w.-])" + _SECRET_WORD
+                            + r"[\"']?[^\S\r\n]*+:[^\S\r\n]++[|>][1-9+-]{0,2}+[^\S\r\n]*+(?:#.*)?$", re.I)
+
+
+class LineRedactor:
+    """redact_text for a text read line by line (the [doctor] lines of the add-on log, `oc-upgrade log`), with the
+    rules that span lines: a PEM private key block (every line from BEGIN up to the matching END, at most
+    _PEM_MAX_LINES), a YAML block scalar under a secret key (the lines indented deeper than its key), and a value
+    alone on the line after its key ("password:" and the value below). Feed the lines in order to one instance."""
+
+    def __init__(self):
+        self.prev = None  # the previous line when it ends open (_OPEN_END_RE)
+        self.pem_end = None  # the END line of an open PEM block
+        self.pem_left = 0
+        self.block = None  # the indentation of an open block scalar's key
+
+    def line(self, s):
+        """One line (no line break), redacted."""
+        if self.pem_end is not None:
+            i = s.find(self.pem_end)
+            if i >= 0:
+                end, self.pem_end = self.pem_end, None
+                return ("***" if s[:i].strip() else s[:i]) + end + self._plain(s[i + len(end):])
+            self.pem_left -= 1
+            if self.pem_left >= 0:
+                return "***" if s.strip() else s
+            self.pem_end = None
+        if self.block is not None:
+            if not s.strip():
+                return s
+            ind = len(s) - len(s.lstrip())
+            if ind > self.block:
+                return s[:ind] + "***"
+            self.block = None
+        return self._plain(s)
+
+    def _plain(self, s):
+        if self.prev is not None and s.strip():
+            r = redact_text(self.prev + "\n" + s)
+            out = r.split("\n", 1)[1] if r.count("\n") == 1 else "***"
+        else:
+            out = redact_text(s)
+        self.prev = s if _OPEN_END_RE.search(s) else None
+        m = _BLOCK_HEAD_RE.match(s)
+        if m:
+            self.block, self.prev = len(m.group("i")), None
+        begins = list(_PEM_BEGIN_RE.finditer(s))
+        if begins and s.find(f"-----END {begins[-1].group(1)}-----", begins[-1].end()) < 0:
+            self.pem_end, self.pem_left, self.prev = f"-----END {begins[-1].group(1)}-----", _PEM_MAX_LINES, None
+        return out
 
 
 # --- subprocess runner -------------------------------------------------------------------
