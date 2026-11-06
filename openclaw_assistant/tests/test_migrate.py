@@ -3128,6 +3128,24 @@ class TestCronKeyCopyForecast(unittest.TestCase):
                                            "where": "config", "pending": True}])
 
 
+class TestEnvSubstituted(unittest.TestCase):
+    """OpenClaw's ${NAME} / ${NAME:-default} substitution (config/env-substitution.ts, 2026.11.1), which the config
+    doctor copies a literal key from has gone through: the gate compares doctor's earlier copy with this value."""
+
+    def test_substitution_grammar(self):
+        env = {"A": "va", "_X": "vx", "EMPTY_ONE": ""}
+        for raw, want in (("${A}", "va"), ("pre-${A}-post", "pre-va-post"), ("${MISSING}", "${MISSING}"),
+                          ("${MISSING:-dflt}", "dflt"), ("${EMPTY_ONE:-dflt}", "dflt"), ("${EMPTY_ONE}", "${EMPTY_ONE}"),
+                          ("${A:-dflt}", "va"), ("${MISSING:-}", ""), ("${_X}", "vx"), ("$${A}", "${A}"),
+                          ("$${A:-d}", "${A:-d}"), ("${a}", "${a}"), ("${A:-x$y}", "${A:-x$y}"),
+                          ("${A:-x{y}", "${A:-x{y}"), ("${A", "${A"), ("$A", "$A"), ("no-dollar", "no-dollar"),
+                          ("${A}${_X}", "vavx"), ("$$${A}", "$${A}")):
+            with self.subTest(raw=raw):
+                self.assertEqual(m.env_substituted(raw, env), want)
+        self.assertEqual(m.env_substituted("${A}", None), "${A}")
+        self.assertIsNone(m.env_substituted(None, env))
+
+
 class TestCronKeyAutofix(unittest.TestCase):
     """decisions.md addendum 2026-11-05: the gate sets models.providers.<p>.auth "api-key" itself before doctor pass 1
     for a provider whose literal openclaw.json key doctor copies and that a cron job uses (pure part)."""

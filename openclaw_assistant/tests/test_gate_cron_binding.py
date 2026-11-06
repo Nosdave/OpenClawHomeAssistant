@@ -16,6 +16,7 @@ import os
 import sqlite3
 import sys
 import unittest
+import unittest.mock
 from pathlib import Path
 
 TESTS = Path(__file__).resolve().parent
@@ -46,6 +47,24 @@ EXTRA_JOBS = [
     ("job-paused", {"agentId": "main", "sessionTarget": "isolated", "enabled": False,
                     "payload": {"kind": "agentTurn", "message": PROMPT, "model": "openai/gpt-5.5"}}),
 ]
+
+
+# what OpenClaw's own migration (2026.11.5, openclaw/openclaw#172792) does for the jobs: it records the account of a
+# job's own model only (inference-binding-migration.ts), and a bound job's fallbacks to other providers are refused
+OUTLOOK_PRIM = ("OpenClaw records the inference account of {who} itself from 2026.11.5 (doctor migration, "
+                "openclaw/openclaw#172792), but then refuses their fallbacks to other providers (as with "
+                "openclaw/openclaw#192463)")
+OUTLOOK_FB = ("OpenClaw's own migration{v} records only the account of a job's own model: a job whose own model needs "
+              "no account stays unbound, and its fallback on a stored login stays refused")
+OUTLOOK_FB_ALONE = OUTLOOK_FB.format(v=" (2026.11.5, openclaw/openclaw#172792)")
+MANUAL_SCOPED = G.CRON_MANUAL.replace("after the start: ", "after the start, for a job whose own model is refused: ")
+MANUAL_LAST_SCOPED = G.CRON_MANUAL_LAST.replace("after the start: ",
+                                                "after the start, for a job whose own model is refused: ")
+
+
+def outlook(who):
+    """The closing note's 2026.11.5 clauses for jobs on a stored login (who) and jobs that only stop at a fallback."""
+    return OUTLOOK_PRIM.format(who=who) + "; " + OUTLOOK_FB.format(v="")
 
 
 def sha(p):
@@ -97,12 +116,15 @@ class CronForecastGateTests(T.GateEnv):
             "WARN [gate] cron job 'Local digest' (job-local): its model vllm/qwen3.5-122b needs no stored login and "
             "keeps working, but when it fails OpenClaw 2026.10.10 stops at the fallback openai/gpt-5.5 (stored login, "
             "no recorded inference account; openclaw/openclaw#192195) instead of trying further models",
-            "WARN [gate] 2 cron job(s) above: the add-on changes nothing; OpenClaw records the inference account of "
-            "such jobs itself from 2026.11.5 (doctor migration, openclaw/openclaw#172792). " + G.CRON_MANUAL,
+            "WARN [gate] 2 cron job(s) above: the add-on changes nothing for these jobs; "
+            + outlook("the jobs whose own model is on a stored login") + ". " + MANUAL_SCOPED + ". " + G.CRON_FALLBACK,
             "[gate]   cron inference accounts: 2 enabled cron job(s) stop at a stored login on OpenClaw 2026.10.10 "
             "(the WARN lines above, openclaw/openclaw#192195); report only, the gate changes nothing"])
         self.assertIn("openclaw automations edit <id> --model <provider/model>@<profileId>", G.CRON_MANUAL)
         self.assertIn("openclaw/openclaw#192463", G.CRON_MANUAL)
+        # a job that only stops at a fallback: no binding (it would make that fallback the job's model)
+        self.assertIn("openclaw automations edit <id> --fallbacks <list> without it", G.CRON_FALLBACK)
+        self.assertNotIn("@<profileId>", G.CRON_FALLBACK)
         # report only: never a HOLD code
         self.assertIn("[gate] dry-run: the precheck would pass", text)
         # id + name + model refs only: no prompt, no profile id, no credential
@@ -135,9 +157,9 @@ class CronForecastGateTests(T.GateEnv):
             "and keeps working, but when it fails OpenClaw 2026.10.10 stops at the fallback amazon-bedrock/claude-x "
             "(AWS SDK credentials, no recorded inference account; openclaw/openclaw#192195) instead of trying further "
             "models; also on a stored login: openai/gpt-5.5",
-            "WARN [gate] 4 cron job(s) above: the add-on changes nothing; OpenClaw records the inference account of a "
-            "stored login itself from 2026.11.5 (doctor migration, openclaw/openclaw#172792). " + G.CRON_MANUAL + ". "
-            + G.CRON_AWS_SDK,
+            "WARN [gate] 4 cron job(s) above: the add-on changes nothing for these jobs; "
+            + outlook("the jobs whose own model is on a stored login") + ". " + MANUAL_SCOPED + ". " + G.CRON_FALLBACK
+            + ". " + G.CRON_AWS_SDK,
             "[gate]   cron inference accounts: 4 enabled cron job(s) stop at a stored login or AWS SDK credentials on "
             "OpenClaw 2026.10.10 (the WARN lines above, openclaw/openclaw#192195); report only, the gate changes "
             "nothing"])
@@ -154,7 +176,7 @@ class CronForecastGateTests(T.GateEnv):
                          [("job-bedrock", ["amazon-bedrock/claude-x"], ["amazon-bedrock/claude-x"]),
                           ("job-bedrock-fb", ["amazon-bedrock/claude-x"], ["amazon-bedrock/claude-x"])])
         lines = G.cron_job_lines(rec)
-        self.assertEqual(lines[-1], "2 cron job(s) above: the add-on changes nothing. " + G.CRON_AWS_SDK)
+        self.assertEqual(lines[-1], "2 cron job(s) above: the add-on changes nothing for these jobs. " + G.CRON_AWS_SDK)
         self.assertEqual(G.cron_job_lines(dict(rec, doctor_migration=True))[-1],
                          "2 cron job(s) above still have no recorded inference account after the migration: OpenClaw "
                          "2026.10.10 doctor left them (its warnings are in oc-upgrade log). " + G.CRON_AWS_SDK)
@@ -215,7 +237,8 @@ class CronForecastGateTests(T.GateEnv):
             "the migration): 2 affected of 3 checked",
             "    'Morning summary' (job-morning): every run refused; openai/gpt-5.5, anthropic/claude-sonnet-4-6",
             "    'Local digest' (job-local): stops at the fallback openai/gpt-5.5; openai/gpt-5.5",
-            "    OpenClaw records the account itself from 2026.11.5 (openclaw/openclaw#172792). " + G.CRON_MANUAL])
+            "    " + OUTLOOK_PRIM.format(who="the jobs whose own model is on a stored login") + ". "
+            + OUTLOOK_FB.format(v="") + ". " + MANUAL_SCOPED + ". " + G.CRON_FALLBACK])
         self.assertLess(i, next(k for k, x in enumerate(st) if x.startswith("Migrated marker")))
         # a later maintenance run reports again from the migrated state
         G.retry_cmd(["--doctor"], emit=lambda s: None)
@@ -455,17 +478,19 @@ class CronKeyCopyGateTests(T.GateEnv):
                 lines = self.dry()
                 text = "\n".join(lines)
                 self.assertIn("WARN [gate] " + D1_HAUS.format(rt=rt), lines)
+                # openclaw.json uses $include: "keeps working" only as far as openclaw.json itself shows
                 self.assertIn("WARN [gate] cron job 'Job Lan Fb' (job-lan-fb): its model lan/q needs no stored login "
-                              f"and keeps working, but when it fails OpenClaw {rt} stops at the fallback glm/glm-5 "
+                              "(as far as openclaw.json itself shows; its included files are not checked) and keeps "
+                              f"working, but when it fails OpenClaw {rt} stops at the fallback glm/glm-5 "
                               "(its literal API key becomes a stored login during the migration; no recorded inference "
                               "account; openclaw/openclaw#192195) instead of trying further models; also on a stored "
                               "login: openai/gpt-5.5", lines)
                 fix = lines.index("WARN [gate] " + D1_FIX.format(rt=rt))
                 close = next(i for i, ln in enumerate(lines) if ln.startswith("WARN [gate] 4 cron job(s) above:"))
                 self.assertEqual(fix + 1, close)
-                self.assertEqual(lines[close], "WARN [gate] 4 cron job(s) above: the add-on changes nothing; OpenClaw "
-                                 "records the inference account of the jobs on other stored logins itself from "
-                                 "2026.11.5 (doctor migration, openclaw/openclaw#172792). " + G.CRON_MANUAL_LAST)
+                self.assertEqual(lines[close], "WARN [gate] 4 cron job(s) above: the add-on changes nothing for these "
+                                 "jobs; " + outlook("the jobs whose own model is on another stored login") + ". "
+                                 + MANUAL_LAST_SCOPED + ". " + G.CRON_FALLBACK)
                 self.assertTrue(G.CRON_MANUAL_LAST.startswith("Otherwise (last resort), after the start: openclaw "
                                                               "automations edit <id> --model"))
                 self.assertIn(f"[gate]   cron inference accounts: 4 enabled cron job(s) stop at a stored login on "
@@ -594,8 +619,9 @@ class CronKeyCopyGateTests(T.GateEnv):
         st = G.status_lines()
         i = next(i for i, x in enumerate(st) if x.startswith("    provider glm:"))
         self.assertIn("openclaw config set models.providers.glm.auth api-key", st[i])
-        self.assertEqual(st[i + 1], "    OpenClaw records the account of the jobs on other stored logins itself from "
-                         "2026.11.5 (openclaw/openclaw#172792). " + G.CRON_MANUAL_LAST)
+        self.assertEqual(st[i + 1], "    " + OUTLOOK_PRIM.format(who="the jobs whose own model is on another stored "
+                                                                "login") + ". " + OUTLOOK_FB.format(v="") + ". "
+                         + MANUAL_LAST_SCOPED + ". " + G.CRON_FALLBACK)
         for blob in (self.out, json.dumps(j), "\n".join(st)):
             self.assertNotIn(GLM_KEY, blob)
             self.assertNotIn(PROMPT, blob)
@@ -606,12 +632,12 @@ class CronKeyCopyGateTests(T.GateEnv):
         self.assertIn("    'Job Glm Haus' (job-glm-haus): every run refused; glm/glm-5 (literal key that doctor "
                       "copies)", st)
         self.assertIn("    " + D1_FIX.format(rt="2026.11.1"), st)
-        self.assertTrue(st[-1].endswith(G.CRON_MANUAL_LAST), st[-1])
+        self.assertTrue(st[-1].endswith(MANUAL_LAST_SCOPED + ". " + G.CRON_FALLBACK), st[-1])
         # only provider keys and paths: the jobs of a provider with a key fix get no 2026.11.5 promise
         only = dict(rec, affected=[a for a in rec["affected"] if a["id"] == "job-glm-haus"])
         self.assertEqual(G._status_cron({"cron_binding_forecast": only})[-1], "    " + G.CRON_MANUAL_LAST)
-        self.assertEqual(G.cron_job_lines(only)[-1], "1 cron job(s) above: the add-on changes nothing. "
-                         + G.CRON_MANUAL_LAST)
+        self.assertEqual(G.cron_job_lines(only)[-1], "1 cron job(s) above: the add-on changes nothing for these "
+                         "jobs. " + G.CRON_MANUAL_LAST)
         self.assertNotIn(GLM_KEY, json.dumps(rec) + "\n".join(st))
 
     def test_key_fix_line_variants(self):
@@ -763,8 +789,8 @@ class CronConfigFixupTests(T.GateEnv):
                               "doctor pass 1 (keeps 3 enabled cron job(s) on glm working; openclaw/openclaw#192195)",
                               lines)
                 self.assertIn(f"[gate]   cron inference accounts: 3 enabled cron job(s) stop at a stored login on "
-                              f"OpenClaw {rt} (the WARN lines above, openclaw/openclaw#192195); report only, the gate "
-                              "changes nothing", lines)
+                              f"OpenClaw {rt} (the WARN lines above, openclaw/openclaw#192195); report only; apart "
+                              "from the config fixup above, the gate changes nothing for cron", lines)
                 self.assertIn("[gate] dry-run: the precheck would pass", lines)
                 d = self.plan()
                 self.assertEqual(d["rc"], 10)
@@ -997,12 +1023,26 @@ class CronConfigFixupTests(T.GateEnv):
         con.close()
         lines = self.dry()
         self.assertIn("[gate] 1/8 " + FIXUP_PRE.format(verb="would set", rt="2026.11.1"), lines)
-        self.assertIn("[gate] 1/8 info: no automatic config fixup for openai: it has a stored login of its own (a "
-                      "subscription login, a token or another API key), which models.providers.openai.auth = "
-                      "\"api-key\" would set aside for every run of openai, not only for cron; the provider openai "
-                      "line says what you can do", lines)
-        self.assertTrue([ln for ln in lines if ln.startswith("WARN [gate] provider openai:")
-                         and "auth api-key" in ln])
+        self.assertIn("[gate] 1/8 info: no automatic config fixup for openai: it has a stored login of its own: a "
+                      "subscription login, a token, or a stored API key that differs from the configured one "
+                      "(possibly doctor's copy of an earlier value). models.providers.openai.auth = \"api-key\" sets "
+                      "that login aside for every run of openai, not only for cron; to do so after the start: "
+                      "openclaw config set models.providers.openai.auth api-key. The provider openai line gives the "
+                      "other options", lines)
+        # the provider line: the refusal comes from openai's own login, and both remedies cost it for every run
+        own = ("provider openai: OpenClaw 2026.11.1 runs openai on a stored login of its own (a subscription login, a "
+               "token or another API key), not on the literal key in models.providers.openai.apiKey. To lift the "
+               "refusal for the cron jobs above that use openai and keep their fallbacks, run: openclaw config set "
+               "models.providers.openai.auth api-key (OpenClaw then uses the configured key for openai, not the "
+               "stored login; no restart needed), or give the key as an env SecretRef (a gateway_env_vars entry, then "
+               "openclaw config set models.providers.openai.apiKey '" + G.CRON_ENV_REF + "' --strict-json); this "
+               "makes every run of openai, not only cron, use the configured key instead of that login. To keep the "
+               "login: drop openai from the job's fallbacks (openclaw automations edit <id> --fallbacks <list> "
+               "without it), and for a job whose own model is on openai the last resort below")
+        self.assertIn("WARN [gate] " + own, lines)
+        rec = G.cron_account_report(self.state, cfg, "2026.11.1", pending_copies=True)
+        self.assertEqual([(k["provider"], k.get("own_login")) for k in rec["key_fix"]],
+                         [("glm", None), ("openai", True)])  # glm: doctor's earlier copy of the same key
         self.assertFalse([ln for ln in lines if "would set models.providers.openai" in ln])
         self.assertEqual(G.own_provider_logins(self.state, cfg, {"glm": GLM_KEY, "openai": "x"}), {"openai"})
         # another key for glm, a declared non-api_key profile: an own login too
@@ -1013,6 +1053,10 @@ class CronConfigFixupTests(T.GateEnv):
         self.assertEqual(self.run_gate(), 0, self.out)
         provs = self.cfg_now()["models"]["providers"]
         self.assertEqual((provs["glm"].get("auth"), provs["openai"].get("auth")), ("api-key", None))
+        # finalize and status give the same provider line (the postconditions' report marks the own login too)
+        fin = self.out[self.out.index("[gate] 7/8 postconditions OK"):].splitlines()
+        self.assertIn("WARN [gate] " + own, fin)
+        self.assertIn("    " + own, G.status_lines())
         self.assertNotIn("sk-synthetic-openai-0000", self.out + json.dumps(self.journal()))
 
     def test_include_config_writes_nothing_and_warns(self):
@@ -1050,6 +1094,169 @@ class CronConfigFixupTests(T.GateEnv):
         self.assertEqual(G._status_cron({"cron_binding_forecast": rec, "doctor_started": True})[:1],
                          ["  cron jobs without a recorded inference account (openclaw/openclaw#192195, OpenClaw "
                           "2026.11.1, precheck forecast): none affected (4 checked)"])
+
+    def test_fallback_only_jobs_get_no_2026_11_5_promise(self):
+        """The owner's layout after the fix: every job runs its own model on glm (the configured key) or on a local model
+        and stops only at a stored-login fallback. OpenClaw's own migration (2026.11.5) resolves only the job's own
+        model and skips a job whose model runs on a configured key or needs none (inference-binding-migration.ts), and
+        2026.11.5 still refuses an unbound cron attempt on a stored login: no line promises that 2026.11.5 records these
+        jobs, and none offers the binding (it would make the fallback the job's model)."""
+        con = sqlite3.connect(str(self.sdb))
+        con.execute("UPDATE cron_jobs SET enabled=0 WHERE job_id='job-morning'")
+        con.commit()
+        con.close()
+        close = ("2 cron job(s) above: the add-on changes nothing for these jobs; " + OUTLOOK_FB_ALONE + ". "
+                 + G.CRON_FALLBACK)
+        lines = self.dry()
+        self.assertIn("WARN [gate] " + close, lines)
+        self.doctor_copies_key("2026.11.1")
+        self.assertEqual(self.run_gate(), 0, self.out)
+        fin = self.out[self.out.index("[gate] 7/8 postconditions OK"):].splitlines()
+        self.assertIn("WARN [gate] " + close, fin)
+        st = G.status_lines()
+        self.assertIn("    " + OUTLOOK_FB_ALONE + ". " + G.CRON_FALLBACK, st)
+        text = "\n".join(lines + fin + st)
+        self.assertNotIn("records the inference account", text)
+        self.assertNotIn("@<profileId>", text)
+        # whose account 2026.11.5 records: the jobs whose own model is on a stored login (no AWS SDK, no key fix)
+        prim = {"id": "p", "primary_affected": True, "refs": ["openai/gpt-5.5"]}
+        fb = {"id": "f", "primary_affected": False, "refs": ["openai/gpt-5.5"]}
+        aws = {"id": "a", "primary_affected": True, "refs": ["bedrock/x"], "aws_sdk": ["bedrock/x"]}
+        keyed = {"id": "k", "primary_affected": True, "refs": ["glm/glm-5"]}
+        kf = {"key_fix": [{"provider": "glm"}]}
+        self.assertEqual(G._cron_promise([fb], {}), "")
+        self.assertEqual(G._cron_promise([aws, fb], {}), "")
+        self.assertEqual(G._cron_promise([keyed, fb], kf), "")
+        self.assertEqual(G._cron_promise([prim], {}), "such jobs")
+        self.assertEqual(G._cron_promise([prim, fb], {}), "the jobs whose own model is on a stored login")
+        self.assertEqual(G._cron_promise([prim, keyed], kf), "the jobs whose own model is on another stored login")
+        self.assertEqual(G._cron_outlook([prim], {}), [OUTLOOK_PRIM.format(who="such jobs")])
+        self.assertEqual(G._cron_remedy([prim]), G.CRON_MANUAL)
+        self.assertEqual(G._cron_remedy([fb]), G.CRON_FALLBACK)
+
+    def test_providers_in_an_included_file(self):
+        """$include with the providers in the included file: the report reads only openclaw.json itself, so it says
+        so in the precheck, the finalize and `oc-upgrade status` (with the command), says "keeps working" only as far
+        as openclaw.json shows, and qualifies the line about unconfigured agents; the gate writes nothing."""
+        cfg = json.loads(json.dumps(CFG_GLM))
+        moved = {"models": cfg.pop("models")}
+        cfg["$include"] = "./models.json5"
+        self.write_cfg(cfg)
+        (self.state / "models.json5").write_text(json.dumps(moved))
+        add_jobs(self.state, [("job-mail", {"agentId": "mail", "sessionTarget": "isolated",
+                                            "payload": {"kind": "agentTurn", "message": PROMPT,
+                                                        "model": "lan/q"}})], start=50)
+        inc = ("openclaw.json uses $include ($include): the cron report reads only openclaw.json itself, so providers "
+               "and agents defined in included files are not checked, and the gate makes no automatic config fixup. "
+               "For a provider defined there with a literal apiKey that cron jobs use, run after the start: openclaw "
+               "config set models.providers.<provider>.auth api-key (doctor stores such a key as a login, and "
+               "OpenClaw 2026.11.1 then refuses every unbound cron run on it: openclaw/openclaw#192195; for a "
+               "provider with a stored login of its own this sets that login aside for every run, not only for cron)")
+        lines = self.dry()
+        self.assertIn("WARN [gate] 1/8 " + inc, lines)
+        self.assertIn("WARN [gate] cron job 'Local digest' (job-local): its model glm/glm-5 needs no stored login (as "
+                      "far as openclaw.json itself shows; its included files are not checked) and keeps working, but "
+                      "when it fails OpenClaw 2026.11.1 stops at the fallback openai/gpt-5.5 (stored login, no "
+                      "recorded inference account; openclaw/openclaw#192195) instead of trying further models", lines)
+        self.assertIn("[gate] 1/8 info: 1 enabled cron job(s) belong to agent(s) that openclaw.json itself does not "
+                      "configure (mail; its included files are not checked): unless an included file configures them, "
+                      "OpenClaw cancels their runs ('cron job agent is unavailable'); the inference-account report "
+                      "leaves them out: 'Job Mail' (job-mail)", lines)
+        self.assertFalse([ln for ln in lines if "config fixup:" in ln], lines)
+        raw = self.cfgp.read_text()
+        plan = G.cron_fixup_plan(self.state, cfg, raw, "2026.11.1")
+        self.assertEqual((plan["fix"], plan["include"]), ([], ["$include"]))
+        before = self.cfgp.read_bytes()
+        self.doctor_copies_key("2026.11.1")
+        self.assertEqual(self.run_gate(), 0, self.out)
+        fin = self.out[self.out.index("[gate] 7/8 postconditions OK"):].splitlines()
+        self.assertIn("WARN [gate] " + inc, fin)
+        self.assertIn("  " + inc, G.status_lines())
+        self.assertNotIn("models", self.cfg_now())  # nothing written into openclaw.json (no provider entry)
+        self.assertEqual(json.loads((self.run_dir() / "config.pre-pass1.json").read_bytes()), json.loads(before))
+        j = self.journal()
+        self.assertNotIn("cron_autofix", j)
+        self.assertEqual(j["cron_binding"]["include"], ["$include"])
+        self.assertNotIn(GLM_KEY, self.out + json.dumps(j))
+        # without $include no such line and no key
+        self.assertNotIn("include", G.cron_account_report(self.state, CFG_GLM, "2026.11.1"))
+        self.assertIsNone(G.cron_include_line({"affected": []}))
+
+    def test_env_template_key_and_doctors_earlier_copy(self):
+        """OpenClaw substitutes "${NAME}" / "${NAME:-default}" (NAME also lower-case-free with "_") before doctor copies
+        the key, but treats only "${UPPER}"/"$UPPER" as a SecretRef: a stored api_key profile with the substituted value
+        is doctor's earlier copy, no login of its own, so the gate still sets auth "api-key"."""
+        cfg = json.loads(json.dumps(CFG_GLM))
+        cfg["models"]["providers"]["glm"]["apiKey"] = "${GLM_KEY:-sk-synthetic-local}"
+        self.write_cfg(cfg)
+        adb = self.state / "agents" / "main" / "agent" / "openclaw-agent.sqlite"
+        store = json.loads(json.dumps(T.AUTH_1004_STORE))
+        store["profiles"]["glm:default"] = {"type": "api_key", "provider": "glm", "key": "sk-synthetic-local"}
+        con = sqlite3.connect(str(adb))
+        con.execute("UPDATE auth_profile_store SET store_json=? WHERE store_key='primary'", (json.dumps(store),))
+        con.commit()
+        con.close()
+        lines = self.dry()
+        self.assertIn("[gate] 1/8 " + FIXUP_PRE.format(verb="would set", rt="2026.11.1"), lines)
+        self.assertFalse([ln for ln in lines if "no automatic config fixup for glm" in ln], lines)
+        tmpl = {"glm": "${GLM_KEY:-sk-synthetic-local}"}
+        self.assertEqual(G.own_provider_logins(self.state, cfg, tmpl, env={}), set())
+        # the variable set (gateway_env_vars): doctor copied its value; the default is then no copy of it
+        self.assertEqual(G.own_provider_logins(self.state, cfg, tmpl, env={"GLM_KEY": "sk-synthetic-local"}), set())
+        self.assertEqual(G.own_provider_logins(self.state, cfg, tmpl, env={"GLM_KEY": "sk-synthetic-env"}), {"glm"})
+        self.assertEqual(G.own_provider_logins(self.state, cfg, {"glm": "${_GLM}"}, env={"_GLM": "sk-synthetic-local"}),
+                         set())
+        self.assertEqual(G.own_provider_logins(self.state, cfg, {"glm": "$${_GLM}"}, env={"_GLM": "sk-synthetic-local"}),
+                         {"glm"})
+        self.assertNotIn("sk-synthetic-local", "\n".join(lines))
+
+    def test_a_fixed_model_behind_a_refused_fallback_is_not_kept_working(self):
+        """A job reaches the fixed provider only after a fallback that stays refused (the refusal stops the chain): the
+        fix is still written, but the job is not counted as kept working; the readiness line says why it is set."""
+        cfg = json.loads(json.dumps(CFG_GLM))
+        cfg["models"]["providers"]["google"] = {"apiKey": "sk-synthetic-google-0000"}
+        self.write_cfg(cfg)
+        add_jobs(self.state, [("job-lan-g", {"agentId": "main", "sessionTarget": "isolated",
+                                             "payload": {"kind": "agentTurn", "message": PROMPT, "model": "lan/q",
+                                                         "fallbacks": ["openai/gpt-5.5", "google/gemini-3-pro"]}})],
+                 start=50)
+        lines = self.dry()
+        self.assertIn("[gate] 1/8 config fixup: would set models.providers.google.auth = \"api-key\" before doctor "
+                      "pass 1 (doctor stores its literal key as a login; without this OpenClaw 2026.11.1 refuses every "
+                      "unbound cron run on google: openclaw/openclaw#192195)", lines)
+        self.assertIn("[gate] 1/8 " + FIXUP_KEPT.format(rt="2026.11.1"), lines)
+        self.assertIn("[gate] 1/8 info: 1 enabled cron job(s) reach google/gemini-3-pro only after a fallback that "
+                      "stays refused (the WARN lines below): the automatic fix covers that model, but the job stops "
+                      "before it: 'Job Lan G' (job-lan-g)", lines)
+        self.assertIn("[gate]   cron config fixup: would set models.providers.google.auth = \"api-key\" before doctor "
+                      "pass 1 (for 1 enabled cron job(s) that reach google only after a fallback that stays refused; "
+                      "openclaw/openclaw#192195)", lines)
+        self.assertFalse([ln for ln in lines if "on google working" in ln], lines)
+        before = {"affected": [{"id": "j", "refs": ["glm/glm-5", "openai/gpt-5.5", "google/g"]}]}
+        after = {"affected": [{"id": "j", "refs": ["openai/gpt-5.5"]}]}
+        behind = []
+        self.assertEqual(G.cron_fixup_kept_jobs(before, after, {"glm", "google"}, behind),
+                         [(before["affected"][0], ["glm/glm-5"])])
+        self.assertEqual(behind, [(before["affected"][0], ["google/g"])])
+        self.assertNotIn("sk-synthetic-google-0000", "\n".join(lines))
+
+    def test_pass_2_diff_leaves_out_the_fixup_before_pass_2(self):
+        """A run whose pass 1 ran without the fixup (an earlier add-on version) gets it before pass 2; when pass 2
+        then changes openclaw.json, its diff lists only doctor's change, not the gate's own auth."""
+        orig = G.Gate.cron_config_fixup
+
+        def earlier_version(gate, phase):
+            return None if phase == "doctor1" else orig(gate, phase)
+        p2 = {"state_uv": 22, "agent_uv": 27, "app_version": "2026.11.1"}
+        p1 = dict(p2, app_version="2026.10.10")  # pass 2 then changes meta.lastTouchedVersion
+        self.doctor_script(passes=[p1, p2, p2])
+        with unittest.mock.patch.object(G.Gate, "cron_config_fixup", earlier_version):
+            self.assertEqual(self.run_gate(), 0, self.out)
+        out = self.out.splitlines()
+        self.assertIn("[gate] 6/8 " + FIXUP.format(rt="2026.11.1"), out)
+        self.assertIn("[gate] 6/8 doctor pass 2 changed openclaw.json: meta.lastTouchedVersion", out)
+        self.assertEqual(self.cfg_now()["models"]["providers"]["glm"]["auth"], "api-key")
+
 
     def test_nothing_on_1004(self):
         """2026.10.4 (no cron refusal): no line, no write, no journal key, no ledger step."""

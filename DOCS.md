@@ -1358,7 +1358,11 @@ a known provider variable that is set, or a literal key with
 `models.providers.<provider>.auth: "api-key"`. OpenClaw's doctor records the accounts
 itself only from 2026.11.5 (openclaw/openclaw#172792), and only for a stored login: AWS
 SDK credentials are no stored account, so no account can be recorded for them, by
-doctor or by you.
+doctor or by you. That migration also records only the account of the job's own model:
+a job whose own model needs no account (a local model, a configured key) stays unbound,
+and its fallback on a stored login stays refused; a job it binds runs only on that
+account's provider, so its fallbacks to other providers are refused (as with
+`@<profileId>`, item 5 below).
 
 **The gate fixes the literal-key case itself.** Before doctor pass 1 it sets
 `models.providers.<p>.auth` to `"api-key"` in `openclaw.json` for each provider `<p>`
@@ -1370,7 +1374,8 @@ that meets all of these:
 - `models.providers.<p>.auth` is not set;
 - `<p>` has no stored login of its own: a subscription login, a token or another API
   key. `"api-key"` would set such a login aside for every run of `<p>`, not only for
-  cron jobs. Doctor's copy of the same key does not count.
+  cron jobs. Doctor's copy of the same key does not count, also not a copy of its value
+  after OpenClaw's `${NAME}` / `${NAME:-default}` substitution from the environment.
 
 OpenClaw then runs `<p>` on the configured key instead of doctor's copy, and the jobs
 keep running with their fallbacks. The rehearsal on 2026.10.10 verified this. `auth` is
@@ -1383,7 +1388,9 @@ What you see:
   without this OpenClaw 2026.11.1 refuses every unbound cron run on glm:
   openclaw/openclaw#192195)`.
 - The precheck says `will set` and lists the jobs the fix keeps working (`kept working by
-  the automatic fix`). `oc-upgrade gate --dry-run`, `oc-upgrade gate --plan` and
+  the automatic fix`). A job that reaches the provider only after a fallback that stays
+  refused is not counted: an info line names it (`… only after a fallback that stays
+  refused …`). `oc-upgrade gate --dry-run`, `oc-upgrade gate --plan` and
   `oc-upgrade check` say `would set` and write nothing.
 - The end of the run and `oc-upgrade status` repeat the line.
 
@@ -1404,8 +1411,14 @@ The gate leaves these cases to you (the `WARN` lines below stay):
 
 - `auth` is already set (`"oauth"`, `"token"`): only the SecretRef helps;
 - the key is only in an agent's model catalog: the gate creates no provider entry;
-- the provider has a stored login of its own: an info line says so;
-- `openclaw.json` uses `$include`: a `WARN` gives the command.
+- the provider has a stored login of its own, or a stored API key that differs from the
+  configured one (also doctor's copy of an earlier value): an info line says so and gives
+  the command with its cost (it sets that login aside for every run of `<p>`);
+- `openclaw.json` uses `$include`: the gate writes nothing, and its cron report covers
+  only the providers and agents in `openclaw.json` itself, not those in the included
+  files. A `WARN` (precheck, end of the run, `oc-upgrade status`) says so and gives the
+  command for a provider with a literal key in an included file:
+  `openclaw config set models.providers.<p>.auth api-key`.
 
 Apart from this fixup the gate only reports: it changes no cron job and no auth store, and
 never holds. With OpenClaw 2026.10.4 it prints and changes nothing.
@@ -1422,14 +1435,16 @@ never holds. With OpenClaw 2026.10.4 it prints and changes nothing.
   affected models, each with what it would run on (a stored login, the literal key doctor
   copies, or AWS SDK credentials), and says either that every run is refused (the job's
   own model is one of them) or that the job keeps working on its own model and stops at
-  the first such fallback when that model fails. Then one `WARN [gate] provider <p>: …`
+  the first such fallback when that model fails (with `$include`: as far as `openclaw.json`
+  itself shows). Then one `WARN [gate] provider <p>: …`
   line per provider whose literal key is the reason, with the fix (below). Only the job
   id, its name, model names, provider ids and config paths are shown, no prompt, no
   account and no key.
 - **Jobs of an agent that `openclaw.json` does not configure** are left out: OpenClaw
   cancels their runs anyway ("cron job agent is unavailable"). One `1/8 info: N enabled
   cron job(s) belong to agent(s) not configured in openclaw.json …` line names them (again
-  at the end of the run and in `oc-upgrade status`).
+  at the end of the run and in `oc-upgrade status`). With `$include` the line says that an
+  included file may configure them (it is not checked).
 - **After the migration** the gate reads the migrated jobs again: the `7/8
   postconditions` line counts them, the end of the run repeats the warnings (with the
   provider lines), and `oc-upgrade status` lists them.
@@ -1452,18 +1467,33 @@ never holds. With OpenClaw 2026.10.4 it prints and changes nothing.
      the environment. The rehearsal verified this object form; OpenClaw reads an
      upper-case `"${GLM_API_KEY}"` string the same way. With `auth: "oauth"` or `"token"`
      the line offers only this way (`"api-key"` would change how OpenClaw sends the key).
+
+     If the provider has a stored login of its own (a subscription login, a token or another
+     API key; the line then says `runs <p> on a stored login of its own`), that login is
+     the reason, not doctor's copy. Items 1 and 2 then set it aside for every run of `<p>`,
+     not only for cron jobs (for a subscription: the metered API key instead). To keep the
+     login, drop that fallback (item 4) or bind the job's own model (item 5).
   3. **A key only in an agent's model catalog** (`models.json`): declare it in
      `openclaw.json` instead, as `models.providers.<p>.apiKey` with `auth: "api-key"`, or
      as an env SecretRef (`auth: "api-key"` alone does not help there: it needs the key in
      `openclaw.json`).
-  4. Nothing, if the job's own model needs no account and you can do without that
-     fallback until OpenClaw 2026.11.5 (on AWS SDK credentials: for good, see below).
-  5. **Last resort**, for a model on a stored login (a subscription login, a token or a
-     stored API key without one in `openclaw.json`):
+  4. **A fallback on a stored login** (the job's own model needs no account: `… keeps
+     working, but when it fails … stops at the fallback …`). OpenClaw 2026.11.5 does not
+     change this: its migration records only the account of the job's own model, so the
+     job stays unbound and that fallback stays refused. Either do without the fallback:
+     after the start, `openclaw automations edit <id> --fallbacks <list>` without it (the
+     job's own list replaces the agent's and the default fallbacks). Or run that provider
+     on a configured key (an env SecretRef, or a literal key with `auth: "api-key"`):
+     every run of that provider, not only cron, then uses that key instead of its stored
+     login (for a subscription login: the metered API key). Do not bind the fallback with
+     `@<profileId>`: that makes it the job's own model. On AWS SDK credentials, see below.
+  5. **Last resort**, for the job's own model on a stored login (a subscription login, a
+     token or a stored API key without one in `openclaw.json`):
      after the start, `openclaw automations edit <id> --model
      <provider/model>@<profileId>` records the account (and makes that model the job's
      model). The job then runs only on that account's provider: fallbacks to other
-     providers are refused (openclaw/openclaw#192463).
+     providers are refused (openclaw/openclaw#192463). OpenClaw 2026.11.5's own migration
+     records the account of such a job itself, with the same cost.
 
   `openclaw config set` is refused while a HOLD is active (the wrapper allows only
   `config validate|get|file|schema`): then edit `openclaw.json` by hand, or set it after
@@ -1569,15 +1599,17 @@ them.
   exposure before anything is changed (information only, no HOLD): `[gate] 1/8 info:
   largest agent database … (… with WAL); biggest session: N transcript events (agent …,
   <channel>, <chat type>)`; no session ids are shown.
-- **Cron fallbacks.** Until OpenClaw's doctor records the inference accounts itself
-  (2026.11.5, openclaw/openclaw#172792), a cron job from before 2026.10.10 is refused, or
-  stops at the first fallback, as soon as a model would use a stored login or AWS SDK
-  credentials (openclaw/openclaw#192195). A literal key in
+- **Cron fallbacks.** OpenClaw 2026.10.10 and 2026.11.1 refuse a cron job from before
+  2026.10.10, or stop it at the first fallback, as soon as a model would use a stored
+  login or AWS SDK credentials (openclaw/openclaw#192195). OpenClaw's own migration
+  (2026.11.5, openclaw/openclaw#172792) records only the account of a job's own model: a
+  job that only stops at a fallback stays so, and a job it binds has its fallbacks to
+  other providers refused. A literal key in
   `models.providers.<provider>.apiKey` (also a placeholder such as `EMPTY`) becomes a
   stored login during the migration: set `models.providers.<provider>.auth: "api-key"`
   or use an env SecretRef. For AWS SDK credentials (`auth: "aws-sdk"`)
-  this stays so after 2026.11.5 too: no account can be recorded for them. The gate only
-  reports the affected jobs; see
+  this stays so after 2026.11.5 too: no account can be recorded for them. Apart from its
+  `auth: "api-key"` fixup the gate only reports the affected jobs; see
   [Cron jobs without a recorded inference account](#cron-jobs-without-a-recorded-inference-account-openclaw-20261010).
 - **No forecast on the current image.** `oc-upgrade check` of the add-on version you
   update from does not know these checks. They run in the precheck of the new image,

@@ -1972,7 +1972,9 @@ def auth_order_adjust(cfg, profiles, store_order):
 # would run on a stored auth profile or a direct credential that is not a configured key
 # (embedded-agent-runner/run/auth-plan.ts), and
 # the refusal stops the fallback chain (recordModelFallbackStop). OpenClaw's own doctor migration (#172792)
-# ships with 2026.11.5. The gate only forecasts which jobs are affected; it writes nothing. The stored logins include
+# ships with 2026.11.5; it records only the account of a job's own model (inference-binding-migration.ts), so a job
+# that only stops at a fallback stays refused there. The gate only forecasts which jobs are affected; it writes
+# nothing. The stored logins include
 # the ones OpenClaw's doctor creates during the migration from literal provider keys (doctor_key_copies; found in the
 # add-on's 10.10 rehearsal): a job on such a provider is refused unless the key is a SecretRef or has auth "api-key".
 
@@ -2048,6 +2050,43 @@ def _local_base_url(url):
         return False
     ip = getattr(ip, "ipv4_mapped", None) or ip
     return ip.is_loopback or (ip.version == 4 and any(ip in n for n in _RFC1918))
+
+
+_ENV_TEMPLATE_NAME_RE = re.compile(r"\A[A-Z_][A-Z0-9_]*\Z")  # env-substitution.ts ENV_VAR_NAME_PATTERN
+
+
+def env_substituted(value, env):
+    """OpenClaw's substituteString (config/env-substitution.ts, 2026.11.1) on one config string with the onMissing
+    behaviour of a snapshot read (pure): "${NAME}" and "${NAME:-default}" (NAME upper case or "_", the default without
+    "$" or "{") take the variable's value from `env`, an unset or empty one the default, without one the placeholder
+    stays; "$${NAME}" is the escaped placeholder "${NAME}". Anything else stays as written. The config OpenClaw's
+    doctor reads (sourceConfig) is substituted so, so its copy of a literal key holds this value."""
+    if not isinstance(value, str) or "$" not in value:
+        return value
+    out, end, i = [], 0, value.find("$")
+    while i != -1:
+        escaped = value[i + 1:i + 3] == "${"
+        if escaped or value[i + 1:i + 2] == "{":
+            start = i + (3 if escaped else 2)
+            close = value.find("}", start)
+            if close != -1:
+                body = value[start:close]
+                name, sep, default = body.partition(":-")
+                if _ENV_TEMPLATE_NAME_RE.match(name) and not (sep and ("$" in default or "{" in default)):
+                    out.append(value[end:i])
+                    end = close + 1
+                    token = "${" + body + "}"
+                    if escaped:
+                        out.append(token)
+                    elif (env or {}).get(name):
+                        out.append(env[name])
+                    else:
+                        out.append(default if sep else token)
+                    i = value.find("$", close + 1)
+                    continue
+        i = value.find("$", i + 1)
+    out.append(value[end:])
+    return "".join(out)
 
 
 def doctor_copies(value, cfg_entry=None, store_ids=()):
