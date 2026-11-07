@@ -1154,6 +1154,43 @@ class CronConfigFixupTests(T.GateEnv):
         self.assertNotIn("cron_autofix", self.journal())
         self.assertNotIn("sk-synthetic-cat-0000", self.out + json.dumps(self.journal()))
 
+    def test_key_also_in_main_catalog_and_a_keyed_fallback_provider(self):
+        """The layout of the owner's install (2026-11-07, structure only, synthetic values): the same literal
+        placeholder for glm in openclaw.json and in agents/main/agent/models.json, a second local provider with the
+        same placeholder that no cron job uses, a catalog-only provider no job uses, and a cloud provider with a real
+        literal key as the last default fallback. Doctor copies the duplicate only once; current config owns the
+        provider's auth, so the openclaw.json fixup covers glm and no catalog WARN appears for it. The fallback
+        provider gets its own fixup; the unused providers are left alone; no key value is printed."""
+        cloud_key = "AIzaSy-synthetic-cloud-key-0000000000000000"
+        cfg = json.loads(json.dumps(CFG_GLM))
+        prov = cfg["models"]["providers"]
+        prov["glm-alt"] = dict(prov["glm"], models=[{"id": "glm-5-alt"}])
+        prov["cloud"] = {"baseUrl": "https://cloud.invalid/v1", "api": "openai-completions", "apiKey": cloud_key,
+                         "models": [{"id": "c1"}]}
+        cfg["agents"]["defaults"]["model"]["fallbacks"] = ["openai/gpt-5.5", "cloud/c1"]
+        self.write_cfg(cfg)
+        add_jobs(self.state, [("job-default", {"agentId": "main", "sessionTarget": "isolated",
+                                               "payload": {"kind": "agentTurn", "message": PROMPT}})], start=50)
+        (self.state / "agents" / "main" / "agent" / "models.json").write_text(json.dumps({"providers": {
+            "glm": {"baseUrl": prov["glm"]["baseUrl"], "apiKey": GLM_KEY, "models": [{"id": "glm-5"}]},
+            "glm-alt": {"baseUrl": prov["glm"]["baseUrl"], "apiKey": GLM_KEY, "models": [{"id": "glm-5-alt"}]},
+            "spare": {"baseUrl": "http://127.0.0.1:8009/v1", "apiKey": "spare1", "models": [{"id": "s"}]}}}))
+        lines = self.dry()
+        fixups = [ln for ln in lines if "config fixup: would set" in ln and ln.startswith("[gate] 1/8 ")]
+        self.assertEqual(sorted(ln.split("models.providers.")[1].split(".auth")[0] for ln in fixups),
+                         ["cloud", "glm"], lines)
+        self.assertFalse([ln for ln in lines if "model catalog" in ln or "glm-alt" in ln or "spare" in ln], lines)
+        out = "\n".join(lines)
+        for secret in (GLM_KEY, cloud_key, "spare1"):
+            self.assertNotIn(secret, out)
+        self.doctor_copies_key("2026.11.1")
+        self.assertEqual(self.run_gate(), 0, self.out)
+        now = self.cfg_now()["models"]["providers"]
+        self.assertEqual((now["glm"].get("auth"), now["cloud"].get("auth")), ("api-key", "api-key"))
+        self.assertNotIn("auth", now["glm-alt"])
+        for secret in (GLM_KEY, cloud_key, "spare1"):
+            self.assertNotIn(secret, self.out + json.dumps(self.journal()))
+
     def test_no_enabled_cron_job_uses_the_provider(self):
         cfg = json.loads(json.dumps(CFG_GLM))
         cfg["agents"]["defaults"]["model"] = {"primary": "lan/q", "fallbacks": ["openai/gpt-5.5"]}
