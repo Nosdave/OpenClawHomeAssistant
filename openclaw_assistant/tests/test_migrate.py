@@ -1284,6 +1284,20 @@ class TestPins(unittest.TestCase):
         ours = {m.fmt_path(p["path"]) for p in m.PINS if p["cond"]}
         self.assertTrue(conditional <= ours, conditional - ours)
 
+    def test_approval_policy_pin_skipped_when_proposals_retired(self):
+        """full5: OpenClaw 2026.10.10+ has no Skill Workshop proposals (strict skills.workshop schema, doctor removes
+        approvalPolicy); the pin is skipped there and written as before on 2026.10.4."""
+        cfg = {"skills": {"workshop": {}}}
+        new, written, skipped = m.apply_pins(cfg, set(), retires_skill_proposals=True)
+        self.assertNotIn("approvalPolicy", new["skills"]["workshop"])
+        self.assertEqual(self.skipped(skipped)["skills.workshop.approvalPolicy"],
+                         "condition:Skill Workshop proposals were removed in this OpenClaw version")
+        self.assertEqual(new["skills"]["workshop"]["autonomous"]["mode"], "off")
+        self.assertEqual(len(written) + len(skipped), 31)
+        new, written, skipped = self.apply(cfg)
+        self.assertEqual(new["skills"]["workshop"]["approvalPolicy"], "pending")
+        self.assertNotIn("skills.workshop.approvalPolicy", self.skipped(skipped))
+
     def apply(self, cfg, ledgered=()):
         snap = copy.deepcopy(cfg)
         out = m.apply_pins(cfg, set(ledgered))
@@ -2035,6 +2049,453 @@ class TestRetiredFormats(unittest.TestCase):
         self.assertIn("installs", cfg["plugins"], "input must not be mutated")
 
 
+DDL_STATE_1004 = os.path.join(FIX, "openclaw-state-schema-2026.10.4.sql")  # verbatim OpenClaw v2026.10.4 DDL
+
+
+def _caps(version):
+    """oc_common.runtime_caps of a bundled OpenClaw `version` (no build-time features record)."""
+    from unittest import mock
+    import oc_common as C
+    with mock.patch.dict(os.environ, {"OC_ADDON_FEATURES_FILE": os.path.join(HERE, "no-such-features.json")}):
+        return C.runtime_caps(version)
+
+
+RUNTIME_FILES = ("acp/event-ledger.json", "acp/event-ledger.json.doctor-import", "settings/voicewake.json",
+                 "settings/voicewake-routing.json", "bindings/current-conversations.json",
+                 "plugin-binding-approvals.json", "restart-sentinel.json", "restart-sentinel.json.doctor-importing")
+SANDBOX_REGISTRIES = ("sandbox/containers.json", "sandbox/browsers.json")
+SANDBOX_DIRS = ("sandbox/containers", "sandbox/browsers")
+
+
+class TestRetiredRuntimeFiles(unittest.TestCase):
+    """OpenClaw 2026.10.5+ refuses pre-July runtime files 2026.10.4 still imported (#165402, #164669): quarantine
+    only with proof that OpenClaw imported them (or when 2026.10.4 would import nothing), otherwise an acceptable
+    HOLD per file type; retired config keys of 2026.10.5/10.6 (runtime_caps)."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.home = self.tmp.name
+        self.root = os.path.join(self.home, ".openclaw")  # the default home of HOME=self.home
+        self.db = os.path.join(self.root, "state", "openclaw.sqlite")
+        os.makedirs(os.path.dirname(self.db))
+        con = sqlite3.connect(self.db)
+        with open(DDL_STATE_1004, encoding="utf-8") as f:
+            con.executescript(f.read())
+        con.close()
+        self.c1010 = _caps("2026.10.10")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def sql(self, *statements, params=()):
+        con = sqlite3.connect(self.db)
+        try:
+            for s in statements:
+                con.execute(s, params) if params else con.execute(s)
+            con.commit()
+        finally:
+            con.close()
+
+    def run_cls(self, cfg=None, caps="1010", env=None, **kw):
+        before = _snapshot(self.home)
+        out = m.classify_retired_state(self.root, cfg or {}, accepted=kw.pop("accepted", set()), home="/config",
+                                       caps=self.c1010 if caps == "1010" else caps,
+                                       env={"HOME": self.home} if env is None else env, **kw)
+        self.assertEqual(_snapshot(self.home), before, "classification must not touch the state dir")
+        json.dumps(out)
+        return out
+
+    def plan(self, out):
+        return {p["rel"]: (p["kind"], p["action"]) for p in out["plan"]}
+
+    def proof(self, out, rel):
+        return next(p.get("proof") for p in out["plan"] if p["rel"] == rel)
+
+    def codes(self, out):
+        return {f["code"]: f["cls"] for f in out["findings"]}
+
+    def ledger(self, sessions):
+        return json.dumps({"version": 1, "sessions": sessions})
+
+    # ----- version gating -----
+    def test_runtime_files_left_to_doctor_for_10_4(self):
+        for rel in RUNTIME_FILES + SANDBOX_REGISTRIES:
+            _write(self.root, rel, "{}")
+        for rel in SANDBOX_DIRS:
+            os.makedirs(os.path.join(self.root, rel))
+        for caps in (None, _caps("2026.10.4"), _caps("2026.10.4-2")):
+            out = self.run_cls(caps=caps)
+            self.assertEqual(out["plan"], [], caps)
+            self.assertEqual(out["findings"], [], caps)
+        # 2026.10.5 and later: every path is checked
+        for v in ("2026.10.5", "2026.10.10", "2026.11.1"):
+            out = self.run_cls(caps=_caps(v))
+            self.assertEqual(set(self.plan(out)), set(RUNTIME_FILES + SANDBOX_REGISTRIES + SANDBOX_DIRS), v)
+        # "{}" is nothing 2026.10.4 would import for Voice Wake (defaults), bindings, approvals and the empty
+        # shard directories; the ledger, the sentinel and the registry files need proof
+        self.assertEqual(self.codes(out), {c: "acceptable" for c in (
+            "acp-ledger-unimported", "restart-sentinel-unimported", "sandbox-registry-unimported")})
+        for rel in ("settings/voicewake.json", "settings/voicewake-routing.json", "bindings/current-conversations.json",
+                    "plugin-binding-approvals.json") + SANDBOX_DIRS:
+            self.assertEqual(self.plan(out)[rel][1], "quarantine", rel)
+            self.assertTrue(self.proof(out, rel).startswith("nothing to import"), rel)
+
+    # ----- ACP replay ledger -----
+    def acp_rows(self, session_key="agent:main:acp", update2=None, run_id2="run-1"):
+        self.sql("INSERT INTO acp_replay_sessions (session_id, session_key, cwd, complete, created_at, updated_at, "
+                 "next_seq) VALUES ('s1', '%s', '/config/clawd', 1, 1000, 2000, 3)" % session_key)
+        self.sql("INSERT INTO acp_replay_events (session_id, seq, at, session_key, run_id, update_json) VALUES "
+                 "('s1', 1, 1100, 'agent:main:acp', NULL, ?)", params=(json.dumps({"sessionUpdate": "a", "n": 1}),))
+        self.sql("INSERT INTO acp_replay_events (session_id, seq, at, session_key, run_id, update_json) VALUES "
+                 "('s1', 2, 1200, 'agent:main:acp', ?, ?)",
+                 params=(run_id2, json.dumps(update2 or {"sessionUpdate": "b", "ok": True})))
+
+    def acp_file(self, rel="acp/event-ledger.json", **over):
+        s = {"sessionId": "s1", "sessionKey": "agent:main:acp", "cwd": "/config/clawd", "complete": True,
+             "createdAt": 1000, "updatedAt": 2000.0, "nextSeq": 3, "events": [
+                 {"seq": 2, "at": 1200, "sessionId": "s1", "sessionKey": "agent:main:acp", "runId": "run-1",
+                  "update": {"ok": True, "sessionUpdate": "b"}},
+                 {"seq": 1, "at": 1100, "sessionId": "s1", "sessionKey": "agent:main:acp",
+                  "update": {"sessionUpdate": "a", "n": 1}}]}
+        s.update(over)
+        _write(self.root, rel, self.ledger({"s1": s}))
+
+    def test_acp_ledger_proof(self):
+        self.acp_rows()
+        self.acp_file()
+        out = self.run_cls()
+        self.assertEqual(self.plan(out)["acp/event-ledger.json"], ("acp-replay-ledger", "quarantine"))
+        self.assertEqual(self.proof(out, "acp/event-ledger.json"), "1 session(s), 2 event(s) in acp_replay_*")
+        self.assertEqual(out["findings"], [])
+        # the doctor claim file is checked the same way
+        os.rename(os.path.join(self.root, "acp/event-ledger.json"),
+                  os.path.join(self.root, "acp/event-ledger.json.doctor-import"))
+        self.assertEqual(self.plan(self.run_cls())["acp/event-ledger.json.doctor-import"],
+                         ("acp-replay-ledger", "quarantine"))
+        os.remove(os.path.join(self.root, "acp/event-ledger.json.doctor-import"))
+        # nextSeq not above the last event, invalid JSON, a null run id: 2026.10.4 could not import it either
+        for bad in ({"nextSeq": 2}, {"complete": 1}):
+            self.acp_file(**bad)
+            out = self.run_cls()
+            self.assertEqual(self.plan(out)["acp/event-ledger.json"], ("acp-replay-ledger", "leave"), bad)
+            self.assertEqual(self.codes(out), {"acp-ledger-unimported": "acceptable"})
+        _write(self.root, "acp/event-ledger.json", "{not json")
+        self.assertIn("invalid JSON", self.run_cls()["findings"][0]["message"])
+        # nothing to import: no sessions
+        _write(self.root, "acp/event-ledger.json", self.ledger({}))
+        out = self.run_cls()
+        self.assertEqual((self.plan(out)["acp/event-ledger.json"], self.proof(out, "acp/event-ledger.json")),
+                         (("acp-replay-ledger", "quarantine"), "nothing to import"))
+        self.assertEqual(out["findings"], [])
+
+    def test_acp_ledger_proof_needs_exact_rows(self):
+        self.acp_rows(update2={"sessionUpdate": "b", "ok": 1})  # true is not 1 (isDeepStrictEqual)
+        self.acp_file()
+        out = self.run_cls()
+        self.assertEqual(self.plan(out)["acp/event-ledger.json"], ("acp-replay-ledger", "leave"))
+        self.assertIn("acp/event-ledger.json (1 of 1 session(s) not in SQLite)", out["findings"][0]["message"])
+        out = self.run_cls(accepted={"acp-ledger-unimported"})
+        self.assertEqual(self.plan(out)["acp/event-ledger.json"], ("acp-replay-ledger", "quarantine"))
+        self.assertIsNone(self.proof(out, "acp/event-ledger.json"))
+        self.sql("DELETE FROM acp_replay_events", "DELETE FROM acp_replay_sessions")
+        self.acp_rows(run_id2=None)  # NULL run_id against a recorded runId
+        self.assertEqual(self.codes(self.run_cls()), {"acp-ledger-unimported": "acceptable"})
+        self.sql("DELETE FROM acp_replay_events", "DELETE FROM acp_replay_sessions")
+        self.acp_rows(session_key="agent:main:other")
+        self.assertEqual(self.codes(self.run_cls()), {"acp-ledger-unimported": "acceptable"})
+        self.sql("DROP TABLE acp_replay_events")  # unreadable tables: never proof
+        self.assertEqual(self.codes(self.run_cls()), {"acp-ledger-unimported": "acceptable"})
+
+    # ----- Voice Wake -----
+    def test_voicewake_proof(self):
+        rel = "settings/voicewake.json"
+        _write(self.root, rel, json.dumps({"triggers": [" hey ", "computer", 7, "  "]}))
+        self.sql("INSERT INTO config_machine_state VALUES ('voicewake.triggers', '[\"hey\",\"computer\"]', 1)")
+        out = self.run_cls()
+        self.assertEqual((self.plan(out)[rel], self.proof(out, rel)),
+                         (("voicewake-json", "quarantine"), "voicewake.triggers in SQLite"))
+        self.sql("UPDATE config_machine_state SET value_json='[\"other\"]'")
+        out = self.run_cls()
+        self.assertEqual(self.plan(out)[rel], ("voicewake-json", "leave"))
+        self.assertEqual(self.codes(out), {"voicewake-unimported": "acceptable"})
+        # an identical archived copy (2026.10.4 archives only after the SQLite commit) is proof; .migrated.N too
+        self.sql("DELETE FROM config_machine_state")
+        _write(self.root, rel + ".migrated", "different")
+        self.assertEqual(self.plan(self.run_cls())[rel], ("voicewake-json", "leave"))
+        _write(self.root, rel + ".migrated.2", json.dumps({"triggers": [" hey ", "computer", 7, "  "]}))
+        out = self.run_cls()
+        self.assertEqual((self.plan(out)[rel], self.proof(out, rel)),
+                         (("voicewake-json", "quarantine"), "identical archived copy voicewake.json.migrated.2"))
+        # the default trigger words without a SQLite row: nothing to import (the runtime uses the defaults)
+        for n in (".migrated", ".migrated.2"):
+            os.remove(os.path.join(self.root, rel + n))
+        _write(self.root, rel, json.dumps({"triggers": []}))
+        out = self.run_cls()
+        self.assertEqual(self.plan(out)[rel], ("voicewake-json", "quarantine"))
+        self.assertTrue(self.proof(out, rel).startswith("nothing to import"))
+        os.remove(os.path.join(self.root, rel))
+        # routing: the stored defaultTarget and routes equal the file's
+        routing = {"version": 1, "defaultTarget": {"agentId": "main"},
+                   "routes": [{"trigger": "hey", "target": {"mode": "current"}}]}
+        _write(self.root, "settings/voicewake-routing.json", json.dumps(routing))
+        self.assertEqual(self.codes(self.run_cls()), {"voicewake-unimported": "acceptable"})
+        self.sql("INSERT INTO config_machine_state VALUES ('voicewake.routing', ?, 1)",
+                 params=(json.dumps(dict(routing, updatedAtMs=5)),))
+        out = self.run_cls()
+        self.assertEqual(self.plan(out)["settings/voicewake-routing.json"], ("voicewake-json", "quarantine"))
+        self.assertEqual(out["findings"], [])
+
+    # ----- current-conversation bindings -----
+    def binding_row(self, channel, account, parent, conv, target):
+        self.sql("INSERT INTO current_conversation_bindings (binding_key, binding_id, target_session_key, channel, "
+                 "account_id, conversation_kind, parent_conversation_id, conversation_id, target_kind, status, "
+                 "bound_at, record_json, updated_at) VALUES (?, 'b', ?, ?, ?, 'current', ?, ?, 'session', 'active', "
+                 "1, '{}', 1)", params=("%s|%s|%s|%s" % (channel, account, parent, conv), target, channel, account,
+                                         parent, conv))
+
+    def test_current_conversation_bindings_proof(self):
+        rel = "bindings/current-conversations.json"
+        _write(self.root, rel, json.dumps({"version": 1, "bindings": [
+            {"conversation": {"channel": " Telegram ", "accountId": "Main", "conversationId": " 42 ",
+                              "parentConversationId": "42"}, "targetSessionKey": " agent:main:x "},
+            {"conversation": {"channel": "discord", "accountId": "", "conversationId": "c1",
+                              "parentConversationId": "g1"}, "targetSessionKey": "agent:main:y"},
+            {"conversation": {"channel": "slack", "conversationId": "c9"}}]}))  # no target: ignored
+        self.binding_row("telegram", "main", None, "42", "agent:main:x")
+        out = self.run_cls()
+        self.assertEqual(self.plan(out)[rel], ("conversation-bindings-json", "leave"))
+        self.assertIn("1 of 2 binding(s) not in SQLite", out["findings"][0]["message"])
+        self.binding_row("discord", "default", "g1", "c1", "agent:main:other")  # another target session
+        self.assertEqual(self.codes(self.run_cls()), {"conversation-bindings-unimported": "acceptable"})
+        self.sql("UPDATE current_conversation_bindings SET target_session_key='agent:main:y' WHERE channel='discord'")
+        out = self.run_cls()
+        self.assertEqual((self.plan(out)[rel], self.proof(out, rel)),
+                         (("conversation-bindings-json", "quarantine"), "2 binding(s) in current_conversation_bindings"))
+        _write(self.root, rel, json.dumps({"version": 2, "bindings": [{"conversation": {"conversationId": "x"}}]}))
+        out = self.run_cls()
+        self.assertEqual(self.plan(out)[rel], ("conversation-bindings-json", "quarantine"))
+        self.assertTrue(self.proof(out, rel).startswith("nothing to import"))
+
+    # ----- plugin binding approvals (default home only) -----
+    def test_plugin_binding_approvals_default_home_only(self):
+        rel = "plugin-binding-approvals.json"
+        _write(self.root, rel, json.dumps({"version": 1, "approvals": [
+            {"pluginRoot": "/p/brave", "pluginId": "brave", "channel": " Telegram ", "approvedAt": 1},
+            {"pluginRoot": "/p/x", "pluginId": "x"}]}))  # no channel: ignored
+        out = self.run_cls()
+        self.assertEqual(self.plan(out)[rel], ("plugin-approvals-json", "leave"))
+        self.assertEqual(self.codes(out), {"plugin-approvals-unimported": "acceptable"})
+        self.sql("INSERT INTO plugin_binding_approvals VALUES ('/p/brave', 'telegram', 'default', 'brave', NULL, 1)")
+        out = self.run_cls()
+        self.assertEqual((self.plan(out)[rel], self.proof(out, rel)),
+                         (("plugin-approvals-json", "quarantine"), "1 approval(s) in plugin_binding_approvals"))
+        self.sql("DELETE FROM plugin_binding_approvals")
+        # only the default home's state dir: OPENCLAW_HOME wins over HOME; a leading ~ is the OS home
+        for env, checked in (({"HOME": "/elsewhere"}, False), ({"HOME": self.home}, True),
+                             ({"HOME": "/elsewhere", "OPENCLAW_HOME": self.home}, True),
+                             ({"HOME": self.home, "OPENCLAW_HOME": "/elsewhere"}, False),
+                             ({"HOME": self.home, "OPENCLAW_HOME": " ~ "}, True),
+                             ({"HOME": self.home + "/./"}, True), ({}, False)):
+            out = self.run_cls(env=env)
+            self.assertEqual(rel in self.plan(out), checked, env)
+            self.assertEqual("plugin-approvals-unimported" in self.codes(out), checked, env)
+        # path.resolve semantics: a symlinked home is not resolved (OpenClaw compares the paths as given)
+        link_home = os.path.join(self.home, "linked")
+        os.makedirs(link_home)
+        os.symlink(self.root, os.path.join(link_home, ".openclaw"))
+        self.assertNotIn(rel, self.plan(self.run_cls(env={"HOME": link_home})))
+
+    # ----- restart sentinel -----
+    def receipt(self, sha, decision="legacy-imported", status="completed", source_row=True, path="/old/x.json"):
+        import hashlib
+        key = "restart-sentinel-json:" + hashlib.sha256(path.encode()).hexdigest()
+        report = json.dumps({"source": "legacy-restart-sentinel-json", "target": "gateway_restart_sentinel",
+                             "decision": decision, "sourceSha256": sha, "sourceValid": True,
+                             "importedRecordCount": 1, "preservedSqliteRecordCount": 0})
+        run_id = "%s:%s" % (key, sha[:16])
+        self.sql("INSERT INTO migration_runs VALUES (?, 1, 1, ?, ?)", params=(run_id, status, report))
+        if source_row:
+            self.sql("INSERT INTO migration_sources (source_key, migration_kind, source_path, target_table, "
+                     "source_sha256, last_run_id, status, imported_at, report_json) VALUES (?, "
+                     "'legacy-restart-sentinel-json', ?, 'gateway_restart_sentinel', ?, ?, 'completed', 1, ?)",
+                     params=(key, path, sha, run_id, report))
+
+    def test_restart_sentinel_receipts(self):
+        import hashlib
+        body = '{"version":1,"payload":{"kind":"restart"}}'
+        sha = hashlib.sha256(body.encode()).hexdigest()
+        _write(self.root, "restart-sentinel.json", body)
+        out = self.run_cls()
+        self.assertEqual(self.plan(out)["restart-sentinel.json"], ("restart-sentinel-json", "leave"))
+        self.assertEqual(self.codes(out), {"restart-sentinel-unimported": "acceptable"})
+        self.receipt(hashlib.sha256(b"other bytes").hexdigest())  # a receipt for other content
+        self.assertEqual(self.codes(self.run_cls()), {"restart-sentinel-unimported": "acceptable"})
+        # any recorded decision for exactly these bytes, whatever path it was recorded for
+        self.receipt(sha, decision="canonical-preserved", path="/old/y.json")
+        out = self.run_cls()
+        self.assertEqual((self.plan(out)["restart-sentinel.json"], self.proof(out, "restart-sentinel.json")),
+                         (("restart-sentinel-json", "quarantine"), "receipt canonical-preserved"))
+        # the doctor claim with only a migration_runs row: completed counts, running or an unknown decision not
+        os.rename(os.path.join(self.root, "restart-sentinel.json"),
+                  os.path.join(self.root, "restart-sentinel.json.doctor-importing"))
+        self.sql("DELETE FROM migration_sources", "DELETE FROM migration_runs")
+        self.receipt(sha, status="running", source_row=False)
+        self.assertEqual(self.codes(self.run_cls()), {"restart-sentinel-unimported": "acceptable"})
+        self.sql("DELETE FROM migration_runs")
+        self.receipt(sha, decision="made-up", source_row=False)
+        self.assertEqual(self.codes(self.run_cls()), {"restart-sentinel-unimported": "acceptable"})
+        self.sql("DELETE FROM migration_runs")
+        self.receipt(sha, source_row=False)
+        out = self.run_cls()
+        self.assertEqual(self.plan(out)["restart-sentinel.json.doctor-importing"],
+                         ("restart-sentinel-json", "quarantine"))
+        self.assertEqual(out["findings"], [])
+
+    # ----- sandbox registries (strict) -----
+    def test_sandbox_registry_proof(self):
+        _write(self.root, "sandbox/containers.json", json.dumps({"entries": [{"containerName": "a", "x": 1}]}))
+        _write(self.root, "sandbox/browsers/x.json", json.dumps({"containerName": "b"}))
+        _write(self.root, "sandbox/browsers/notes.txt", "ignored")
+        os.makedirs(os.path.join(self.root, "sandbox/skills-workspaces/w"))  # live runtime path: never planned
+        out = self.run_cls()
+        plan = self.plan(out)
+        self.assertEqual(plan["sandbox/containers.json"], ("sandbox-registry", "leave"))
+        self.assertEqual(plan["sandbox/browsers"], ("sandbox-registry", "leave"))  # the directory is the entry
+        self.assertEqual(set(plan), {"sandbox/containers.json", "sandbox/browsers"})
+        self.assertEqual(self.codes(out), {"sandbox-registry-unimported": "acceptable"})
+        self.sql("INSERT INTO sandbox_registry_entries (registry_kind, container_name, entry_json, updated_at) "
+                 "VALUES ('container', 'a', '{}', 1)")
+        out = self.run_cls()
+        self.assertEqual((self.plan(out)["sandbox/containers.json"], self.proof(out, "sandbox/containers.json")),
+                         (("sandbox-registry", "quarantine"), "1 entr(ies) in sandbox_registry_entries"))
+        self.sql("INSERT INTO sandbox_registry_entries (registry_kind, container_name, entry_json, updated_at) "
+                 "VALUES ('container', 'b', '{}', 1)")  # a container row does not prove a browser entry
+        self.assertEqual(self.plan(self.run_cls())["sandbox/browsers"], ("sandbox-registry", "leave"))
+        self.sql("INSERT INTO sandbox_registry_entries (registry_kind, container_name, entry_json, updated_at) "
+                 "VALUES ('browser', 'b', '{}', 1)")
+        self.assertEqual(self.plan(self.run_cls())["sandbox/browsers"], ("sandbox-registry", "quarantine"))
+        # strict: an invalid shard or registry file holds even though 2026.10.4 would have set it aside
+        _write(self.root, "sandbox/browsers/y.json", "{not json")
+        self.assertEqual(self.plan(self.run_cls())["sandbox/browsers"], ("sandbox-registry", "leave"))
+        _write(self.root, "sandbox/containers.json", json.dumps({"entries": [{"name": "a"}]}))
+        self.assertEqual(self.plan(self.run_cls())["sandbox/containers.json"], ("sandbox-registry", "leave"))
+        # an empty registry directory or file: nothing to import
+        os.remove(os.path.join(self.root, "sandbox/containers.json"))
+        os.makedirs(os.path.join(self.root, "sandbox/containers"))
+        _write(self.root, "sandbox/browsers.json", json.dumps({"entries": []}))
+        out = self.run_cls()
+        for rel in ("sandbox/containers", "sandbox/browsers.json"):
+            self.assertEqual((self.plan(out)[rel], self.proof(out, rel)),
+                             (("sandbox-registry", "quarantine"), "nothing to import"))
+        # a regular file where the shard directory belongs
+        os.rmdir(os.path.join(self.root, "sandbox/containers"))
+        _write(self.root, "sandbox/containers", "x")
+        self.assertEqual(self.plan(self.run_cls())["sandbox/containers"], ("sandbox-registry", "leave"))
+
+    def test_runtime_files_uninspectable_and_symlinks(self):
+        _write(self.root, "settings", "a file where a directory belongs")
+        out = self.run_cls()
+        self.assertEqual(self.codes(out), {"retired-state-uninspectable": "hard"})
+        self.assertIn("settings/voicewake.json (", out["findings"][0]["message"])
+        os.remove(os.path.join(self.root, "settings"))
+        # a symlink is never followed (2026.10.10 refuses the link itself): accepting quarantines the link
+        self.acp_rows()
+        self.acp_file(rel="../ledger.json")  # a valid ledger OpenClaw imported, outside the state dir
+        os.makedirs(os.path.join(self.root, "acp"))
+        os.symlink(os.path.join(self.home, "ledger.json"), os.path.join(self.root, "acp", "event-ledger.json"))
+        out = self.run_cls()
+        self.assertEqual(self.plan(out)["acp/event-ledger.json"], ("acp-replay-ledger", "leave"))
+        self.assertIn("not a regular file", out["findings"][0]["message"])
+        out = self.run_cls(accepted={"acp-ledger-unimported"})
+        self.assertEqual(self.plan(out)["acp/event-ledger.json"], ("acp-replay-ledger", "quarantine"))
+        os.remove(os.path.join(self.home, "ledger.json"))  # a broken link still counts as present
+        self.assertEqual(self.plan(self.run_cls())["acp/event-ledger.json"], ("acp-replay-ledger", "leave"))
+
+    # ----- retired config keys -----
+    def test_config_keys_targets(self):
+        c104, c105, c106 = _caps("2026.10.4"), _caps("2026.10.5"), _caps("2026.10.6")
+        empty = {"plugins": {"installs": {}}}
+        self.assertEqual(m.retired_config_keys(empty)[0], ["plugins.installs"])
+        for caps, flagged in ((c104, True), (c105, True), (c106, False), (self.c1010, False)):
+            self.assertEqual("plugins.installs" in m.retired_config_keys(empty, caps)[0], flagged, caps)
+        for installs in (None, [], {"x": {}}):
+            for caps in (None, self.c1010):
+                self.assertIn("plugins.installs", m.retired_config_keys({"plugins": {"installs": installs}}, caps)[0])
+        cfg = {"models": {"providers": {
+                   "p": {"api": "openai-codex-responses",
+                         "models": [{"id": "a"}, {"id": "b", "api": "openai-codex-responses"}, "x"]},
+                   "q": {"api": "openai-chatgpt-responses"}, "r": {"api": " openai-codex-responses"}}},
+               "browser": {"profiles": {"e": {"driver": " extension ", "cdpUrl": "ws://x"},
+                                        "blank": {"driver": "extension", "cdpUrl": "  "},
+                                        "other": {"driver": "openclaw", "cdpUrl": "ws://y"},
+                                        "num": {"driver": "extension", "cdpUrl": 9222}}}}
+        want = ["models.providers.p.api", "models.providers.p.models[1].api", "browser.profiles.e.cdpUrl"]
+        for caps in (c105, self.c1010):
+            self.assertEqual(m.retired_config_keys(cfg, caps)[0], want)
+        for caps in (None, c104):
+            self.assertEqual(m.retired_config_keys(cfg, caps)[0], [])
+
+    def test_config_rewrites_and_findings_modes(self):
+        cfg = {"models": {"providers": {"openai": {"api": "openai-codex-responses",
+                                                   "models": [{"id": "gpt-5.5", "api": "openai-codex-responses"}]}}},
+               "browser": {"profiles": {"e": {"driver": "extension", "cdpUrl": "ws://x"}}}}
+        self.assertEqual(m.retired_config_rewrites(cfg, _caps("2026.10.4")), [])
+        self.assertEqual(m.retired_config_rewrites(cfg), [])
+        rw = m.retired_config_rewrites(cfg, self.c1010)
+        self.assertEqual([(e["parts"], e["op"], e.get("value")) for e in rw], [
+            (["models", "providers", "openai", "api"], "set", "openai-chatgpt-responses"),
+            (["models", "providers", "openai", "models", 0, "api"], "set", "openai-chatgpt-responses"),
+            (["browser", "profiles", "e", "cdpUrl"], "delete", None)])
+        # from-7x: the pre-migrate step fixes them; bump/maintenance: a hard HOLD naming the exact fix
+        self.assertEqual(m.retired_config_findings(cfg, "from-7x", self.c1010, "2026.10.10"), [])
+        f = m.retired_config_findings(cfg, "bump", self.c1010, "2026.10.10")
+        self.assertEqual([(x["code"], x["cls"]) for x in f], [("config-retired-keys", "hard")])
+        self.assertIn("OpenClaw 2026.10.10 refuses", f[0]["message"])
+        self.assertIn('set models.providers.openai.api to "openai-chatgpt-responses"', f[0]["message"])
+        self.assertIn("delete browser.profiles.e.cdpUrl", f[0]["message"])
+        self.assertNotIn("remove the others", f[0]["message"])
+        f = m.retired_config_findings(dict(cfg, heartbeat={}), "maintenance", self.c1010, "2026.10.10")
+        self.assertIn("; remove the others (or migrate them with OpenClaw 2026.9.5); then oc-upgrade retry",
+                      f[0]["message"])
+        self.assertEqual(m.retired_config_findings(cfg, "bump", _caps("2026.10.4")), [])
+        # the classify result carries the rewrites in from-7x mode only; an empty installs {} is an info on 10.6+
+        self.assertEqual(self.run_cls(cfg)["config_rewrites"], rw)
+        self.assertEqual(self.run_cls(cfg, mode="bump")["config_rewrites"], [])
+        out = self.run_cls({"plugins": {"installs": {}}}, mode="bump")
+        self.assertEqual(out["info"], ["openclaw.json plugins.installs is an empty object; OpenClaw doctor removes it "
+                                       "(install records stay in SQLite)"])
+        self.assertEqual(self.run_cls({"plugins": {"installs": {}}}, mode="bump", caps=None)["info"], [])
+        self.assertEqual(self.run_cls({"plugins": {"installs": {}}})["config_removals"], [["plugins", "installs"]])
+
+    def test_premigrate_r0_rewrites(self):
+        cfg = {"models": {"providers": {"openai": {"api": "openai-codex-responses",
+                                                   "models": [{"id": "gpt-5.5", "api": "openai-codex-responses"}]}}},
+               "browser": {"profiles": {"e": {"driver": "extension", "cdpUrl": "ws://user:pw@127.0.0.1:18792/x?t=1"},
+                                        "f": {"driver": "extension", "cdpUrl": "http://h"}}}}
+        snap = copy.deepcopy(cfg)
+        rw = m.retired_config_rewrites(cfg, self.c1010)
+        cfg["browser"]["profiles"]["f"]["cdpUrl"] = "http://h"  # unchanged
+        new, ledger, _s = m.premigrate_config(cfg, rewrites=rw)
+        self.assertEqual(cfg, snap, "input must not be mutated")
+        self.assertEqual(new["models"]["providers"]["openai"]["api"], "openai-chatgpt-responses")
+        self.assertEqual(new["models"]["providers"]["openai"]["models"][0]["api"], "openai-chatgpt-responses")
+        self.assertEqual(new["browser"]["profiles"], {"e": {"driver": "extension"}, "f": {"driver": "extension"}})
+        self.assertEqual([(e["step"], e["path"], e["before"], e["after"]) for e in ledger if e["step"] == "R0"], [
+            ("R0", "models.providers.openai.api", "openai-codex-responses", "openai-chatgpt-responses"),
+            ("R0", "models.providers.openai.models[0].api", "openai-codex-responses", "openai-chatgpt-responses"),
+            ("R0", "browser.profiles.e.cdpUrl", "ws://127.0.0.1:18792", None),  # no credentials in the ledger
+            ("R0", "browser.profiles.f.cdpUrl", "http://h", None)])
+        # idempotent; a value already changed by hand is left alone
+        again, ledger2, _s = m.premigrate_config(new, rewrites=rw)
+        self.assertEqual([e for e in ledger2 if e["step"] == "R0"], [])
+        self.assertEqual(again["models"], new["models"])
+        hand = copy.deepcopy(cfg)
+        hand["models"]["providers"]["openai"]["api"] = "openai-responses"
+        out, ledger3, _s = m.premigrate_config(hand, rewrites=rw)
+        self.assertEqual(out["models"]["providers"]["openai"]["api"], "openai-responses")
+        self.assertNotIn("models.providers.openai.api", [e["path"] for e in ledger3])
+
+
 class TestVllmUntouched(unittest.TestCase):
     """The live user's primary is vllm/qwen3.5-122b: no transform may touch vllm refs or the provider block."""
 
@@ -2210,6 +2671,562 @@ class TestGlmThinkingLevels(unittest.TestCase):
         self.assertIn("(option glm_thinking_levels off): glm/GLM-5.3-Flash-EXL3 only switch thinking on/off",
                       m.glm_thinking_preview(cfg, False)[0])
         self.assertEqual(m.glm_thinking_preview(m.glm_thinking_levels(glm_cfg())[0], True), [])
+
+
+class TestCronAccountForecast(unittest.TestCase):
+    """full5 (report only): which cron jobs OpenClaw 2026.10.10/2026.11.1 refuses or stops at a fallback because
+    they have no recorded inference account (openclaw/openclaw#192195). Synthetic jobs and profiles only."""
+
+    CFG = {"agents": {"defaults": {"model": {"primary": "vllm/qwen", "fallbacks": ["openai/gpt-5.5", "google/g"]},
+                                   "models": {"openai/gpt-5.5": {"alias": "GPT"}}},
+                      "list": [{"id": "main", "default": True},
+                               {"id": "mail", "model": "vllm/small"},
+                               {"id": "ops", "model": {"primary": "vllm/small", "fallbacks": ["anthropic/c"]}},
+                               {"id": "lab", "model": {"primary": "vllm/small"}}, {"id": "dev", "model": {}}]},
+           "models": {"providers": {"vllm": {"baseUrl": "http://127.0.0.1:8000/v1"}}}}
+    PROFILES = [{"id": "openai:default", "provider": "openai"}, {"id": "anthropic:default", "provider": "anthropic"}]
+
+    def job(self, jid="j1", enabled=True, **kw):
+        payload = {"kind": "agentTurn", "message": "synthetic prompt"}
+        payload.update(kw.pop("payload", {}))
+        return {"id": jid, "name": f"Job {jid}", "enabled": enabled, "runtime_authority": kw.pop("authority", False),
+                "job": dict({"agentId": "main", "sessionTarget": "isolated", "payload": payload}, **kw)}
+
+    def forecast(self, *jobs, cfg=None, profiles=None):
+        return m.cron_account_forecast(list(jobs), self.CFG if cfg is None else cfg,
+                                       lambda aid: self.PROFILES if profiles is None else profiles, "main")
+
+    def test_split_trailing_auth_profile_matches_openclaw(self):
+        # agents/model-ref-profile.ts (identical in 2026.10.4 and 2026.10.10)
+        for raw, want in [("openai/gpt-5.5@openai:a", ("openai/gpt-5.5", "openai:a")),
+                          ("p/m@20250101", ("p/m@20250101", None)), ("p/m@q4_k_m@work", ("p/m@q4_k_m", "work")),
+                          ("p/m@20250101@Q4_K_M@w", ("p/m@20250101@Q4_K_M", "w")), ("p/m@8bit", ("p/m@8bit", None)),
+                          ("@x", ("@x", None)), ("p/m@ ", ("p/m@", None)), ("", ("", None)), (None, ("", None)),
+                          ("a@b/c@d", ("a@b/c", "d")), (" openai/gpt-5.5 ", ("openai/gpt-5.5", None)),
+                          ("p/m@١٢٣٤٥٦٧٨", ("p/m", "١٢٣٤"
+                                                                                   "٥٦٧٨"))]:
+            with self.subTest(raw=raw):
+                self.assertEqual(m.split_trailing_auth_profile(raw), want)
+
+    def test_model_chain_follows_the_cron_fallback_policy(self):
+        chain = lambda job, aid="main": m.cron_model_chain(job, self.CFG, aid)  # noqa: E731
+        # no job model: the defaults' primary and fallbacks
+        self.assertEqual(chain({"payload": {}}), ("vllm/qwen", ["openai/gpt-5.5", "google/g"], "defaults"))
+        # job model without job fallbacks: the agent's override, else the defaults' fallbacks
+        self.assertEqual(chain({"payload": {"model": "anthropic/c"}}),
+                         ("anthropic/c", ["openai/gpt-5.5", "google/g"], "defaults"))
+        # job fallbacks (also []) replace everything
+        self.assertEqual(chain({"payload": {"fallbacks": []}}), ("vllm/qwen", [], "job"))
+        self.assertEqual(chain({"payload": {"fallbacks": ["x/y", 3, " "]}}), ("vllm/qwen", ["x/y"], "job"))
+        # an agent with a primary of its own and no fallbacks has none; an explicit list replaces the defaults
+        self.assertEqual(chain({"payload": {}}, "mail"), ("vllm/small", [], "agent"))
+        self.assertEqual(chain({"payload": {}}, "OPS"), ("vllm/small", ["anthropic/c"], "agent"))
+        self.assertEqual(chain({"payload": {}}, "lab"), ("vllm/small", [], "agent"))
+        self.assertEqual(chain({"payload": {}}, "dev"), ("vllm/qwen", ["openai/gpt-5.5", "google/g"], "defaults"))
+        self.assertEqual(m.cron_model_chain({"payload": {}}, {}, "main"), (None, [], "defaults"))
+
+    def test_model_chain_agent_string_model_repeating_the_default_primary(self):
+        """Review (gate1010): an agent model "provider/model" equal to the defaults' primary keeps the defaults'
+        fallbacks for a job without its own model (run-prepare.ts inheritDefaultFallbacksForAgentStringModel,
+        run-fallback-policy.ts), although a string agent model otherwise means no fallbacks."""
+        cfg = copy.deepcopy(self.CFG)
+        cfg["agents"]["list"] = [{"id": "main", "default": True, "model": " vllm/qwen "}, {"id": "obj",
+                                 "model": {"primary": "vllm/qwen"}}, {"id": "mail", "model": "vllm/small"}]
+        chain = lambda job, aid="main", c=cfg: m.cron_model_chain(job, c, aid)  # noqa: E731
+        self.assertEqual(chain({"payload": {}}), ("vllm/qwen", ["openai/gpt-5.5", "google/g"], "defaults"))
+        # only a string: an object with that primary and no fallbacks still has none
+        self.assertEqual(chain({"payload": {}}, "obj"), ("vllm/qwen", [], "agent"))
+        self.assertEqual(chain({"payload": {}}, "mail"), ("vllm/small", [], "agent"))
+        # a job model owns its chain: the agent's override (none) applies; job fallbacks replace everything
+        self.assertEqual(chain({"payload": {"model": "vllm/qwen"}}), ("vllm/qwen", [], "agent"))
+        self.assertEqual(chain({"payload": {"fallbacks": ["anthropic/c"]}}), ("vllm/qwen", ["anthropic/c"], "job"))
+        # without default fallbacks the agent's override (none) applies
+        cfg2 = copy.deepcopy(cfg)
+        cfg2["agents"]["defaults"]["model"] = {"primary": "vllm/qwen", "fallbacks": []}
+        self.assertEqual(chain({"payload": {}}, c=cfg2), ("vllm/qwen", [], "agent"))
+        # the S1 shape: every enabled job is reported for the fallbacks on a stored login (was: nothing)
+        res = self.forecast(self.job("s1"), cfg=cfg)
+        self.assertEqual(res["affected"], [{"id": "s1", "name": "Job s1", "agent": "main", "primary": "vllm/qwen",
+                                            "primary_affected": False, "refs": ["openai/gpt-5.5"]}])
+
+    def test_model_chain_follows_the_subagent_model_rules(self):
+        """Review (gate1010): without a job model, cron selects the model as a sub-agent spawn does
+        (model-selection.ts, agents/agent-scope.ts resolveSubagentModelConfigSelectionResult): the agent's
+        subagents.model, then agents.defaults.subagents.model, then the agent's model, then the defaults; the
+        fallbacks of a subagents.model come from resolveSubagentModelFallbacksOverride."""
+        def cfg_with(defaults_sub=None, **agents):
+            c = copy.deepcopy(self.CFG)
+            if defaults_sub is not None:
+                c["agents"]["defaults"]["subagents"] = {"model": defaults_sub}
+            for e in c["agents"]["list"]:
+                if e["id"] in agents:
+                    e["subagents"] = {"model": agents[e["id"]]}
+            return c
+        chain = lambda c, job=None, aid="main": m.cron_model_chain(job or {"payload": {}}, c, aid)  # noqa: E731
+        # a string sub-agent model has no fallbacks: the job runs on it alone
+        c = cfg_with("openai/gpt-5.5")
+        self.assertEqual(chain(c), ("openai/gpt-5.5", [], "subagent"))
+        self.assertEqual(chain(c, aid="ops"), ("openai/gpt-5.5", [], "subagent"))  # before the agent's model too
+        self.assertEqual(chain(c, {"payload": {"model": "vllm/qwen"}}),  # a job model wins
+                         ("vllm/qwen", ["openai/gpt-5.5", "google/g"], "defaults"))
+        self.assertEqual(chain(c, {"payload": {"fallbacks": ["google/g"]}}), ("openai/gpt-5.5", ["google/g"], "job"))
+        # the agent's own subagents.model wins over the defaults'; its fallback list is used
+        c = cfg_with("openai/gpt-5.5", main={"primary": "vllm/sub", "fallbacks": ["anthropic/c"]})
+        self.assertEqual(chain(c), ("vllm/sub", ["anthropic/c"], "subagent"))
+        c = cfg_with({"primary": "vllm/sub", "fallbacks": ["google/g"]})
+        self.assertEqual(chain(c), ("vllm/sub", ["google/g"], "subagent"))
+        # an agent subagents.model without a primary is not selected but its list is the override
+        c = cfg_with("vllm/d", mail={"fallbacks": ["anthropic/c"]})
+        self.assertEqual(chain(c, aid="mail"), ("vllm/d", ["anthropic/c"], "subagent"))
+        c = cfg_with(None, mail={"fallbacks": ["anthropic/c"]})
+        self.assertEqual(chain(c, aid="mail"), ("vllm/small", [], "agent"))
+        # forecast in both directions: a default sub-agent model on a stored login is refused every run; a local
+        # one with an openai default primary runs without fallbacks and is not reported
+        res = self.forecast(self.job("a"), cfg=cfg_with("openai/gpt-5.5"))
+        self.assertEqual(res["affected"], [{"id": "a", "name": "Job a", "agent": "main", "primary": "openai/gpt-5.5",
+                                           "primary_affected": True, "refs": ["openai/gpt-5.5"]}])
+        c = cfg_with("vllm/local")
+        c["agents"]["defaults"]["model"] = {"primary": "openai/gpt-5.5"}
+        self.assertEqual(self.forecast(self.job("b"), cfg=c)["affected"], [])
+
+    def test_job_agent(self):
+        self.assertEqual(m.cron_job_agent({"agentId": " Mail "}), "mail")
+        self.assertEqual(m.cron_job_agent({"sessionKey": "agent:ops:telegram:dm:1"}), "ops")
+        self.assertEqual(m.cron_job_agent({"sessionKey": "main"}, "Main"), "main")
+
+    def test_model_ref_alias_and_profile(self):
+        self.assertEqual(m.cron_model_ref(self.CFG, "OpenAI/gpt-5.5@openai:b"), ("openai", "gpt-5.5", "openai:b"))
+        self.assertEqual(m.cron_model_ref(self.CFG, "gpt"), ("openai", "gpt-5.5", None))
+        self.assertIsNone(m.cron_model_ref(self.CFG, "unknown-alias"))
+        self.assertIsNone(m.cron_model_ref(self.CFG, "openai/"))
+
+    def test_stored_profile_rules(self):
+        uses = lambda cfg, prov="openai", explicit=None, profiles=self.PROFILES: \
+            m.cron_ref_uses_stored_profile(cfg, prov, explicit, profiles)  # noqa: E731
+        prov = lambda **p: {"models": {"providers": {"OpenAI": p}}}  # noqa: E731
+        self.assertTrue(uses({}))
+        self.assertFalse(uses({}, "vllm"))  # local route, no stored account
+        self.assertFalse(uses({}, "google"))  # environment / configured key
+        self.assertTrue(uses({}, "vllm", explicit="vllm:x"))  # model@profile names a stored account
+        # a configured key suppresses the profiles (prepare-auth.ts providerBindingSuppressesProfiles)
+        self.assertFalse(uses(prov(apiKey={"source": "env", "provider": "default", "id": "OPENAI_API_KEY"})))
+        self.assertFalse(uses(prov(apiKey="${OPENAI_API_KEY}")))
+        self.assertFalse(uses(prov(apiKey="OPENAI_API_KEY")))
+        self.assertFalse(uses(prov(apiKey="sk-synthetic", auth="api-key")))
+        # a literal key without explicit api-key auth: the stored profiles still come first
+        self.assertTrue(uses(prov(apiKey="sk-synthetic")))
+        # apiKey naming a stored profile pins it
+        self.assertTrue(uses(prov(apiKey="anthropic:default")))
+        # rehearsal D1: OpenClaw's SecretRef grammar (config/types.secrets.ts): "${VAR}" and "$VAR" with VAR upper
+        # case, trimmed; anything else is a literal key (the stored profiles come first)
+        for ref in ("$OPENAI_API_KEY", " ${OPENAI_API_KEY} ", "${A" + "B" * 127 + "}",
+                    {"source": "file", "provider": "vault", "id": "/openai"}):
+            with self.subTest(ref=ref):
+                self.assertFalse(uses(prov(apiKey=ref)))
+        for literal in ("${openai_key}", "${_OPENAI}", "${OPENAI:-x}", "Bearer ${OPENAI}", "${A" + "B" * 128 + "}",
+                        "$openai"):
+            with self.subTest(literal=literal):
+                self.assertTrue(uses(prov(apiKey=literal)))
+                self.assertFalse(uses(prov(apiKey=literal, auth="api-key")))
+
+    def test_stored_profile_rules_non_env_markers(self):
+        """Rehearsal D1 research: a non-env marker suppresses the stored profiles only while usable
+        (model-auth-provider-config.ts resolveUsableCustomProviderApiKey): on a local base URL with api
+        "openai-completions" or "ollama"; auth "api-key" does not make a marker a key."""
+        vllm = [{"id": "vllm:default", "provider": "vllm"}]
+        uses = lambda pcfg: m.cron_ref_uses_stored_profile(  # noqa: E731
+            {"models": {"providers": {"vllm": pcfg}}}, "vllm", None, vllm)
+        local = {"baseUrl": "http://127.0.0.1:8000/v1", "api": "openai-completions"}
+        self.assertFalse(uses(dict(local, apiKey="custom-local")))
+        self.assertFalse(uses(dict(local, apiKey="ollama-local", api="ollama")))
+        self.assertFalse(uses(dict(local, apiKey="lmstudio-local", baseUrl="http://192.168.1.5:1234/v1")))
+        self.assertFalse(uses(dict(local, apiKey="custom-local", baseUrl="http://host.docker.internal:8000")))
+        self.assertTrue(uses(dict(local, apiKey="custom-local", baseUrl="https://api.example.org/v1")))
+        self.assertTrue(uses(dict(local, apiKey="custom-local", api="anthropic-messages")))
+        self.assertTrue(uses(dict(local, apiKey="custom-local", baseUrl="https://api.example.org/v1", auth="api-key")))
+        self.assertTrue(uses(dict(local, apiKey="oauth:vllm", baseUrl="https://api.example.org/v1")))
+        self.assertFalse(uses(dict(local, apiKey="VLLM_API_KEY", baseUrl="https://api.example.org/v1")))
+
+    def test_stored_profile_rules_aws_sdk_and_unknown_markers(self):
+        """Review (gate1010): auth "aws-sdk" is a direct source OpenClaw does not count as a configured key
+        (refused without a recorded account, profiles or not); only the env-var names OpenClaw knows are markers
+        (model-auth-markers.ts), any other ALL_CAPS value is a literal key."""
+        vllm = [{"id": "vllm:default", "provider": "vllm"}]
+        uses = lambda pcfg, prov="vllm", profiles=vllm: m.cron_ref_uses_stored_profile(  # noqa: E731
+            {"models": {"providers": {prov: pcfg}}}, prov, None, profiles)
+        self.assertTrue(uses({"auth": "aws-sdk"}, "amazon-bedrock", []))
+        self.assertTrue(uses({"auth": "aws-sdk", "apiKey": "${AWS_KEY}"}, "amazon-bedrock", []))
+        for literal in ("EMPTY", "NONE", "LOCAL", "MY_LOCAL_KEY", "AWS_PROFILE"):
+            with self.subTest(literal=literal):
+                self.assertTrue(uses({"apiKey": literal}))  # the stored vllm profile comes first
+                self.assertFalse(uses({"apiKey": literal}, profiles=[]))  # nothing stored: not affected
+        self.assertFalse(uses({"apiKey": "EMPTY", "auth": "api-key"}))
+        self.assertTrue(uses({"apiKey": "AWS_PROFILE", "auth": "api-key"}))  # a marker, never a usable key
+        for marker in ("VLLM_API_KEY", "OPENAI_API_KEY", "GEMINI_API_KEY", "DEEPSEEK_API_KEY", "${EMPTY}"):
+            with self.subTest(marker=marker):
+                self.assertFalse(uses({"apiKey": marker}))
+        res = self.forecast(self.job("e", payload={"model": "vllm/qwen", "fallbacks": []}), profiles=vllm,
+                            cfg={"models": {"providers": {"vllm": {"apiKey": "EMPTY"}}}})
+        self.assertEqual([a["refs"] for a in res["affected"]], [["vllm/qwen"]])
+
+    def test_forecast_tells_aws_sdk_from_a_stored_login(self):
+        """Recheck: AWS SDK credentials are refused like a stored login, but no account can be recorded for them
+        (model@profile needs a stored one), so the forecast keeps the reason: "aws_sdk" lists those refs. An explicit
+        profile is a stored login also on an aws-sdk provider (prepare-auth.ts drops the configured auth then)."""
+        cfg = json.loads(json.dumps(self.CFG))
+        cfg["models"]["providers"]["amazon-bedrock"] = {"auth": "aws-sdk"}
+        why = lambda prov, explicit=None: m.cron_ref_refusal(cfg, prov, explicit, self.PROFILES)  # noqa: E731
+        self.assertEqual((why("amazon-bedrock"), why("openai"), why("vllm"), why("amazon-bedrock", "bedrock:work")),
+                         ("aws-sdk", "profile", None, "profile"))
+        res = self.forecast(
+            self.job("a", payload={"model": "amazon-bedrock/claude", "fallbacks": ["openai/gpt-5.5"]}),
+            self.job("b", payload={"fallbacks": ["amazon-bedrock/claude", "google/g"]}),
+            self.job("c", payload={"model": "openai/gpt-5.5", "fallbacks": []}), cfg=cfg)
+        self.assertEqual(res["affected"], [
+            {"id": "a", "name": "Job a", "agent": "main", "primary": "amazon-bedrock/claude", "primary_affected": True,
+             "refs": ["amazon-bedrock/claude", "openai/gpt-5.5"], "aws_sdk": ["amazon-bedrock/claude"]},
+            {"id": "b", "name": "Job b", "agent": "main", "primary": "vllm/qwen", "primary_affected": False,
+             "refs": ["amazon-bedrock/claude"], "aws_sdk": ["amazon-bedrock/claude"]},
+            {"id": "c", "name": "Job c", "agent": "main", "primary": "openai/gpt-5.5", "primary_affected": True,
+             "refs": ["openai/gpt-5.5"]}])
+        # the recheck's setup: the default model on aws-sdk and no auth profile at all
+        cfg["agents"]["defaults"]["model"] = "amazon-bedrock/claude"
+        res = self.forecast(self.job("d"), cfg=cfg, profiles=[])
+        self.assertEqual([(a["primary_affected"], a["refs"], a.get("aws_sdk")) for a in res["affected"]],
+                         [(True, ["amazon-bedrock/claude"], ["amazon-bedrock/claude"])])
+
+    def test_forecast_primary_and_fallbacks(self):
+        res = self.forecast(self.job("a", payload={"model": "openai/gpt-5.5@openai:default",
+                                                   "fallbacks": ["anthropic/c", "vllm/qwen", "openai/gpt-5.5"]}),
+                            self.job("b"), self.job("c", agentId="mail"), self.job("d", payload={"model": "gpt"}))
+        self.assertEqual((res["checked"], res["bound"]), (4, 0))
+        self.assertEqual(res["affected"], [
+            {"id": "a", "name": "Job a", "agent": "main", "primary": "openai/gpt-5.5", "primary_affected": True,
+             "refs": ["openai/gpt-5.5", "anthropic/c"]},
+            {"id": "b", "name": "Job b", "agent": "main", "primary": "vllm/qwen", "primary_affected": False,
+             "refs": ["openai/gpt-5.5"]},
+            {"id": "d", "name": "Job d", "agent": "main", "primary": "openai/gpt-5.5", "primary_affected": True,
+             "refs": ["openai/gpt-5.5"]}])
+        # without any stored profile nothing is affected (configured keys, local models)
+        self.assertEqual(self.forecast(self.job("a", payload={"model": "openai/gpt-5.5"}), profiles=[])["affected"], [])
+
+    def test_forecast_never_keeps_a_profile_id_and_counts_an_explicit_profile(self):
+        """Security review: a bare model id that is no alias but names a profile ("glm-local@lan:someone@example.org")
+        runs on that stored login (OpenClaw gives the bare id the default provider), so the primary is affected; the
+        report keeps neither the profile id of the primary nor that of a fallback."""
+        cfg = {"agents": {"defaults": {"model": {"primary": "glm-local@lan:someone@example.org",
+                                                 "fallbacks": ["openai/gpt-5.5", "other-bare@work:ops@example.org"]}},
+                          "list": [{"id": "main", "default": True}]}}
+        res = self.forecast(self.job("j1"), self.job("j2", payload={"model": "bare-local"}), cfg=cfg)
+        self.assertEqual(res["affected"], [
+            {"id": "j1", "name": "Job j1", "agent": "main", "primary": "glm-local", "primary_affected": True,
+             "refs": ["glm-local", "openai/gpt-5.5", "other-bare"]},
+            {"id": "j2", "name": "Job j2", "agent": "main", "primary": "bare-local", "primary_affected": False,
+             "refs": ["openai/gpt-5.5", "other-bare"]}])
+        self.assertNotIn("example.org", json.dumps(res))
+
+    def test_forecast_skips_what_openclaw_does_not_refuse(self):
+        jobs = [self.job("off", enabled=False), self.job("ev", payload={"kind": "systemEvent"}),
+                self.job("main", sessionTarget="main"), self.job("auth", authority=True),
+                self.job("bound", inferenceBinding={"version": 1, "provider": "openai"}),
+                {"id": "bad", "name": "Bad", "enabled": True, "runtime_authority": False, "job": None}]
+        res = self.forecast(*jobs)
+        self.assertEqual((res["checked"], res["bound"], res["affected"]), (0, 1, []))
+
+    def test_forecast_leaves_its_inputs_alone(self):
+        jobs = [self.job("a", payload={"model": "gpt"})]
+        snap, cfg_snap = copy.deepcopy(jobs), copy.deepcopy(self.CFG)
+        self.forecast(*jobs)
+        self.assertEqual((jobs, self.CFG), (snap, cfg_snap))
+
+
+class TestDoctorKeyCopies(unittest.TestCase):
+    """Rehearsal D1: OpenClaw's doctor (2026.8.1+, unchanged in 2026.10.10 and 2026.11.1) copies a literal provider
+    apiKey into its auth store as "<provider>:default" (doctor-model-catalog-credentials.ts collectCredentials), and
+    OpenClaw 2026.10.10/2026.11.1 then refuse every cron run on that provider without a recorded inference account.
+    The cases follow doctor's skip rules; synthetic values only."""
+
+    COPIED = ["sk-synth-1", "EMPTY", "NONE", "none", " EMPTY ", "LOCAL", "MY_LOCAL_KEY", "openai_api_key",
+              "Ollama-Local", "oauth", "llama-cpp-local", "${glm_key}", "${_GLM}", "${GLM:-x}", "Bearer ${GLM}",
+              "${" + "A" * 129 + "}", "$glm", "glm:default"]
+    KEPT = ["", "  ", "${GLM_API_KEY}", " ${GLM_API_KEY} ", "$GLM_API_KEY", "${EMPTY}", "OPENAI_API_KEY",
+            "VLLM_API_KEY", "AWS_PROFILE", "AWS_BEARER_TOKEN_BEDROCK", "AWS_ACCESS_KEY_ID", "secretref-env:X",
+            "oauth:glm", "custom-local", "codex-app-server", "gcp-vertex-credentials", "ollama-local",
+            "secretref-managed", "openclaw:claude-cli-native-auth", "apple-fm-local", "lmstudio-local",
+            "minimax-oauth", None, 3, {"source": "env", "provider": "default", "id": "GLM_API_KEY"}]
+    REFS = [{"source": s, "provider": "default", "id": "GLM_API_KEY"} for s in ("env", "file", "exec", "store")]
+
+    def test_doctor_copies_follows_the_skip_rules(self):
+        for v in self.COPIED:
+            with self.subTest(copied=v):
+                self.assertTrue(m.doctor_copies(v, {"apiKey": v}))
+                self.assertTrue(m.doctor_copies(v, {"apiKey": v, "auth": "api-key"}))  # auth plays no part
+        for v in self.KEPT:
+            with self.subTest(kept=v):
+                self.assertFalse(m.doctor_copies(v, {"apiKey": v}))
+        for ref in self.REFS:
+            with self.subTest(ref=ref):
+                self.assertTrue(m.is_secret_ref(ref))
+                self.assertFalse(m.doctor_copies(ref, {"apiKey": ref}))
+                # a catalog literal of a provider whose openclaw.json entry is a SecretRef is not copied either
+                self.assertFalse(m.doctor_copies("sk-synth-catalog", {"apiKey": ref}))
+        self.assertFalse(m.doctor_copies("sk-synth-catalog", {"apiKey": "${GLM_API_KEY}"}))
+        # a catalog value is copied as it is: only the openclaw.json entry is checked for a reference
+        self.assertTrue(m.doctor_copies("${GLM_API_KEY}", None))
+        self.assertTrue(m.doctor_copies("${GLM_API_KEY}", {"apiKey": "sk-synth-1"}))
+        # a value that is the id of a stored profile is a reference to it, not a key
+        self.assertFalse(m.doctor_copies("glm:default", {"apiKey": "glm:default"}, {"glm:default"}))
+        self.assertTrue(m.doctor_copies("glm:work", {"apiKey": "glm:work"}, {"glm:default"}))
+
+    def test_secret_ref_and_marker_grammar(self):
+        for v in ({"source": "env", "provider": "default"}, {"source": "env", "provider": " ", "id": "X"},
+                  {"source": "keychain", "provider": "default", "id": "X"},
+                  {"source": "env", "provider": "default", "id": "X", "extra": 1}, "${glm}", "$1X", "${X}y", ""):
+            with self.subTest(v=v):
+                self.assertFalse(m.is_secret_ref(v))
+        self.assertTrue(m.is_key_marker(" oauth:x "))
+        self.assertFalse(m.is_key_marker("OAuth:x"))
+        self.assertFalse(m.is_key_marker("EMPTY"))
+        self.assertEqual(len(m._KNOWN_ENV_KEY_MARKERS), 54)  # the 2026.11.1 set (core, legacy, bundled manifests)
+
+    def test_model_catalog_json_is_parsed_like_openclaw(self):
+        text = '{\n // comment\n "providers": {"glm": {"apiKey": "a//b", "models": [1, 2,],},}, // end\n}\n'
+        self.assertEqual(m.parse_model_catalog_json(text), {"providers": {"glm": {"apiKey": "a//b", "models": [1, 2]}}})
+        for bad in ("{", "\ufeff{}", '{"a": NaN}', "{'a': 1}"):
+            with self.subTest(bad=bad):
+                with self.assertRaises(ValueError):
+                    m.parse_model_catalog_json(bad)
+
+    def test_config_path_follows_append_config_path_segment(self):
+        self.assertEqual(m.config_path("glm"), "models.providers.glm")
+        self.assertEqual(m.config_path("GLM_2:x-y"), "models.providers.GLM_2:x-y")
+        self.assertEqual(m.config_path("my.glm"), 'models.providers["my.glm"]')
+        self.assertEqual(m.config_path("2glm"), 'models.providers["2glm"]')
+
+    def test_doctor_key_copies_destinations(self):
+        cfg = {"models": {"providers": {
+            "GLM": {"apiKey": "sk-synth-1"}, "vllm": {"apiKey": "VLLM_API_KEY"},
+            "envref": {"apiKey": {"source": "env", "provider": "default", "id": "ENVREF_KEY"}},
+            "pinned": {"apiKey": "pinned:work"}, "blank": {"apiKey": " "}}}}
+        catalogs = [("main", True, {"cat": "sk-synth-2", "envref": "sk-synth-3", "glm": "sk-synth-4"}),
+                    ("haus", False, {"local": "EMPTY", "vllm": "VLLM_API_KEY", "x": None}),
+                    ("Ops", False, {"dup": "sk-synth-5", "dup ": "sk-synth-6"})]
+        stores = {None: {"pinned:work"}, "haus": set()}
+        res = m.doctor_key_copies(cfg, catalogs, lambda aid: stores.get(aid, set()))
+        self.assertEqual(res, {
+            "shared": [{"id": "glm:default", "provider": "glm", "copy": "config"},
+                       {"id": "cat:default", "provider": "cat", "copy": "catalog"}],
+            "agents": {"haus": [{"id": "local:default", "provider": "local", "copy": "catalog"}],
+                       "ops": [{"id": "dup:default", "provider": "dup", "copy": "catalog"}]}})
+        self.assertNotIn("sk-synth", json.dumps(res))
+        self.assertEqual(m.doctor_key_copies({}, [], None), {"shared": [], "agents": {}})
+
+
+class TestCronKeyCopyForecast(unittest.TestCase):
+    """Rehearsal D1 (report only): the precheck forecast counts the stored login doctor creates from a literal
+    provider key during the migration (copies_pending) and names the fix that keeps the job and its fallbacks."""
+
+    PROFILES = [{"id": "openai:default", "provider": "openai"}]
+
+    def cfg(self, **glm):
+        return {"agents": {"defaults": {"model": {"primary": "glm/glm-5", "fallbacks": ["openai/gpt-5.5"]}},
+                           "list": [{"id": "main", "default": True}, {"id": "haus"}]},
+                "models": {"providers": {"glm": dict({"baseUrl": "http://127.0.0.1:8000/v1",
+                                                      "api": "openai-completions"}, **glm),
+                                         "vllm": {"baseUrl": "http://127.0.0.1:8001/v1"}}}}
+
+    def job(self, jid, agent="haus", **payload):
+        return {"id": jid, "name": f"Job {jid}", "enabled": True, "runtime_authority": False,
+                "job": {"agentId": agent, "sessionTarget": "isolated",
+                        "payload": dict({"kind": "agentTurn", "message": "synthetic prompt"}, **payload)}}
+
+    def forecast(self, cfg, *jobs, pending=True, profiles=None, catalogs=()):
+        copies = m.doctor_key_copies(cfg, catalogs, lambda aid: set())
+        return m.cron_account_forecast(list(jobs), cfg, lambda aid: self.PROFILES if profiles is None else profiles,
+                                       "main", lambda aid: copies["shared"] + copies["agents"].get(aid, []), pending)
+
+    def test_literal_key_is_refused_after_the_copy(self):
+        """The D1 regression: a glm-only job on a literal glm key with no stored glm login was "not affected"."""
+        res = self.forecast(self.cfg(apiKey="sk-synth-glm"), self.job("only", fallbacks=[]))
+        self.assertEqual(res["affected"], [{"id": "only", "name": "Job only", "agent": "haus", "primary": "glm/glm-5",
+                                            "primary_affected": True, "refs": ["glm/glm-5"],
+                                            "key_copy": ["glm/glm-5"]}])
+        self.assertEqual(res["key_fix"], [{"provider": "glm", "path": "models.providers.glm", "auth": None,
+                                           "where": "config", "pending": True}])
+        # without the pending copy (the old forecast) it was not affected
+        self.assertEqual(self.forecast(self.cfg(apiKey="sk-synth-glm"), self.job("only", fallbacks=[]),
+                                       pending=False)["affected"], [])
+        self.assertNotIn("sk-synth", json.dumps(res))
+
+    def test_what_keeps_a_literal_key_job_working(self):
+        for glm in ({"apiKey": "sk-synth-glm", "auth": "api-key"},
+                    {"apiKey": {"source": "env", "provider": "default", "id": "GLM_API_KEY"}},
+                    {"apiKey": "${GLM_API_KEY}"}, {"apiKey": "$GLM_API_KEY"}, {"apiKey": "VLLM_API_KEY"},
+                    {"apiKey": "custom-local"}, {}, {"apiKey": ""}):
+            with self.subTest(glm=glm):
+                res = self.forecast(self.cfg(**glm), self.job("only", fallbacks=[]))
+                self.assertEqual((res["affected"], res["key_fix"]), ([], []))
+        for literal in ("EMPTY", "NONE", "${glm_key}"):
+            with self.subTest(literal=literal):
+                res = self.forecast(self.cfg(apiKey=literal), self.job("only", fallbacks=[]))
+                self.assertEqual([a.get("key_copy") for a in res["affected"]], [["glm/glm-5"]])
+
+    def test_auth_modes(self):
+        res = self.forecast(self.cfg(apiKey="sk-synth-glm", auth="oauth"), self.job("only", fallbacks=[]))
+        self.assertEqual([(k["auth"], k["pending"]) for k in res["key_fix"]], [("oauth", True)])
+        # aws-sdk stays AWS SDK credentials (no stored login, no key fix)
+        res = self.forecast(self.cfg(apiKey="sk-synth-glm", auth="aws-sdk"), self.job("only", fallbacks=[]))
+        self.assertEqual([(a["refs"], a.get("aws_sdk"), a.get("key_copy")) for a in res["affected"]],
+                         [(["glm/glm-5"], ["glm/glm-5"], None)])
+        self.assertEqual(res["key_fix"], [])
+
+    def test_fallback_on_a_copied_provider_and_explicit_profiles(self):
+        res = self.forecast(self.cfg(apiKey="sk-synth-glm"),
+                            self.job("fb", model="vllm/q", fallbacks=["glm/glm-5", "openai/gpt-5.5"]),
+                            self.job("pin", model="glm/glm-5@glm:work", fallbacks=[]))
+        self.assertEqual(res["affected"], [
+            {"id": "fb", "name": "Job fb", "agent": "haus", "primary": "vllm/q", "primary_affected": False,
+             "refs": ["glm/glm-5", "openai/gpt-5.5"], "key_copy": ["glm/glm-5"]},
+            {"id": "pin", "name": "Job pin", "agent": "haus", "primary": "glm/glm-5", "primary_affected": True,
+             "refs": ["glm/glm-5"]}])
+        self.assertEqual([k["provider"] for k in res["key_fix"]], ["glm"])
+        # an explicit @profile is no key: alone it gives no key fix
+        res = self.forecast(self.cfg(apiKey="sk-synth-glm"), self.job("pin", model="glm/glm-5@glm:work",
+                                                                       fallbacks=[]))
+        self.assertEqual(res["key_fix"], [])
+
+    def test_after_the_migration_the_key_fix_stays(self):
+        """Postconditions: doctor's copy is in the stores; the literal key still names the fix (pending False)."""
+        stored = [{"id": "glm:default", "provider": "glm"}]
+        res = self.forecast(self.cfg(apiKey="sk-synth-glm"), self.job("only", fallbacks=[]), pending=False,
+                            profiles=stored)
+        self.assertEqual([(a["primary_affected"], a.get("key_copy")) for a in res["affected"]], [(True, None)])
+        self.assertEqual(res["key_fix"], [{"provider": "glm", "path": "models.providers.glm", "auth": None,
+                                           "where": "config", "pending": False}])
+        # a stored glm login without a literal key: no key fix (only the binding helps)
+        res = self.forecast(self.cfg(), self.job("only", fallbacks=[]), pending=False, profiles=stored)
+        self.assertEqual((len(res["affected"]), res["key_fix"]), (1, []))
+
+    def test_catalog_keys_reach_their_agent_only(self):
+        cfg = self.cfg()
+        jobs = (self.job("h", fallbacks=[]), self.job("m", agent="main", fallbacks=[]))
+        res = self.forecast(cfg, *jobs, catalogs=[("haus", False, {"glm": "sk-synth-cat"})])
+        self.assertEqual([(a["id"], a.get("key_copy")) for a in res["affected"]], [("h", ["glm/glm-5"])])
+        self.assertEqual(res["key_fix"], [{"provider": "glm", "path": "models.providers.glm", "auth": None,
+                                           "where": "catalog", "pending": True}])
+        res = self.forecast(cfg, *jobs, catalogs=[("main", True, {"GLM": "sk-synth-cat"})])
+        self.assertEqual([a["id"] for a in res["affected"]], ["h", "m"])
+        # an env SecretRef in openclaw.json stops the catalog copy too
+        cfg = self.cfg(apiKey={"source": "env", "provider": "default", "id": "GLM_API_KEY"})
+        self.assertEqual(self.forecast(cfg, *jobs, catalogs=[("main", True, {"glm": "sk-synth-cat"})])["affected"], [])
+
+    def test_bracket_path_for_a_provider_key_that_is_no_identifier(self):
+        cfg = self.cfg()
+        cfg["models"]["providers"]["my.glm"] = {"apiKey": "sk-synth-glm"}
+        res = self.forecast(cfg, self.job("only", model="my.glm/glm-5", fallbacks=[]))
+        self.assertEqual(res["key_fix"], [{"provider": "my.glm", "path": 'models.providers["my.glm"]', "auth": None,
+                                           "where": "config", "pending": True}])
+
+
+class TestEnvSubstituted(unittest.TestCase):
+    """OpenClaw's ${NAME} / ${NAME:-default} substitution (config/env-substitution.ts, 2026.11.1), which the config
+    doctor copies a literal key from has gone through: the gate compares doctor's earlier copy with this value."""
+
+    def test_substitution_grammar(self):
+        env = {"A": "va", "_X": "vx", "EMPTY_ONE": ""}
+        for raw, want in (("${A}", "va"), ("pre-${A}-post", "pre-va-post"), ("${MISSING}", "${MISSING}"),
+                          ("${MISSING:-dflt}", "dflt"), ("${EMPTY_ONE:-dflt}", "dflt"), ("${EMPTY_ONE}", "${EMPTY_ONE}"),
+                          ("${A:-dflt}", "va"), ("${MISSING:-}", ""), ("${_X}", "vx"), ("$${A}", "${A}"),
+                          ("$${A:-d}", "${A:-d}"), ("${a}", "${a}"), ("${A:-x$y}", "${A:-x$y}"),
+                          ("${A:-x{y}", "${A:-x{y}"), ("${A", "${A"), ("$A", "$A"), ("no-dollar", "no-dollar"),
+                          ("${A}${_X}", "vavx"), ("$$${A}", "$${A}")):
+            with self.subTest(raw=raw):
+                self.assertEqual(m.env_substituted(raw, env), want)
+        self.assertEqual(m.env_substituted("${A}", None), "${A}")
+        self.assertIsNone(m.env_substituted(None, env))
+
+
+class TestCronKeyAutofix(unittest.TestCase):
+    """decisions.md addendum 2026-11-05: the gate sets models.providers.<p>.auth "api-key" itself before doctor pass 1
+    for a provider whose literal openclaw.json key doctor copies and that a cron job uses (pure part)."""
+
+    KEY = "sk-synth-glm-autofix"
+
+    def cfg(self):
+        return {"models": {"providers": {
+            "glm": {"baseUrl": "http://127.0.0.1:8000/v1", "apiKey": self.KEY},
+            "tok": {"apiKey": self.KEY, "auth": "token"},
+            "cat": {"baseUrl": "http://127.0.0.1:8002/v1"},
+            "My.Glm": {"apiKey": self.KEY},
+            "acct": {"apiKey": self.KEY}}}}
+
+    def key_fix(self, *provs, where="config"):
+        return [{"provider": p, "path": m.config_path(p), "auth": None, "where": where, "pending": True}
+                for p in provs]
+
+    def test_which_providers_are_fixed(self):
+        cfg = self.cfg()
+        snap = copy.deepcopy(cfg)
+        seen = []
+
+        def own(cand):
+            seen.append(dict(cand))
+            return {"acct"}
+        kf = self.key_fix("glm", "tok", "my.glm", "acct") + self.key_fix("cat", where="catalog") \
+            + [{"provider": ""}, "x", None]
+        fix, kept = m.cron_key_autofix(cfg, kf, own)
+        self.assertEqual(fix, [{"provider": "glm", "entry": "glm", "path": "models.providers.glm.auth"},
+                               {"provider": "my.glm", "entry": "My.Glm", "path": 'models.providers["My.Glm"].auth'}])
+        self.assertEqual(kept, [{"provider": "tok", "path": "models.providers.tok.auth", "why": "auth"},
+                                {"provider": "cat", "path": "models.providers.cat.auth", "why": "catalog"},
+                                {"provider": "acct", "path": "models.providers.acct.auth", "why": "login"}])
+        # the stored-login check sees only the candidates, each with its literal key (compared in memory)
+        self.assertEqual(seen, [{"glm": self.KEY, "my.glm": self.KEY, "acct": self.KEY}])
+        self.assertNotIn(self.KEY, json.dumps([fix, kept]))
+        # a resume never repeats a provider this run set; a catalog-only provider never gets an entry
+        fix, kept = m.cron_key_autofix(cfg, self.key_fix("glm"), done={"glm"})
+        self.assertEqual((fix, kept), ([], [{"provider": "glm", "path": "models.providers.glm.auth", "why": "done"}]))
+        fix, kept = m.cron_key_autofix(cfg, self.key_fix("nope", where="catalog"))
+        self.assertEqual((fix, [k["why"] for k in kept]), ([], ["catalog"]))
+        # an entry whose key doctor does not copy (SecretRef, marker) is no candidate
+        cfg2 = {"models": {"providers": {"glm": {"apiKey": "${GLM_API_KEY}"}, "v": {"apiKey": "VLLM_API_KEY"}}}}
+        self.assertEqual(m.cron_key_autofix(cfg2, self.key_fix("glm", "v"))[0], [])
+        self.assertEqual(cfg, snap)
+
+    def test_set_provider_auth(self):
+        cfg = self.cfg()
+        snap = copy.deepcopy(cfg)
+        fix, _kept = m.cron_key_autofix(cfg, self.key_fix("glm", "my.glm"))
+        new, ledger = m.set_provider_auth(cfg, fix)
+        self.assertEqual(cfg, snap)  # pure
+        self.assertEqual(new["models"]["providers"]["glm"], dict(snap["models"]["providers"]["glm"], auth="api-key"))
+        self.assertEqual(new["models"]["providers"]["My.Glm"]["auth"], "api-key")
+        expect = copy.deepcopy(snap)
+        expect["models"]["providers"]["glm"]["auth"] = "api-key"
+        expect["models"]["providers"]["My.Glm"]["auth"] = "api-key"
+        self.assertEqual(new, expect)  # nothing else changes
+        self.assertEqual(ledger, [{"step": "C1", "path": "models.providers.glm.auth", "before": None, "after": "api-key"},
+                                  {"step": "C1", "path": 'models.providers["My.Glm"].auth', "before": None,
+                                   "after": "api-key"}])
+        # idempotent: an entry that has auth by now is left as it is
+        again, ledger = m.set_provider_auth(new, fix)
+        self.assertEqual((again, ledger), (new, []))
+
+    def test_auth_api_key_lifts_the_refusal_after_the_copy(self):
+        """research_d1 section 2: a literal key with auth "api-key" is not refused, also with doctor's copy stored."""
+        cfg = {"models": {"providers": {"glm": {"apiKey": self.KEY}}}}
+        copy_ = [{"id": "glm:default", "provider": "glm"}]
+        self.assertEqual(m.cron_ref_refusal(cfg, "glm", None, copy_), "profile")
+        new, _l = m.set_provider_auth(cfg, m.cron_key_autofix(cfg, self.key_fix("glm"))[0])
+        self.assertIsNone(m.cron_ref_refusal(new, "glm", None, copy_))
+        self.assertEqual(m.cron_ref_refusal(new, "glm", "glm:default", copy_), "profile")  # model@profile stays bound
+
+    def test_include_paths(self):
+        self.assertEqual(m.include_paths({"a": {"$include": "x.json5"}}), ["a.$include"])
+        self.assertEqual(m.include_paths({"a": [{"$include": "x"}]}), ["a[0].$include"])
+        self.assertEqual(m.include_paths({}, '{"x": {"$include" : "y"}}'), ["(raw text)"])
+        self.assertEqual(m.include_paths({"a": 1}, '{"a": 1}'), [])
+        self.assertEqual(m.include_paths(None), [])
 
 
 class TestPurity(unittest.TestCase):

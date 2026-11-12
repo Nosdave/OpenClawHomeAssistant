@@ -1,0 +1,59 @@
+{
+  "openclaw_version": "2026.11.1",
+  "patches": [
+    {
+      "name": "memory-search-half-life",
+      "file": "dist/memory-search-Bpi69SDH.mjs",
+      "region": "//#region src/agents/memory-search.ts",
+      "stock_sha256": "49283bf2d65d92d87c0050569d169459fea0d42080e6dad9814a9eac74e86e88",
+      "patched_sha256": "6976e5212377d89b397643639db81fc19020c0db55ddfaac3a273cfe6560e208",
+      "diff": "memory-search-half-life.patch",
+      "note": "Memory search temporal-decay half-life 365 days instead of the hard-coded 30 (see DOCS.md, \"Memory search recency\"; 2026.11.1 still hard-codes 30 days). Since 2026.10.10 minScore is checked before the decay (openclaw/openclaw#168692), so the half-life only sets the ranking (and with it which eligible hits fit into the returned maxResults, default 6). Same diff as oc-patches/2026.10.10, at the same line."
+    },
+    {
+      "name": "telegram-voice-text-first",
+      "file": "dist/send-30N-rox3.mjs",
+      "region": "//#region extensions/telegram/src/send-message.ts",
+      "stock_sha256": "b79848e3205dc1713e546c8fc3d0634abc566db0ad2179b2a5fc195902b10f4e",
+      "patched_sha256": "818579774e85dcef7e7148702e9377bb135231998292ec38c363d515daa3cca5",
+      "diff": "telegram-voice-text-first.patch",
+      "note": "Telegram hotfix VOLT-TG-20261023 (1/3): a single voice reply whose text exceeds the caption limit sends and confirms the text first, then the audio without caption; a network failure or voice-privacy rejection of the audio keeps the text and is not retried. Same diff as oc-patches/2026.10.10 (re-derived there from 2026.10.4: no needsSeparateText, the logger is sendLogger); extensions/telegram/src/send-message.ts is unchanged in 2026.11.1."
+    },
+    {
+      "name": "telegram-delivery-live-custody",
+      "file": "dist/lifecycle-GQXUB0Fh.mjs",
+      "region": "//#region src/channels/turn/lifecycle.ts",
+      "stock_sha256": "06025a06ee8eb9ac8a78e1ef787d33790f86561af0b69a1b1cef0fb5638ba3a5",
+      "patched_sha256": "98ec472856213eaa71c3dda5b7e8a41ad4837538cfc653a40f53196445309ec0",
+      "diff": "telegram-delivery-live-custody.patch",
+      "note": "Telegram hotfix VOLT-TG-20261023 (2/3): a process-local refcount per sessionId/intentId is held from the start of a direct reply delivery until its canonical settlement (also across deferred finalization). Same diff as oc-patches/2026.10.10 (local names voltLive and attempt.voltReleaseLive, because deliverReply has its own custody/releaseCustody); src/channels/turn/lifecycle.ts is unchanged in 2026.11.1."
+    },
+    {
+      "name": "telegram-notice-live-guard",
+      "file": "dist/execution-DBEztLxG.mjs",
+      "region": "//#region src/channels/turn/pending-delivery-notice.ts",
+      "stock_sha256": "97025f09423decbd22c243bb1fa30eb47b8078704eb06019c8df85cfb9d2ce36",
+      "patched_sha256": "c1fb15d5e33d3690874d51a6fc16990ca0634f210d81cf967f2bcb32a56757a6",
+      "diff": "telegram-notice-live-guard.patch",
+      "note": "Telegram hotfix VOLT-TG-20261023 (2/3): the pending-delivery notice (\"I couldn’t confirm whether my previous reply reached this chat ...\") skips an intent that is still being delivered; settled unknown outcomes and restart debts are still reported. Same diff as oc-patches/2026.10.10; pending-delivery-notice.ts is unchanged in 2026.11.1."
+    },
+    {
+      "name": "telegram-fetch-fresh-audio",
+      "file": "dist/fetch-B--3zb-R.mjs",
+      "region": "//#region extensions/telegram/src/fetch.ts",
+      "stock_sha256": "57d2c7a84224a8f2c047ef80a812b67f56794c6f5926ed57cf37a2aab41c60a0",
+      "patched_sha256": "0f56f5cfb94eca6f64c6ba512ae0f70c5427785c49673dc15e4ba204cd6c9267",
+      "diff": "telegram-fetch-fresh-audio.patch",
+      "note": "Telegram hotfix VOLT-TG-20261023 (3/3): sendVoice/sendAudio use a fresh connection like sendMessage, with the same rule that a request Telegram may have received is not replayed (isSafeToRetrySendError). Same diff as oc-patches/2026.10.10; extensions/telegram/src/fetch.ts is unchanged in 2026.11.1."
+    },
+    {
+      "name": "telegram-reply-self-audio",
+      "file": "dist/bot-message-D8YOSV-y.mjs",
+      "region": "//#region extensions/telegram/src/bot-message-context.session.ts",
+      "stock_sha256": "15c89649ddf7c86b3bb26da2bb1bee83e7c079b66a74174a7be736216080a509",
+      "patched_sha256": "103f2429828d17b9a78882a9fedb11a7db8cb09b5629b74e34b9431c31d804bd",
+      "diff": "telegram-reply-self-audio.patch",
+      "note": "Telegram hotfix VOLT-TG-20261112: voice and audio of a replied-to message the bot itself sent (a reply-chain entry, or the reply target, whose sender id is the bot's own, ctx.me.id) are no longer merged into the user's turn media; they stay in the reply chain under the bot's name ([media_path] under '<bot name> (you)'). Audio as OpenClaw counts it for hasInboundAudio: kind audio or an audio content type, i.e. Telegram voice and audio messages, plus a downloaded file with an audio/* type deeper in the reply chain; a document the user replies to directly takes the reply target's kind document (stock head merge of the reply target into the first chain entry) and stays attached as before. The bot's other media (images, documents, stickers, video), all media of other senders and the reply-chain text are unchanged; without the bot's id on the update nothing changes. Before, a reply to one of the bot's own voice messages (also an unintended one, for example a notification quick reply) attached the bot's TTS audio to the user's turn ('[Audio attachment could not be analyzed]', or with audio transcription '[Audio] User text: ... Transcript: <the bot's words>'), as if the user had sent it. Stock behaviour since at least 2026.10.4, still in 2026.11.5-beta.2. Same diff as oc-patches/2026.10.10, hunk at line 962 instead of 961."
+    }
+  ]
+}

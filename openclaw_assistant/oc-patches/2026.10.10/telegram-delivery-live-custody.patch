@@ -1,0 +1,61 @@
+--- a/dist/lifecycle-CTu0ulYU.mjs
++++ b/dist/lifecycle-CTu0ulYU.mjs
+@@ -38,6 +38,22 @@
+ 	onPlatformSendDispatch: () => Promise.resolve(),
+ 	release: () => void 0
+ };
++// VOLT-TG-20261023: process-local live custody; no persisted debt is removed.
++const voltLiveDeliveries = globalThis[Symbol.for("volt.telegram.live-final.v1")] ??= new Map();
++function voltLiveKey(sessionId, intentId) { return JSON.stringify([sessionId, intentId]); }
++function voltAcquireDelivery(completion) {
++    if (!completion) return () => {};
++    const key = voltLiveKey(completion.sessionId, completion.intentId);
++    voltLiveDeliveries.set(key, (voltLiveDeliveries.get(key) ?? 0) + 1);
++    let released = false;
++    return () => {
++        if (released) return;
++        released = true;
++        const count = voltLiveDeliveries.get(key) ?? 0;
++        if (count <= 1) voltLiveDeliveries.delete(key);
++        else voltLiveDeliveries.set(key, count - 1);
++    };
++}
+ function resolvePendingFinalCompletion(payload) {
+ 	const identity = getReplyPayloadMetadata(payload)?.pendingFinalDeliveryCompletion;
+ 	return identity ? {
+@@ -182,6 +198,10 @@
+ 	else await settlePendingFinalDelivery(completion, "unknown", ["queued", "unknown"]);
+ }
+ async function settleChannelDeliveryAttempt(attempt, onDelivered, onFinalizationError) {
++    try { return await voltSettleChannelDeliveryAttempt(attempt, onDelivered, onFinalizationError); }
++    finally { attempt.voltReleaseLive?.(); }
++}
++async function voltSettleChannelDeliveryAttempt(attempt, onDelivered, onFinalizationError) {
+ 	const emitFailure = (error) => {
+ 		const partial = isChannelPartialDeliveryError(error) ? error.deliveryResult : void 0;
+ 		if (!isPlatformMessageNotDispatchedError(error)) attempt.emitMessageSent?.({
+@@ -318,6 +338,11 @@
+ 		})
+ 	};
+ 	async function deliverReply(payload, info, operation) {
++        const voltLive = { release: voltAcquireDelivery(resolvePendingFinalCompletion(payload)), deferred: false };
++        try { return await voltDeliverReply(payload, info, operation, voltLive); }
++        finally { if (!voltLive.deferred) voltLive.release(); }
++    }
++    async function voltDeliverReply(payload, info, operation, voltLive) {
+ 		const preparedPayloadResult = delivery.preparePayload ? await delivery.preparePayload(payload, info) : payload;
+ 		const preparedValue = preparedPayloadResult === null ? null : operation.prepare(copyReplyPayloadMetadata(payload, preparedPayloadResult));
+ 		if (preparedValue === null) return await suppressReply(payload, info, "no_visible_payload");
+@@ -407,9 +432,11 @@
+ 			payload: effectivePayload,
+ 			info: directInfo,
+ 			result,
+-			emitMessageSent: emitMessageSentForDelivery
++			emitMessageSent: emitMessageSentForDelivery,
++			voltReleaseLive: voltLive.release
+ 		};
+ 		if (result?.finalization) {
++			voltLive.deferred = true;
+ 			result.finalization.catch(() => void 0);
+ 			pendingAttempts.push(attempt);
+ 		} else await settleChannelDeliveryAttempt(attempt, delivery.onDelivered);
