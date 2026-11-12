@@ -45,6 +45,15 @@
       "patched_sha256": "971c1c06cc843a91a9d9065f812ed8edfc4cd62e28f8bb8079918412fece0454",
       "diff": "telegram-fetch-fresh-audio.patch",
       "note": "Telegram hotfix VOLT-TG-20261023 (3/3): sendVoice/sendAudio use a fresh connection like sendMessage, with the same rule that a request Telegram may have received is not replayed (isSafeToRetrySendError). Same diff as oc-patches/2026.11.1, at the same lines; extensions/telegram/src/fetch.ts is unchanged in 2026.11.3 (the chunk differs from 2026.11.1 only in its import/export lines)."
+    },
+    {
+      "name": "telegram-reply-self-audio",
+      "file": "dist/bot-message-zuOD8Xt7.mjs",
+      "region": "//#region extensions/telegram/src/bot-message-context.session.ts",
+      "stock_sha256": "9243c30d8a47e5a360ff43ad46cd1219d8fdef20e5fc33fd08229cc2d4c96804",
+      "patched_sha256": "0d83e65b57db87e0aa9c6c42b6a062f556607ce445c8d23b002976b73a9a4635",
+      "diff": "telegram-reply-self-audio.patch",
+      "note": "Telegram hotfix VOLT-TG-20261112: voice and audio of a replied-to message the bot itself sent (a reply-chain entry, or the reply target, whose sender id is the bot's own, ctx.me.id) are no longer merged into the user's turn media; they stay in the reply chain under the bot's name ([media_path] under '<bot name> (you)'). Audio as OpenClaw counts it for hasInboundAudio: kind audio or an audio content type, i.e. Telegram voice and audio messages, plus a downloaded file with an audio/* type deeper in the reply chain; a document the user replies to directly takes the reply target's kind document (stock head merge of the reply target into the first chain entry) and stays attached as before. The bot's other media (images, documents, stickers, video), all media of other senders and the reply-chain text are unchanged; without the bot's id on the update nothing changes. Before, a reply to one of the bot's own voice messages (also an unintended one, for example a notification quick reply) attached the bot's TTS audio to the user's turn ('[Audio attachment could not be analyzed]', or with audio transcription '[Audio] User text: ... Transcript: <the bot's words>'), as if the user had sent it. Stock behaviour since at least 2026.10.4, still in 2026.11.5-beta.2. Same diff as oc-patches/2026.11.1, at the same line."
     }
   ]
 }

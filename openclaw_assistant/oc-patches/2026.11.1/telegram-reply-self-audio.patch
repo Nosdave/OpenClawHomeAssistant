@@ -1,0 +1,23 @@
+--- a/dist/bot-message-D8YOSV-y.mjs
++++ b/dist/bot-message-D8YOSV-y.mjs
+@@ -962,10 +962,18 @@
+ 		} : {},
+ 		...resolveReplyChainMediaType(entry)
+ 	} : void 0;
++	// VOLT-TG-20261112: voice/audio of the bot's own replied-to messages is not merged into the user's turn media
++	// (it stays in the reply chain under the bot's name); the bot's other media and all user media are unchanged.
++	const voltSelfId = primaryCtx?.me?.id != null ? String(primaryCtx.me.id) : void 0;
++	const voltIsSelfAudio = (entry, media) => {
++		if (voltSelfId === void 0 || !media || entry?.senderId !== voltSelfId) return false;
++		const contentType = typeof media.contentType === "string" ? media.contentType.split(";")[0].trim().toLowerCase() : "";
++		return media.kind === "audio" || contentType === "audio" || contentType.startsWith("audio/");
++	};
+ 	const replyMediaFacts = visibleReplyChain.length > 0 ? visibleReplyChain.flatMap((entry) => {
+ 		const media = toReplyChainMediaFact(entry);
+-		return media ? [media] : [];
+-	}) : visibleReplyTarget ? replyMedia.length > 0 ? replyMedia.map((media) => toInboundMedia(media)) : visibleReplyTarget.mediaType ? [{ kind: visibleReplyTarget.mediaType }] : [] : [];
++		return media && !voltIsSelfAudio(entry, media) ? [media] : [];
++	}) : visibleReplyTarget ? (replyMedia.length > 0 ? replyMedia.map((media) => toInboundMedia(media)) : visibleReplyTarget.mediaType ? [{ kind: visibleReplyTarget.mediaType }] : []).filter((media) => !voltIsSelfAudio(visibleReplyTarget, media)) : [];
+ 	const replyTargetMedia = (replyHead ? toReplyChainMediaFact(replyHead) : void 0) ?? (visibleReplyTarget?.mediaType ? { kind: visibleReplyTarget.mediaType } : void 0);
+ 	const replyBody = replyHead?.body ?? visibleReplyTarget?.body ?? (replyTargetMedia ? formatMediaPlaceholderText([replyTargetMedia]) : void 0);
+ 	const telegramFrom = isGroup ? buildTelegramGroupFrom(chatId, threadSpec) : `telegram:${chatId}`;

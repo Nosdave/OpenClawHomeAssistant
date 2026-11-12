@@ -227,6 +227,9 @@ RUN npm config set fund false && npm config set audit false \
 #    replies send their text first, no "couldn't confirm" notice while a reply is still being
 #    delivered, voice/audio uploads on a fresh connection without replay. Not fixed upstream in
 #    2026.11.3 (the patched sources are unchanged from 2026.10.10).
+#  - Telegram hotfix VOLT-TG-20261112 (bot-message-*.mjs): voice/audio of the bot's own replied-to
+#    messages is no longer merged into the user's turn media (the bot's other media and all user media
+#    unchanged). Not fixed upstream in 2026.11.5-beta.2.
 COPY oc_dist_patch.py /usr/local/lib/oc-addon/oc_dist_patch.py
 COPY oc-patches/ /usr/local/lib/oc-addon/oc-patches/
 RUN set -eu; \

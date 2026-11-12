@@ -2159,10 +2159,45 @@ regression tests are in `openclaw_assistant/tests/oc_patches/telegram_hotfix_<Op
 with those versions); they need the image's OpenClaw (run them in a container of the image with
 `node --test`; the two negative controls need the stock modules in `OC_STOCK_DIST`).
 
+#### Telegram replies to Volt's own voice messages (hotfix VOLT-TG-20261112)
+
+When you reply to one of Volt's own voice messages in Telegram, or quote it (also without
+meaning to, for example with the quick reply of a notification on the phone), stock
+OpenClaw downloads that voice message and adds it to **your** message, as if you had sent
+it. Volt then reads "[Audio attachment could not be analyzed]" or, with audio
+transcription, `[Audio] User text: … Transcript: <Volt's own words>`, and answers as if
+you had said them. This happens with all OpenClaw versions the add-on has patch sets for
+(2026.10.4 to 2026.11.3) and still with 2026.11.5-beta.2; OpenClaw has not fixed it.
+
+**What the add-on changes.** In OpenClaw's Telegram reply handling
+(`dist/bot-message-*.mjs`; `bot-message-zuOD8Xt7.mjs` in 2026.11.3) the voice and audio
+of messages the bot sent itself (sender id = the bot's own id) are no longer added to your
+message. They stay in the reply context under the bot's name (`Volt (you)` with
+`<media:audio>` and the file), so Volt still knows which message you answered. "Audio"
+means Telegram voice and audio messages (Volt's voice replies are voice messages), plus a
+file with an `audio/…` type further up the reply chain once OpenClaw has downloaded it. A
+file the bot sent as a document (an `.mp3`, say) stays a document when you reply to it
+directly and is still added to your message, as before.
+
+**Unchanged.** Your own media, including your voice messages (also older ones further up
+the reply chain); the bot's images, documents, stickers and videos (they are still
+attached when you reply to them); the text of the reply context; the download of the
+replied-to file; Volt's voice replies (TTS; only with `tts.auto` "inbound" does a text reply to Volt's voice message no longer count as a voice message, which was a side effect of the bug). If an update carries no bot identity, nothing
+changes. A voice message of another bot, or one forwarded into the chat, is not the bot's
+own and is handled as before.
+
+The patch (`telegram-reply-self-audio`) is in the patch sets for 2026.11.3 (bundled),
+2026.10.4, 2026.10.10 and 2026.11.1. Its regression tests,
+`openclaw_assistant/tests/oc_patches/telegram_reply_self_audio.test.mjs` (one file for all
+four versions), run the real statements of the installed chunk with synthetic reply
+chains and need no runtime dependencies (Node 22 or 24): `node --test` in a container of
+the image, or `OC_DIST=<package>/dist` for an unpacked package patched by
+`oc_dist_patch.py`; against a stock package the four bot-audio cases fail.
+
 #### Patches to OpenClaw's files
 
 The add-on changes a few of OpenClaw's own files in the image: the memory search
-half-life and the Telegram hotfix above. They are kept per OpenClaw version in
+half-life and the two Telegram hotfixes above. They are kept per OpenClaw version in
 `openclaw_assistant/oc-patches/<version>/`: one unified diff per file and a
 `manifest.json` with each file's sha256 before and after. `oc_dist_patch.py` applies
 them at build time and fails the build when the installed OpenClaw is another version,
@@ -2178,12 +2213,17 @@ diffs with `diff -u` (lines are split on newlines only).
 
 **Patch sets in the repository (maintainers).** The image ships OpenClaw 2026.11.3
 (`OPENCLAW_VERSION=2026.11.3`, `NPM_BEFORE=2026-11-10T18:00:00Z`, just after
-`openclaw@2026.11.3` was published at 17:59:44Z). `oc-patches/2026.11.3/` holds the same five diffs as `oc-patches/2026.11.1/`, moved to the
+`openclaw@2026.11.3` was published at 17:59:44Z). `oc-patches/2026.11.3/` holds the same six diffs as `oc-patches/2026.11.1/`, moved to the
 renamed 2026.11.3 files: the hunk bodies are identical, the memory search hunk sits nine
 lines further down (2026.11.3 changed `src/agents/memory-search.ts` above it for
-openclaw/openclaw#184966 and #186310, not the 30-day half-life), and the four Telegram
-sources are unchanged from 2026.11.1 (their chunks differ only in import and export
-lines); none of the problems is fixed upstream in 2026.11.3. `oc-patches/2026.11.1/` holds
+openclaw/openclaw#184966 and #186310, not the 30-day half-life), and the five Telegram
+sources are unchanged from 2026.11.1 (the four chunks of VOLT-TG-20261023 differ only in
+import and export lines; `telegram-reply-self-audio` sits at the same line); none of the
+problems is fixed upstream in 2026.11.3. `telegram-reply-self-audio` (VOLT-TG-20261112)
+was derived for each of the four versions from its stock `bot-message` chunk: one hunk
+that replaces the same statement (`extensions/telegram/src/bot-message-context.session.ts`
+is unchanged from 2026.10.10 to 2026.11.3; 2026.10.4 has other context lines).
+`oc-patches/2026.11.1/` holds
 the diffs re-derived for 2026.10.10 (the rehearsal stand-in of this line), moved to the
 renamed 2026.11.1 files; 2026.11.1 was the target of this add-on version until 2026.11.3
 and was never shipped. `oc-patches/2026.10.4/`, `oc-patches/2026.10.10/` and
@@ -2200,9 +2240,11 @@ tests.test_dist_patch` applies the shipped set to a copy (it picks
 `OC_STOCK_DIST=<stock package>/dist node --test
 tests/oc_patches/telegram_hotfix_2026.11.3.test.mjs` runs the hotfix tests (Node 24; outside
 the image, `OC_DIST=<copy>/dist` points them at a package patched by `oc_dist_patch.py`
-whose runtime dependencies resolve). Moving from 2026.10.4 changes the databases one-way
-(state 20 → 22, agent 24 → 27); the encrypted Home Assistant backup stays the only
-rollback.
+whose runtime dependencies resolve) and `node --test
+tests/oc_patches/telegram_reply_self_audio.test.mjs` those of VOLT-TG-20261112 (no runtime
+dependencies needed, so `OC_DIST=<copy>/dist` works for any unpacked package). Moving
+from 2026.10.4 changes the databases one-way (state 20 → 22, agent 24 → 27); the
+encrypted Home Assistant backup stays the only rollback.
 
 **Release checklist (maintainers).**
 
@@ -2441,6 +2483,21 @@ If Telegram is configured but polling fails with network fetch errors:
 2. If IPv4 works but default/IPv6 fails, ensure add-on option `force_ipv4_dns` is `true` (default) and restart.
 3. Keep `channels.telegram.network.autoSelectFamily: false` (default on Node 22).
 4. If still failing, check host/VM IPv6 routing and DNS configuration.
+
+### Telegram: Volt takes its own voice message for yours
+
+**Symptom**: after you replied to one of Volt's voice messages (also by accident, for
+example with a notification's quick reply), Volt answers as if you had sent that voice
+message: it comments on its own words as yours, or says your audio attachment could not be
+analyzed.
+
+**Cause**: stock OpenClaw adds the replied-to voice message to your message (up to
+2026.11.5-beta.2). The add-on's patch `telegram-reply-self-audio` keeps the bot's own
+voice and audio out of your message; see "Telegram replies to Volt's own voice messages
+(hotfix VOLT-TG-20261112)".
+
+**Fix**: update to an image with that patch. Until then, send your message without the
+reply (remove the quoted message before sending); your chat history stays as it is.
 
 ### Outbound proxy not applied
 

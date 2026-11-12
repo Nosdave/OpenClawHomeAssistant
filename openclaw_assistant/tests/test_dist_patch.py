@@ -378,13 +378,17 @@ class MainTests(DistPatchCase):
 # The patches each shipped set carries, per OpenClaw version. A new set, or dropping a patch because
 # OpenClaw fixed it, is a deliberate edit here (with the reason in CHANGELOG.md).
 _HOTFIX_2026_10 = {"memory-search-half-life", "telegram-voice-text-first", "telegram-delivery-live-custody",
-                   "telegram-notice-live-guard", "telegram-fetch-fresh-audio"}
+                   "telegram-notice-live-guard", "telegram-fetch-fresh-audio",
+                   "telegram-reply-self-audio"}  # VOLT-TG-20261112, not fixed upstream through 2026.11.5-beta.2
 EXPECTED_PATCHES = {
     "2026.10.4": _HOTFIX_2026_10,
     "2026.10.10": _HOTFIX_2026_10,  # rehearsal stand-in for the 2026.11.1 line
     "2026.11.1": _HOTFIX_2026_10,  # the previous image default, rehearsed, never shipped
     "2026.11.3": _HOTFIX_2026_10,  # the image default (Dockerfile ARG OPENCLAW_VERSION)
 }
+# Telegram patches whose regression tests are one file for all versions (it maps each version to the patched chunk)
+# instead of a part of tests/oc_patches/telegram_hotfix_<version>.test.mjs.
+CROSS_VERSION_TESTS = {"telegram-reply-self-audio": "telegram_reply_self_audio.test.mjs"}
 
 
 def dockerfile_arg(name):
@@ -417,11 +421,13 @@ class RepoPatchSetTests(unittest.TestCase):
             if not telegram:
                 continue
             with self.subTest(version=d.name):
-                js = ADDON / "tests" / "oc_patches" / f"telegram_hotfix_{d.name}.test.mjs"
-                self.assertTrue(js.is_file(), f"{js.name} missing for oc-patches/{d.name}")
-                text = js.read_text()
                 for e in telegram:
-                    self.assertIn(f"'{os.path.basename(e['file'])}'", text, f"{js.name} does not name {e['file']}")
+                    chunk = os.path.basename(e["file"])
+                    cross = CROSS_VERSION_TESTS.get(e["name"])
+                    js = ADDON / "tests" / "oc_patches" / (cross or f"telegram_hotfix_{d.name}.test.mjs")
+                    self.assertTrue(js.is_file(), f"{js.name} missing for {e['name']} in oc-patches/{d.name}")
+                    named = f"'{d.name}': '{chunk}'" if cross else f"'{chunk}'"
+                    self.assertIn(named, js.read_text(), f"{js.name} does not name {e['file']} for {d.name}")
 
     def test_dockerfile_default_pin_has_patch_set_and_lockstep_plugins(self):
         version = dockerfile_arg("OPENCLAW_VERSION")
