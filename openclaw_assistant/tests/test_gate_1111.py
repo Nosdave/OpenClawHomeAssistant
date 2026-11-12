@@ -523,10 +523,10 @@ class Docs1111Tests(unittest.TestCase):
 
     def test_pins_and_texts_name_the_bundled_version(self):
         version = self.dockerfile_arg("OPENCLAW_VERSION")
-        self.assertEqual(version, "2026.11.1")
-        # after openclaw@2026.11.1 (npm, 2026-11-05T09:41:26Z), the last package the image resolves with this cutoff
-        self.assertGreater(self.dockerfile_arg("NPM_BEFORE"), "2026-11-05T09:41:26Z")
-        self.assertLess(self.dockerfile_arg("NPM_BEFORE"), "2026-11-05T10:00:00Z")
+        self.assertEqual(version, "2026.11.3")
+        # after openclaw@2026.11.3 (npm, 2026-11-10T17:59:44.785Z), the last package the image resolves with this cutoff
+        self.assertGreater(self.dockerfile_arg("NPM_BEFORE"), "2026-11-10T17:59:44.785Z")
+        self.assertLess(self.dockerfile_arg("NPM_BEFORE"), "2026-11-10T18:15:00Z")
         docs = (self.REPO / "DOCS.md").read_text(encoding="utf-8")
         self.assertIn(f"This fork now ships **OpenClaw `{version}`**", docs)
         log = (ADDON / "CHANGELOG.md").read_text(encoding="utf-8")

@@ -666,8 +666,17 @@ RUNTIME_CAPS = (
     # doctor keeps an invalid heartbeat.activeHours window instead of removing it (#186305) and, with #187192,
     # then exits 1 ("Doctor blocked; required repairs remain incomplete."): the precheck holds on it first
     ("heartbeat_hours_kept", (2026, 11, 1, 0)),
-    # doctor records the cron inference accounts itself (#172792; 2026.11.5-beta.1 parses as 2026.11.5)
-    ("cron_doctor_migration", (2026, 11, 5, 0)),
+    # doctor records the cron inference accounts itself (#172792, backported to 2026.11.2 in 9716cc4c964e; also on
+    # the main line from 2026.11.5-beta.1). The same backport makes the gateway log "cron: automation has no recorded
+    # inference account" at every start for each unbound agentTurn job (server-cron-inference.ts)
+    ("cron_doctor_migration", (2026, 11, 2, 0)),
+    # a per-agent memory search whose provider differs from the shared one no longer inherits the shared
+    # memory.search.remote apiKey/headers, unless the agent sets no remote.baseUrl and the shared one is non-blank
+    # (#184966, memory-search.ts isSameMemorySearchProvider; release line 2026.11.3)
+    ("memory_remote_scoped", (2026, 11, 3, 0)),
+    # a model row without maxTokens (row, provider level, catalog) gets min(32768, max(min(8192, W), floor(W/2)))
+    # instead of min(8192, W) as its output cap (#193899, release line 2026.11.3; not in its changelog)
+    ("output_cap_raised", (2026, 11, 3, 0)),
 )
 CAP_NAMES = tuple(n for n, _v in RUNTIME_CAPS)
 # Build-time record (Dockerfile): {"openclaw_version": ..., <cap>: true|false} for capabilities the image can

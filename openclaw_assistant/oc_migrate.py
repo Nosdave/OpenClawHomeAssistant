@@ -1972,8 +1972,10 @@ def auth_order_adjust(cfg, profiles, store_order):
 # would run on a stored auth profile or a direct credential that is not a configured key
 # (embedded-agent-runner/run/auth-plan.ts), and
 # the refusal stops the fallback chain (recordModelFallbackStop). OpenClaw's own doctor migration (#172792)
-# ships with 2026.11.5; it records only the account of a job's own model (inference-binding-migration.ts), so a job
-# that only stops at a fallback stays refused there. The gate only forecasts which jobs are affected; it writes
+# was backported into 2026.11.2 (9716cc4c964e; main line from 2026.11.5-beta.1; oc_common.RUNTIME_CAPS
+# cron_doctor_migration), so it runs in the gate's doctor passes with the bundled 2026.11.3; it records only the
+# account of a job's own model (inference-binding-migration.ts), so a job that only stops at a fallback stays refused
+# there. The gate only forecasts which jobs are affected; it writes
 # nothing. The stored logins include
 # the ones OpenClaw's doctor creates during the migration from literal provider keys (doctor_key_copies; found in the
 # add-on's 10.10 rehearsal): a job on such a provider is refused unless the key is a SecretRef or has auth "api-key".

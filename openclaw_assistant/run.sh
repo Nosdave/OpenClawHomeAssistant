@@ -600,7 +600,7 @@ trap early_stop INT TERM
 # Upgrade-state backup (OpenClaw 2026.7.x runtimes only)
 #
 # OpenClaw 2026.8+ migrates the persistent databases one-way (2026.10.4: state
-# schema 20, agent schema 24; 2026.10.10 and 2026.11.1: 22/27); older OpenClaw
+# schema 20, agent schema 24; 2026.10.10 to 2026.11.3: 22/27); older OpenClaw
 # builds cannot open them. For those
 # runtimes the migration gate (`oc-upgrade gate`, below) requires a recent
 # encrypted Home Assistant backup with this add-on (the only rollback point; the

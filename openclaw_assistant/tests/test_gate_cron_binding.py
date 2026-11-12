@@ -2,9 +2,10 @@
 
 These runtimes refuse a cron agent turn that has no recorded inference account as soon as a candidate model would run
 on a stored auth profile, and the refusal stops the fallback chain. OpenClaw's own doctor migration (#172792) comes
-with 2026.11.5. The gate only reports (precheck 11c WARN lines, a postconditions summary bit, finalize WARN lines,
-`oc-upgrade status`, the dry-run/`oc-upgrade check` readiness line); it never holds and never writes into OpenClaw's
-databases or auth stores. codex_cron_ids/F15 keep reading only the 7.x columns.
+with 2026.11.2 (a backport; tests/test_gate_1113.py covers the 2026.11.2+ wording). The gate only reports (precheck
+11c WARN lines, a postconditions summary bit, finalize WARN lines, `oc-upgrade status`, the dry-run/`oc-upgrade check`
+readiness line); it never holds and never writes into OpenClaw's databases or auth stores. codex_cron_ids/F15 keep
+reading only the 7.x columns.
 
 Also the read-only precheck info 11d for openclaw/openclaw#191847 (largest agent database, biggest session).
 Synthetic 10.4-shaped fixtures only (tests/fixtures/openclaw-*-schema-2026.10.4.sql).
@@ -50,21 +51,21 @@ EXTRA_JOBS = [
 ]
 
 
-# what OpenClaw's own migration (2026.11.5, openclaw/openclaw#172792) does for the jobs: it records the account of a
+# what OpenClaw's own migration (2026.11.2, openclaw/openclaw#172792) does for the jobs: it records the account of a
 # job's own model only (inference-binding-migration.ts), and a bound job's fallbacks to other providers are refused
-OUTLOOK_PRIM = ("OpenClaw records the inference account of {who} itself from 2026.11.5 (doctor migration, "
+OUTLOOK_PRIM = ("OpenClaw records the inference account of {who} itself from 2026.11.2 (doctor migration, "
                 "openclaw/openclaw#172792), but then refuses their fallbacks to other providers (as with "
                 "openclaw/openclaw#192463)")
 OUTLOOK_FB = ("OpenClaw's own migration{v} records only the account of a job's own model: a job whose own model needs "
               "no account stays unbound, and its fallback on a stored login stays refused")
-OUTLOOK_FB_ALONE = OUTLOOK_FB.format(v=" (2026.11.5, openclaw/openclaw#172792)")
+OUTLOOK_FB_ALONE = OUTLOOK_FB.format(v=" (2026.11.2, openclaw/openclaw#172792)")
 MANUAL_SCOPED = G.CRON_MANUAL.replace("after the start: ", "after the start, for a job whose own model is refused: ")
 MANUAL_LAST_SCOPED = G.CRON_MANUAL_LAST.replace("after the start: ",
                                                 "after the start, for a job whose own model is refused: ")
 
 
 def outlook(who):
-    """The closing note's 2026.11.5 clauses for jobs on a stored login (who) and jobs that only stop at a fallback."""
+    """The closing note's 2026.11.2 clauses for jobs on a stored login (who) and jobs that only stop at a fallback."""
     return OUTLOOK_PRIM.format(who=who) + "; " + OUTLOOK_FB.format(v="")
 
 
@@ -190,16 +191,17 @@ class CronForecastGateTests(T.GateEnv):
         for ln in lines + st:
             self.assertNotIn("stored login (auth profile)", ln)
             self.assertNotIn("@<profileId>", ln)
-        # a runtime whose doctor records the accounts does so only for a stored login
-        self.set_runtime("2026.11.5-beta.1", 22, 27)
+        # a runtime whose doctor records the accounts does so only for a stored login: the jobs on AWS SDK
+        # credentials keep their WARN lines (2026.11.2+ wording, tests/test_gate_1113.py)
+        self.set_runtime("2026.11.3", 22, 27)
         text = self.quiet_dry()
-        self.assertIn("[gate] 1/8 info: 2 enabled cron job(s) without a recorded inference account use AWS SDK "
-                      "credentials; OpenClaw 2026.11.5-beta.1 doctor records the account of a stored login, not of "
-                      "AWS SDK credentials (openclaw/openclaw#172792); the gate reports the jobs it leaves after the "
-                      "migration", text)
-        self.assertIn("[gate]   cron inference accounts: 2 enabled cron job(s) use AWS SDK credentials without a "
-                      "recorded account; OpenClaw 2026.11.5-beta.1 doctor records it for a stored login, not for AWS "
-                      "SDK credentials (openclaw/openclaw#172792)", text)
+        self.assertNotIn("doctor records that account", text)
+        self.assertIn("WARN [gate] cron job 'Job Bedrock' (job-bedrock): OpenClaw 2026.11.3 refuses every run", text)
+        self.assertIn("WARN [gate] 2 cron job(s) above: the add-on changes nothing for these jobs. "
+                      + G.CRON_AWS_SDK, text)
+        self.assertIn("[gate]   cron inference accounts: 2 enabled cron job(s) stop at AWS SDK credentials on "
+                      "OpenClaw 2026.11.3 and doctor records no account for them (the WARN lines above, "
+                      "openclaw/openclaw#192195); report only, the gate changes nothing", text)
 
     def test_bump_reports_in_precheck_finalize_and_status(self):
         before = {p: sha(p) for p in (self.sdb, self.adb)}
@@ -339,17 +341,27 @@ class CronForecastGateTests(T.GateEnv):
         self.assertEqual(G.cron_jobs_inventory(self.tmp / "missing.sqlite"), [])
 
     def test_doctor_migration_runtime_reports_only_what_doctor_leaves(self):
+        """2026.11.2+ (R4): the precheck promises doctor's binding only for the job whose own model is on a stored
+        login (info line); the job that only stops at a fallback keeps its WARN line, as doctor records nothing for
+        it. After the migration the jobs doctor left are WARNed with what doctor does for each kind."""
         self.set_runtime("2026.11.5-beta.1", 22, 27)
         self.assertEqual(self.run_gate(), 0, self.out)
         out = self.out
         pre = out[:out.index("[gate] 1/8 precheck:")]
-        self.assertIn("[gate] 1/8 info: 2 enabled cron job(s) without a recorded inference account use a stored "
-                      "login; OpenClaw 2026.11.5-beta.1 doctor records the account (openclaw/openclaw#172792)", pre)
-        self.assertNotIn("WARN [gate] cron job", pre)
+        self.assertIn("[gate] 1/8 info: 1 enabled cron job(s) without a recorded inference account run their own "
+                      "model on a stored login: 'Morning summary' (job-morning); OpenClaw 2026.11.5-beta.1 doctor "
+                      "records that account during the migration when exactly one fits (openclaw/openclaw#172792), but "
+                      "then refuses their fallbacks to other providers (as with openclaw/openclaw#192463); the gate "
+                      "reports the jobs doctor leaves after the migration", pre)
+        self.assertNotIn("WARN [gate] cron job 'Morning summary'", pre)
+        self.assertIn("WARN [gate] cron job 'Local digest' (job-local)", pre)
         fin = out[out.index("[gate] 7/8 postconditions OK"):]
         self.assertIn("WARN [gate] cron job 'Morning summary' (job-morning)", fin)  # the fake doctor binds nothing
         self.assertIn("WARN [gate] 2 cron job(s) above still have no recorded inference account after the migration: "
-                      "OpenClaw 2026.11.5-beta.1 doctor left them", fin)
+                      "OpenClaw 2026.11.5-beta.1 doctor left the jobs whose own model is refused (its warnings are in "
+                      "oc-upgrade log); OpenClaw 2026.11.5-beta.1 doctor records only the account of a job's own "
+                      "model: a job whose own model needs no account stays unbound, and its fallback on a stored login "
+                      "stays refused. ", fin)
         self.assertTrue(self.journal()["cron_binding"]["doctor_migration"])
 
     def test_features_record_switches_the_report_on(self):
@@ -634,7 +646,7 @@ class CronKeyCopyGateTests(T.GateEnv):
                       "copies)", st)
         self.assertIn("    " + D1_FIX.format(rt="2026.11.1"), st)
         self.assertTrue(st[-1].endswith(MANUAL_LAST_SCOPED + ". " + G.CRON_FALLBACK), st[-1])
-        # only provider keys and paths: the jobs of a provider with a key fix get no 2026.11.5 promise
+        # only provider keys and paths: the jobs of a provider with a key fix get no 2026.11.2 promise
         only = dict(rec, affected=[a for a in rec["affected"] if a["id"] == "job-glm-haus"])
         self.assertEqual(G._status_cron({"cron_binding_forecast": only})[-1], "    " + G.CRON_MANUAL_LAST)
         self.assertEqual(G.cron_job_lines(only)[-1], "1 cron job(s) above: the add-on changes nothing for these "
@@ -1297,10 +1309,10 @@ class CronConfigFixupTests(T.GateEnv):
 
     def test_fallback_only_jobs_get_no_2026_11_5_promise(self):
         """The owner's layout after the fix: every job runs its own model on glm (the configured key) or on a local model
-        and stops only at a stored-login fallback. OpenClaw's own migration (2026.11.5) resolves only the job's own
+        and stops only at a stored-login fallback. OpenClaw's own migration (2026.11.2) resolves only the job's own
         model and skips a job whose model runs on a configured key or needs none (inference-binding-migration.ts), and
-        2026.11.5 still refuses an unbound cron attempt on a stored login: no line promises that 2026.11.5 records these
-        jobs, and none offers the binding (it would make the fallback the job's model)."""
+        2026.11.2+ still refuses an unbound cron attempt on a stored login: no line promises that 2026.11.2 records
+        these jobs, and none offers the binding (it would make the fallback the job's model)."""
         con = sqlite3.connect(str(self.sdb))
         con.execute("UPDATE cron_jobs SET enabled=0 WHERE job_id='job-morning'")
         con.commit()
@@ -1319,7 +1331,7 @@ class CronConfigFixupTests(T.GateEnv):
         text = "\n".join(lines + fin + st)
         self.assertNotIn("records the inference account", text)
         self.assertNotIn("@<profileId>", text)
-        # whose account 2026.11.5 records: the jobs whose own model is on a stored login (no AWS SDK, no key fix)
+        # whose account 2026.11.2 records: the jobs whose own model is on a stored login (no AWS SDK, no key fix)
         prim = {"id": "p", "primary_affected": True, "refs": ["openai/gpt-5.5"]}
         fb = {"id": "f", "primary_affected": False, "refs": ["openai/gpt-5.5"]}
         aws = {"id": "a", "primary_affected": True, "refs": ["bedrock/x"], "aws_sdk": ["bedrock/x"]}

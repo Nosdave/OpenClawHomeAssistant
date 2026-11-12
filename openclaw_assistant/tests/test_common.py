@@ -282,6 +282,9 @@ class RuntimeCapsTests(TmpCase):
     AT_1010 = dict(AT_1006, retires_skill_proposals=True, cron_refusal=True, held_store_skip=True,
                    large_session_oom_issue=True, doctor_plugin_space=True)
     AT_1111 = dict(AT_1010, heartbeat_hours_kept=True)
+    # the doctor cron inference-account migration was backported to 2026.11.2 (9716cc4c964e)
+    AT_1112 = dict(AT_1111, cron_doctor_migration=True)
+    AT_1113 = dict(AT_1112, memory_remote_scoped=True, output_cap_raised=True)
 
     def setUp(self):
         super().setUp()
@@ -297,8 +300,8 @@ class RuntimeCapsTests(TmpCase):
         table = [("2026.9.9", self.ALL_OFF), ("2026.10.4", self.ALL_OFF), ("2026.10.5", self.AT_1005),
                  ("2026.10.5-beta.1", self.AT_1005), ("2026.10.6", self.AT_1006), ("2026.10.9", self.AT_1006),
                  ("2026.10.10", self.AT_1010), ("2026.11.0", self.AT_1010), ("2026.11.1", self.AT_1111),
-                 ("2026.11.5-beta.1", dict(self.AT_1111, cron_doctor_migration=True)),
-                 ("2026.12.1", dict(self.AT_1111, cron_doctor_migration=True))]
+                 ("2026.11.2", self.AT_1112), ("2026.11.3", self.AT_1113),
+                 ("2026.11.5-beta.1", self.AT_1113), ("2026.12.1", self.AT_1113)]
         for version, want in table:
             with self.subTest(version=version):
                 self.assertEqual(C.runtime_caps(version), want)
@@ -328,8 +331,9 @@ class RuntimeCapsTests(TmpCase):
         self.assertEqual(C.runtime_features("2026.11.1"),
                          {"cron_refusal": True, "cron_doctor_migration": True, "retires_skill_proposals": True})
         # a record of another version (an image rebuilt with another pin, a stale file) is ignored
-        self.assertEqual(C.runtime_caps("2026.11.2"), self.AT_1111)
+        self.assertEqual(C.runtime_caps("2026.11.0"), self.AT_1010)
         self.assertEqual(C.runtime_caps("2026.11.1-1"), self.AT_1111)
+        self.assertEqual(C.runtime_features("2026.11.0"), {})
         self.assertEqual(C.runtime_features("2026.11.2"), {})
 
     def test_image_record_never_switches_a_capability_off(self):

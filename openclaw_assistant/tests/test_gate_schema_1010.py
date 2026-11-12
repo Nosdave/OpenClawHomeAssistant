@@ -619,7 +619,7 @@ class DocsWordingTests(unittest.TestCase):
         docs = self.text("DOCS.md")
         self.assertIn("`sqlite-fk-violation`, `orphan-agent-db` and `agent-db-held` apply with every OpenClaw\n"
                       "version", docs)
-        nxt = docs.split("**OpenClaw 2026.11.1 (this add-on version).**", 1)[1].split("With OpenClaw 2026.10.4", 1)[0]
+        nxt = docs.split("**OpenClaw 2026.11.3 (this add-on version).**", 1)[1].split("With OpenClaw 2026.10.4", 1)[0]
         self.assertNotIn("agent databases outside the configured agents", nxt)
 
     def test_memory_half_life_still_selects_the_returned_results(self):

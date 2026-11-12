@@ -344,6 +344,31 @@ DOCTOR_COPY_RE = re.compile(r"[^/]{1,240}\.pre-startup-migration-([A-Za-z0-9][A-
 # with every blank and box character removed (a long path can wrap inside doctor's box): the id names the group
 SAVED_COPY_ID_RE = re.compile(r"(?:Saved|Reused)pre-migrationSQLitebackup:\S*?\.pre-startup-migration-"
                               r"([A-Za-z0-9][A-Za-z0-9-]{0,63}?)(?:\.scoped)?\.bak")
+# R5: doctor's pre-repair copy of the whole state database before every cron store repair it commits
+# (store-repair.ts backupCronStoreForDoctor: <state>/state/openclaw.sqlite.doctor-cron-<Date.now()>-<uuid>.bak, a
+# verified plaintext snapshot without the lease rows; 2026.10.4 legacy owner/store repairs and the memory-core dreaming
+# cron repair, 2026.10.10 also provider renames, 2026.11.2+ also the inference account migration). OpenClaw never
+# deletes it.
+_DOCTOR_CRON_ID = r"(\d{10,16}-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})"
+DOCTOR_CRON_COPY_RE = re.compile(r"[^/]{1,240}\.doctor-cron-" + _DOCTOR_CRON_ID + r"\.bak")
+# its log lines, matched like SAVED_COPY_ID_RE: "Saved pre-repair cron backup: <path>", the dreaming repair's
+# "... SQLite backup: <path>." and "Cron Doctor repair failed; verified backup retained at <path>: ..."
+SAVED_CRON_COPY_ID_RE = re.compile(r"(?:Savedpre-repaircronbackup:|SQLitebackup:|verifiedbackupretainedat)"
+                                   r"[^:]{0,600}?\.doctor-cron-" + _DOCTOR_CRON_ID + r"\.bak")
+# doctor's pre-repair recovery directories beside a database (sqlite-index-recovery.ts backupDoctorSqliteRepair: mkdtemp
+# <db dir>/openclaw-<repair>-recovery-XXXXXX/ holding database.sqlite, a verified full plaintext copy of the database;
+# the index repair with every version, from the 2026.10.10 line also the media-persistence, transcript-directives,
+# transcript-headers, transcript-labels and session-window repairs; the orphan task delivery repair, which the
+# precheck lets doctor make, with every version, adding orphan-rows.jsonl and manifest.json,
+# state-db-task-delivery-recovery.ts). OpenClaw never deletes them.
+DOCTOR_RECOVERY_DIR_RE = re.compile(r"openclaw-(?:index|session-window|transcript-directives|media-persistence|"
+                                    r"transcript-headers|transcript-labels|task-delivery)-recovery-[A-Za-z0-9]{6}")
+DOCTOR_RECOVERY_FILES = ("orphan-rows.jsonl", "manifest.json", "database.sqlite")  # deleted in this order
+# their log lines, matched like SAVED_COPY_ID_RE: "Saved pre-repair SQLite backup: <dir>/database.sqlite", a failed
+# index repair's "Preserved pre-repair database: <dir>/database.sqlite.", the task delivery repair's "backup and row
+# export: <dir>" and its failure's "retained artifacts: <dir>"
+SAVED_RECOVERY_DIR_RE = re.compile(r"(?:Savedpre-repairSQLitebackup:|Preservedpre-repairdatabase:|backupandrowexport:|"
+                                   r"retainedartifacts:)[^:]{0,600}?/(" + DOCTOR_RECOVERY_DIR_RE.pattern + ")")
 
 STOP = threading.Event()
 _STOP_SIG = [None]
@@ -2269,6 +2294,9 @@ class Gate:
         self.cron_binding_forecast(F, mode)
         # 11d session sizes (full5, openclaw/openclaw#191847; information only)
         self.large_session_info()
+        # 11e memory search remote inheritance (#184966, WARN only), 11f output caps (#193899, information only)
+        self.memory_remote_check()
+        self.output_cap_info()
         b = self.budget()
         if self.j is not None:
             self.j["budget"] = b
@@ -2665,7 +2693,10 @@ class Gate:
             if db["kind"] == "state" and r["repairable"]:
                 repairable += 1
                 self.say(f"{self.pn('precheck')} info: {rel_} has {r['count']} task_delivery_state row(s) whose "
-                         "task run is gone; doctor deletes them (OpenClaw's own repair for this case)")
+                         "task run is gone; doctor deletes them (OpenClaw's own repair for this case) after it saves a "
+                         "full plaintext copy of the state database and those rows in "
+                         "state/openclaw-task-delivery-recovery-*/, which the add-on deletes like the run's doctor "
+                         "captures (gate_cleanup_hours)")
                 continue
             failed += 1
             uv, target = db.get("uv"), db.get("target")
@@ -2729,8 +2760,10 @@ class Gate:
         (journal: "autofix"); with $include in openclaw.json the gate writes nothing and WARNs the command instead.
 
         Before the first write only (a resumed run reports after doctor, cron_binding_postcheck). On a runtime
-        whose doctor records the accounts itself (cron_doctor_migration) one info line; the jobs doctor leaves
-        are reported after the migration."""
+        whose doctor records the accounts itself (cron_doctor_migration, 2026.11.2+) one info line for the jobs whose
+        own model is on a stored login (doctor binds them, and their fallbacks to other providers are refused from then
+        on); the jobs doctor leaves (a fallback on a stored login, AWS SDK credentials) keep their WARN lines, and the
+        jobs it does not bind are reported again after the migration."""
         caps = self.caps()
         if not caps["cron_refusal"] or (self.j or {}).get("first_write_at"):
             return None
@@ -2762,7 +2795,8 @@ class Gate:
             if kept:
                 self.say(f"{pn} info: {cron_fixup_kept_text(kept, plan['fix'], rt)}")
             if behind:
-                self.say(f"{pn} info: {cron_fixup_behind_text(behind)}")
+                bound = {a.get("id") for a in _cron_doctor_binds([a for a, _r in behind])} if dm else set()
+                self.say(f"{pn} info: {cron_fixup_behind_text(behind, bound)}")
 
             def on(entries, p_):
                 return [str(a.get("id"))[:120] for a, refs in entries if any(r.split("/", 1)[0] == p_ for r in refs)]
@@ -2784,12 +2818,20 @@ class Gate:
             self.j["cron_binding_forecast"] = rec
         n = len(rec["affected"])
         if n and caps["cron_doctor_migration"]:
-            aws = _cron_kinds(rec["affected"])[1]
-            self.say(f"{self.pn('precheck')} info: {n} enabled cron job(s) without a recorded inference account use "
-                     f"{_cron_on(rec['affected'])}; OpenClaw {self.pkg['version']} doctor records the account"
-                     + (" of a stored login, not of AWS SDK credentials" if aws else "")
-                     + " (openclaw/openclaw#172792); the gate reports the "
-                     "jobs it leaves after the migration")
+            # 2026.11.2+: doctor records the account of a job's own model on a stored login only; the jobs it leaves
+            # (a fallback on a stored login, AWS SDK credentials) keep their WARN lines
+            binds = _cron_doctor_binds(rec["affected"])
+            if binds:
+                self.say(f"{pn} info: {cron_doctor_binds_text(binds, rec, rt)}")
+            rest = cron_doctor_rest(rec)
+            if rest:
+                for line in cron_job_lines(rest, fixup=bool(rec.get("autofix")), forecast=True):
+                    self.warn(line)
+            elif cron_doctor_binds_keyed(binds, rec):  # the provider lines the info line points at
+                keyed = cron_doctor_binds_keyed(binds, rec)
+                for line in cron_key_fix_lines(dict(rec, key_fix=[k for k in rec.get("key_fix") or []
+                                                                  if k.get("provider") in keyed])):
+                    self.warn(line)
         elif n:
             for line in cron_job_lines(rec, fixup=bool(rec.get("autofix"))):
                 self.warn(line)
@@ -2991,13 +3033,26 @@ class Gate:
     def record_doctor_copies(self, n):
         """After doctor pass n: the SQLite copies this pass created (not in the run's baseline taken before its first
         pass, not journaled by an earlier pass of the run), on the pass's journal record. They are deleted with the
-        run's doctor captures (run_doctor_copies)."""
+        run's doctor captures (run_doctor_copies). Also doctor's pre-repair cron backups of the state database (scope
+        "cron", R5), only those whose name says they were made after the run started: a baseline taken by an earlier
+        add-on version (or a resumed run's) does not list them, and an older one is not this run's. Likewise doctor's
+        pre-repair recovery directories (scope "recovery"), by the directory's modification time."""
         cur = doctor_copies(self.gp["STATE"])
         base = set(self.j.get("doctor_copies_before") or [])
         known = {e.get("path") for d in self.j.get("doctor") or [] if isinstance(d, dict)
                  for e in d.get("pre_migration_backups") or [] if isinstance(e, dict)}
+        since = _parse_backup_date(self.j.get("started_at"))
+        since_ms = int(since.timestamp() * 1000) if since is not None else None
+
+        def this_run(r, scope):
+            if scope == "recovery":
+                return _made_since(Path(self.gp["STATE"]) / r, since)
+            if scope != "cron":
+                return True
+            ms = doctor_cron_copy_ms(Path(r).name)
+            return since_ms is not None and ms is not None and ms >= since_ms
         new = [{"path": r, "size": size, "scope": scope} for r, (size, scope) in sorted(cur.items())
-               if r not in base and r not in known]
+               if r not in base and r not in known and this_run(r, scope)]
         rec = self.j["doctor"][-1]
         rec["pre_migration_backups"] = new
         rec["pre_migration_backups_older"] = len(cur) - len(new)
@@ -3007,7 +3062,7 @@ class Gate:
                      for e in d.get("pre_migration_backups_outside") or [] if isinstance(e, dict)}
         outside = [{"path": x, "size": size, "scope": scope} for x, (size, scope) in
                    sorted(outside_doctor_copies(outside_agent_dirs(self.gp["STATE"], self.cfg)).items())
-                   if x not in out_base and x not in out_known]
+                   if x not in out_base and x not in out_known and (scope != "recovery" or _made_since(x, since))]
         if outside:
             rec["pre_migration_backups_outside"] = outside
         self.save()
@@ -3028,6 +3083,9 @@ class Gate:
             self.warn(line.removeprefix("WARN: "))
         for line in cron_job_lines(self.j.get("cron_binding"), fixup=bool(done)):
             self.warn(line)
+        lw = cron_load_warn_line(self.j.get("cron_binding"))  # R6 (2026.11.2+)
+        if lw:
+            self.say(f"info: {lw}")
         un = cron_unconfigured_line(self.j.get("cron_binding"))
         if un:
             self.say(f"info: {un}")
@@ -3059,6 +3117,31 @@ class Gate:
         self.say(f"{self.pn('precheck')} info: {text}. An open OpenClaw issue reports the 512 MB SQLite worker of "
                  f"OpenClaw {self.pkg['version']} running out of memory on large Telegram direct-chat sessions "
                  "(openclaw/openclaw#191847)")
+        return None
+
+    def memory_remote_check(self):
+        """Precheck 11e (openclaw/openclaw#184966; WARN, never a HOLD): from 2026.11.3 an agent whose memory search
+        provider differs from the shared one no longer takes the shared memory.search.remote apiKey/headers when it
+        sets its own remote.baseUrl or the shared one is blank (memory-search.ts isSameMemorySearchProvider). Reads
+        openclaw.json in either shape (memory_remote_losses); prints agent ids and field names only, never a value.
+        Read-only; runtime_caps memory_remote_scoped."""
+        if not self.caps()["memory_remote_scoped"]:
+            return None
+        lost = memory_remote_losses(self.cfg)
+        if lost:
+            self.warn(f"{self.pn('precheck')} {memory_remote_text(lost, self.pkg['version'])}")
+        return None
+
+    def output_cap_info(self):
+        """Precheck 11f (openclaw/openclaw#193899, not in OpenClaw's changelog; information only): from 2026.11.3 a
+        model row of openclaw.json without maxTokens (row or provider level) gets an output cap sized from its context
+        window instead of 8192. Lists provider/model ids with their context window and both caps; no value of
+        anything else. Read-only; runtime_caps output_cap_raised."""
+        if not self.caps()["output_cap_raised"]:
+            return None
+        rows = output_cap_rows(self.cfg)
+        if rows:
+            self.say(f"{self.pn('precheck')} info: {output_cap_text(rows, self.pkg['version'])}")
         return None
 
     def phase_precheck(self):
@@ -3585,9 +3668,13 @@ class Gate:
         """Doctor pass 2/3: its own SQLite copies, and the Skill Workshop notes of a retirement that only finishes in
         a later pass (the other doctor notes come from pass 1 only)."""
         new = self.record_doctor_copies(n)
-        if new or "Saved pre-migration SQLite backup" in normalize_doctor_text(ev["text"]):
+        # R5: a cron repair doctor committed in this pass; a pre-repair recovery directory of another repair
+        cron = [e for e in new if e.get("scope") in ("cron", "recovery")]
+        if len(new) > len(cron) or "Saved pre-migration SQLite backup" in normalize_doctor_text(ev["text"]):
             self.warn(f"doctor pass {n} saved another pre-migration SQLite copy (doctor's own; not the rollback "
                       "point)")
+        if cron:
+            self.say(f"6/8 doctor pass {n}: {copies_text(cron)} (plaintext, not the rollback point)")
         notes = self.j.setdefault("doctor_notes", [])
         add = [x for x in doctor_notes(ev["text"], _SW_NOTE_RES) if x not in notes]
         if add:
@@ -4409,14 +4496,14 @@ CRON_MANUAL = "Manual alternative after the start: " + CRON_MANUAL_EDIT
 CRON_MANUAL_LAST = "Otherwise (last resort), after the start: " + CRON_MANUAL_EDIT
 CRON_ENV_REF = '{"source":"env","provider":"default","id":"<VAR>"}'
 # AWS SDK credentials are no stored account: model@profile cannot record them (prepare-auth.ts refuses an aws-sdk
-# profile as the job's account), and OpenClaw's own migration (2026.11.5) leaves such a job unbound as well.
+# profile as the job's account), and OpenClaw's own migration (2026.11.2) leaves such a job unbound as well.
 CRON_AWS_SDK = ("A model on AWS SDK credentials (models.providers.<provider>.auth \"aws-sdk\") cannot be recorded as "
-                "a job's account, also not by OpenClaw's own migration from 2026.11.5: after the start, give the job "
+                "a job's account, also not by OpenClaw's own migration from 2026.11.2: after the start, give the job "
                 "a model whose provider runs on a configured key (models.providers.<provider>.apiKey, an environment "
                 "variable or a SecretRef) or a local model: openclaw automations edit <id> --model <provider/model> "
                 "(for a fallback: --fallbacks <list> without it)")
 # a job whose own model needs no stored login and that stops at a fallback on one: no binding (model@profile would
-# make that fallback the job's model), and OpenClaw's own migration (2026.11.5) leaves the job unbound
+# make that fallback the job's model), and OpenClaw's own migration (2026.11.2) leaves the job unbound
 CRON_FALLBACK = ("For a job that only stops at a fallback, after the start: drop that fallback (openclaw automations "
                  "edit <id> --fallbacks <list> without it; the job's own list replaces the agent's and the default "
                  "fallbacks), or run that fallback's provider on a configured key (models.providers.<provider>.apiKey "
@@ -4467,7 +4554,7 @@ def _cron_key_fix(rec):
 
 
 def _cron_promise(aff, rec):
-    """Whose account OpenClaw's own migration records from 2026.11.5 (#172792), for the closing note: the jobs whose
+    """Whose account OpenClaw's own migration records from 2026.11.2 (#172792), for the closing note: the jobs whose
     own model is on a stored login that is no copy of a provider key. That migration resolves only the job's own model
     (inference-binding-migration.ts resolveCronModelSelection) and skips a job whose model runs on a configured key or
     needs none, so a job that only stops at a fallback stays unbound; it would bind a key-fix provider's jobs to
@@ -4488,22 +4575,52 @@ def _cron_promise(aff, rec):
     return "the jobs whose own model is on a stored login"
 
 
-def _cron_outlook(aff, rec):
-    """What OpenClaw's own migration (2026.11.5, #172792) will do for the affected jobs, as clauses for the closing
-    note and `oc-upgrade status`: the account of a job's own model is recorded, but a bound job's fallbacks to other
-    providers are refused (cron/run-inference.ts assertCandidate, as with model@profile: #192463); a job whose own
-    model needs no account stays unbound, and its fallback on a stored login stays refused (embedded runner
-    auth-plan.ts: an unbound cron attempt on a stored profile)."""
+def _cron_doctor_binds(aff):
+    """The affected entries OpenClaw's own migration (#172792, 2026.11.2+) records an account for: the jobs whose own
+    model is on a stored login (not on AWS SDK credentials), also one on doctor's copy of a literal key; it binds a job
+    only when exactly one account fits, and the gate reports the jobs doctor leaves after the migration."""
+    return [a for a in aff if a.get("primary_affected") and a.get("refs")
+            and a["refs"][0] not in (a.get("aws_sdk") or [])]
+
+
+CRON_BOUND_FALLBACKS = ("but then refuses their fallbacks to other providers (as with openclaw/openclaw#192463)")
+CRON_FB_ONLY = ("records only the account of a job's own model: a job whose own model needs no account stays "
+                "unbound, and its fallback on a stored login stays refused")
+
+
+def _cron_outlook(aff, rec, after=False):
+    """What OpenClaw's own migration (#172792) does for the affected jobs, as clauses for the closing note and
+    `oc-upgrade status`: the account of a job's own model is recorded, but a bound job's fallbacks to other providers
+    are refused (cron/run-inference.ts assertCandidate, as with model@profile: #192463); a job whose own model needs
+    no account stays unbound, and its fallback on a stored login stays refused (embedded runner auth-plan.ts: an
+    unbound cron attempt on a stored profile). On a runtime without that migration (2026.10.10, 2026.11.1) as an
+    outlook "from 2026.11.2"; on one with it (rec "doctor_migration") for this runtime's doctor, and `after` (the
+    report after the migration): the jobs on a stored login that are still listed are the ones doctor left."""
+    rt = printable((rec or {}).get("runtime") or "2026.11.2+")
+    fb = bool(_cron_fallback_only(aff))
+    if (rec or {}).get("doctor_migration"):
+        out = []
+        prim = [a for a in aff if a.get("primary_affected")] if after else _cron_doctor_binds(aff)
+        if after and not fb:  # also a job on AWS SDK credentials: doctor warns that it records no ambient credential
+            return [f"OpenClaw {rt} doctor left them (its warnings are in oc-upgrade log)"]
+        if prim and after:
+            out.append(f"OpenClaw {rt} doctor left the jobs whose own model is refused (its warnings are in "
+                       "oc-upgrade log)")
+        elif prim:
+            who = "such jobs" if len(prim) == len(aff) else "the jobs whose own model is on a stored login"
+            out.append(f"OpenClaw {rt} doctor records the inference account of {who} during the migration "
+                       f"(openclaw/openclaw#172792) when exactly one account fits, {CRON_BOUND_FALLBACKS}")
+        if fb:
+            out.append(f"OpenClaw {rt} doctor {CRON_FB_ONLY}")
+        return out
     who = _cron_promise(aff, rec)
     out = []
     if who:
-        out.append(f"OpenClaw records the inference account of {who} itself from 2026.11.5 (doctor migration, "
-                   "openclaw/openclaw#172792), but then refuses their fallbacks to other providers (as with "
-                   "openclaw/openclaw#192463)")
-    if _cron_fallback_only(aff):
-        out.append("OpenClaw's own migration" + ("" if who else " (2026.11.5, openclaw/openclaw#172792)")
-                   + " records only the account of a job's own model: a job whose own model needs no account stays "
-                   "unbound, and its fallback on a stored login stays refused")
+        out.append(f"OpenClaw records the inference account of {who} itself from 2026.11.2 (doctor migration, "
+                   f"openclaw/openclaw#172792), {CRON_BOUND_FALLBACKS}")
+    if fb:
+        out.append("OpenClaw's own migration" + ("" if who else " (2026.11.2, openclaw/openclaw#172792)")
+                   + " " + CRON_FB_ONLY)
     return out
 
 
@@ -4784,11 +4901,112 @@ def cron_account_report(state_dir, cfg, runtime=None, doctor_migration=False, pe
     for k in rec["key_fix"]:
         if k["provider"] in own:
             k["own_login"] = True
+    if doctor_migration and not pending_copies:  # R6: after a 2026.11.2+ doctor, the gateway's startup warning
+        lw = cron_load_warn_jobs(jobs, cfg, profiles_for, default_agent_id(cfg), configured)
+        if lw:
+            rec["load_warn"] = [dict(a, id=str(a["id"])[:120], name=C.redact_text(str(a["name"]))[:120])
+                                for a in lw[:CRON_REPORT_MAX]]
+            rec["load_warn_count"] = len(lw)
     # $include: the report reads only openclaw.json itself (cron_include_line); only when there are jobs to check
     inc = mig().include_paths(cfg)
     if inc and (fc["checked"] or fc["unconfigured"]):
         rec["include"] = [str(x)[:120] for x in inc[:4]]
     return rec
+
+
+# CLI runtime providers (cli-backends.ts listCliRuntimeProviderIds; the retired codex-cli too): the gateway's cron
+# warning skips them
+CRON_CLI_PROVIDERS = frozenset({"claude-cli", "google-gemini-cli", "codex-cli"})
+
+
+def _synthetic_local_provider(entry):
+    """OpenClaw's hasSyntheticLocalProviderAuthConfig (model-auth-provider-config.ts) for a models.providers entry:
+    a non-blank api and a local baseUrl, no explicit apiKey, auth unset or "api-key" (the gateway's cron warning skips
+    such a keyless local route)."""
+    if not isinstance(entry, dict) or entry.get("auth") not in (None, "api-key"):
+        return False
+    key = entry.get("apiKey")
+    if (isinstance(key, str) and key.strip()) or mig().is_secret_ref(key):
+        return False
+    api = entry.get("api")
+    return isinstance(api, str) and bool(api.strip()) and mig()._local_base_url(entry.get("baseUrl"))
+
+
+def cron_load_warn_jobs(jobs, cfg, profiles_for, default_agent="main", configured=None):
+    """R6: the cron jobs OpenClaw 2026.11.2+ warns about at every gateway start and cron reload ("cron: automation has
+    no recorded inference account; run openclaw doctor --fix ...", gateway/server-cron-inference.ts) although its
+    doctor leaves them unbound on purpose: agentTurn jobs, enabled or not, with no session target "main", no recorded
+    inference account and no runtime authority, whose own model (cron_model_chain) needs no stored login
+    (oc_migrate.cron_ref_refusal None; doctor's inference-binding migration skips a configured-key or environment
+    route) and is neither on a CLI runtime provider nor on a keyless local provider (_synthetic_local_provider: the
+    warning skips those). "key": "config" when the provider has an explicit models.providers.<p>.apiKey (any
+    non-blank value or a SecretRef), else "env": the key can only come from the gateway's environment (a
+    gateway_env_vars entry such as OPENAI_API_KEY), which a gate run cannot see; without it the job has no credential.
+    Read from openclaw.json only; not modelled: native runtimes. [{"id", "name", "enabled", "provider", "key"}]."""
+    M = mig()
+    provs = _cfg_get(cfg, "models", "providers")
+    out = []
+    for row in jobs or []:
+        job = row.get("job")
+        if not isinstance(job, dict) or row.get("runtime_authority") or row.get("retired_review"):
+            continue
+        payload = job.get("payload") if isinstance(job.get("payload"), dict) else {}
+        if payload.get("kind") != "agentTurn" or job.get("sessionTarget") == "main" \
+                or job.get("inferenceBinding") or job.get("authProfileBinding"):
+            continue
+        agent = M.cron_job_agent(job, default_agent)
+        if configured is not None and agent not in configured:  # reported by cron_unconfigured_line
+            continue
+        primary = M.cron_model_chain(job, cfg, agent)[0]
+        r = M.cron_model_ref(cfg, primary) if primary else None
+        if r is None or r[2]:  # an explicit @profile is a stored login: doctor records it or warns itself
+            continue
+        entry = next((v for k, v in provs.items() if isinstance(k, str) and k.strip().lower() == r[0]
+                      and isinstance(v, dict)), None) if isinstance(provs, dict) else None
+        if M.cron_ref_refusal(cfg, r[0], None, profiles_for(agent)) is not None:
+            continue  # a stored login (or AWS SDK) comes first: doctor records it (or says why not), the forecast reports it
+        key = entry.get("apiKey") if entry else None
+        if (isinstance(key, str) and key.strip()) or M.is_secret_ref(key):
+            kind = "config"
+        elif r[0] in CRON_CLI_PROVIDERS or _synthetic_local_provider(entry):
+            continue
+        else:
+            kind = "env"
+        out.append({"id": row.get("id"), "name": row.get("name"), "enabled": bool(row.get("enabled")),
+                    "provider": r[0], "key": kind})
+    return out
+
+
+def cron_load_warn_line(rec):
+    """R6: the info text for a cron_account_report record of a 2026.11.2+ runtime after the migration whose jobs
+    run their own model on a configured key or a key from the environment (load_warn), or None. Job ids, names and
+    provider ids only (never a variable's value; the gate cannot see whether it is set)."""
+    lw = [a for a in (rec or {}).get("load_warn") or [] if isinstance(a, dict)]
+    if not lw:
+        return None
+    n = (rec or {}).get("load_warn_count") or len(lw)
+    rt = printable((rec or {}).get("runtime") or "2026.11.2+")
+    off = sum(1 for a in lw if not a.get("enabled"))
+    more = f" and {n - len(lw)} more" if n > len(lw) else ""
+
+    def provs(env):
+        return ", ".join(dict.fromkeys(printable(a.get("provider")) for a in lw if (a.get("key") == "env") == env))
+    where = [x for x in (f"a configured key ({provs(False)}: models.providers.<provider>.apiKey)" if provs(False)
+                         else "",
+                         f"a key from the environment ({provs(True)}: a gateway_env_vars entry such as OPENAI_API_KEY "
+                         "or GEMINI_API_KEY)" if provs(True) else "") if x]
+    env_note = (" For the jobs on a key from the environment this holds only while that variable is set for the "
+                "gateway (a gate run cannot check it): without it they have no credential and fail when they run."
+                if provs(True) else "")
+    return (f"{n} cron job(s){f' ({off} of them disabled)' if off else ''} run their own model on "
+            + " or on ".join(where)
+            + f" and have no recorded inference account: OpenClaw {rt} doctor leaves "
+            "such jobs unbound on purpose, but its gateway logs 'cron: automation has no recorded inference account; "
+            "run openclaw doctor --fix before its next scheduled run ...' for each of them at every start and cron "
+            "reload. Expected and harmless for their own model, which runs on that key; nothing to do (a fallback "
+            "on a stored login that stays refused is reported separately)." + env_note + " The add-on refuses "
+            "openclaw doctor --fix, and its equivalent oc-upgrade retry --doctor would not record an account for these "
+            "jobs either: " + ", ".join(cron_job_label(a) for a in lw) + more)
 
 
 def cron_job_label(a):
@@ -4847,10 +5065,49 @@ def cron_include_line(rec):
             "stored login of its own this sets that login aside for every run, not only for cron)")
 
 
-def cron_job_lines(rec, fixup=False):
+def cron_doctor_binds_text(binds, rec, runtime):
+    """Precheck info text on a 2026.11.2+ runtime (cron_doctor_migration) for the affected jobs whose own model is on a
+    stored login (_cron_doctor_binds): doctor records that account during the migration when exactly one fits, and a
+    bound job's fallbacks to other providers are refused from then on (job ids, names and model refs only)."""
+    rt = printable(runtime or "2026.11.2+")
+    jobs = ", ".join(cron_job_label(a) for a in binds[:CRON_REPORT_MAX])
+    more = f" and {len(binds) - CRON_REPORT_MAX} more" if len(binds) > CRON_REPORT_MAX else ""
+    copied = sorted(printable(x) for x in cron_doctor_binds_keyed(binds, rec))
+    return (f"{len(binds)} enabled cron job(s) without a recorded inference account run their own model on a stored "
+            f"login: {jobs}{more}; OpenClaw {rt} doctor records that account during the migration when exactly one "
+            f"fits (openclaw/openclaw#172792), {CRON_BOUND_FALLBACKS}"
+            + (f"; for {', '.join(copied)} that account would be doctor's copy of the literal key (the provider line "
+               "below says how to keep that key configured instead)" if copied else "")
+            + "; the gate reports the jobs doctor leaves after the migration")
+
+
+def cron_doctor_rest(rec):
+    """The part of a precheck cron_account_report record a 2026.11.2+ doctor leaves (None when nothing is left): the
+    jobs whose own model needs no stored login and that stop at a fallback on one, and the jobs on AWS SDK
+    credentials; with the key fix entries of the providers those jobs reach."""
+    binds = _cron_doctor_binds((rec or {}).get("affected") or [])
+    rest = [a for a in (rec or {}).get("affected") or [] if all(a is not b for b in binds)]
+    if not rest:
+        return None
+    provs = {str(r).split("/", 1)[0] for a in rest for r in a.get("refs") or [] if "/" in str(r)}
+    provs |= cron_doctor_binds_keyed(binds, rec)
+    return dict(rec, affected=rest, key_fix=[k for k in rec.get("key_fix") or []
+                                             if isinstance(k, dict) and k.get("provider") in provs])
+
+
+def cron_doctor_binds_keyed(binds, rec):
+    """The key fix providers (cron_account_report key_fix) on which jobs of _cron_doctor_binds run their own model:
+    the account doctor would record is its copy of that provider's literal key."""
+    keyed = _cron_key_fix(rec)
+    return {str(a["refs"][0]).split("/", 1)[0] for a in binds
+            if "/" in str(a["refs"][0]) and str(a["refs"][0]).split("/", 1)[0] in keyed}
+
+
+def cron_job_lines(rec, fixup=False, forecast=False):
     """Per-job WARN texts of a cron_account_report record, the key fix lines, then the closing note (empty when
     none). fixup: the lines above name a config fixup of this run (planned or made), which the closing note
-    excepts."""
+    excepts. forecast: the precheck report of a 2026.11.2+ runtime (doctor has not run yet; the record holds only the
+    jobs doctor leaves, cron_doctor_rest)."""
     aff = (rec or {}).get("affected") or []
     if not aff:
         return []
@@ -4900,9 +5157,10 @@ def cron_job_lines(rec, fixup=False):
         lines.append(f"and {len(aff) - CRON_REPORT_MAX} more cron job(s) (oc-upgrade status)")
     lines += cron_key_fix_lines(rec)
     remedy = _cron_remedy(aff, bool(keyed))
-    if rec.get("doctor_migration"):
+    if rec.get("doctor_migration") and not forecast:
+        left = _cron_outlook(aff, rec, after=True)
         lines.append(f"{len(aff)} cron job(s) above still have no recorded inference account after the migration: "
-                     f"OpenClaw {rt} doctor left them (its warnings are in oc-upgrade log). {remedy}")
+                     + "; ".join(left) + f". {remedy}")
     else:
         lines.append(f"{len(aff)} cron job(s) above: the add-on changes nothing for these jobs"
                      + (" apart from the config fixup above" if fixup else "")
@@ -5031,14 +5289,18 @@ def cron_fixup_kept_text(kept, fix, runtime):
             f"pass 1; otherwise OpenClaw {runtime} refuses {models} on doctor's copy of the literal key): {jobs}{more}")
 
 
-def cron_fixup_behind_text(behind):
+def cron_fixup_behind_text(behind, bound=()):
     """Info text: the cron jobs that reach a model the automatic fix covers only after a fallback that stays refused,
-    so the fix does not keep them working (job id, name and model refs only)."""
+    so the fix does not keep them working (job id, name and model refs only). bound: the ids of those jobs whose own
+    model doctor binds on a 2026.11.2+ runtime (the precheck's info line covers them, not a WARN line)."""
     models = ", ".join(dict.fromkeys(printable(r) for _a, refs in behind for r in refs))
     jobs = ", ".join(cron_job_label(a) for a, _r in behind[:CRON_REPORT_MAX])
     more = f" and {len(behind) - CRON_REPORT_MAX} more" if len(behind) > CRON_REPORT_MAX else ""
-    return (f"{len(behind)} enabled cron job(s) reach {models} only after a fallback that stays refused (the WARN "
-            f"lines below): the automatic fix covers that model, but the job stops before it: {jobs}{more}")
+    nb = sum(1 for a, _r in behind if a.get("id") in set(bound or ()))
+    where = ("the WARN lines below" if not nb else "the info line below on the jobs doctor binds" if nb == len(behind)
+             else "the WARN lines and the info line below")
+    return (f"{len(behind)} enabled cron job(s) reach {models} only after a fallback that stays refused ({where}): "
+            f"the automatic fix covers that model, but the job stops before it: {jobs}{more}")
 
 
 def _fixup_pass(phase):
@@ -5102,6 +5364,161 @@ def cron_fixup_done_lines(j, cfg=None):
                        f"key, so its unbound cron runs on {p} are not refused on doctor's copy ({CRON_FIXUP_ISSUE}); "
                        "transform-ledger.json step C1")
     return out
+
+
+# --- memory search remote inheritance (R7, openclaw/openclaw#184966) and output caps (R8, #193899) ------------
+
+_MS_BLOCKED = ("__proto__", "prototype", "constructor")
+
+
+def _merge_missing(target, source):
+    """OpenClaw's mergeMissing (config/merge-missing.ts): the keys of `source` that `target` lacks (a JSON null counts
+    as set), recursively into records both have; `target` is changed, `source` is not."""
+    for k, v in source.items():
+        if k in _MS_BLOCKED:
+            continue
+        if k not in target:
+            target[k] = json.loads(json.dumps(v))
+        elif isinstance(target[k], dict) and isinstance(v, dict):
+            _merge_missing(target[k], v)
+    return target
+
+
+def memory_search_scopes(cfg):
+    """(shared memory search, [(agent id, its memory search)]) of openclaw.json as OpenClaw 2026.11.x reads it after
+    doctor's memorySearch -> memory.search migration (legacy-config-migrations.runtime.agents.ts, mergeMissing: the
+    explicit memory.search values win): shared = memory.search + agents.defaults.memorySearch + memorySearch; per
+    agent of agents.entries (or agents.list without entries) its memory.search + memorySearch. A 2026.10.4 config
+    (agents.defaults.memorySearch, agents.list[].memorySearch) and a migrated one give the same result."""
+    cfg = cfg if isinstance(cfg, dict) else {}
+    shared = {}
+    for src in (_cfg_get(cfg, "memory", "search"), _cfg_get(cfg, "agents", "defaults", "memorySearch"),
+                cfg.get("memorySearch")):
+        if isinstance(src, dict):
+            _merge_missing(shared, src)
+    agents = cfg.get("agents") if isinstance(cfg.get("agents"), dict) else {}
+    if isinstance(agents.get("entries"), dict):
+        roster = [(k, v) for k, v in agents["entries"].items() if isinstance(v, dict) and k not in _MS_BLOCKED]
+    elif isinstance(agents.get("list"), list):
+        roster = [(v.get("id"), v) for v in agents["list"] if isinstance(v, dict) and isinstance(v.get("id"), str)
+                  and v.get("id") not in _MS_BLOCKED]
+    else:
+        roster = []
+    out = []
+    for aid, entry in roster:
+        ms = {}
+        for src in (_cfg_get(entry, "memory", "search"), entry.get("memorySearch")):
+            if isinstance(src, dict):
+                _merge_missing(ms, src)
+        if ms:
+            out.append((str(aid), ms))
+    return shared, out
+
+
+def _ms_provider(value):
+    """isSameMemorySearchProvider's canonical id (memory-search.ts, 2026.11.3): trimmed and lower-cased; "none" in
+    any case; blank, unset or "auto" mean openai; google is gemini."""
+    v = value.strip().lower() if isinstance(value, str) else ""
+    if v == "none":
+        return "none"
+    v = v if v and v != "auto" else "openai"
+    return "gemini" if v == "google" else v
+
+
+def memory_remote_losses(cfg):
+    """[(agent id, ["remote.apiKey", "remote.headers"])]: the agents that OpenClaw 2026.11.3+ no longer gives the
+    shared memory.search.remote fields they took before (#184966). An agent loses a field when all of these hold:
+    its memory search is enabled; it sets its own provider, which differs canonically from the shared one
+    (_ms_provider) and is not "none"; the shared remote sets that field (a non-blank apiKey or a SecretRef, a non-empty
+    headers record); the agent does not set it; the agent sets its own remote.baseUrl (any value, also "" or null), or
+    the shared remote.baseUrl is unset or blank. Names only, never a value."""
+    shared, agents = memory_search_scopes(cfg)
+    d_remote = shared.get("remote") if isinstance(shared.get("remote"), dict) else None
+    if d_remote is None:
+        return []
+    have = [f for f, ok in (("apiKey", (isinstance(d_remote.get("apiKey"), str) and d_remote["apiKey"].strip())
+                                       or isinstance(d_remote.get("apiKey"), dict)),
+                            ("headers", isinstance(d_remote.get("headers"), dict) and bool(d_remote["headers"])))
+            if ok]
+    if not have:
+        return []
+    shared_base = isinstance(d_remote.get("baseUrl"), str) and bool(d_remote["baseUrl"].strip())
+    out = []
+    for aid, ms in agents:
+        enabled = next((v for v in (ms.get("enabled"), shared.get("enabled")) if v is not None), True)
+        if not enabled or ms.get("provider") is None:
+            continue
+        prov = _ms_provider(ms["provider"])
+        if prov == "none" or prov == _ms_provider(shared.get("provider")):
+            continue
+        o_remote = ms.get("remote") if isinstance(ms.get("remote"), dict) else {}
+        if "baseUrl" not in o_remote and shared_base:
+            continue  # still inherits the whole shared remote
+        lost = [f"remote.{f}" for f in have if o_remote.get(f) is None]
+        if lost:
+            out.append((aid, lost))
+    return out
+
+
+def memory_remote_text(lost, runtime):
+    """The precheck WARN text for memory_remote_losses (agent ids and field names only)."""
+    agents = "; ".join(f"agent {printable(aid)[:80]}: {', '.join(fields)}" for aid, fields in lost[:CRON_REPORT_MAX])
+    more = f"; and {len(lost) - CRON_REPORT_MAX} more" if len(lost) > CRON_REPORT_MAX else ""
+    return (f"memory search: OpenClaw {printable(runtime)} no longer gives an agent whose memory search provider "
+            "differs from the shared one (memory.search.provider) the shared memory.search.remote apiKey/headers when "
+            "the agent sets its own remote.baseUrl or the shared remote.baseUrl is empty (openclaw/openclaw#184966). "
+            f"{len(lost)} agent(s) lose shared fields: {agents}{more}. If its provider needs a credential, without its own such an agent's "
+            "memory embeddings fail: give it its own memory search remote apiKey/headers (in its agent entry in "
+            "openclaw.json) or a key for its provider in models.providers.<provider>; if it relied on shared headers "
+            "that are no credential, rebuild its memory index afterwards (openclaw memory index --force). The "
+            "migration continues")
+
+
+def _pos_num(v):
+    return v if isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v) and v > 0 else None
+
+
+def output_cap_rows(cfg):
+    """[{"ref", "window", "tokens", "old", "new"}] for each model row of openclaw.json (models.providers.<p>.models[])
+    with no maxTokens of its own and no provider-level maxTokens: its output cap before 2026.11.3, min(8192, window),
+    and from 2026.11.3, min(32768, max(min(8192, W), floor(W/2))) with W = min(contextTokens or window, window)
+    (config/defaults.ts, agents/defaults.ts resolveDefaultModelMaxTokens; window = contextWindow, else 200000).
+    A model OpenClaw's own catalog knows keeps the catalog's maxTokens (not modelled). Ids and numbers only."""
+    provs = _cfg_get(cfg if isinstance(cfg, dict) else {}, "models", "providers")
+    out = []
+    for p, pc in sorted(provs.items()) if isinstance(provs, dict) else []:
+        if not isinstance(pc, dict) or not isinstance(p, str) or _pos_num(pc.get("maxTokens")) is not None:
+            continue
+        for row in pc.get("models") if isinstance(pc.get("models"), list) else []:
+            if not isinstance(row, dict) or not isinstance(row.get("id"), str) or \
+                    _pos_num(row.get("maxTokens")) is not None:
+                continue
+            win = _pos_num(row.get("contextWindow"))
+            ctx = _pos_num(row.get("contextTokens"))
+            w = win or 200000
+            eff = max(1, math.floor(min(ctx or w, w)))
+            out.append({"ref": f"{p.strip()}/{row['id'].strip()}", "window": win, "tokens": ctx,
+                        "old": int(min(8192, w)), "new": int(min(32768, max(min(8192, eff), eff // 2)))})
+    return out
+
+
+def output_cap_text(rows, runtime):
+    """The precheck info text for output_cap_rows (provider/model ids and numbers only)."""
+    def num(x):
+        return str(int(x)) if float(x).is_integer() else str(x)
+
+    def one(r):
+        win = (f"contextWindow {num(r['window'])}" if r["window"] else "no contextWindow, so 200000 is assumed") \
+            + (f", contextTokens {num(r['tokens'])}" if r["tokens"] else "")
+        cap = f"{r['old']} -> {r['new']}" if r["new"] != r["old"] else f"{r['new']}, unchanged"
+        return f"{printable(r['ref'])[:120]} ({win}; output cap {cap})"
+    shown = ", ".join(one(r) for r in rows[:CRON_REPORT_MAX])
+    more = f" and {len(rows) - CRON_REPORT_MAX} more" if len(rows) > CRON_REPORT_MAX else ""
+    return (f"model output caps: OpenClaw {printable(runtime)} gives a model row without maxTokens (row or provider "
+            "level) an output cap of min(32768, max(8192, window/2)) instead of 8192 (openclaw/openclaw#193899; a "
+            "window under 8192 stays the cap): " + shown + more + ". A model OpenClaw's own catalog knows keeps the "
+            "catalog's limit. For a local server, set contextWindow (and maxTokens, if it limits the output) to its "
+            "real limits")
 
 
 def _db_bytes(pth):
@@ -5649,20 +6066,71 @@ def sw_export_record(gp, run_id):
         else None
 
 
-# --- doctor's pre-migration SQLite copies (*.pre-startup-migration-*.bak / .scoped.bak) ---------
+# --- doctor's pre-migration SQLite copies (*.pre-startup-migration-*.bak / .scoped.bak) and pre-repair cron
+# backups of the state database (state/openclaw.sqlite.doctor-cron-*.bak, R5) ---------
+
+def doctor_copy_kind(name):
+    """"full" | "scoped" for doctor's pre-migration SQLite copies, "cron" for its pre-repair cron backups of the
+    state database (DOCTOR_CRON_COPY_RE), else None."""
+    if DOCTOR_COPY_RE.fullmatch(name):
+        return "scoped" if name.endswith(".scoped.bak") else "full"
+    return "cron" if DOCTOR_CRON_COPY_RE.fullmatch(name) else None
+
+
+def doctor_cron_copy_ms(name):
+    """The creation time (ms since the epoch) in the name of a pre-repair cron backup, else None."""
+    m = DOCTOR_CRON_COPY_RE.fullmatch(name)
+    return int(m.group(1).split("-", 1)[0]) if m else None
+
+
+def _made_since(path, since):
+    """True when `path` (lstat, a link is not followed) was modified at or after the datetime `since` (1 s slack)."""
+    try:
+        return since is not None and os.lstat(path).st_mtime >= since.timestamp() - 1
+    except (OSError, OverflowError, ValueError):
+        return False
+
+
+def doctor_recovery_size(path):
+    """The bytes of doctor's regular files in a pre-repair recovery directory (DOCTOR_RECOVERY_FILES), None when
+    `path` is no real directory (a link is never followed) or cannot be read. Other entries are not counted; the
+    delete refuses a directory that holds any (_delete_recovery_dir)."""
+    try:
+        if not stat.S_ISDIR(os.lstat(path).st_mode):
+            return None
+        total = 0
+        with os.scandir(path) as it:
+            for e in it:
+                st = e.stat(follow_symlinks=False)
+                if e.name in DOCTOR_RECOVERY_FILES and stat.S_ISREG(st.st_mode):
+                    total += st.st_size
+        return total
+    except OSError:
+        return None
+
 
 def doctor_copies(state_dir):
-    """{state-relative path: (size, "full" | "scoped")} of doctor's SQLite copies below the state dir (regular files
-    only; links are not followed). The walk runs beside the gateway (cleanup loop): a directory that vanishes or
-    cannot be read during it is skipped (os.walk without onerror), never an error that would hold back the rest of
-    a run's cleanup (Path.rglob raises FileNotFoundError for it on Python 3.11)."""
+    """{state-relative path: (size, "full" | "scoped" | "cron" | "recovery")} of doctor's SQLite copies below the
+    state dir (regular files only; links are not followed): the pre-migration copies and the pre-repair cron backups
+    of the state database (doctor_copy_kind), and doctor's pre-repair recovery directories (DOCTOR_RECOVERY_DIR_RE,
+    real directories beside a *.sqlite database; never walked into). The walk runs beside the gateway (cleanup loop):
+    a directory that vanishes or cannot be read during it is skipped (os.walk without onerror), never an error that
+    would hold back the rest of a run's cleanup (Path.rglob raises FileNotFoundError for it on Python 3.11)."""
     state_dir = Path(state_dir)
     found = {}
     if not state_dir.is_dir():
         return found
-    for root, _dirs, files in os.walk(state_dir, followlinks=False):
+    for root, dirs, files in os.walk(state_dir, followlinks=False):
+        rec = [d for d in dirs if DOCTOR_RECOVERY_DIR_RE.fullmatch(d)]
+        if rec:
+            dirs[:] = [d for d in dirs if d not in rec]
+            for d in rec if any(f.endswith(".sqlite") for f in files) else []:
+                size = doctor_recovery_size(Path(root) / d)
+                if size is not None:
+                    found[C.rel(Path(root) / d, state_dir)] = (size, "recovery")
         for name in files:
-            if not DOCTOR_COPY_RE.fullmatch(name):
+            kind = doctor_copy_kind(name)
+            if kind is None:
                 continue
             pth = Path(root) / name
             try:
@@ -5670,7 +6138,7 @@ def doctor_copies(state_dir):
             except OSError:
                 continue
             if stat.S_ISREG(st.st_mode):
-                found[C.rel(pth, state_dir)] = (st.st_size, "scoped" if name.endswith(".scoped.bak") else "full")
+                found[C.rel(pth, state_dir)] = (st.st_size, kind)
     return found
 
 
@@ -5805,8 +6273,9 @@ def outside_agent_dirs(state_dir, cfg):
 
 
 def outside_doctor_copies(dirs):
-    """{absolute path: (size, "full" | "scoped")} of doctor's SQLite copies directly in `dirs` (no recursion; regular
-    files only, links are not followed)."""
+    """{absolute path: (size, "full" | "scoped" | "recovery")} of doctor's SQLite copies directly in `dirs` (no
+    recursion; regular files only, links are not followed), and its pre-repair recovery directories there (real
+    directories only)."""
     found = {}
     for d in dirs:
         try:
@@ -5815,6 +6284,11 @@ def outside_doctor_copies(dirs):
         except OSError:
             continue
         for name, pth in entries:
+            if DOCTOR_RECOVERY_DIR_RE.fullmatch(name):
+                size = doctor_recovery_size(pth)
+                if size is not None:
+                    found[pth] = (size, "recovery")
+                continue
             if not DOCTOR_COPY_RE.fullmatch(name):
                 continue
             try:
@@ -5842,21 +6316,37 @@ def outside_copies_text(paths, state_dir):
     """The WARN text for doctor's SQLite copies beside agent databases outside the state dir: the add-on never
     deletes them (its deletes stay below the state dir)."""
     it = "it" if len(paths) == 1 else "them"
-    return (f"{len(paths)} pre-migration SQLite cop{'y' if len(paths) == 1 else 'ies'} by doctor beside agent "
+    kind = "SQLite" if any(DOCTOR_RECOVERY_DIR_RE.fullmatch(os.path.basename(str(x))) for x in paths) \
+        else "pre-migration SQLite"
+    return (f"{len(paths)} {kind} cop{'y' if len(paths) == 1 else 'ies'} by doctor beside agent "
             f"databases outside {state_dir} (plaintext, not the rollback point; the add-on does not delete {it}): "
             f"delete {it} yourself once the update is confirmed: " + ", ".join(printable(x) for x in paths[:4])
             + (" …" if len(paths) > 4 else ""))
 
 
 def copies_text(entries):
-    """'2 full and 1 table-scoped pre-migration SQLite copies by doctor, 1.2 GiB' for journal entries."""
-    nf = sum(1 for e in entries if e.get("scope") != "scoped")
-    ns = len(entries) - nf
+    """'2 full and 1 table-scoped pre-migration SQLite copies by doctor, 1.2 GiB' for journal entries; with
+    pre-repair cron backups (scope "cron") '1 full pre-migration SQLite copy and 1 pre-repair cron backup of the
+    state database by doctor, 1.2 GiB'; with pre-repair recovery directories (scope "recovery") '… and 1 pre-repair
+    recovery directory with a full database copy by doctor, …'."""
     if not entries:
         return "no new pre-migration SQLite copy by doctor"
-    kinds = " and ".join(x for x in (f"{nf} full" if nf else "", f"{ns} table-scoped" if ns else "") if x)
-    return (f"{kinds} pre-migration SQLite cop{'y' if len(entries) == 1 else 'ies'} by doctor, "
-            f"{C.human(sum(int(e.get('size') or 0) for e in entries))}")
+    mig_ = [e for e in entries if e.get("scope") not in ("cron", "recovery")]
+    nc = sum(1 for e in entries if e.get("scope") == "cron")
+    nr = sum(1 for e in entries if e.get("scope") == "recovery")
+    nf = sum(1 for e in mig_ if e.get("scope") != "scoped")
+    ns = len(mig_) - nf
+    parts = []
+    if mig_:
+        kinds = " and ".join(x for x in (f"{nf} full" if nf else "", f"{ns} table-scoped" if ns else "") if x)
+        parts.append(f"{kinds} pre-migration SQLite cop{'y' if len(mig_) == 1 else 'ies'}")
+    if nc:
+        parts.append(f"{nc} pre-repair cron backup{'' if nc == 1 else 's'} of the state database")
+    if nr:
+        parts.append("1 pre-repair recovery directory with a full database copy" if nr == 1 else
+                     f"{nr} pre-repair recovery directories with full database copies")
+    what = parts[0] if len(parts) == 1 else ", ".join(parts[:-1]) + " and " + parts[-1]
+    return f"{what} by doctor, {C.human(sum(int(e.get('size') or 0) for e in entries))}"
 
 
 def _doctor_copy_parts(state_real, path):
@@ -5866,22 +6356,42 @@ def _doctor_copy_parts(state_real, path):
     if not os.path.isabs(p) or not p.startswith(root):
         return None
     parts = p[len(root):].split("/")
-    if any(x in ("", ".", "..") for x in parts) or not DOCTOR_COPY_RE.fullmatch(parts[-1]):
+    if any(x in ("", ".", "..") for x in parts) or (doctor_copy_kind(parts[-1]) is None
+                                                    and not DOCTOR_RECOVERY_DIR_RE.fullmatch(parts[-1])):
         return None
     return parts
 
 
+def _flat_doctor_text(text):
+    return re.sub(r"\s+", "", BOX_RE.sub("", ANSI_RE.sub("", text or "")))
+
+
 def doctor_copy_groups(text):
     """The backup group ids of the copies one doctor log says it saved or reused."""
-    flat = re.sub(r"\s+", "", BOX_RE.sub("", ANSI_RE.sub("", text or "")))
-    return set(SAVED_COPY_ID_RE.findall(flat))
+    return set(SAVED_COPY_ID_RE.findall(_flat_doctor_text(text)))
+
+
+def doctor_cron_copy_ids(text):
+    """The <ms>-<uuid> ids of the pre-repair cron backups one doctor log says it saved (or kept after a failed
+    repair)."""
+    return set(SAVED_CRON_COPY_ID_RE.findall(_flat_doctor_text(text)))
+
+
+def doctor_recovery_dirs(text):
+    """The names of the pre-repair recovery directories one doctor log says it saved (or kept after a failed
+    repair)."""
+    return set(SAVED_RECOVERY_DIR_RE.findall(_flat_doctor_text(text)))
 
 
 def run_doctor_copies(gp, j, present=None):
     """Doctor's pre-migration SQLite copies a gate run created: the copies the run journaled per doctor pass (this
     version) and every copy of a backup group its doctor logs say they saved or reused ("Saved pre-migration SQLite
-    backup: …", also in the runs of earlier add-on versions). Like the doctor captures they are plaintext copies of the
-    databases, so the owner's rule applies: they go gate_cleanup_hours after the run (the encrypted Home Assistant
+    backup: …", also in the runs of earlier add-on versions); likewise doctor's pre-repair cron backups of the state
+    database the run journaled or its doctor logs name ("Saved pre-repair cron backup: …", also from a pass the gate
+    was stopped in, and in the runs of earlier add-on versions), and its pre-repair recovery directories the run
+    journaled or its doctor logs name ("Saved pre-repair SQLite backup: …", "backup and row export: …", likewise).
+    Like the doctor captures they are plaintext copies of
+    the databases, so the owner's rule applies: they go gate_cleanup_hours after the run (the encrypted Home Assistant
     backup is the rollback point). Only regular files below the state dir with doctor's name pattern (doctor_copies,
     `present` when the caller listed them already); copies already gone are skipped. Returns (paths, kept): kept
     lists the copies the run journaled beside agent databases outside the state dir, which are reported only."""
@@ -5891,14 +6401,24 @@ def run_doctor_copies(gp, j, present=None):
         for e in (d.get("pre_migration_backups") or []) if isinstance(d, dict) else []:
             if isinstance(e, dict) and e.get("scope") and isinstance(e.get("path"), str):
                 want.add(e["path"])
-    groups = set()
+    groups, cron_ids, rec_dirs = set(), set(), set()
     for log in sorted((gp["RUNS"] / str(j.get("run_id"))).glob("doctor-pass*.log")):
         try:
-            groups |= doctor_copy_groups(log.read_bytes().decode("utf-8", "replace"))
+            text = log.read_bytes().decode("utf-8", "replace")
         except OSError:
             continue
-    if groups:
-        want |= {r for r in present if DOCTOR_COPY_RE.fullmatch(Path(r).name).group(1) in groups}
+        groups |= doctor_copy_groups(text)
+        cron_ids |= doctor_cron_copy_ids(text)  # R5: also a pass the gate was stopped in (no journal record)
+        rec_dirs |= doctor_recovery_dirs(text)
+    for r, (_size, kind) in present.items():
+        if kind == "recovery" and Path(r).name in rec_dirs:
+            want.add(r)
+        m = DOCTOR_COPY_RE.fullmatch(Path(r).name)
+        if m and m.group(1) in groups:
+            want.add(r)
+        c = DOCTOR_CRON_COPY_RE.fullmatch(Path(r).name)
+        if c and c.group(1) in cron_ids:
+            want.add(r)
     state_real = Path(os.path.realpath(str(gp["STATE"])))
     kept = [(x, f"beside an agent database outside {gp['STATE']}: not deleted by the add-on, delete it yourself")
             for x in run_outside_copies(j)]
@@ -6606,10 +7126,21 @@ def _readiness_cron(g):
         return lines
     aff = rec["affected"]
     n, rt, on = len(aff), g.pkg["version"], _cron_on(aff)
-    if rec.get("doctor_migration"):
-        which = " for a stored login, not for AWS SDK credentials" if _cron_kinds(aff)[1] else ""
-        return lines + [f"[gate]   cron inference accounts: {n} enabled cron job(s) use {on} without a recorded "
-                        f"account; OpenClaw {rt} doctor records it{which} (openclaw/openclaw#172792)"]
+    if rec.get("doctor_migration"):  # 2026.11.2+: doctor records only the account of a job's own stored login
+        binds = _cron_doctor_binds(aff)
+        rest = (cron_doctor_rest(rec) or {}).get("affected") or []
+        out = []
+        if binds:
+            out.append(f"[gate]   cron inference accounts: {len(binds)} enabled cron job(s) run their own model on "
+                       f"a stored login without a recorded account; OpenClaw {rt} doctor records it when exactly one "
+                       "account fits (openclaw/openclaw#172792), then refuses their fallbacks to other providers")
+        if rest:
+            out.append(f"[gate]   cron inference accounts: {len(rest)} enabled cron job(s) stop at {_cron_on(rest)} on "
+                       f"OpenClaw {rt} and doctor records no account for them (the WARN lines above, "
+                       "openclaw/openclaw#192195)"
+                       + ("; apart from the config fixup above, the gate changes nothing for cron" if fix else
+                          "; report only, the gate changes nothing"))
+        return lines + out
     copied = sum(1 for a in aff if a.get("key_copy"))
     return lines + [f"[gate]   cron inference accounts: {n} enabled cron job(s) stop at {on} on OpenClaw {rt} "
                     + (f"({copied} because OpenClaw's doctor copies a literal provider key into its auth store; fix: "
@@ -6977,11 +7508,36 @@ def _delete_run_copy(base, name):
         os.close(bfd)
 
 
+def _delete_recovery_dir(pfd, name):
+    """Doctor's pre-repair recovery directory `name` in the directory pfd, opened without following a link: only
+    doctor's regular files (DOCTOR_RECOVERY_FILES) are unlinked, the database copy last, then the empty directory is
+    removed; any other entry refuses the delete before anything is removed."""
+    dfd = os.open(name, _DIR_NOFOLLOW, dir_fd=pfd)
+    size = 0
+    try:
+        names = os.listdir(dfd)
+        for n in names:
+            st = os.stat(n, dir_fd=dfd, follow_symlinks=False)
+            if n not in DOCTOR_RECOVERY_FILES or not stat.S_ISREG(st.st_mode):
+                raise OSError(errno.EPERM, f"unexpected entry {printable(n)[:80]} in doctor's recovery directory", name)
+        for n in DOCTOR_RECOVERY_FILES:
+            if n in names:
+                size += os.stat(n, dir_fd=dfd, follow_symlinks=False).st_size
+                os.unlink(n, dir_fd=dfd)
+    finally:
+        os.close(dfd)
+    os.rmdir(name, dir_fd=pfd)
+    return size
+
+
 def _delete_doctor_copy(gp, parts):
     """One of doctor's SQLite copies <state>/<parts...>: every directory below the state dir is opened without
-    following links, and only a regular file with doctor's name pattern is unlinked."""
+    following links, and only a regular file with doctor's name pattern is unlinked (a pre-repair recovery directory:
+    _delete_recovery_dir)."""
     dfd = open_dir_nofollow(gp["STATE"], *parts[:-1])
     try:
+        if DOCTOR_RECOVERY_DIR_RE.fullmatch(parts[-1]):
+            return _delete_recovery_dir(dfd, parts[-1])
         st = os.stat(parts[-1], dir_fd=dfd, follow_symlinks=False)
         if not stat.S_ISREG(st.st_mode):
             raise OSError(errno.EPERM, "not a regular file", "/".join(parts))
@@ -7386,9 +7942,11 @@ def _status_cron(j):
     un = cron_unconfigured_line(rec)  # D6
     inc = cron_include_line(rec)
     gone = cron_retired_review_line(rec)  # a forecast record: the jobs doctor deletes
+    lw = cron_load_warn_line(rec)  # R6: only in the report after a 2026.11.2+ migration
     if not aff:
         return fix + ([head + f"none affected ({rec['checked']} checked)"] if rec.get("checked") else []) \
-            + ([f"  {un}"] if un else []) + ([f"  {gone}"] if gone else []) + ([f"  {inc}"] if inc else [])
+            + ([f"  {lw}"] if lw else []) + ([f"  {un}"] if un else []) + ([f"  {gone}"] if gone else []) \
+            + ([f"  {inc}"] if inc else [])
     L = fix + [head + f"{len(aff)} affected of {rec.get('checked', 0)} checked"]
     for a in aff[:CRON_REPORT_MAX]:
         refs = [printable(r) for r in a.get("refs") or []]
@@ -7401,7 +7959,10 @@ def _status_cron(j):
     if len(aff) > CRON_REPORT_MAX:
         L.append(f"    and {len(aff) - CRON_REPORT_MAX} more")
     L += cron_key_fix_lines(rec, "    ", held=gpaths()["HOLD"].exists())  # the wrapper refuses config set while held
-    L.append("    " + "".join(x + ". " for x in _cron_outlook(aff, rec)) + _cron_remedy(aff, bool(_cron_key_fix(rec))))
+    L.append("    " + "".join(x + ". " for x in _cron_outlook(aff, rec, after=when == "after the migration"))
+             + _cron_remedy(aff, bool(_cron_key_fix(rec))))
+    if lw:
+        L.append(f"  {lw}")
     if un:
         L.append(f"  {un}")
     if gone:
@@ -7627,7 +8188,10 @@ def status_lines():
         L.append(f"Quarantine: {qd} ({n} files)")
     L += _status_skills(gp)  # full5
     L += _status_openclaw_leftovers(gp)  # D8, D11, plugin captures
-    baks = doctor_copies(gp["STATE"])
+    allbaks = doctor_copies(gp["STATE"])
+    baks = {r: v for r, v in allbaks.items() if v[1] not in ("cron", "recovery")}
+    crons = {r: v for r, v in allbaks.items() if v[1] == "cron"}
+    recs = {r: v for r, v in allbaks.items() if v[1] == "recovery"}
     if baks:
         ns = sum(1 for _size, scope in baks.values() if scope == "scoped")
         L.append(f"Doctor pre-migration SQLite copies: {len(baks) - ns} full (.bak), {ns} table-scoped (.scoped.bak) "
@@ -7636,11 +8200,28 @@ def status_lines():
                  + leftover_note(o["cleanup_hours"])
                  + ("; restore a .scoped.bak only with openclaw database restore-migration-backup, never by copying"
                     if ns else ""))
+    if crons:  # R5: doctor's pre-repair cron backups (openclaw.sqlite.doctor-cron-<ms>-<uuid>.bak)
+        dirs = sorted({str(Path(r).parent) for r in crons})
+        L.append(f"Doctor pre-repair cron backups of the state database (openclaw.sqlite.doctor-cron-*.bak): "
+                 f"{len(crons)} ({C.human(sum(size for size, _scope in crons.values()))}) in "
+                 + ", ".join(printable(str(gp["STATE"] / d)) if d != "." else printable(str(gp["STATE"]))
+                             for d in dirs[:4])
+                 + ": plaintext copies (device keys and tokens), not the rollback point; OpenClaw never deletes "
+                 "them; those a gate run made: " + leftover_note(o["cleanup_hours"]))
+    if recs:  # doctor's pre-repair recovery directories (openclaw-<repair>-recovery-*/database.sqlite)
+        L.append(f"Doctor pre-repair recovery directories (openclaw-*-recovery-*/database.sqlite): {len(recs)} "
+                 f"({C.human(sum(size for size, _scope in recs.values()))}): "
+                 + ", ".join(printable(str(gp["STATE"] / r)) for r in sorted(recs)[:4])
+                 + (" …" if len(recs) > 4 else "")
+                 + ": full plaintext copies of the databases (transcripts, device keys and tokens), not the rollback "
+                 "point; OpenClaw never deletes them; those a gate run made: " + leftover_note(o["cleanup_hours"]))
     outside = []
     for _rid, rj in sorted(_run_journals(gp)[0].items()):
         outside += [x for x in run_outside_copies(rj) if x not in outside]
     if outside:
-        L.append("Doctor pre-migration SQLite copies beside agent databases outside "
+        kind = "SQLite" if any(DOCTOR_RECOVERY_DIR_RE.fullmatch(os.path.basename(x)) for x in outside) \
+            else "pre-migration SQLite"
+        L.append(f"Doctor {kind} copies beside agent databases outside "
                  f"{gp['STATE']}: {len(outside)}, plaintext, not the rollback point; the add-on does not delete them, "
                  "delete them yourself: " + ", ".join(printable(x) for x in outside[:8])
                  + (" …" if len(outside) > 8 else ""))
