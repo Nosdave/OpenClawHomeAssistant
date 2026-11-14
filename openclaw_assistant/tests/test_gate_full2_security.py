@@ -521,10 +521,10 @@ class CleanupRobustnessTests(SecEnv):
         b = self.make_run(finished=T0 + SEC)
         real = G._safe_delete
 
-        def failing(gp, p):
+        def failing(gp, p, facts=None):
             if p == a.adir:
                 raise RuntimeError("simulated bug")
-            return real(gp, p)
+            return real(gp, p, facts)
         state = {}
         with mock.patch.object(G, "_safe_delete", side_effect=failing):
             self.assertEqual(self.cleanup(T0 + H48 + SEC, state=state), 1)
@@ -541,10 +541,10 @@ class CleanupRobustnessTests(SecEnv):
         b = self.make_run(finished=T0 + SEC)
         real = G._safe_delete
 
-        def failing(gp, p):
+        def failing(gp, p, facts=None):
             if p == a.adir:
                 raise PermissionError(errno.EACCES, os.strerror(errno.EACCES), str(p))
-            return real(gp, p)
+            return real(gp, p, facts)
         state = {}
         with mock.patch.object(G, "_safe_delete", side_effect=failing):
             self.assertEqual(self.cleanup(T0 + H48 + SEC, state=state), 1)
