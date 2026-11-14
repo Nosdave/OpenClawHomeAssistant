@@ -2777,7 +2777,8 @@ is expected to work, and OpenClaw then stops at that fallback.
 **Symptom**: `openclaw update cleanup --dry-run` lists files named
 `<database>.pre-startup-migration-<id>.bak` or `….scoped.bak` that no longer exist, as
 `protected: <path> (<n> bytes; awaiting-later-completed-update)`, `protected: <path> (<n>
-bytes; incomplete-recovery-operation)` or `blocked: <path> (<n> bytes;
+bytes; incomplete-recovery-operation)`, `protected: <path> (<n> bytes;
+unsupported-target-ownership)` or `blocked: <path> (<n> bytes;
 unexpectedly-missing-artifact)`. The byte counts are the sizes the copies had. With `--yes`,
 a `blocked` line makes the command end with exit code 1 after it removed everything else it
 could. In the add-on you only see this when you run OpenClaw's own entry directly (for
@@ -2787,20 +2788,36 @@ wrapper refuses `openclaw update`.
 **Cause**: before it migrates a database, doctor records its copy in OpenClaw's recovery
 records (`/config/.openclaw/session-sqlite-migration-runs/startup-migration-<id>.json`). The
 add-on deletes the copies of a gate run `gate_cleanup_hours` after the run ([Doctor's SQLite
-copies](#automatic-deletion-gate_cleanup_hours)) and leaves OpenClaw's records unchanged, so
-OpenClaw still expects the files. Which line you see depends only on OpenClaw's own
-bookkeeping: `awaiting-later-completed-update` as long as OpenClaw has recorded no successful
-`openclaw update` after the migration (always the case in the add-on),
-`incomplete-recovery-operation` when doctor never finished that migration, and `blocked …
-unexpectedly-missing-artifact` once a later OpenClaw update has completed.
+copies](#automatic-deletion-gate_cleanup_hours)) and leaves OpenClaw's records unchanged,
+so OpenClaw still expects the files. Which line you see depends on OpenClaw's own
+bookkeeping and on where the state is:
+- `incomplete-recovery-operation` when doctor never completed that record. It stays, also
+  after a later OpenClaw update, until a doctor run completes the record.
+- For a completed record, `awaiting-later-completed-update` as long as OpenClaw has
+  recorded no successful `openclaw update` after the migration (always the case in the
+  add-on), and `blocked … unexpectedly-missing-artifact` once a later OpenClaw update has
+  completed.
+- `unsupported-target-ownership` once the state is no longer at `/config/.openclaw` (for
+  example after moving it to a plain OpenClaw install), because the records name
+  `/config/.openclaw` paths. This also applies to copies the add-on did not delete.
 
-**Fix**: none needed. The gateway, doctor and restores do not depend on these lines, and the
-encrypted Home Assistant backup is the rollback point. Do not recreate the files. Do not edit
-or delete the record files by hand: an unreadable record makes OpenClaw protect every other
-recovery file. `oc-upgrade cleanup`, the cleanup log (`[cleanup] run …: deleted …`) and the
-run's `cleanup.json` (with each deleted copy's file identity) show what the add-on deleted
-and when. Doctor's captures in `/config/.openclaw.update-captures/`, its pre-repair cron
-backups and its recovery directories leave no such entries.
+**Fix**: none needed. The gateway and `openclaw doctor --fix` do not depend on these lines,
+and the encrypted Home Assistant backup is the rollback point. Outside the add-on,
+OpenClaw's `openclaw doctor --session-sqlite recover`, which the add-on's wrapper refuses,
+reports `recover_manifest_missing` ("No failed session SQLite migration manifest found.")
+and ends with exit code 1 when there is nothing to recover and such a line is `blocked` or
+`unsupported-target-ownership`. Do not recreate the files. Do not edit the record files by
+hand: OpenClaw cannot read an edited record. It then lists that record as `blocked …
+unreadable-manifest` and every other recorded file it could remove as `blocked …
+unreadable-recovery-dependencies`, so `--yes` removes none of them (only update captures)
+and exits 1, and doctor's session import becomes more cautious. Do not delete them either:
+a copy that a deleted record still names is then listed as `protected …
+unmanifested-recovery-original`, and OpenClaw can no longer remove it. The cleanup log
+(`[cleanup] run …: deleted …`) and the run's `cleanup.json` (with each deleted copy's file
+identity) show what the add-on deleted and when. `oc-upgrade status` shows the time of
+deletion for the current run; `oc-upgrade cleanup` lists only what is still to be deleted.
+Doctor's captures in `/config/.openclaw.update-captures/`, its pre-repair cron backups and
+its recovery directories leave no such entries.
 
 ### Gateway exited with code 78
 

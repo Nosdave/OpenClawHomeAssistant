@@ -343,8 +343,9 @@ class CleanupTests(CleanupEnv):
         for x in (full, scoped, cron, rec_dir):
             self.assertFalse(os.path.lexists(x), x)
         self.assertEqual(len(self.lines), 1, self.text)
-        self.assertNotIn("identity", self.text)
-        self.assertNotIn("ino", self.text)
+        logged = self.text.replace(os.path.realpath(self.tmp), "<tmp>").replace(str(self.tmp), "<tmp>")
+        for word in ("identity", "ino", "mtime_ns", *(str(b.st_mtime_ns) for b in want.values())):
+            self.assertNotIn(word, logged)  # nothing of the identity is logged (the temp paths taken out first)
         rec = self.record(r.rid)
         by_path = {d["path"]: d for d in rec["deleted"]}
         for path, before in want.items():
