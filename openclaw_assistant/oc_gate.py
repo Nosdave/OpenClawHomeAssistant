@@ -2794,20 +2794,14 @@ class Gate:
             self.warn(f"{pn} config fixup: could not check the auth stores ({type(exc).__name__}: "
                       f"{C.redact_text(str(exc))[:200]}); doctor pass 1 checks again")
         if after is not None:
-            behind = []
+            behind, bound_behind = [], []
             kept = cron_fixup_kept_jobs(rec, after, {f["provider"] for f in plan["fix"]}, behind)
-            for f in plan["fix"]:
-                self.say(f"{pn} config fixup: {'would set' if self.dry_run else 'will set'} {printable(f['path'])} = "
-                         f"\"api-key\" before doctor pass 1 ({cron_fixup_why(f['provider'], rt)})")
-            if kept:
-                self.say(f"{pn} info: {cron_fixup_kept_text(kept, plan['fix'], rt)}")
             if behind and dm:  # N2: doctor binds such a job's own model; its fallbacks to other providers are refused
                 now = {a.get("id"): a for a in after.get("affected") or []}
                 bound = {a.get("id") for a in _cron_doctor_binds([now[a.get("id")] for a, _r in behind
                                                                   if a.get("id") in now])}
+                bound_behind = [(a, r) for a, r in behind if a.get("id") in bound]
                 behind[:] = [(a, r) for a, r in behind if a.get("id") not in bound]
-            if behind:
-                self.say(f"{pn} info: {cron_fixup_behind_text(behind)}")
 
             def on(entries, p_):
                 return [str(a.get("id"))[:120] for a, refs in entries if any(r.split("/", 1)[0] == p_ for r in refs)]
@@ -2815,7 +2809,19 @@ class Gate:
             for f in plan["fix"]:  # jobs: kept working on f's provider; behind: reach it only after a refused ref
                 ent = {"provider": f["provider"], "path": f["path"], "jobs": on(kept, f["provider"])}
                 late = [x for x in on(behind, f["provider"]) if x not in ent["jobs"]]
-                rec["autofix"].append(dict(ent, behind=late) if late else ent)
+                # N2-R2: reach it only as a fallback of their own model on another provider's stored login, which
+                # doctor binds: the fixup keeps none of them working
+                gone = [x for x in on(bound_behind, f["provider"]) if x not in ent["jobs"] and x not in late]
+                rec["autofix"].append(dict(ent, **({"behind": late} if late else {}),
+                                           **({"bound": gone} if gone else {})))
+            for a in rec["autofix"]:
+                none = "" if a["jobs"] or a.get("behind") else f"; {cron_fixup_none_text(a, rt)}"
+                self.say(f"{pn} config fixup: {'would set' if self.dry_run else 'will set'} {printable(a['path'])} = "
+                         f"\"api-key\" before doctor pass 1 ({cron_fixup_why(a['provider'], rt)}){none}")
+            if kept:
+                self.say(f"{pn} info: {cron_fixup_kept_text(kept, plan['fix'], rt)}")
+            if behind:
+                self.say(f"{pn} info: {cron_fixup_behind_text(behind)}")
         elif plan["fix"]:
             for f in plan["fix"]:
                 self.warn(f"{pn} {cron_fixup_include_text(f, rt, plan['include'])}")
@@ -3100,6 +3106,8 @@ class Gate:
         bl = cron_bound_line(self.j.get("cron_binding"))  # N2 (2026.11.2+)
         if bl:
             self.say(f"info: {bl}")
+        for line in cron_bound_warn_lines(self.j.get("cron_binding")):
+            self.warn(line)
         un = cron_unconfigured_line(self.j.get("cron_binding"))
         if un:
             self.say(f"info: {un}")
@@ -4578,8 +4586,7 @@ def _cron_promise(aff, rec):
     def provider(a):
         r = (a.get("refs") or [""])[0]
         return r.split("/", 1)[0] if "/" in r else None
-    prim = [a for a in aff if a.get("primary_affected") and a.get("refs")
-            and a["refs"][0] not in (a.get("aws_sdk") or []) and provider(a) not in keyed]
+    prim = [a for a in _cron_doctor_binds(aff) if provider(a) not in keyed]
     if not prim:
         return ""
     if len(prim) == len(aff):
@@ -4592,9 +4599,12 @@ def _cron_promise(aff, rec):
 def _cron_doctor_binds(aff):
     """The affected entries OpenClaw's own migration (#172792, 2026.11.2+) records an account for: the jobs whose own
     model is on a stored login (not on AWS SDK credentials), also one on doctor's copy of a literal key; it binds a job
-    only when exactly one account fits, and the gate reports the jobs doctor leaves after the migration."""
+    only when exactly one account fits, and the gate reports the jobs doctor leaves after the migration. Doctor skips a
+    job whose own model is set to another runtime than openclaw ("own_runtime": 'runtime <id> inference ownership was
+    left unchanged') or is on a CLI runtime provider (inference-binding-migration.ts)."""
     return [a for a in aff if a.get("primary_affected") and a.get("refs")
-            and a["refs"][0] not in (a.get("aws_sdk") or [])]
+            and a["refs"][0] not in (a.get("aws_sdk") or []) and not a.get("own_runtime")
+            and str(a["refs"][0]).split("/", 1)[0] not in CRON_CLI_PROVIDERS]
 
 
 CRON_BOUND_FALLBACKS = ("but then refuses their fallbacks to other providers (as with openclaw/openclaw#192463)")
@@ -4888,8 +4898,15 @@ def cron_account_report(state_dir, cfg, runtime=None, doctor_migration=False, pe
     def copies_for(aid):
         return copies["shared"] + copies["agents"].get(aid, [])
     configured = {mig().normalize_agent_id(a) for a in configured_agent_ids(cfg)}  # as OpenClaw compares them
+    codex = codex_plugin_active(state_dir, cfg)  # wf4: an openai ref on the Codex runtime looks up its models first
+    if codex:
+        rec["codex_active"] = True
+    try:
+        env = C.openclaw_env()
+    except Exception:  # noqa: BLE001 - only OPENAI_BASE_URL is read from it
+        env = dict(os.environ)
     fc = mig().cron_account_forecast(jobs, cfg, profiles_for, default_agent_id(cfg), copies_for, pending_copies,
-                                     configured=configured)
+                                     configured=configured, codex_active=codex, env=env)
     # job names are free text (an agent may name a reminder from the conversation): redacted, then cut
     rec.update(checked=fc["checked"], bound=fc["bound"],
                affected=[dict(a, id=str(a["id"])[:120], name=C.redact_text(str(a["name"]))[:120])
@@ -4931,6 +4948,24 @@ def cron_account_report(state_dir, cfg, runtime=None, doctor_migration=False, pe
     if inc and (fc["checked"] or fc["unconfigured"]):
         rec["include"] = [str(x)[:120] for x in inc[:4]]
     return rec
+
+
+def codex_plugin_active(state_dir, cfg):
+    """wf4: OpenClaw loads the Codex plugin (@openclaw/codex, npm-installed, not bundled): an install record of it
+    (official_plugin_installs) or an npm project npm/projects/openclaw-codex-*, and openclaw.json does not disable it
+    (plugin_config_off: plugins.enabled false, plugins.deny, plugins.entries.codex.enabled false, a plugins.allow
+    without it; plugins/config-activation-shared.ts). Read-only; False when nothing can be read. Not cron_openai_ids /
+    codex_pkg_before: those say Codex was in use before the migration, not that it is loaded."""
+    if plugin_config_off(cfg, "codex"):
+        return False
+    if any(x.get("id") == "codex" or x.get("package") == "@openclaw/codex"
+           for x in official_plugin_installs(state_dir, cfg) if x.get("enabled") is not False):
+        return True
+    try:
+        return any(p.name.startswith("openclaw-codex-") and p.is_dir() and not p.is_symlink()
+                   for p in (Path(state_dir) / "npm" / "projects").iterdir())
+    except OSError:
+        return False
 
 
 # CLI runtime providers (cli-backends.ts listCliRuntimeProviderIds; the retired codex-cli too): the gateway's cron
@@ -5001,8 +5036,13 @@ def cron_bound_jobs(jobs, cfg, default_agent="main", configured=None):
     2026.11.2+ doctor records it for a job whose own model is on a stored login, openclaw/openclaw#172792) and the
     refs of their model chain (cron_model_chain) that OpenClaw refuses for them from then on: every candidate on a
     provider other than the recorded account's (cron/run-inference.ts assertCandidate, as with model@profile:
-    openclaw/openclaw#192463). Never the profile id. [{"id", "name", "enabled", "provider", "refused"}]; provider
-    None when the record names none (the refused refs are then unknown, [])."""
+    openclaw/openclaw#192463). Never the profile id. [{"id", "name", "enabled", "provider", "refused"}]: refused the
+    fallbacks on another provider; provider None when the record names none (OpenClaw rejects such a record,
+    normalizeCronInferenceBinding: the refused refs are then unknown, []). A job whose own model is on another provider
+    than the record's (the record is kept when its model is edited without @profile, or when the default model it
+    inherits changes: cron-input-validation.ts captureCronUpdatedInferenceBinding) also has "own_refused": that ref,
+    and "on_account": its fallbacks on the record's provider, the only candidates OpenClaw can still run (the refusal
+    is no chain stop: model-fallback-runner.ts goes on to the next candidate)."""
     M = mig()
     out = []
     for row in jobs or []:
@@ -5018,43 +5058,87 @@ def cron_bound_jobs(jobs, cfg, default_agent="main", configured=None):
             continue
         prov = b.get("provider") if isinstance(b, dict) else None
         prov = prov.strip().lower() if isinstance(prov, str) and prov.strip() else None
-        refused = []
+        refused, own, on_account = [], None, []
         if prov:
             primary, fbs, _src = M.cron_model_chain(job, cfg, agent)
-            for raw in ([primary] if primary else []) + fbs:
-                r = M.cron_model_ref(cfg, raw)  # never the @profile in the ref
-                if r and r[0] and r[0] != prov and f"{r[0]}/{r[1]}" not in refused:
-                    refused.append(f"{r[0]}/{r[1]}")
-        out.append({"id": row.get("id"), "name": row.get("name"), "enabled": bool(row.get("enabled")),
-                    "provider": prov, "refused": refused})
+            r = M.cron_model_ref(cfg, primary) if primary else None  # never the @profile in the ref
+            if r and r[0] and r[0] != prov:
+                own = f"{r[0]}/{r[1]}"
+            for raw in fbs:
+                r = M.cron_model_ref(cfg, raw)
+                if not (r and r[0]):
+                    continue
+                ref = f"{r[0]}/{r[1]}"
+                if r[0] != prov:
+                    if ref not in refused and ref != own:
+                        refused.append(ref)
+                elif ref not in on_account:
+                    on_account.append(ref)
+        out.append(dict({"id": row.get("id"), "name": row.get("name"), "enabled": bool(row.get("enabled")),
+                         "provider": prov, "refused": refused},
+                        **({"own_refused": own, "on_account": on_account} if own else {})))
     return out
+
+
+def _cron_bound_label(a):
+    lab = cron_job_label(a)
+    return lab if a.get("enabled") else lab[:-1] + ", disabled)"
+
+
+def _cron_bound_odd(a):
+    """A bound_jobs entry whose own model does not run on its recorded account: the record names no provider, or the
+    job's own model is on another provider (cron_bound_warn_lines)."""
+    return not a.get("provider") or bool(a.get("own_refused"))
 
 
 def cron_bound_line(rec):
     """N2: the info text for the jobs of a cron_account_report record after a 2026.11.2+ migration that have a
-    recorded inference account (bound_jobs), with the fallbacks OpenClaw refuses for them, or None. Job ids, names,
-    provider and model ids only (never the recorded profile id)."""
+    recorded inference account (bound_jobs) and whose own model runs on it, with the fallbacks OpenClaw refuses for
+    them, or None (the other bound jobs: cron_bound_warn_lines). Job ids, names, provider and model ids only (never
+    the recorded profile id)."""
     bj = [a for a in (rec or {}).get("bound_jobs") or [] if isinstance(a, dict)]
-    if not bj:
+    ok = [a for a in bj if not _cron_bound_odd(a)]
+    n = ((rec or {}).get("bound_jobs_count") or len(bj)) - (len(bj) - len(ok))
+    if not bj or n <= 0:
         return None
-    n = (rec or {}).get("bound_jobs_count") or len(bj)
-    rt = printable((rec or {}).get("runtime") or "2026.11.2+")
-    off = sum(1 for a in bj if not a.get("enabled"))
-    more = f" and {n - len(bj)} more" if n > len(bj) else ""
+    off = sum(1 for a in ok if not a.get("enabled"))
+    more = f"{' and ' if ok else ''}{n - len(ok)} more" if n > len(ok) else ""
 
     def one(a):
-        lab = cron_job_label(a)
-        if not a.get("enabled"):
-            lab = lab[:-1] + ", disabled)"
-        prov = printable(a.get("provider")) if a.get("provider") else "a provider the record does not name"
         ref = [printable(r) for r in a.get("refused") or []]
-        return f"{lab} on {prov}" + (f", refused: {', '.join(ref)}" if ref else ", no fallback on another provider")
+        return (f"{_cron_bound_label(a)} on {printable(a.get('provider'))}"
+                + (f", refused: {', '.join(ref)}" if ref else ", no fallback on another provider"))
     return (f"{n} cron job(s){f' ({off} of them disabled)' if off else ''} have a recorded inference account (OpenClaw "
-            f"{rt} doctor records it during the migration for a job whose own model is on a stored login, "
-            "openclaw/openclaw#172792): their own model runs on that account, and OpenClaw refuses their fallbacks "
-            "to other providers (as with openclaw/openclaw#192463): " + "; ".join(one(a) for a in bj) + more
+            "2026.11.2+ doctor records one for a job whose own model is on a stored login, openclaw/openclaw#172792): "
+            "their own model runs on that account, and OpenClaw refuses their fallbacks to other providers (as with "
+            "openclaw/openclaw#192463): " + "; ".join(one(a) for a in ok) + more
             + ". To keep such a fallback from being tried, drop it (openclaw automations edit <id> --fallbacks <list> "
             "without it; the job's own list replaces the agent's and the default fallbacks)")
+
+
+def cron_bound_warn_lines(rec):
+    """N2-R1: WARN texts for the bound jobs of a cron_account_report record whose own model does not run on the
+    recorded account: its provider differs from the record's (OpenClaw refuses it, cron/run-inference.ts
+    assertCandidate, and goes on only to fallbacks on the record's provider), or the record names no provider
+    (OpenClaw's normalizeCronInferenceBinding rejects it). Job ids, names, provider and model ids only."""
+    rt = printable((rec or {}).get("runtime") or "2026.11.2+")
+    out = []
+    for a in (rec or {}).get("bound_jobs") or []:
+        if not isinstance(a, dict) or not _cron_bound_odd(a):
+            continue
+        head = f"cron job {_cron_bound_label(a)}: "
+        fix = "; to fix: openclaw automations edit <id> --model <provider/model>@<profileId>"
+        if not a.get("provider"):
+            out.append(head + f"its recorded inference account names no provider: OpenClaw {rt} treats such a record "
+                       "as invalid ('Invalid automation inference binding; explicitly select an account again.')" + fix)
+            continue
+        own, prov = printable(a.get("own_refused")), printable(a.get("provider"))
+        acct = [printable(r) for r in a.get("on_account") or []]
+        out.append(head + f"its own model {own} is on {own.split('/', 1)[0]}, not on its recorded inference account's "
+                   f"provider {prov}: OpenClaw {rt} refuses it ('The selected model uses a different provider from "
+                   "this job's stored account') and tries only fallbacks on " + prov
+                   + (f" ({', '.join(acct)})" if acct else "; the job has none, so every run fails") + fix)
+    return out
 
 
 def cron_load_warn_line(rec):
@@ -5183,6 +5267,45 @@ def cron_doctor_binds_keyed(binds, rec):
             if "/" in str(a["refs"][0]) and str(a["refs"][0]).split("/", 1)[0] in keyed}
 
 
+def _cron_codex_login(a):
+    """How the Codex runtime signs in for a cron_account_report entry's Codex refs (wf4)."""
+    return ('uses the login of its own Codex home (appServer.homeScope "user")' if a.get("codex_home") == "user"
+            else "signs in with the stored login")
+
+
+def cron_codex_clause(a, ref, primary=False):
+    """wf4: the clause of a per-job cron WARN for a refused ref that runs on the Codex runtime (entry "codex"), or "".
+    OpenClaw 2026.10.10+ loads that runtime's model catalog before its auth plan refuses the candidate: Codex starts
+    with the first openai login of the auth order and reads the account and its models (model-catalog.ts; for a
+    ChatGPT login at chatgpt.com), and a failed lookup is an ordinary candidate failure, no chain stop
+    (model-fallback-attempt.ts): the chain goes on to the next fallback. What a failed lookup of a job's own model does
+    to its fallbacks is not traced, hence "may"."""
+    if ref not in {printable(r) for r in a.get("codex") or []}:
+        return ""
+    look = (f"Codex {_cron_codex_login(a)} and looks up the account and its models unless it has them already (for a "
+            "ChatGPT login at chatgpt.com)")
+    if primary:
+        return (f"; {ref} runs on the Codex runtime, so before that refusal {look}; if that lookup fails (for example "
+                "without network), OpenClaw may try the fallbacks instead")
+    return (f"; {ref} runs on the Codex runtime, so before that refusal {look}, and if that lookup fails (for example "
+            "without network) OpenClaw counts the fallback as failed and tries the next one")
+
+
+def cron_own_runtime_clause(a, rec):
+    """wf4: the clause of a per-job cron WARN whose own model is set to another runtime than openclaw (entry
+    "own_runtime"): OpenClaw 2026.11.2+ doctor records no inference account for such a job, or ""."""
+    rid = a.get("own_runtime")
+    if not rid:
+        return ""
+    rid, at = printable(rid), printable(a.get("own_runtime_at") or "agentRuntime")
+    if (rec or {}).get("doctor_migration"):
+        rt = printable(rec.get("runtime") or "2026.11.2+")
+        return (f"; its model is set to the {rid} runtime ({at}), so OpenClaw {rt} doctor records no inference account "
+                f"for it (doctor: 'runtime {rid} inference ownership was left unchanged') and every run stays refused")
+    return (f"; its model is set to the {rid} runtime ({at}), so OpenClaw's own migration (2026.11.2, "
+            "openclaw/openclaw#172792) records no inference account for it either")
+
+
 def cron_job_lines(rec, fixup=False, forecast=False):
     """Per-job WARN texts of a cron_account_report record, the key fix lines, then the closing note (empty when
     none). fixup: the lines above name a config fixup of this run (planned or made), which the closing note
@@ -5198,9 +5321,10 @@ def cron_job_lines(rec, fixup=False, forecast=False):
         refs = [printable(r) for r in a.get("refs") or []]
         aws = {printable(r) for r in a.get("aws_sdk") or []}
         copied = {printable(r) for r in a.get("key_copy") or []}
+        cdx = {printable(r) for r in a.get("codex") or []}
         head = f"cron job {cron_job_label(a)}: "
         more = "".join(f"; also on {on}: {', '.join(x)}" for on, x in (
-            ("a stored login", [r for r in refs[1:] if r not in aws]),
+            ("a stored login", [r + (" (Codex runtime)" if r in cdx else "") for r in refs[1:] if r not in aws]),
             ("AWS SDK credentials", [r for r in refs[1:] if r in aws])) if x)
         if a.get("primary_affected") and refs[0] in aws:
             lines.append(head + f"OpenClaw {rt} refuses every run and tries no fallback: its model {refs[0]} would "
@@ -5220,7 +5344,8 @@ def cron_job_lines(rec, fixup=False, forecast=False):
         elif a.get("primary_affected"):
             lines.append(head + f"OpenClaw {rt} refuses every run and tries no fallback: its model {refs[0]} would "
                          "use a stored login (auth profile) and the job has no recorded inference account "
-                         "(openclaw/openclaw#192195)" + more)
+                         "(openclaw/openclaw#192195)" + cron_codex_clause(a, refs[0], primary=True)
+                         + cron_own_runtime_clause(a, rec) + more)
         else:
             primary = f"its model {printable(a['primary'])}" if a.get("primary") else "its primary model"
             on = ("AWS SDK credentials" if refs[0] in aws else
@@ -5232,7 +5357,8 @@ def cron_job_lines(rec, fixup=False, forecast=False):
                 if rec.get("include") else ""
             lines.append(head + f"{primary} needs no stored login{seen} and keeps working, but when it fails OpenClaw "
                          f"{rt} stops at the fallback {refs[0]} ({on}{sep} no recorded inference account; "
-                         "openclaw/openclaw#192195) instead of trying further models" + more)
+                         "openclaw/openclaw#192195) instead of trying further models" + cron_codex_clause(a, refs[0])
+                         + more)
     if len(aff) > CRON_REPORT_MAX:
         lines.append(f"and {len(aff) - CRON_REPORT_MAX} more cron job(s) (oc-upgrade status)")
     lines += cron_key_fix_lines(rec)
@@ -5314,6 +5440,19 @@ def cron_fixup_why(provider, runtime):
     """The reason of a config fixup line (provider id only, never a key)."""
     return (f"doctor stores its literal key as a login; without this OpenClaw {runtime or '2026.10.10+'} refuses every "
             f"unbound cron run on {printable(provider)}: {CRON_FIXUP_ISSUE}")
+
+
+def cron_fixup_none_text(a, runtime):
+    """N2-R2: why a config fixup (a cron_account_report "autofix" entry) keeps no enabled cron job working: the jobs
+    that reach its provider ("bound": their ids) do so only as a fallback of their own model on another provider's
+    stored login, which OpenClaw 2026.11.2+ doctor records as their account (their fallbacks to other providers are
+    refused from then on; unbound, the stored login stops the chain first)."""
+    p, nb = printable(a.get("provider")), len(a.get("bound") or [])
+    if not nb:
+        return "for no enabled cron job"
+    return (f"for no enabled cron job: the {nb} enabled cron job(s) that reach {p} only as a fallback run their own "
+            f"model on another provider's stored login, so OpenClaw {printable(runtime or '2026.11.2+')} refuses {p} "
+            "for them either way (with the account doctor records for them, or without it)")
 
 
 def cron_fixup_include_text(f, runtime, inc):
@@ -7198,6 +7337,8 @@ def _readiness_cron(g):
         n, late, p = len(a.get("jobs") or []), len(a.get("behind") or []), printable(a["provider"])
         if not n and late:
             return f"for {late} enabled cron job(s) that reach {p} only after a fallback that stays refused"
+        if not n:  # N2-R2: only jobs doctor binds to another provider's stored login reach it
+            return cron_fixup_none_text(a, g.pkg["version"])
         return f"keeps {n} enabled cron job(s) on {p} working"
     lines = [f"[gate]   cron config fixup: would set {printable(a['path'])} = \"api-key\" before doctor pass 1 "
              f"({why(a)}; {CRON_FIXUP_ISSUE})" for a in fix]
@@ -8023,18 +8164,25 @@ def _status_cron(j):
     gone = cron_retired_review_line(rec)  # a forecast record: the jobs doctor deletes
     lw = cron_load_warn_line(rec)  # R6: only in the report after a 2026.11.2+ migration
     bl = cron_bound_line(rec)  # N2: likewise
+    bw = [f"  WARN: {x}" for x in cron_bound_warn_lines(rec)]
     if not aff:
         return fix + ([head + f"none affected ({rec['checked']} checked)"] if rec.get("checked") else []) \
-            + ([f"  {lw}"] if lw else []) + ([f"  {bl}"] if bl else []) + ([f"  {un}"] if un else []) \
+            + ([f"  {lw}"] if lw else []) + ([f"  {bl}"] if bl else []) + bw + ([f"  {un}"] if un else []) \
             + ([f"  {gone}"] if gone else []) + ([f"  {inc}"] if inc else [])
     L = fix + [head + f"{len(aff)} affected of {rec.get('checked', 0)} checked"]
     for a in aff[:CRON_REPORT_MAX]:
         refs = [printable(r) for r in a.get("refs") or []]
         aws = {printable(r) for r in a.get("aws_sdk") or []}
         copied = {printable(r) for r in a.get("key_copy") or []}
+        cdx = {printable(r) for r in a.get("codex") or []}
         what = "every run refused" if a.get("primary_affected") else f"stops at the fallback {refs[0] if refs else '?'}"
+        if refs and refs[0] in cdx:  # wf4: the Codex runtime looks up the account's models before the refusal
+            login = ("uses its own Codex home's login" if a.get("codex_home") == "user" else
+                     "signs in with the stored login")
+            what += f" (Codex runtime: it {login} and looks up the models first unless it has them)"
         shown = ", ".join(r + (" (AWS SDK credentials)" if r in aws else
-                               " (literal key that doctor copies)" if r in copied else "") for r in refs)
+                               " (literal key that doctor copies)" if r in copied else
+                               " (Codex runtime)" if r in cdx and i else "") for i, r in enumerate(refs))
         L.append(f"    {cron_job_label(a)}: {what}; {shown}")
     if len(aff) > CRON_REPORT_MAX:
         L.append(f"    and {len(aff) - CRON_REPORT_MAX} more")
@@ -8045,6 +8193,7 @@ def _status_cron(j):
         L.append(f"  {lw}")
     if bl:
         L.append(f"  {bl}")
+    L += bw
     if un:
         L.append(f"  {un}")
     if gone:
@@ -8192,28 +8341,43 @@ def _status_held_and_plugins(gp, marker):
 def _status_captures(gp, caps):
     """N1: only the captures a gate run's doctor log names (and leftover tombstones of an interrupted delete) are
     deleted with their run; any other doctor-<uuid> directory (doctor run by hand, a capture no log line names) is
-    named as kept."""
-    mine = set()
-    for _rid, rj in sorted(_run_journals(gp)[0].items()):
+    named as kept. A run's captures count as deleted with it only when cleanup_targets deletes them: the run finished
+    (run_due_base), or it is the current run and still running, interrupted or held. Those of a run closed without
+    finished_at (abandoned, e.g. after the state dir was wiped during a HOLD) are never deleted (cleanup_targets
+    skips that run): named on a line of their own as kept."""
+    runs, cur = _run_journals(gp)
+    live = cur.get("run_id") if isinstance(cur, dict) and cur.get("status") in ("running", "interrupted", "hold") \
+        else None
+    mine, unfinished = set(), set()
+    for rid, rj in sorted(runs.items()):
         try:
-            mine.update(c.name for c in run_captures(gp, rj)[0])
+            names = {c.name for c in run_captures(gp, rj)[0]}
         except OSError:
             continue
-    n, other = 0, []
+        try:
+            done = run_due_base(rj) is not None
+        except (ValueError, TypeError, OverflowError, AttributeError):
+            done = False
+        (mine if done or rid == live else unfinished).update(names)
+    unfinished -= mine
+    n, other, left = 0, [], []
     for x in sorted(caps.iterdir()):
         if x.name.startswith(TOMB_PREFIX) and CAPTURE_NAME_RE.match(x.name[len(TOMB_PREFIX):]):
             n += 1
         elif CAPTURE_NAME_RE.match(x.name):
             if x.name in mine:
                 n += 1
+            elif x.name in unfinished:
+                left.append(x.name)
             else:
                 other.append(x.name)
     L = [f"Doctor captures: {n} in {caps} (pre-repair database copies; deleted with their gate run)"]
-    if other:
-        L.append(f"Doctor captures no gate run names: {len(other)} in {caps}: "
-                 + ", ".join(printable(x) for x in other[:4]) + (" …" if len(other) > 4 else "")
-                 + ": plaintext copies of the databases; kept, the add-on does not delete them: delete them yourself "
-                 "once you are satisfied")
+    for what, names in (("of a gate run that did not finish", left), ("no gate run names", other)):
+        if names:
+            L.append(f"Doctor captures {what}: {len(names)} in {caps}: "
+                     + ", ".join(printable(x) for x in names[:4]) + (" …" if len(names) > 4 else "")
+                     + ": plaintext copies of the databases; kept, the add-on does not delete them: delete them "
+                     "yourself once you are satisfied")
     return L
 
 

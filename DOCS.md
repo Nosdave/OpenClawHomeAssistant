@@ -1457,7 +1457,11 @@ What you see:
 - The precheck says `will set` and lists the jobs the fix keeps working (`kept working by
   the automatic fix`). A job that reaches the provider only after a fallback that stays
   refused is not counted: an info line names it (`… only after a fallback that stays
-  refused …`). `oc-upgrade gate --dry-run`, `oc-upgrade gate --plan` and
+  refused …`). With OpenClaw 2026.11.2 and later, a job whose own model is on another
+  provider's stored login is not counted either: doctor records that login as its account,
+  and its fallback on `<p>` is refused either way. If only such jobs reach `<p>`, the line
+  says `… for no enabled cron job: …` (the setting is harmless: `<p>` runs on the same
+  key). `oc-upgrade gate --dry-run`, `oc-upgrade gate --plan` and
   `oc-upgrade check` say `would set` and write nothing.
 - The end of the run and `oc-upgrade status` repeat the line. Both also read
   `openclaw.json` again: if the setting is gone or changed later (by hand, for example
@@ -1510,7 +1514,28 @@ never holds. With OpenClaw 2026.10.4 it prints and changes nothing.
   copies, or AWS SDK credentials), and says either that every run is refused (the job's
   own model is one of them) or that the job keeps working on its own model and stops at
   the first such fallback when that model fails (with `$include`: as far as `openclaw.json`
-  itself shows). Then one `WARN [gate] provider <p>: …`
+  itself shows). An `openai/…` model on the **Codex runtime** is marked: OpenClaw runs an
+  `openai/…` model there when the Codex plugin (`@openclaw/codex`) is installed and not
+  disabled and `openclaw.json` sets no other runtime for it (`agentRuntime`), no route
+  (`api` or `baseUrl` on `models.providers.openai` or its model row; also
+  `OPENAI_BASE_URL` for the gateway), no request `params` for it and no
+  `cloudWorkers.requiredProfile`. With a route of your own OpenClaw decides by the
+  endpoint; the gate leaves such a model unmarked. Before OpenClaw refuses a model on the
+  Codex runtime, Codex signs in with the stored login and looks up the account and its
+  models (for a ChatGPT login at chatgpt.com), unless an earlier lookup of the gateway
+  already loaded them. If that lookup fails (for example without network), OpenClaw counts
+  the model as failed, not as refused, and goes on to the next fallback, so the job can then
+  stop at a later fallback instead (`… openai/gpt-5.5 runs on the Codex runtime, so before
+  that refusal Codex signs in with the stored login …`; in the list of the other models
+  `openai/gpt-5.5 (Codex runtime)`; in `oc-upgrade status` `stops at the fallback
+  openai/gpt-5.5 (Codex runtime: …)`). With
+  `plugins.entries.codex.config.discovery.enabled: false` Codex looks nothing up, and the
+  line stays as for any other model. With `appServer.homeScope: "user"` Codex uses the
+  login of its own Codex home instead of the stored login. OpenClaw's own migration
+  (2026.11.2 and later) records no account for a job whose own model is set to another
+  runtime than `openclaw` (for example `agentRuntime: {"id": "codex"}`); its `WARN` line
+  says so (`… so OpenClaw 2026.11.3 doctor records no inference account for it …`).
+  Then one `WARN [gate] provider <p>: …`
   line per provider whose literal key is the reason, with the fix (below). Only the job
   id, its name (redacted like the log), model names, provider ids and config paths are
   shown, no prompt, no account and no key.
@@ -1537,7 +1562,14 @@ never holds. With OpenClaw 2026.10.4 it prints and changes nothing.
   migration the end of the run and `oc-upgrade status` name every job that has a recorded
   account, disabled ones too, with the fallbacks OpenClaw now refuses for it (`info: N
   cron job(s) … have a recorded inference account …: '<name>' (<id>) on <provider>,
-  refused: <provider/model>, …`; no account id).
+  refused: <provider/model>, …`; no account id). OpenClaw keeps a recorded account when
+  the job's model changes later without `@<profileId>` (an edit with `--model
+  <provider/model>`, or a new default model that the job inherits). If the job's own
+  model is then on another provider than the account's, OpenClaw refuses that model and
+  tries only the fallbacks on the account's provider. Such a job gets a `WARN` instead
+  (`cron job '<name>' (<id>): its own model … is on …, not on its recorded inference
+  account's provider …`). The fix is `openclaw automations edit <id> --model
+  <provider/model>@<profileId>`; dropping fallbacks does not help.
 - **Skill Workshop's retired weekly curator** (its jobs, for example
   `skill-collection-review-main`, with a `skill-collection-review:` declaration or the old
   `skillCollectionReview` payload) is left out too: OpenClaw 2026.10.10+ doctor deletes
@@ -1761,6 +1793,12 @@ release of the 2026.11.1 line, built on 2026.10.10); add-on versions with OpenCl
   `WARN [gate] provider <provider>: …` line (`auth: "api-key"` or an env SecretRef). For
   AWS SDK credentials (`auth: "aws-sdk"`)
   this stays so with OpenClaw's own migration too: no account can be recorded for them.
+  An `openai/…` model on the Codex runtime (the Codex plugin installed and enabled) is
+  not refused at once: Codex first signs in with the stored login and looks up the
+  account and its models (for a ChatGPT login at chatgpt.com), even for a job that
+  OpenClaw then refuses (unless an earlier lookup already loaded them); without network
+  that lookup fails and OpenClaw goes on to the next fallback. The gate marks such
+  models; it cannot tell whether the lookup will work.
   Apart from its `auth: "api-key"` fixup the gate only reports the affected jobs; see
   [Cron jobs without a recorded inference account](#cron-jobs-without-a-recorded-inference-account-openclaw-20261010).
 - **Cron warning at every gateway start (OpenClaw 2026.11.2 and later).** The gateway
@@ -1852,7 +1890,11 @@ doctor repairs it): doctor names that directory only as `Original update capture
 evidence retained at …` and `Database backup files retained at …/database.…`, and it holds
 plaintext database copies too. A `doctor-<uuid>` directory that no doctor pass of a gate
 run names (a doctor you ran yourself) is kept; `oc-upgrade status` names it under
-`Doctor captures no gate run names`: delete it yourself. If the add-on held after the
+`Doctor captures no gate run names`: delete it yourself. The captures of a gate run that
+never finished (for example a held run whose state you then deleted, so that the next
+start closed it as abandoned) are kept as well, since the add-on cannot tell whether they
+are still needed; `oc-upgrade status` names them under `Doctor captures of a gate run
+that did not finish`: delete them yourself once you are satisfied. If the add-on held after the
 run (gateway exit 78 or a crash loop), the time counts from when that hold was cleared
 with `oc-upgrade retry`, since that is later.
 
@@ -2716,6 +2758,14 @@ refuses it); `oc-upgrade retry --doctor`, its add-on equivalent, would not recor
 account for these jobs either. A job that stops at a fallback on a stored login is
 reported by the gate with a `WARN` line and what to do; see
 [Cron jobs without a recorded inference account](#cron-jobs-without-a-recorded-inference-account-openclaw-20261010).
+
+If such a fallback is an `openai/…` model on the Codex runtime (the gate's line says
+`runs on the Codex runtime`), OpenClaw's log can show `model fallback decision:
+decision=candidate_failed … candidate=openai/… next=…` with `detail=workspace routing
+discovery failed` (without network), and then the next fallback being tried or refused:
+Codex looks up the account with the stored login before OpenClaw refuses the model, and
+a failed lookup counts as an ordinary failure of that fallback. With network the lookup
+is expected to work, and OpenClaw then stops at that fallback.
 
 ### Gateway exited with code 78
 

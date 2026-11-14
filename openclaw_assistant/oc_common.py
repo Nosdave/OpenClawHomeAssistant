@@ -887,9 +887,12 @@ _REDACT_RES = [
     # Authorization: <any other scheme> <credentials> (Token, Bot, Digest, ...; also Proxy-Authorization, "quoted")
     (re.compile(r"(?i)(\bAuthorization[\"']?:[^\S\r\n]*+[\"']?[A-Za-z][\w-]*+)[^\S\r\n]++[^\s\"'`,;]{8,}"),
      r"\1 ***"),
-    # sk-… keys stand on their own: not the "sk-" inside a word (N7: "openclaw-task-delivery-recovery-38FuVU", the
-    # directory doctor names in its [doctor] line, became "openclaw-ta***"; also "risk-…", "desk-…")
-    (re.compile(r"(?<![A-Za-z0-9])sk-[A-Za-z0-9_-]{10,}"), "***"),
+    # sk-… keys (also Cerebras csk-… and hsk-…) stand on their own: not the "sk-" after a letter or digit, as inside a
+    # word (N7: "openclaw-task-delivery-recovery-38FuVU", the directory doctor names in its [doctor] line, became
+    # "openclaw-ta***"; also "risk-…", "desk-…", "ask-…"), but after an escape or percent-encoding that ends in one
+    # ("\nsk-…", "\x22sk-…", "\u0022sk-…", "%3Dsk-…", an ANSI SGR "\x1b[0msk-…")
+    (re.compile(r"(?:(?<![A-Za-z0-9])|(?<=\\[a-z])|(?<=%[0-9A-Fa-f]{2})|(?<=\\x[0-9A-Fa-f]{2})"
+                r"|(?<=\\u[0-9A-Fa-f]{4})|(?<=[0-9]m))[ch]?sk-[A-Za-z0-9_-]{10,}"), "***"),
     (re.compile(r"(?i)\bbot\d{6,12}:[A-Za-z0-9_-]{30,}"), "bot***"),  # Telegram Bot API URL form
     (re.compile(r"\b\d{6,12}:[A-Za-z0-9_-]{30,}\b"), "***"),
     (re.compile(r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}"), "***"),  # JWT

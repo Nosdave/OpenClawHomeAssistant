@@ -856,7 +856,10 @@ class OpenClawNameRedactTests(unittest.TestCase):
                 f"Original update capture failed; evidence retained at /config/.openclaw.update-captures/{self.CAP}",
                 f"Doctor captures no gate run names: 1 in /config/.openclaw.update-captures: {self.CAP}: kept",
                 f"capture: {self.CAP}.",
-                "a risk-assessment-tool on the desk-organizer-2026 task-runner-0123456789"):
+                "a risk-assessment-tool on the desk-organizer-2026 task-runner-0123456789",
+                # wf4 N7-R1: the escape allow-list keeps 'ask-…' and capitalised names readable
+                "[warning] policy/tools-exec-ask-unapproved: exec asks before it runs",
+                "Task-runner-0123456789 and Desk-lamp-0123456789"):
             with self.subTest(line=line[:40]):
                 self.assertEqual(C.redact_text(line), line)
                 self.assertEqual(C.redact_text_counted(line), (line, 0))
@@ -870,6 +873,36 @@ class OpenClawNameRedactTests(unittest.TestCase):
                           ("token-" + "Q" * 40, "***")):
             with self.subTest(raw=raw[:20]):
                 self.assertEqual(C.redact_text(raw), want)
+
+    def test_keys_after_an_escape_or_percent_encoding_are_hidden(self):
+        """wf4 N7-R1: an escape sequence or percent-encoding that ends in a letter or digit directly before the key
+        ('\\n', '\\x22', '%3D', an ANSI SGR) is no word: the key is hidden, as before N7 (a short sk- key is no
+        long token either)."""
+        sk = "sk-" + "0123456789abcdef" * 2  # the 35-character sk- + 32 hex shape
+        for raw, want in ((f"value\\n{sk}", "value\\n***"), (f"%3D{sk}", "%3D***"), (f"%22{sk}%22", "%22***%22"),
+                          (f"\\x22{sk}\\x22", "\\x22***\\x22"), (f"\x1b[0m{sk}", "\x1b[0m***"),
+                          (f"key\\t{sk}", "key\\t***"), (f"\\u0022{sk}", "\\u0022***"),
+                          (f"q=key%20{sk}", "q=key%20***"), (f"text\\nsk-proj-{'Ab1' * 20}/v1", "text\\n***/v1"),
+                          (repr(["header", "x\n" + sk]), "['header', 'x\\n***']")):
+            with self.subTest(raw=raw[:24]):
+                self.assertEqual(C.redact_text(raw), want)
+                self.assertEqual(C.redact_text_counted(raw, long_tokens=False), (want, 1))
+
+    def test_csk_and_hsk_keys_are_hidden(self):
+        """wf4 N7-R2: Cerebras csk-… and hsk-… keys (OpenClaw's own log redactor lists hsk-) are hidden as a whole,
+        also next to '/' or '.<word>' and in the export path without the long-token rule; inside a word they are not."""
+        csk = "csk-" + "a1b2c3d4" * 6
+        for raw, want in (("memory hsk-abcdefghij12345 rejected", "memory *** rejected"),
+                          ("value 'hsk-abcdefghij12345' invalid", "value '***' invalid"),
+                          ("provider cerebras key csk-a1b2c3d4e5f6g7h8i9j0 rejected",
+                           "provider cerebras key *** rejected"),
+                          (f"/{csk}/x", "/***/x"), (f"wrote {csk}.json", "wrote ***.json"), (f"%3D{csk}", "%3D***")):
+            with self.subTest(raw=raw[:24]):
+                self.assertEqual(C.redact_text(raw), want)
+                self.assertEqual(C.redact_text_counted(raw, long_tokens=False), (want, 1))
+        for word in ("Wachsk-0123456789ab", "Kiosk-0123456789ab"):
+            with self.subTest(word=word):
+                self.assertEqual(C.redact_text(word), word)
 
 
 class KeyValueRedactTests(unittest.TestCase):

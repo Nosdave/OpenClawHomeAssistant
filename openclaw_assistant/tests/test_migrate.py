@@ -2940,6 +2940,127 @@ class TestCronAccountForecast(unittest.TestCase):
         self.assertEqual((jobs, self.CFG), (snap, cfg_snap))
 
 
+class TestCronCodexRuntimeForecast(unittest.TestCase):
+    """wf4 (11.3 rehearsal, Codex runtime fallback): an affected openai ref on the Codex app-server runtime is marked
+    ("codex"): OpenClaw 2026.10.10+ loads Codex's model catalog with the stored login before its auth plan refuses
+    the candidate, and a failed lookup is no chain stop. Implicit Codex needs the plugin active (codex_active) and no
+    authored route, request params or cloudWorkers.requiredProfile; discovery.enabled false skips the lookup.
+    Synthetic config, jobs and profiles only."""
+
+    CFG = {"agents": {"defaults": {"model": {"primary": "glm/glm-5",
+                                             "fallbacks": ["openai/gpt-5.5", "anthropic/claude-sonnet-4-6"]}},
+                      "list": [{"id": "main", "default": True}]},
+           "models": {"providers": {"glm": {"baseUrl": "http://127.0.0.1:8000/v1", "api": "openai-completions",
+                                            "apiKey": {"source": "env", "provider": "default", "id": "GLM_KEY"}}}}}
+    PROFILES = [{"id": "openai:synthetic", "provider": "openai"}, {"id": "anthropic:manual", "provider": "anthropic"}]
+    BASE = {"id": "j1", "name": "Job j1", "agent": "main", "primary": "glm/glm-5", "primary_affected": False,
+            "refs": ["openai/gpt-5.5", "anthropic/claude-sonnet-4-6"]}
+
+    def job(self, **payload):
+        return {"id": "j1", "name": "Job j1", "enabled": True, "runtime_authority": False,
+                "job": {"agentId": "main", "sessionTarget": "isolated",
+                        "payload": dict({"kind": "agentTurn", "message": "synthetic prompt"}, **payload)}}
+
+    def forecast(self, cfg=None, codex_active=True, env=None, **payload):
+        return m.cron_account_forecast([self.job(**payload)], self.CFG if cfg is None else cfg,
+                                       lambda aid: self.PROFILES, "main", codex_active=codex_active, env=env)
+
+    def cfg(self, *path_value):
+        cfg = copy.deepcopy(self.CFG)
+        for path, value in path_value:
+            cur = cfg
+            for k in path[:-1]:
+                cur = cur.setdefault(k, {})
+            cur[path[-1]] = value
+        return cfg
+
+    def test_codex_active_marks_the_openai_fallback(self):
+        self.assertEqual(self.forecast()["affected"], [dict(self.BASE, codex=["openai/gpt-5.5"])])
+
+    def test_defaults_keep_todays_result(self):
+        # without the plugin (the default) nothing changes: the embedded runner refuses before any request
+        self.assertEqual(self.forecast(codex_active=False)["affected"], [self.BASE])
+        self.assertEqual(m.cron_account_forecast([self.job()], self.CFG, lambda aid: self.PROFILES, "main")["affected"],
+                         [self.BASE])
+
+    def test_runtime_pins(self):
+        pin = {"agentRuntime": {"id": "openclaw"}}
+        for cfg in (self.cfg((["agents", "defaults", "models"], {"openai/gpt-5.5": pin})),
+                    self.cfg((["agents", "defaults", "models"], {"openai/*": {"agentRuntime": {"id": "pi"}}})),
+                    self.cfg((["agents", "list"], [{"id": "main", "default": True,
+                                                    "models": {"openai/gpt-5.5": pin}}])),
+                    self.cfg((["models", "providers", "openai"], {"agentRuntime": {"id": "openclaw"}})),
+                    self.cfg((["models", "providers", "openai"], {"models": [dict(pin, id="gpt-5.5")]}))):
+            with self.subTest(cfg=json.dumps(cfg)[-90:]):
+                self.assertEqual(self.forecast(cfg)["affected"], [self.BASE])
+        codex = self.cfg((["agents", "defaults", "models"], {"openai/gpt-5.5": {"agentRuntime": {"id": "codex"}}}))
+        self.assertEqual(self.forecast(codex)["affected"], [dict(self.BASE, codex=["openai/gpt-5.5"])])
+        # an explicit codex pin without the plugin: not modelled (fails closed), no mark
+        self.assertEqual(self.forecast(codex, codex_active=False)["affected"], [self.BASE])
+        # an agent's pin wins over the defaults' (model-runtime-policy.ts precedence)
+        both = self.cfg((["agents", "defaults", "models"], {"openai/gpt-5.5": {"agentRuntime": {"id": "codex"}}}),
+                        (["agents", "list"], [{"id": "main", "default": True, "models": {"openai/gpt-5.5": pin}}]))
+        self.assertEqual(self.forecast(both)["affected"], [self.BASE])
+
+    def test_authored_route_params_and_cloud_workers_keep_the_embedded_runner(self):
+        for name, cfg, env in (
+                ("custom baseUrl", self.cfg((["models", "providers", "openai"],
+                                             {"baseUrl": "https://llm.example.invalid/v1"})), None),
+                ("api completions", self.cfg((["models", "providers", "openai"], {"api": "openai-completions"})), None),
+                ("model row route", self.cfg((["models", "providers", "openai"], {"models": [
+                    {"id": "gpt-5.5", "baseUrl": "https://llm.example.invalid/v1"}]})), None),
+                ("env OPENAI_BASE_URL", None, {"OPENAI_BASE_URL": "https://llm.example.invalid/v1"}),
+                ("defaults params", self.cfg((["agents", "defaults", "params"], {"temperature": 0.2})), None),
+                ("model params", self.cfg((["agents", "defaults", "models"], {"openai/gpt-5.5": {
+                    "params": {"temperature": 0.2}}})), None),
+                ("agent params", self.cfg((["agents", "list"], [{"id": "main", "default": True,
+                                                                 "params": {"temperature": 0.2}}])), None),
+                ("cloud workers", self.cfg((["cloudWorkers", "requiredProfile"], "synthetic-profile")), None),
+                ("discovery off", self.cfg((["plugins", "entries", "codex", "config", "discovery"],
+                                            {"enabled": False})), None)):
+            with self.subTest(name):
+                self.assertEqual(self.forecast(cfg, env=env)["affected"], [self.BASE])
+        # an empty params object and an empty OPENAI_BASE_URL author nothing
+        cfg = self.cfg((["agents", "defaults", "params"], {}))
+        self.assertEqual(self.forecast(cfg, env={"OPENAI_BASE_URL": " "})["affected"],
+                         [dict(self.BASE, codex=["openai/gpt-5.5"])])
+
+    def test_codex_home_scope_user(self):
+        cfg = self.cfg((["plugins", "entries", "codex", "config", "appServer"], {"homeScope": "user"}))
+        self.assertEqual(self.forecast(cfg)["affected"],
+                         [dict(self.BASE, codex=["openai/gpt-5.5"], codex_home="user")])
+        self.assertEqual(self.forecast(cfg, codex_active=False)["affected"], [self.BASE])
+
+    def test_explicit_runtime_of_the_own_model(self):
+        cfg = self.cfg((["agents", "defaults", "models"], {"openai/gpt-5.5": {"agentRuntime": {"id": "codex"}}}))
+        got = self.forecast(cfg, model="openai/gpt-5.5", fallbacks=[])["affected"]
+        self.assertEqual(got, [{"id": "j1", "name": "Job j1", "agent": "main", "primary": "openai/gpt-5.5",
+                                "primary_affected": True, "refs": ["openai/gpt-5.5"], "codex": ["openai/gpt-5.5"],
+                                "own_runtime": "codex",
+                                "own_runtime_at": 'agents.defaults.models["openai/gpt-5.5"].agentRuntime'}])
+        # also without the plugin (doctor skips the job either way); an implicit Codex runtime is no own_runtime
+        got = self.forecast(cfg, codex_active=False, model="openai/gpt-5.5", fallbacks=[])["affected"]
+        self.assertEqual(got[0]["own_runtime"], "codex")
+        self.assertNotIn("codex", got[0])
+        got = self.forecast(model="openai/gpt-5.5", fallbacks=[])["affected"]
+        self.assertNotIn("own_runtime", got[0])
+        self.assertEqual(got[0]["codex"], ["openai/gpt-5.5"])
+        # a pin of a fallback is no own_runtime
+        got = self.forecast(cfg)["affected"]
+        self.assertNotIn("own_runtime", got[0])
+
+    def test_ref_runtime_helper(self):
+        rt = m.cron_ref_runtime
+        self.assertEqual(rt(self.CFG, "openai", "gpt-5.5", "main", True), "codex")
+        self.assertEqual(rt(self.CFG, "openai", "gpt-5.5", "main", False), "openclaw")
+        self.assertEqual(rt(self.CFG, "anthropic", "claude-sonnet-4-6", "main", True), "openclaw")
+        self.assertEqual(rt(self.CFG, None, "gpt-5.5", "main", True), "openclaw")
+        acpx = self.cfg((["models", "providers", "openai"], {"agentRuntime": {"id": "acpx"}}))
+        self.assertEqual(rt(acpx, "openai", "gpt-5.5", "main", True), "acpx")
+        auto = self.cfg((["models", "providers", "openai"], {"agentRuntime": {"id": "auto"}}))
+        self.assertEqual(rt(auto, "openai", "gpt-5.5", "main", True), "codex")
+
+
 class TestDoctorKeyCopies(unittest.TestCase):
     """Rehearsal D1: OpenClaw's doctor (2026.8.1+, unchanged in 2026.10.10 and 2026.11.1) copies a literal provider
     apiKey into its auth store as "<provider>:default" (doctor-model-catalog-credentials.ts collectCredentials), and

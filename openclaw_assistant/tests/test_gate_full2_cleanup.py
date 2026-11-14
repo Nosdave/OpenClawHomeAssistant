@@ -1462,6 +1462,41 @@ class StatusTests(CleanupEnv):
         self.status()
         self.no_line("Doctor captures no gate run names: ")
 
+    def test_captures_of_a_run_that_did_not_finish_are_named_as_kept(self):
+        # wf4 N1-R1: a run closed without finished_at (abandoned: the state dir was wiped during a HOLD after a doctor
+        # pass) keeps its captures for good (cleanup_targets skips it); status must not count them as deleted with
+        # their gate run, and names them on a line of their own, not as captures no gate run names
+        left = self.make_run(finished=None, status="abandoned", captures=1, archive=None)
+        done = self.make_run(finished=T0 + timedelta(days=1), captures=1, archive=None, current=True)
+        stray = self.capture()
+        self.status()
+        self.assertEqual(self.line("Doctor captures: "),
+                         f"Doctor captures: 1 in {self.caps} (pre-repair database copies; deleted with their gate run)")
+        self.assertEqual(self.line("Doctor captures of a gate run that did not finish: "),
+                         f"Doctor captures of a gate run that did not finish: 1 in {self.caps}: {left.caps[0].name}: "
+                         "plaintext copies of the databases; kept, the add-on does not delete them: delete them "
+                         "yourself once you are satisfied")
+        self.assertEqual(self.line("Doctor captures no gate run names: "),
+                         f"Doctor captures no gate run names: 1 in {self.caps}: {stray.name}: plaintext copies of the "
+                         "databases; kept, the add-on does not delete them: delete them yourself once you are "
+                         "satisfied")
+        self.cleanup(T0 + timedelta(days=400))
+        self.assertFalse(done.caps[0].exists())
+        self.assertTrue(left.caps[0].is_dir())  # never deleted, as the status line says
+        self.status()
+        self.assertTrue(self.line("Doctor captures: ").startswith(f"Doctor captures: 0 in {self.caps} "), self.st)
+        self.assertTrue(self.line("Doctor captures of a gate run that did not finish: ").startswith(
+            f"Doctor captures of a gate run that did not finish: 1 in {self.caps}: {left.caps[0].name}: "), self.st)
+
+    def test_captures_of_the_current_held_run_count_as_deleted_with_it(self):
+        # wf4 N1-R1: the current run, still held (no finished_at yet), finishes later and then deletes its captures
+        r = self.make_run(finished=None, status="hold", captures=1, archive=None, current=True)
+        self.status()
+        self.assertTrue(self.line("Doctor captures: ").startswith(f"Doctor captures: 1 in {self.caps} "), self.st)
+        self.no_line("Doctor captures of a gate run that did not finish: ")
+        self.no_line("Doctor captures no gate run names: ")
+        self.assertTrue(r.caps[0].is_dir())
+
     def test_no_run_recorded(self):
         self.status()
         self.assertIn("Gate: no run recorded.", self.st)

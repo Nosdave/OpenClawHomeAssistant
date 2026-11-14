@@ -2398,8 +2398,99 @@ def cron_ref_uses_stored_profile(cfg, provider, explicit_profile, profiles):
     return cron_ref_refusal(cfg, provider, explicit_profile, profiles) is not None
 
 
+def _nonblank(v):
+    return v is not None and not (isinstance(v, str) and not v.strip())
+
+
+def _openai_authored_route(cfg, model_id, env):
+    """True when openclaw.json or the gateway's environment authors a route for openai/<model_id>: api or baseUrl on
+    models.providers.openai or on its row for that model, or OPENAI_BASE_URL (extensions/openai/provider-policy-api.ts
+    resolveAuthoredModelRoute). Which runtime OpenClaw then picks depends on the endpoint and adapter; not modelled."""
+    for _pk, block in _provider_blocks(cfg, "openai"):
+        if not isinstance(block, dict):
+            continue
+        if _nonblank(block.get("api")) or _nonblank(block.get("baseUrl")):
+            return True
+        for m in block.get("models") if isinstance(block.get("models"), list) else []:
+            if isinstance(m, dict) and isinstance(m.get("id"), str):
+                mid = m["id"].strip()
+                prov, model = _split_ref(mid)
+                if (mid == model_id or (prov == "openai" and model == model_id)) \
+                        and (_nonblank(m.get("api")) or _nonblank(m.get("baseUrl"))):
+                    return True
+    return isinstance(env, dict) and _nonblank(env.get("OPENAI_BASE_URL"))
+
+
+def _openai_request_params(cfg, model_id, agent_id):
+    """True when openclaw.json authors request params for openai/<model_id> in the scope of agent_id
+    (agents.defaults.params, the agent's params, or the params of its agents.defaults.models / agent models entry:
+    model-extra-params.ts hasAuthoredProviderRequestParams). Any key counts here; OpenClaw does not count a models
+    entry's run controls (isAgentRuntimeModelParam: thinking, fastMode, fast*Seconds), not modelled: such an entry
+    leaves the model unmarked."""
+    def given(v):
+        return isinstance(v, dict) and bool(v)
+    aparts = _agent_entry_parts(cfg, agent_id) if agent_id else None
+    agent = _get(cfg, aparts, None) if aparts else None
+    agent = agent if isinstance(agent, dict) else {}
+    if given(_get(cfg, ["agents", "defaults", "params"], None)) or given(agent.get("params")):
+        return True
+    for models in (_get(cfg, ["agents", "defaults", "models"], None), agent.get("models")):
+        e = models.get(f"openai/{model_id}") if isinstance(models, dict) else None
+        if isinstance(e, dict) and given(e.get("params")):
+            return True
+    return False
+
+
+def _codex_plugin_config(cfg):
+    c = _get(cfg, ["plugins", "entries", "codex", "config"], None)
+    return c if isinstance(c, dict) else {}
+
+
+def cron_ref_runtime(cfg, provider, model_id, agent_id, codex_active=False, env=None):
+    """The runtime OpenClaw 2026.10.10+ runs a cron candidate provider/model_id on, as far as it matters for the
+    refusal of an unbound cron job (openclaw/openclaw#192195): "codex" when it runs on the Codex app-server runtime
+    and that runtime's model catalog lookup comes first (cron/isolated-agent/model-selection.ts and
+    embedded-agent-runner/run/model-setup.ts load the native catalog before auth-plan.ts refuses the candidate), else
+    "openclaw" (the embedded runner: refused before any request), or the id of another explicitly configured runtime.
+
+    Explicit: the openai/<model_id> agentRuntime (_resolve_openai_runtime_at, model-runtime-policy.ts precedence);
+    "codex" only while the Codex plugin is active (codex_active, from the install state; an explicit plugin runtime
+    that is not registered fails closed: not modelled). Implicit ("auto", "default" or none, for openai only:
+    harness/policy.ts, openai-routing.ts resolveOpenAIImplicitAgentRuntime): Codex when the plugin is active, no
+    cloudWorkers.requiredProfile, no authored route (_openai_authored_route; env: the gateway's environment) and no
+    authored request params (_openai_request_params); otherwise "openclaw". With
+    plugins.entries.codex.config.discovery.enabled false the Codex catalog lookup is skipped
+    (extensions/codex/src/app-server/model-catalog.ts): "openclaw" as well. Not modelled: a session's runtime
+    override, a ChatGPT token-sharing login (no Codex lookup either), the transport of appServer."""
+    if provider != "openai" or not model_id or _get(cfg, ["cloudWorkers", "requiredProfile"], None):
+        return "openclaw"
+    rid = _resolve_openai_runtime_at(cfg, model_id, agent_id)[0]
+    if rid not in (None, "auto", "default"):
+        if rid != "codex":
+            return rid
+    elif not codex_active or _openai_authored_route(cfg, model_id, env) \
+            or _openai_request_params(cfg, model_id, agent_id):
+        return "openclaw"
+    discovery = _codex_plugin_config(cfg).get("discovery")
+    if not codex_active or (isinstance(discovery, dict) and discovery.get("enabled") is False):
+        return "openclaw"
+    return "codex"
+
+
+def cron_own_runtime(cfg, provider, model_id, agent_id):
+    """(runtime id, config path) of an explicit agentRuntime other than openclaw/auto/default configured for a job's
+    own model openai/<model_id>, or (None, None): OpenClaw 2026.11.2+ doctor records no inference account for such a
+    job ('runtime <id> inference ownership was left unchanged', inference-binding-migration.ts). openai only."""
+    if provider != "openai" or not model_id:
+        return None, None
+    rid, _src, parts = _resolve_openai_runtime_at(cfg, model_id, agent_id)
+    if rid in (None, "openclaw", "auto", "default") or not parts:
+        return None, None
+    return rid, fmt_path(list(parts) + ["agentRuntime"])
+
+
 def cron_account_forecast(jobs, cfg, profiles_for, default_agent="main", copies_for=None, copies_pending=False,
-                          configured=None):
+                          configured=None, codex_active=False, env=None):
     """Report-only forecast for openclaw/openclaw#192195 (no I/O).
 
     jobs: [{"id", "name", "enabled", "runtime_authority", "job"}] in store order, "job" the parsed job_json
@@ -2422,7 +2513,13 @@ def cron_account_forecast(jobs, cfg, profiles_for, default_agent="main", copies_
     pending: the stored login is doctor's copy during this migration. No key value anywhere.
     configured: the agent ids openclaw.json configures (normalize_agent_id), or None for no check. OpenClaw cancels every run
     of a job whose agent is not configured ("cron job agent is unavailable", the gateway's isAgentAvailable), so such
-    a job is not checked; it is listed in "unconfigured": [{"id", "name", "agent"}]."""
+    a job is not checked; it is listed in "unconfigured": [{"id", "name", "agent"}].
+    codex_active: the Codex plugin is installed and enabled (the caller reads the install state); env: the gateway's
+    environment (OPENAI_BASE_URL). An entry with refs on the Codex runtime (cron_ref_runtime "codex": Codex signs in
+    and looks up the account's models before OpenClaw refuses the candidate, and a failed lookup is no chain stop)
+    also has "codex": those refs, and "codex_home": "user" with plugins.entries.codex.config.appServer.homeScope
+    "user" (Codex then uses its own home's login); one whose own model is set to another runtime than openclaw
+    (cron_own_runtime, primary affected) has "own_runtime" and "own_runtime_at" (the config path)."""
     cfg = cfg if isinstance(cfg, dict) else {}
     res = {"checked": 0, "bound": 0, "affected": [], "key_fix": [], "unconfigured": []}
     keyed = {}
@@ -2444,7 +2541,7 @@ def cron_account_forecast(jobs, cfg, profiles_for, default_agent="main", copies_
         primary, fallbacks, _src = cron_model_chain(job, cfg, agent)
         profiles = list(profiles_for(agent))
         copies = list(copies_for(agent)) if copies_for else []
-        refs, aws, copied, primary_affected = [], [], [], False
+        refs, aws, copied, codex, primary_affected, own = [], [], [], [], False, (None, None)
         for i, raw in enumerate([primary] + fallbacks):
             r = cron_model_ref(cfg, raw) if raw else None
             if r is None and raw:  # a bare id that is no alias: an explicit profile is still a stored login
@@ -2458,6 +2555,10 @@ def cron_account_forecast(jobs, cfg, profiles_for, default_agent="main", copies_
                 continue
             ref = f"{r[0]}/{r[1]}" if r[0] else r[1]
             primary_affected = primary_affected or i == 0
+            if i == 0:
+                own = cron_own_runtime(cfg, r[0], r[1], agent)
+            if ref not in codex and cron_ref_runtime(cfg, r[0], r[1], agent, codex_active, env) == "codex":
+                codex.append(ref)
             # the refusal is on a literal key doctor copies (or copied): auth "api-key" or a SecretRef lifts it
             if why == "profile" and r[0] and not r[2] and cron_ref_refusal(cfg, r[0], None, copies) == "profile":
                 keyed[r[0]] = keyed.get(r[0], False) or now is None
@@ -2470,10 +2571,14 @@ def cron_account_forecast(jobs, cfg, profiles_for, default_agent="main", copies_
         if refs:
             p = cron_model_ref(cfg, primary) if primary else None
             shown = f"{p[0]}/{p[1]}" if p else split_trailing_auth_profile(primary)[0] if primary else primary
+            home = _get(_codex_plugin_config(cfg), ["appServer", "homeScope"], None)
             res["affected"].append(dict({"id": row.get("id"), "name": row.get("name"), "agent": agent,
                                          "primary": shown, "primary_affected": primary_affected, "refs": refs},
                                         **({"aws_sdk": aws} if aws else {}),
-                                        **({"key_copy": copied} if copied else {})))
+                                        **({"key_copy": copied} if copied else {}),
+                                        **({"codex": codex} if codex else {}),
+                                        **({"codex_home": "user"} if codex and home == "user" else {}),
+                                        **({"own_runtime": own[0], "own_runtime_at": own[1]} if own[0] else {})))
     provs = _get(cfg, ["models", "providers"], None)
     provs = provs if isinstance(provs, dict) else {}
     for prov in sorted(keyed):

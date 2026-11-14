@@ -216,6 +216,27 @@ class CronOn1113Tests(T.GateEnv):
                                   "stays refused (the WARN lines below): the automatic fix covers that model, but the "
                                   "job stops before it: 'Job Lan Oa' (job-lan-oa)"])
 
+    def test_fixup_that_keeps_no_job_says_why(self):
+        """wf4 N2-R2: the only enabled job that reaches the key-fixed glm is a job doctor binds to its own openai login
+        (glm only as its fallback, refused either way). The precheck and the readiness line no longer say 'keeps 0
+        enabled cron job(s) on glm working'; they say why the fixup keeps none."""
+        con = sqlite3.connect(str(self.sdb))
+        con.execute("DELETE FROM cron_jobs")
+        con.commit()
+        con.close()
+        CB.add_jobs(self.state, CODEX_JOBS[:1], start=30)
+        lines = self.dry()
+        text = "\n".join(lines)
+        self.assertNotIn("keeps 0 enabled cron job(s)", text)
+        none = ("for no enabled cron job: the 1 enabled cron job(s) that reach glm only as a fallback run their own "
+                "model on another provider's stored login, so OpenClaw 2026.11.3 refuses glm for them either way (with "
+                "the account doctor records for them, or without it)")
+        self.assertIn("[gate] 1/8 config fixup: would set models.providers.glm.auth = \"api-key\" before doctor pass 1 "
+                      f"({G.cron_fixup_why('glm', RT)}); {none}", lines)
+        self.assertIn("[gate]   cron config fixup: would set models.providers.glm.auth = \"api-key\" before doctor "
+                      f"pass 1 ({none}; {G.CRON_FIXUP_ISSUE})", lines)
+        self.assertNotIn("only after a fallback that stays refused", text)
+
     def test_jobs_doctor_bound_are_listed_after_the_migration_with_their_refused_fallbacks(self):
         """N2: after the migration the end of the run and oc-upgrade status name the jobs with a recorded account,
         disabled ones too, and the fallbacks OpenClaw now refuses for them (other providers than the account's);
@@ -235,8 +256,8 @@ class CronOn1113Tests(T.GateEnv):
             ("job-morning", True, "openai", ["anthropic/claude-sonnet-4-6"]),
             ("job-codex", True, "openai", ["glm/glm-5"]),
             ("job-claude-off", False, "anthropic", ["glm/glm-5", "openai/gpt-5.5"])])
-        bl = ("3 cron job(s) (1 of them disabled) have a recorded inference account (OpenClaw 2026.11.3 doctor records "
-              "it during the migration for a job whose own model is on a stored login, openclaw/openclaw#172792): "
+        bl = ("3 cron job(s) (1 of them disabled) have a recorded inference account (OpenClaw 2026.11.2+ doctor "
+              "records one for a job whose own model is on a stored login, openclaw/openclaw#172792): "
               "their own model runs on that account, and OpenClaw refuses their fallbacks to other providers (as "
               "with openclaw/openclaw#192463): 'Morning summary' (job-morning) on openai, refused: "
               "anthropic/claude-sonnet-4-6; 'Job Codex' (job-codex) on openai, refused: glm/glm-5; 'Job Claude Off' "
@@ -271,12 +292,85 @@ class CronOn1113Tests(T.GateEnv):
         self.assertEqual([(a["id"], a["provider"], a["refused"]) for a in got], [
             ("bound", "openai", []), ("pinned", "openai", ["glm/glm-5"]), ("noprov", None, [])])
         self.assertIsNone(G.cron_bound_line({"bound_jobs": []}))
-        line = G.cron_bound_line({"runtime": RT, "bound_jobs": got, "bound_jobs_count": 5})
-        self.assertIn("'noprov' (noprov) on a provider the record does not name, no fallback on another provider",
-                      line)
+        rec = {"runtime": RT, "bound_jobs": got, "bound_jobs_count": 5}
+        line = G.cron_bound_line(rec)
+        # wf4 N2-R1: a record without a provider is no "no fallback on another provider" case: OpenClaw rejects it
+        self.assertNotIn("noprov", line)
+        self.assertTrue(line.startswith("4 cron job(s) have a recorded inference account (OpenClaw 2026.11.2+ doctor "
+                                        "records one for a job whose own model is on a stored login, "
+                                        "openclaw/openclaw#172792): "), line)
         self.assertIn("'bound' (bound) on openai, no fallback on another provider; ", line)
         self.assertIn(" and 2 more. To keep", line)
         self.assertNotIn("openai:x", line)
+        self.assertEqual(G.cron_bound_warn_lines(rec), [
+            "cron job 'noprov' (noprov): its recorded inference account names no provider: OpenClaw 2026.11.3 treats "
+            "such a record as invalid ('Invalid automation inference binding; explicitly select an account again.'); "
+            "to fix: openclaw automations edit <id> --model <provider/model>@<profileId>"])
+
+    def test_bound_job_whose_own_model_is_on_another_provider(self):
+        """wf4 N2-R1: doctor bound a job to openai while its own model was openai; later its model (here the default
+        model it inherits) moved to anthropic. OpenClaw keeps the record, refuses the job's own model (another provider
+        than the record's) and goes on only to fallbacks on openai: no "their own model runs on that account", and the
+        remedy is --model …@<profileId>, not --fallbacks."""
+        cfg = json.loads(json.dumps(CB.CFG_GLM))
+        cfg["agents"]["defaults"]["model"] = {"primary": "anthropic/claude-x", "fallbacks": ["glm/glm-5"]}
+
+        def job(jid, **payload):
+            return {"id": jid, "name": jid, "enabled": True, "runtime_authority": False, "job": {
+                "agentId": "main", "sessionTarget": "isolated", "inferenceBinding": dict(BINDING),
+                "payload": dict({"kind": "agentTurn"}, **payload)}}
+        jobs = [job("inh"), job("edited", model="anthropic/claude-sonnet-4-6", fallbacks=["openai/gpt-5.5-mini",
+                                                                                         "anthropic/claude-x"]),
+                job("fine", model="openai/gpt-5.5", fallbacks=["anthropic/claude-x"])]
+        got = G.cron_bound_jobs(jobs, cfg, "main", {"main"})
+        self.assertEqual(got, [
+            {"id": "inh", "name": "inh", "enabled": True, "provider": "openai", "refused": ["glm/glm-5"],
+             "own_refused": "anthropic/claude-x", "on_account": []},
+            {"id": "edited", "name": "edited", "enabled": True, "provider": "openai", "refused": ["anthropic/claude-x"],
+             "own_refused": "anthropic/claude-sonnet-4-6", "on_account": ["openai/gpt-5.5-mini"]},
+            {"id": "fine", "name": "fine", "enabled": True, "provider": "openai", "refused": ["anthropic/claude-x"]}])
+        rec = {"runtime": RT, "bound_jobs": got, "bound_jobs_count": 3}
+        line = G.cron_bound_line(rec)
+        self.assertTrue(line.startswith("1 cron job(s) have a recorded inference account"), line)
+        self.assertIn(": 'fine' (fine) on openai, refused: anthropic/claude-x. To keep", line)
+        self.assertNotIn("'inh'", line)
+        self.assertNotIn("'edited'", line)
+        fix = "; to fix: openclaw automations edit <id> --model <provider/model>@<profileId>"
+        self.assertEqual(G.cron_bound_warn_lines(rec), [
+            "cron job 'inh' (inh): its own model anthropic/claude-x is on anthropic, not on its recorded inference "
+            "account's provider openai: OpenClaw 2026.11.3 refuses it ('The selected model uses a different provider "
+            "from this job's stored account') and tries only fallbacks on openai; the job has none, so every run "
+            "fails" + fix,
+            "cron job 'edited' (edited): its own model anthropic/claude-sonnet-4-6 is on anthropic, not on its "
+            "recorded inference account's provider openai: OpenClaw 2026.11.3 refuses it ('The selected model uses a "
+            "different provider from this job's stored account') and tries only fallbacks on openai "
+            "(openai/gpt-5.5-mini)" + fix])
+        # only odd jobs: no info line, only the WARN lines
+        odd = {"runtime": RT, "bound_jobs": got[:2], "bound_jobs_count": 2}
+        self.assertIsNone(G.cron_bound_line(odd))
+        self.assertEqual(len(G.cron_bound_warn_lines(odd)), 2)
+
+    def test_bound_job_on_another_provider_warned_at_the_end_and_in_status(self):
+        """wf4 N2-R1 end to end: after the migration the default model is anthropic; job-local (inherits it) has an
+        openai record (doctor bound it while the default was openai). The end of the run and oc-upgrade status warn."""
+        self.doctor_binds_morning(extra_sql=[
+            "UPDATE cron_jobs SET job_json = json_set(job_json, '$.inferenceBinding', json('%s')) "
+            "WHERE job_id = 'job-local'" % json.dumps(BINDING)])
+        cfg = json.loads(json.dumps(CB.CFG_GLM))
+        cfg["agents"]["defaults"]["model"] = {"primary": "anthropic/claude-x", "fallbacks": ["openai/gpt-5.5"]}
+        self.write_cfg(cfg)
+        self.assertEqual(self.run_gate(), 0, self.out)
+        fin = self.out[self.out.index("[gate] 7/8 postconditions OK"):]
+        warn = ("cron job 'Local digest' (job-local): its own model anthropic/claude-x is on anthropic, not on its "
+                "recorded inference account's provider openai: OpenClaw 2026.11.3 refuses it ('The selected model uses "
+                "a different provider from this job's stored account') and tries only fallbacks on openai "
+                "(openai/gpt-5.5); to fix: openclaw automations edit <id> --model <provider/model>@<profileId>")
+        self.assertIn(f"WARN [gate] {warn}", fin)
+        self.assertIn(f"  WARN: {warn}", G.status_lines())
+        bl = [ln for ln in fin.splitlines() if "have a recorded inference account" in ln]
+        self.assertEqual(len(bl), 1, fin)
+        self.assertNotIn("'Local digest'", bl[0])
+        self.assertNotIn("openai:default", fin + "\n".join(G.status_lines()))
 
     def test_run_reports_what_doctor_left_and_the_gateway_warning(self):
         self.doctor_binds_morning()
@@ -399,6 +493,131 @@ class CronOn1113Tests(T.GateEnv):
 
 
 # --- R5: doctor's pre-repair cron backups ----------------------------------------------------------------------
+
+# wf4: the 11.3 rehearsal's layout (synthetic): a keyless local primary, then an openai login (Codex runtime when the
+# Codex plugin is active) and an anthropic token as the default fallbacks
+CFG_CODEX = {"meta": {"lastTouchedVersion": "2026.10.4"}, "gateway": {"mode": "local"},
+             "agents": {"defaults": {"model": {"primary": "lan/q",
+                                               "fallbacks": ["openai/gpt-5.5", "anthropic/claude-sonnet-4-6"]}},
+                        "list": [{"id": "main", "default": True}]},
+             "models": {"providers": {"lan": {"baseUrl": "http://127.0.0.1:8001/v1", "api": "openai-completions",
+                                              "models": [{"id": "q"}]}}},
+             "plugins": {"entries": {"codex": {"enabled": True}}}}
+CODEX_CLAUSE = ("; openai/gpt-5.5 runs on the Codex runtime, so before that refusal Codex signs in with the stored "
+                "login and looks up the account and its models unless it has them already (for a ChatGPT login at "
+                "chatgpt.com), and if that "
+                "lookup fails (for example without network) OpenClaw counts the fallback as failed and tries the next "
+                "one")
+LOCAL_EMBEDDED = ("WARN [gate] cron job 'Local digest' (job-local): its model lan/q needs no stored login and keeps "
+                  "working, but when it fails OpenClaw 2026.11.3 stops at the fallback openai/gpt-5.5 (stored login, "
+                  "no recorded inference account; openclaw/openclaw#192195) instead of trying further models")
+ALSO_ANTH = "; also on a stored login: anthropic/claude-sonnet-4-6"
+
+
+class CronCodexRuntimeTests(T.GateEnv):
+    """wf4 (11.3 rehearsal): openai/gpt-5.5 as a cron fallback ran on the Codex app-server runtime,
+    which loads its model catalog with the stored openai login before OpenClaw refuses the candidate; offline that
+    lookup failed, which is no chain stop, so the chain went on to anthropic. With the Codex plugin installed and
+    enabled the WARN lines and oc-upgrade status say so; without it (or disabled) the text stays as it was."""
+
+    def setUp(self):
+        super().setUp()
+        T.make_1004_state(self.state, content=True)
+        CB.add_jobs(self.state, [("job-anth-first", {"agentId": "main", "sessionTarget": "isolated", "payload": {
+            "kind": "agentTurn", "message": CB.PROMPT, "model": "lan/q",
+            "fallbacks": ["anthropic/claude-sonnet-4-6", "openai/gpt-5.5"]}})], start=30)
+        T.write_install_records(self.state, {"codex": ("@openclaw/codex", "2026.10.4", None)})
+        os.makedirs(T.plugin_project_dir(self.state, "@openclaw/codex", "2026.10.4"), exist_ok=True)
+        self.write_cfg(CFG_CODEX)
+        (self.upg / "gate").mkdir(parents=True, exist_ok=True)
+        (self.upg / "gate" / "migrated.json").write_text(json.dumps({"runtime": "2026.10.4", "mode": "bump"}))
+        self.set_runtime(RT, 22, 27)
+        self.hooks()
+
+    def dry(self):
+        lines = []
+        self.assertEqual(self.quiet(G.dry_run, emit=lines.append), 0, "\n".join(lines))
+        return lines
+
+    def test_fallback_on_the_codex_runtime(self):
+        lines = self.dry()
+        self.assertIn(LOCAL_EMBEDDED + CODEX_CLAUSE + ALSO_ANTH, lines)
+        self.assertIn("WARN [gate] cron job 'Job Anth First' (job-anth-first): its model lan/q needs no stored login "
+                      "and keeps working, but when it fails OpenClaw 2026.11.3 stops at the fallback "
+                      "anthropic/claude-sonnet-4-6 (stored login, no recorded inference account; "
+                      "openclaw/openclaw#192195) instead of trying further models; also on a stored login: "
+                      "openai/gpt-5.5 (Codex runtime)", lines)
+        # the job whose own model is the openai login: doctor binds it (no WARN), as without Codex
+        self.assertFalse([ln for ln in lines if ln.startswith("WARN [gate] cron job 'Morning summary'")])
+        self.assertIn("'Morning summary' (job-morning)", "\n".join(ln for ln in lines if "records that account" in ln))
+        self.assertNotIn("SECRET", "\n".join(lines))
+
+    def test_status_after_the_migration(self):
+        self.assertEqual(self.run_gate(), 0, self.out)
+        self.assertIn(LOCAL_EMBEDDED + CODEX_CLAUSE + ALSO_ANTH, self.out.splitlines())
+        rec = self.journal()["cron_binding"]
+        self.assertTrue(rec["codex_active"])
+        local = next(a for a in rec["affected"] if a["id"] == "job-local")
+        self.assertEqual(local["codex"], ["openai/gpt-5.5"])
+        st = G.status_lines()
+        self.assertIn("    'Local digest' (job-local): stops at the fallback openai/gpt-5.5 (Codex runtime: it signs "
+                      "in with the stored login and looks up the models first unless it has them); openai/gpt-5.5, "
+                      "anthropic/claude-sonnet-4-6", st)
+        self.assertIn("    'Job Anth First' (job-anth-first): stops at the fallback anthropic/claude-sonnet-4-6; "
+                      "anthropic/claude-sonnet-4-6, openai/gpt-5.5 (Codex runtime)", st)
+
+    def test_codex_home_scope_user(self):
+        cfg = json.loads(json.dumps(CFG_CODEX))
+        cfg["plugins"]["entries"]["codex"]["config"] = {"appServer": {"homeScope": "user"}}
+        self.write_cfg(cfg)
+        lines = self.dry()
+        self.assertIn(LOCAL_EMBEDDED + CODEX_CLAUSE.replace(
+            "signs in with the stored login", "uses the login of its own Codex home (appServer.homeScope \"user\")")
+            + ALSO_ANTH, lines)
+
+    def test_disabled_or_missing_codex_keeps_the_embedded_text(self):
+        for name, plugins in (("entry disabled", {"entries": {"codex": {"enabled": False}}}),
+                              ("denied", {"deny": ["codex"]}),
+                              ("allowlist without it", {"allow": ["brave"]}),
+                              ("plugins off", {"enabled": False}),
+                              ("discovery off", {"entries": {"codex": {"config": {"discovery": {"enabled": False}}}}})):
+            with self.subTest(name):
+                self.write_cfg(dict(CFG_CODEX, plugins=plugins))
+                lines = self.dry()
+                self.assertIn(LOCAL_EMBEDDED + ALSO_ANTH, lines)
+                self.assertNotIn("Codex runtime", "\n".join(lines))
+        # not installed: no install record and no npm project
+        self.write_cfg(CFG_CODEX)
+        T.write_install_records(self.state, {})
+        for d in (self.state / "npm" / "projects").iterdir():
+            os.rmdir(d)
+        lines = self.dry()
+        self.assertIn(LOCAL_EMBEDDED + ALSO_ANTH, lines)
+        self.assertNotIn("Codex runtime", "\n".join(lines))
+
+    def test_own_model_pinned_to_codex_is_left_unbound_by_doctor(self):
+        cfg = json.loads(json.dumps(CFG_CODEX))
+        cfg["agents"]["defaults"]["models"] = {"openai/gpt-5.5": {"agentRuntime": {"id": "codex"}}}
+        self.write_cfg(cfg)
+        lines = self.dry()
+        text = "\n".join(lines)
+        self.assertNotIn("records that account", text)  # doctor binds no job: no info line promises it
+        self.assertIn("WARN [gate] cron job 'Morning summary' (job-morning): OpenClaw 2026.11.3 refuses every run and "
+                      "tries no fallback: its model openai/gpt-5.5 would use a stored login (auth profile) and the job "
+                      "has no recorded inference account (openclaw/openclaw#192195); openai/gpt-5.5 runs on the Codex "
+                      "runtime, so before that refusal Codex signs in with the stored login and looks up the account "
+                      "and its models unless it has them already (for a ChatGPT login at chatgpt.com); if that lookup "
+                      "fails (for example without "
+                      "network), OpenClaw may try the fallbacks instead; its model is set to the codex runtime "
+                      "(agents.defaults.models[\"openai/gpt-5.5\"].agentRuntime), so OpenClaw 2026.11.3 doctor records "
+                      "no inference account for it (doctor: 'runtime codex inference ownership was left unchanged') "
+                      "and every run stays refused" + ALSO_ANTH, lines)
+        self.assertEqual(G._cron_doctor_binds([{"primary_affected": True, "refs": ["openai/gpt-5.5"],
+                                                "own_runtime": "codex"},
+                                               {"primary_affected": True, "refs": ["claude-cli/default"]},
+                                               {"primary_affected": True, "refs": ["openai/gpt-5.5"]}]),
+                         [{"primary_affected": True, "refs": ["openai/gpt-5.5"]}])
+
 
 class DoctorCronBackupTests(SW.Base):
     def setUp(self):
