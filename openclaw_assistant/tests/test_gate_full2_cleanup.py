@@ -482,6 +482,53 @@ class CleanupTests(CleanupEnv):
         self.assertEqual(sorted(keep), sorted(good))
         self.assertEqual(refused, [])
 
+    def test_failed_capture_named_only_by_its_evidence_lines_goes_with_its_run(self):
+        # N1 (11.3 rehearsal, state D): an orphan task_delivery_state row makes OpenClaw 2026.11.3's original
+        # capture fail at the start of doctor pass 1; it keeps the unsealed capture (no manifest.json, the database
+        # payload in database.databases/) and names it only in these two lines (synthetic paths, the rehearsal's
+        # wording). The sealed capture of the same pass and the one of pass 2 use the 2026.10 line.
+        failed = self.caps / f"doctor-{uuid.uuid4()}"
+        (failed / "database.databases" / "payload").mkdir(parents=True)
+        (failed / "database.databases" / "payload" / "openclaw-agent.sqlite").write_bytes(b"SQLite format 3\x00")
+        (failed / ".openclaw-private-update-capture").write_text("x")
+        sealed = self.capture()
+        st = self.state / "state" / "openclaw.sqlite"
+        lines = [
+            f"Original state capture was unavailable: Original update capture failed; evidence retained at {failed} "
+            f"| State schema inspection failed (exit): [redacted-diagnostic]; after 3.575 seconds during "
+            f"pre-migration database backup for {st} (scope: 7 source paths):",
+            f"Caused by: SQLite foreign_key_check failed for {st}: repairable task_delivery_state.task_id "
+            "references task_runs.task_id cascade-owned orphans (1 rows). Run openclaw doctor --fix to migrate "
+            f"this legacy state before retrying... Database backup files retained at {failed}/database.databases.. "
+            "Doctor will continue; take a verified backup and run openclaw doctor --fix after resolving the "
+            "capture failure. Inspect retained evidence manually before restoring state.",
+            self.capture_line(sealed)]
+        r = self.make_run(captures=0, archive=None, extra_lines=lines)
+        stray = self.capture()  # a doctor run by hand: no log of a gate run names it
+        keep, refused = G.run_captures(self.gp, r.j)
+        self.assertEqual((sorted(keep), refused), (sorted([failed, sealed]), []))
+        # only one of the two failure lines: still found (each names the capture on its own)
+        for only in (lines[0], lines[1]):
+            (r.rd / "doctor-pass1.log").write_text(only + "\n")
+            self.assertEqual(G.run_captures(self.gp, r.j), ([failed], []))
+        (r.rd / "doctor-pass1.log").write_text("\n".join(lines) + "\n")
+        # a failure line naming something that is no capture in the root is refused, never deleted
+        outside = self.capture(root=self.ws)
+        (r.rd / "doctor-pass2.log").write_text(
+            f"Original update capture failed; evidence retained at {outside}\n"
+            f"x. Database backup files retained at {self.caps}/doctor-not-a-uuid/database.databases.\n")
+        keep, refused = G.run_captures(self.gp, r.j)
+        self.assertEqual(sorted(keep), sorted([failed, sealed]))
+        self.assertEqual(dict(refused), {str(outside): "not inside " + str(self.caps),
+                                         f"{self.caps}/doctor-not-a-uuid": "unexpected name"})
+        (r.rd / "doctor-pass2.log").unlink()
+
+        self.assertEqual(self.cleanup(T0 + H48), 2)
+        self.assertFalse(os.path.lexists(failed))
+        self.assertFalse(os.path.lexists(sealed))
+        self.assertTrue(stray.is_dir())
+        self.assertTrue(outside.is_dir())
+
     def test_capture_paths_outside_the_root_symlinks_and_odd_names_are_never_deleted(self):
         victim = self.tmp / "victim"
         victim.mkdir()
@@ -1386,13 +1433,34 @@ class StatusTests(CleanupEnv):
         self.assertEqual(sorted(C.gate_options()), ["backup_max_age_hours", "cleanup_hours", "problems"])
 
     def test_doctor_captures_count_only_doctor_uuid_dirs(self):
-        for _ in range(3):
-            self.capture()
+        strays = sorted(self.capture().name for _ in range(3))  # no gate run names them: kept
         self.capture(name="doctor-not-a-uuid")
         (self.caps / "README").write_text("x")
         (self.caps / f".oc-addon-deleting-doctor-{uuid.uuid4()}").mkdir()  # still a copy on disk until deleted
         self.status()
-        self.assertTrue(self.line("Doctor captures: ").startswith(f"Doctor captures: 4 in {self.caps} "), self.st)
+        self.assertTrue(self.line("Doctor captures: ").startswith(f"Doctor captures: 1 in {self.caps} "), self.st)
+        self.assertEqual(self.line("Doctor captures no gate run names: "),
+                         f"Doctor captures no gate run names: 3 in {self.caps}: {', '.join(strays)}: plaintext copies "
+                         "of the databases; kept, the add-on does not delete them: delete them yourself once you are "
+                         "satisfied")
+
+    def test_doctor_captures_of_a_run_counted_with_a_failed_capture_and_strays_named_as_kept(self):
+        # N1: status says "deleted with their gate run" only for the captures the run's doctor logs name, the
+        # evidence of a failed capture included
+        failed = self.caps / f"doctor-{uuid.uuid4()}"
+        (failed / "database.databases").mkdir(parents=True)
+        r = self.make_run(captures=2, archive=None, current=True, extra_lines=[
+            f"Original state capture was unavailable: Original update capture failed; evidence retained at {failed} "
+            "| State schema inspection failed (exit): [redacted-diagnostic]"])
+        stray = self.capture()
+        self.status()
+        self.assertTrue(self.line("Doctor captures: ").startswith(f"Doctor captures: 3 in {self.caps} "), self.st)
+        self.assertTrue(self.line("Doctor captures no gate run names: ").startswith(
+            f"Doctor captures no gate run names: 1 in {self.caps}: {stray.name}: "), self.st)
+        self.assertEqual(len(r.caps), 2)
+        stray.rename(self.tmp / stray.name)
+        self.status()
+        self.no_line("Doctor captures no gate run names: ")
 
     def test_no_run_recorded(self):
         self.status()

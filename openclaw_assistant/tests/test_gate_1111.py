@@ -154,6 +154,15 @@ class HeartbeatHoursFindingTests(unittest.TestCase):
         self.assertIn("config-heartbeat-hours", G.ADVICE)
         self.assertNotIn("config-heartbeat-hours", G.ACCEPTABLE)
         self.assertNotIn("--accept", G.advice_for(["config-heartbeat-hours"]))
+        # N4 (11.3 rehearsal): during the HOLD the wrapper refuses openclaw config set and openclaw config get calls
+        # the config invalid; only a hand edit of the file works
+        adv = G.ADVICE["config-heartbeat-hours"]
+        self.assertTrue(adv.startswith("edit /config/.openclaw/openclaw.json by hand "), adv)
+        self.assertIn("the wrapper refuses openclaw config set", adv)
+        self.assertTrue(adv.endswith("then oc-upgrade retry"), adv)
+        f = self.codes({"agents": {"defaults": {"heartbeat": {"activeHours": {"start": "25:00"}}}}})
+        self.assertIn("Fix, by hand in /config/.openclaw/openclaw.json (while the add-on holds, openclaw config set is "
+                      "refused): set each to HH:MM", f[0]["message"])
 
 
 class DoctorBlockedTests(unittest.TestCase):
@@ -530,9 +539,9 @@ class Docs1111Tests(unittest.TestCase):
         docs = (self.REPO / "DOCS.md").read_text(encoding="utf-8")
         self.assertIn(f"This fork now ships **OpenClaw `{version}`**", docs)
         log = (ADDON / "CHANGELOG.md").read_text(encoding="utf-8")
-        unreleased = log.split("## [Unreleased]", 1)[1].split("\n## [", 1)[0]
-        self.assertIn(f"**The image now bundles OpenClaw `{version}`**", unreleased)
-        for rel, body in (("DOCS.md", docs), ("CHANGELOG.md [Unreleased]", unreleased),
+        top = log.split("\n## [", 1)[1].split("\n## [", 1)[0]  # the newest section (the release that ships it)
+        self.assertIn(f"**The image now bundles OpenClaw `{version}`**", top)
+        for rel, body in (("DOCS.md", docs), ("CHANGELOG.md, newest section", top),
                           ("SECURITY.md", (self.REPO / "SECURITY.md").read_text(encoding="utf-8")),
                           ("Dockerfile", (ADDON / "Dockerfile").read_text())):
             for stale in ("still ships OpenClaw", "2026.11.1 candidate", "not on npm yet", "preparation for OpenClaw",

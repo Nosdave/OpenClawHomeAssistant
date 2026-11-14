@@ -4118,7 +4118,8 @@ def heartbeat_hours_findings(cfg, caps=None, runtime=None, env=None):
     return [_finding(
         "config-heartbeat-hours", "hard",
         "openclaw.json has heartbeat windows that OpenClaw %s refuses: %s. Its doctor no longer removes them "
-        "(openclaw/openclaw#186305) and would stop with \"Doctor blocked\" after the migration has started. Fix: "
+        "(openclaw/openclaw#186305) and would stop with \"Doctor blocked\" after the migration has started. Fix, "
+        "by hand in /config/.openclaw/openclaw.json (while the add-on holds, openclaw config set is refused): "
         "set each to HH:MM (00:00-23:59, 24:00 only as end) or remove that activeHours (an agent then uses "
         "agents.defaults.heartbeat.activeHours; without one, heartbeats run at any hour), then oc-upgrade retry"
         % (runtime or "2026.11.1+", _brief(items, 6)), "precheck")]

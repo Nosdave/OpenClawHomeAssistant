@@ -619,16 +619,17 @@ class DocsWordingTests(unittest.TestCase):
         docs = self.text("DOCS.md")
         self.assertIn("`sqlite-fk-violation`, `orphan-agent-db` and `agent-db-held` apply with every OpenClaw\n"
                       "version", docs)
-        nxt = docs.split("**OpenClaw 2026.11.3 (this add-on version).**", 1)[1].split("With OpenClaw 2026.10.4", 1)[0]
+        nxt = docs.split("**OpenClaw 2026.11.3 (this add-on version, `0.5.94-full5`).**", 1)[1]
+        nxt = nxt.split("With OpenClaw 2026.10.4", 1)[0]
         self.assertNotIn("agent databases outside the configured agents", nxt)
 
     def test_memory_half_life_still_selects_the_returned_results(self):
-        # 2026.10.10 manager-search-orchestration.ts: minScore filter, decay, sort, slice(0, maxResults)
+        # 2026.10.10 to 2026.11.3 manager-search-orchestration.ts: minScore filter, decay, sort, slice(0, maxResults)
         docs = self.text("DOCS.md")
         section = docs.split("#### Memory search recency", 1)[1].split("\n#### ", 1)[0]
         self.assertNotIn("only sets the order", section)
         self.assertIn("`maxResults` (default 6)", section)
-        note = json.loads(self.text("openclaw_assistant/oc-patches/2026.10.10/manifest.json"))
+        note = json.loads(self.text("openclaw_assistant/oc-patches/2026.11.3/manifest.json"))
         half = next(e for e in note["patches"] if e["name"] == "memory-search-half-life")
         self.assertIn("maxResults", half["note"])
 

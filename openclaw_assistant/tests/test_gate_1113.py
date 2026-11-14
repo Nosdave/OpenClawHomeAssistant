@@ -82,6 +82,13 @@ class CapabilityTests(unittest.TestCase):
 
 GLM_OFF = [("job-glm-off", {"agentId": "main", "sessionTarget": "isolated", "enabled": False,
                             "payload": {"kind": "agentTurn", "message": CB.PROMPT, "model": "glm/glm-5"}})]
+# N2: a job on the openai login with the fixed glm as fallback (the rehearsal's 'Codex-Bericht'), and a disabled one on
+# the anthropic login (doctor binds it too: 'Claude-Notiz')
+CODEX_JOBS = [("job-codex", {"agentId": "main", "sessionTarget": "isolated", "payload": {
+                  "kind": "agentTurn", "message": CB.PROMPT, "model": "openai/gpt-5.5", "fallbacks": ["glm/glm-5"]}}),
+              ("job-claude-off", {"agentId": "main", "sessionTarget": "isolated", "enabled": False, "payload": {
+                  "kind": "agentTurn", "message": CB.PROMPT, "model": "anthropic/claude-sonnet-4-6",
+                  "fallbacks": ["glm/glm-5", "openai/gpt-5.5"]}})]
 
 
 class CronOn1113Tests(T.GateEnv):
@@ -105,7 +112,7 @@ class CronOn1113Tests(T.GateEnv):
         self.assertEqual(self.quiet(G.dry_run, emit=lines.append), 0, "\n".join(lines))
         return lines
 
-    def doctor_binds_morning(self, **extra):
+    def doctor_binds_morning(self, extra_sql=(), **extra):
         """Like OpenClaw 2026.11.3 doctor: stores the literal glm key as glm:default, records job-morning's account
         (its own model is on the openai login) after a pre-repair copy of the state database."""
         store = json.loads(json.dumps(T.AUTH_1004_STORE))
@@ -116,7 +123,7 @@ class CronOn1113Tests(T.GateEnv):
             "INSERT OR REPLACE INTO config_machine_state VALUES ('auth.sharedStore', '{\"location\": \"state-db\"}', 0)",
             "INSERT OR REPLACE INTO config_machine_state VALUES ('authProfiles.store', '%s', 0)" % json.dumps(store),
             "UPDATE cron_jobs SET job_json = json_set(job_json, '$.inferenceBinding', json('%s')) "
-            "WHERE job_id = 'job-morning'" % json.dumps(BINDING)], **extra)
+            "WHERE job_id = 'job-morning'" % json.dumps(BINDING)] + list(extra_sql), **extra)
         return bak
 
     def test_precheck_promises_doctor_only_for_a_job_on_its_own_stored_login(self):
@@ -182,13 +189,94 @@ class CronOn1113Tests(T.GateEnv):
         self.assertFalse([ln for ln in lines if ln.startswith("WARN [gate] cron job ")])
         self.assertNotIn(CB.GLM_KEY, "\n".join(lines))
 
-    def test_behind_text_points_at_the_info_line_for_a_job_doctor_binds(self):
-        text = G.cron_fixup_behind_text([({"id": "a", "name": "A"}, ["glm/glm-5"])], {"a"})
-        self.assertIn("(the info line below on the jobs doctor binds)", text)
-        text = G.cron_fixup_behind_text([({"id": "a", "name": "A"}, ["glm/glm-5"]),
-                                         ({"id": "b", "name": "B"}, ["glm/glm-5"])], {"a"})
-        self.assertIn("(the WARN lines and the info line below)", text)
+    def test_behind_text_points_at_the_warn_lines(self):
         self.assertIn("(the WARN lines below)", G.cron_fixup_behind_text([({"id": "a", "name": "A"}, ["glm/x"])]))
+
+    def test_a_job_doctor_binds_is_not_behind_a_refused_fallback(self):
+        """N2 (11.3 rehearsal, 'Codex-Bericht'): a job whose own model is on the openai login and whose fallback is on
+        the fixed glm. Doctor binds its own model (it runs), and its glm fallback is refused from then on: the
+        precheck no longer says it reaches glm "only after a fallback that stays refused"; the info line on the jobs
+        doctor binds names it."""
+        CB.add_jobs(self.state, CODEX_JOBS, start=30)
+        lines = self.dry()
+        text = "\n".join(lines)
+        self.assertNotIn("only after a fallback that stays refused", text)
+        info = [ln for ln in lines if "records that account" in ln]
+        self.assertEqual(len(info), 1, lines)
+        self.assertIn("2 enabled cron job(s) without a recorded inference account run their own model on a stored "
+                      "login: 'Morning summary' (job-morning), 'Job Codex' (job-codex); ", info[0])
+        self.assertNotIn("WARN [gate] cron job 'Job Codex'", text)
+        # a job that is not bound and reaches glm only after a refused fallback keeps the behind line
+        CB.add_jobs(self.state, [("job-lan-oa", {"agentId": "main", "sessionTarget": "isolated", "payload": {
+            "kind": "agentTurn", "message": CB.PROMPT, "model": "lan/q", "fallbacks": ["openai/gpt-5.5",
+                                                                                   "glm/glm-5"]}})], start=40)
+        lines = self.dry()
+        behind = [ln for ln in lines if "only after a fallback that stays refused" in ln]
+        self.assertEqual(behind, ["[gate] 1/8 info: 1 enabled cron job(s) reach glm/glm-5 only after a fallback that "
+                                  "stays refused (the WARN lines below): the automatic fix covers that model, but the "
+                                  "job stops before it: 'Job Lan Oa' (job-lan-oa)"])
+
+    def test_jobs_doctor_bound_are_listed_after_the_migration_with_their_refused_fallbacks(self):
+        """N2: after the migration the end of the run and oc-upgrade status name the jobs with a recorded account,
+        disabled ones too, and the fallbacks OpenClaw now refuses for them (other providers than the account's);
+        never the recorded profile id."""
+        CB.add_jobs(self.state, CODEX_JOBS, start=30)
+        anth = dict(BINDING, provider="anthropic", profileId="anthropic:manual")
+        self.doctor_binds_morning(extra_sql=[
+            "UPDATE cron_jobs SET job_json = json_set(job_json, '$.inferenceBinding', json('%s')) "
+            "WHERE job_id = 'job-codex'" % json.dumps(BINDING),
+            "UPDATE cron_jobs SET job_json = json_set(job_json, '$.inferenceBinding', json('%s')) "
+            "WHERE job_id = 'job-claude-off'" % json.dumps(anth)])
+        self.assertEqual(self.run_gate(), 0, self.out)
+        fin = self.out[self.out.index("[gate] 7/8 postconditions OK"):]
+        rec = self.journal()["cron_binding"]
+        self.assertEqual(rec["bound"], 2)  # enabled ones only (the forecast's count)
+        self.assertEqual([(a["id"], a["enabled"], a["provider"], a["refused"]) for a in rec["bound_jobs"]], [
+            ("job-morning", True, "openai", ["anthropic/claude-sonnet-4-6"]),
+            ("job-codex", True, "openai", ["glm/glm-5"]),
+            ("job-claude-off", False, "anthropic", ["glm/glm-5", "openai/gpt-5.5"])])
+        bl = ("3 cron job(s) (1 of them disabled) have a recorded inference account (OpenClaw 2026.11.3 doctor records "
+              "it during the migration for a job whose own model is on a stored login, openclaw/openclaw#172792): "
+              "their own model runs on that account, and OpenClaw refuses their fallbacks to other providers (as "
+              "with openclaw/openclaw#192463): 'Morning summary' (job-morning) on openai, refused: "
+              "anthropic/claude-sonnet-4-6; 'Job Codex' (job-codex) on openai, refused: glm/glm-5; 'Job Claude Off' "
+              "(job-claude-off, disabled) on anthropic, refused: glm/glm-5, openai/gpt-5.5. To keep such a fallback "
+              "from being tried, drop it (openclaw automations edit <id> --fallbacks <list> without it; the job's own "
+              "list replaces the agent's and the default fallbacks)")
+        self.assertIn(f"[gate] info: {bl}", fin)
+        st = G.status_lines()
+        self.assertIn(f"  {bl}", st)
+        for ln in [fin] + st:
+            self.assertNotIn("anthropic:manual", ln)
+            self.assertNotIn("openai:default", ln)
+            self.assertNotIn(CB.GLM_KEY, ln)
+
+    def test_bound_jobs_rules(self):
+        cfg = json.loads(json.dumps(CB.CFG_GLM))
+
+        def job(jid, **kw):
+            j = {"agentId": "main", "sessionTarget": "isolated",
+                 "payload": dict({"kind": "agentTurn", "model": "openai/gpt-5.5"}, **kw.pop("payload", {}))}
+            j.update(kw)
+            return {"id": jid, "name": jid, "enabled": kw.pop("enabled", True), "runtime_authority": False, "job": j}
+        jobs = [job("plain"), job("bound", inferenceBinding={"provider": "OpenAI", "profileId": "openai:x"}),
+                job("pinned", inferenceBinding={"provider": "openai"},
+                    payload={"fallbacks": ["openai/gpt-5.5-mini@openai:y", "glm/glm-5@glm:z", "nope"]}),
+                job("noprov", inferenceBinding={"profileId": "x"}),
+                job("event", inferenceBinding={"provider": "openai"}, payload={"kind": "systemEvent"}),
+                job("ghost", agentId="ghost", inferenceBinding={"provider": "openai"}),
+                dict(job("gone", inferenceBinding={"provider": "openai"}), retired_review=True)]
+        got = G.cron_bound_jobs(jobs, cfg, "main", {"main"})
+        # the agent's default fallbacks (openai/gpt-5.5 from agents.defaults) apply when the job lists none
+        self.assertEqual([(a["id"], a["provider"], a["refused"]) for a in got], [
+            ("bound", "openai", []), ("pinned", "openai", ["glm/glm-5"]), ("noprov", None, [])])
+        self.assertIsNone(G.cron_bound_line({"bound_jobs": []}))
+        line = G.cron_bound_line({"runtime": RT, "bound_jobs": got, "bound_jobs_count": 5})
+        self.assertIn("'noprov' (noprov) on a provider the record does not name, no fallback on another provider",
+                      line)
+        self.assertIn("'bound' (bound) on openai, no fallback on another provider; ", line)
+        self.assertIn(" and 2 more. To keep", line)
+        self.assertNotIn("openai:x", line)
 
     def test_run_reports_what_doctor_left_and_the_gateway_warning(self):
         self.doctor_binds_morning()
@@ -207,9 +295,10 @@ class CronOn1113Tests(T.GateEnv):
                          [("job-local", True, "glm"), ("job-glm-haus", True, "glm"), ("job-glm-off", False, "glm")])
         lw = ("3 cron job(s) (1 of them disabled) run their own model on a configured key (glm: "
               "models.providers.<provider>.apiKey) and have no recorded inference account: OpenClaw 2026.11.3 doctor "
-              "leaves such jobs unbound on purpose, but its gateway logs 'cron: automation has no recorded inference "
-              "account; run openclaw doctor --fix before its next scheduled run ...' for each of them at every start "
-              "and cron reload. Expected and harmless for their own model, which runs on that key; nothing to do (a "
+              "leaves such jobs unbound on purpose, but its gateway writes 'cron: automation has no recorded inference "
+              "account; run openclaw doctor --fix before its next scheduled run ...' for each of them to OpenClaw's own "
+              "log (openclaw logs, the Control UI's Logs page; not the add-on log) at every start and cron reload. "
+              "Expected and harmless for their own model, which runs on that key; nothing to do (a "
               "fallback on a stored login that stays refused is reported separately). The add-on refuses openclaw "
               "doctor --fix, and its equivalent oc-upgrade retry --doctor would not record an account for these jobs "
               "either: 'Local digest' (job-local), 'Job Glm Haus' (job-glm-haus), 'Job Glm Off' (job-glm-off)")

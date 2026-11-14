@@ -168,22 +168,17 @@ USER root
 #                         are checked here only for existence). Keep the exact
 #                         value the release image is rehearsed and built with: a
 #                         different cutoff can resolve a different transitive tree.
-# Earlier pins, for rebuilding a previous image (e.g. to rehearse an update from it;
-# oc-patches/ keeps their patch sets until the release decides to drop them):
+# Earlier pin, for an image of the current add-on with OpenClaw 2026.10.4 (emergency builds
+# on the OpenClaw a rollback returns to; oc-patches/2026.10.4/ stays for it). That is not
+# the 0.5.94-full4 image (this add-on's code, packages and patch set): a rehearsal of the
+# update from 0.5.94-full4 starts from the published, immutable
+# ghcr.io/nosdave/openclaw-assistant-aarch64:0.5.94-full4 (or a build of commit 5d0aa95).
 #   2026.10.4 (0.5.94-full4): --build-arg OPENCLAW_VERSION=2026.10.4
 #     --build-arg NPM_BEFORE=2026-10-16T00:30:00Z (openclaw@2026.10.4
 #     2026-10-15T23:58:28Z, @openclaw/ai 23:43:35Z, @openclaw/brave-plugin
 #     23:19:50Z)
-#   2026.10.10 (rehearsal stand-in for the 2026.11.1 line, never shipped):
-#     --build-arg OPENCLAW_VERSION=2026.10.10 --build-arg NPM_BEFORE=2026-11-03T03:00:00Z
-#     (openclaw@2026.10.10 2026-11-03T02:26:08Z, @openclaw/ai@2026.10.10 02:11:11Z,
-#     @openclaw/brave-plugin@2026.10.10 01:52:47Z, @openclaw/codex@2026.10.10
-#     01:53:01Z, @openclaw/acpx@2026.10.10 01:53:22Z)
-#   2026.11.1 (the previous target of this add-on version, rehearsed, never shipped):
-#     --build-arg OPENCLAW_VERSION=2026.11.1 --build-arg NPM_BEFORE=2026-11-05T09:45:00Z
-#     (openclaw@2026.11.1 2026-11-05T09:41:26Z, @openclaw/ai@2026.11.1 09:16:05Z,
-#     @openclaw/brave-plugin@2026.11.1 06:00:58Z, @openclaw/codex@2026.11.1
-#     05:59:04Z, @openclaw/acpx@2026.11.1 05:57:48Z)
+# Only versions with a patch set build. The rehearsal versions 2026.10.10 and 2026.11.1
+# (never shipped) lost theirs with 0.5.94-full5.
 ARG OPENCLAW_VERSION=2026.11.3
 ARG BRAVE_PLUGIN_VERSION=${OPENCLAW_VERSION}
 ARG NPM_BEFORE=2026-11-10T18:00:00Z
@@ -226,7 +221,7 @@ RUN npm config set fund false && npm config set audit false \
 #  - Telegram hotfix VOLT-TG-20261023 (send-, lifecycle-, execution-, fetch-*.mjs): long voice
 #    replies send their text first, no "couldn't confirm" notice while a reply is still being
 #    delivered, voice/audio uploads on a fresh connection without replay. Not fixed upstream in
-#    2026.11.3 (the patched sources are unchanged from 2026.10.10).
+#    2026.11.3 (the patched sources are unchanged from 2026.10.10, the line 2026.11.3 is built on).
 #  - Telegram hotfix VOLT-TG-20261112 (bot-message-*.mjs): voice/audio of the bot's own replied-to
 #    messages is no longer merged into the user's turn media (the bot's other media and all user media
 #    unchanged). Not fixed upstream in 2026.11.5-beta.2.

@@ -381,10 +381,8 @@ _HOTFIX_2026_10 = {"memory-search-half-life", "telegram-voice-text-first", "tele
                    "telegram-notice-live-guard", "telegram-fetch-fresh-audio",
                    "telegram-reply-self-audio"}  # VOLT-TG-20261112, not fixed upstream through 2026.11.5-beta.2
 EXPECTED_PATCHES = {
-    "2026.10.4": _HOTFIX_2026_10,
-    "2026.10.10": _HOTFIX_2026_10,  # rehearsal stand-in for the 2026.11.1 line
-    "2026.11.1": _HOTFIX_2026_10,  # the previous image default, rehearsed, never shipped
-    "2026.11.3": _HOTFIX_2026_10,  # the image default (Dockerfile ARG OPENCLAW_VERSION)
+    "2026.10.4": _HOTFIX_2026_10,  # 0.5.94-full4 (the version users update from): rollback and emergency builds
+    "2026.11.3": _HOTFIX_2026_10,  # the image default (Dockerfile ARG OPENCLAW_VERSION), from 0.5.94-full5
 }
 # Telegram patches whose regression tests are one file for all versions (it maps each version to the patched chunk)
 # instead of a part of tests/oc_patches/telegram_hotfix_<version>.test.mjs.

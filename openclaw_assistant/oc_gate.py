@@ -107,8 +107,13 @@ CLEANUP_INTERVAL_S = 3600
 BACKUP_VERSION_LOOKUPS = 50  # recent encrypted backups with this add-on whose add-on version the precheck reads
 RUN_ID_RE = re.compile(r"^\d{8}T\d{6}Z-[0-9a-f]{6}\Z")
 SAFE_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,79}")  # one path component, never ".."
-# OpenClaw 2026.10 doctor: "Pre-repair state retained for manual recovery at <dir>/manifest.json."
-CAPTURE_RE = re.compile(r"Pre-repair state retained for manual recovery at (\S+)/manifest\.json")
+# OpenClaw 2026.10 doctor: "Pre-repair state retained for manual recovery at <dir>/manifest.json." A capture that
+# failed (2026.11: update-recovery-baseline-capture, update-database-backup) is kept by OpenClaw unsealed and named
+# only as "Original update capture failed; evidence retained at <dir>" and "Database backup files retained at
+# <dir>/database.<kind>." (N1: it holds plaintext copies of the databases too and goes with its gate run).
+CAPTURE_RE = re.compile(r"Pre-repair state retained for manual recovery at (\S+)/manifest\.json"
+                        r"|Original update capture failed; evidence retained at (\S+)"
+                        r"|Database backup files retained at (\S+?)/database\.\S*")
 CAPTURE_NAME_RE = re.compile(r"^doctor-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\Z")
 # A5/A7: the plaintext files a gate run keeps in runs/<id>/: its copies of openclaw.json (gateway token, literal
 # provider and channel keys) and the saved output of `openclaw models status` / `models auth` (OpenClaw's masked key
@@ -173,8 +178,10 @@ ADVICE = {
                       "System > Backups), then oc-upgrade retry",
     "cleanup-failed": "check permissions under /config/.openclaw-upgrade, then oc-upgrade retry",
     "premigrate-failed": "check free space and permissions, then oc-upgrade retry",
-    "config-heartbeat-hours": "correct the listed heartbeat.activeHours values in openclaw.json (HH:MM, 24:00 only as "
-                              "end) or remove that activeHours, then oc-upgrade retry",
+    "config-heartbeat-hours": "edit /config/.openclaw/openclaw.json by hand (add-on terminal or a file editor: while "
+                              "the add-on holds, the wrapper refuses openclaw config set, and openclaw config get "
+                              "calls the config invalid): correct the listed heartbeat.activeHours values (HH:MM, "
+                              "24:00 only as end) or remove that activeHours, then oc-upgrade retry",
     "config-retired-keys": "change or remove the listed settings in openclaw.json as the reason says (every OpenClaw "
                            "2026.10 refuses them; OpenClaw 2026.7.35 of 0.5.93 does not use them), then oc-upgrade retry",
     "retired-state-outside": "move the listed pre-July-2026 files away by hand (they are in your backup), then oc-upgrade retry",
@@ -2794,9 +2801,13 @@ class Gate:
                          f"\"api-key\" before doctor pass 1 ({cron_fixup_why(f['provider'], rt)})")
             if kept:
                 self.say(f"{pn} info: {cron_fixup_kept_text(kept, plan['fix'], rt)}")
+            if behind and dm:  # N2: doctor binds such a job's own model; its fallbacks to other providers are refused
+                now = {a.get("id"): a for a in after.get("affected") or []}
+                bound = {a.get("id") for a in _cron_doctor_binds([now[a.get("id")] for a, _r in behind
+                                                                  if a.get("id") in now])}
+                behind[:] = [(a, r) for a, r in behind if a.get("id") not in bound]
             if behind:
-                bound = {a.get("id") for a in _cron_doctor_binds([a for a, _r in behind])} if dm else set()
-                self.say(f"{pn} info: {cron_fixup_behind_text(behind, bound)}")
+                self.say(f"{pn} info: {cron_fixup_behind_text(behind)}")
 
             def on(entries, p_):
                 return [str(a.get("id"))[:120] for a, refs in entries if any(r.split("/", 1)[0] == p_ for r in refs)]
@@ -3086,6 +3097,9 @@ class Gate:
         lw = cron_load_warn_line(self.j.get("cron_binding"))  # R6 (2026.11.2+)
         if lw:
             self.say(f"info: {lw}")
+        bl = cron_bound_line(self.j.get("cron_binding"))  # N2 (2026.11.2+)
+        if bl:
+            self.say(f"info: {bl}")
         un = cron_unconfigured_line(self.j.get("cron_binding"))
         if un:
             self.say(f"info: {un}")
@@ -4907,6 +4921,11 @@ def cron_account_report(state_dir, cfg, runtime=None, doctor_migration=False, pe
             rec["load_warn"] = [dict(a, id=str(a["id"])[:120], name=C.redact_text(str(a["name"]))[:120])
                                 for a in lw[:CRON_REPORT_MAX]]
             rec["load_warn_count"] = len(lw)
+        bj = cron_bound_jobs(jobs, cfg, default_agent_id(cfg), configured)  # N2: the jobs doctor bound
+        if bj:
+            rec["bound_jobs"] = [dict(a, id=str(a["id"])[:120], name=C.redact_text(str(a["name"]))[:120])
+                                 for a in bj[:CRON_REPORT_MAX]]
+            rec["bound_jobs_count"] = len(bj)
     # $include: the report reads only openclaw.json itself (cron_include_line); only when there are jobs to check
     inc = mig().include_paths(cfg)
     if inc and (fc["checked"] or fc["unconfigured"]):
@@ -4977,6 +4996,67 @@ def cron_load_warn_jobs(jobs, cfg, profiles_for, default_agent="main", configure
     return out
 
 
+def cron_bound_jobs(jobs, cfg, default_agent="main", configured=None):
+    """N2: the agentTurn cron jobs, enabled or not, with a recorded inference account (inferenceBinding; OpenClaw
+    2026.11.2+ doctor records it for a job whose own model is on a stored login, openclaw/openclaw#172792) and the
+    refs of their model chain (cron_model_chain) that OpenClaw refuses for them from then on: every candidate on a
+    provider other than the recorded account's (cron/run-inference.ts assertCandidate, as with model@profile:
+    openclaw/openclaw#192463). Never the profile id. [{"id", "name", "enabled", "provider", "refused"}]; provider
+    None when the record names none (the refused refs are then unknown, [])."""
+    M = mig()
+    out = []
+    for row in jobs or []:
+        job = row.get("job")
+        if not isinstance(job, dict) or row.get("retired_review"):
+            continue
+        b = job.get("inferenceBinding") or job.get("authProfileBinding")
+        payload = job.get("payload") if isinstance(job.get("payload"), dict) else {}
+        if not b or payload.get("kind") != "agentTurn":
+            continue
+        agent = M.cron_job_agent(job, default_agent)
+        if configured is not None and agent not in configured:  # cancelled anyway (cron_unconfigured_line)
+            continue
+        prov = b.get("provider") if isinstance(b, dict) else None
+        prov = prov.strip().lower() if isinstance(prov, str) and prov.strip() else None
+        refused = []
+        if prov:
+            primary, fbs, _src = M.cron_model_chain(job, cfg, agent)
+            for raw in ([primary] if primary else []) + fbs:
+                r = M.cron_model_ref(cfg, raw)  # never the @profile in the ref
+                if r and r[0] and r[0] != prov and f"{r[0]}/{r[1]}" not in refused:
+                    refused.append(f"{r[0]}/{r[1]}")
+        out.append({"id": row.get("id"), "name": row.get("name"), "enabled": bool(row.get("enabled")),
+                    "provider": prov, "refused": refused})
+    return out
+
+
+def cron_bound_line(rec):
+    """N2: the info text for the jobs of a cron_account_report record after a 2026.11.2+ migration that have a
+    recorded inference account (bound_jobs), with the fallbacks OpenClaw refuses for them, or None. Job ids, names,
+    provider and model ids only (never the recorded profile id)."""
+    bj = [a for a in (rec or {}).get("bound_jobs") or [] if isinstance(a, dict)]
+    if not bj:
+        return None
+    n = (rec or {}).get("bound_jobs_count") or len(bj)
+    rt = printable((rec or {}).get("runtime") or "2026.11.2+")
+    off = sum(1 for a in bj if not a.get("enabled"))
+    more = f" and {n - len(bj)} more" if n > len(bj) else ""
+
+    def one(a):
+        lab = cron_job_label(a)
+        if not a.get("enabled"):
+            lab = lab[:-1] + ", disabled)"
+        prov = printable(a.get("provider")) if a.get("provider") else "a provider the record does not name"
+        ref = [printable(r) for r in a.get("refused") or []]
+        return f"{lab} on {prov}" + (f", refused: {', '.join(ref)}" if ref else ", no fallback on another provider")
+    return (f"{n} cron job(s){f' ({off} of them disabled)' if off else ''} have a recorded inference account (OpenClaw "
+            f"{rt} doctor records it during the migration for a job whose own model is on a stored login, "
+            "openclaw/openclaw#172792): their own model runs on that account, and OpenClaw refuses their fallbacks "
+            "to other providers (as with openclaw/openclaw#192463): " + "; ".join(one(a) for a in bj) + more
+            + ". To keep such a fallback from being tried, drop it (openclaw automations edit <id> --fallbacks <list> "
+            "without it; the job's own list replaces the agent's and the default fallbacks)")
+
+
 def cron_load_warn_line(rec):
     """R6: the info text for a cron_account_report record of a 2026.11.2+ runtime after the migration whose jobs
     run their own model on a configured key or a key from the environment (load_warn), or None. Job ids, names and
@@ -5001,9 +5081,9 @@ def cron_load_warn_line(rec):
     return (f"{n} cron job(s){f' ({off} of them disabled)' if off else ''} run their own model on "
             + " or on ".join(where)
             + f" and have no recorded inference account: OpenClaw {rt} doctor leaves "
-            "such jobs unbound on purpose, but its gateway logs 'cron: automation has no recorded inference account; "
-            "run openclaw doctor --fix before its next scheduled run ...' for each of them at every start and cron "
-            "reload. Expected and harmless for their own model, which runs on that key; nothing to do (a fallback "
+            "such jobs unbound on purpose, but its gateway writes 'cron: automation has no recorded inference account; "
+            "run openclaw doctor --fix before its next scheduled run ...' for each of them to OpenClaw's own log "
+            "(openclaw logs, the Control UI's Logs page; not the add-on log) at every start and cron reload. Expected and harmless for their own model, which runs on that key; nothing to do (a fallback "
             "on a stored login that stays refused is reported separately)." + env_note + " The add-on refuses "
             "openclaw doctor --fix, and its equivalent oc-upgrade retry --doctor would not record an account for these "
             "jobs either: " + ", ".join(cron_job_label(a) for a in lw) + more)
@@ -5289,18 +5369,16 @@ def cron_fixup_kept_text(kept, fix, runtime):
             f"pass 1; otherwise OpenClaw {runtime} refuses {models} on doctor's copy of the literal key): {jobs}{more}")
 
 
-def cron_fixup_behind_text(behind, bound=()):
+def cron_fixup_behind_text(behind):
     """Info text: the cron jobs that reach a model the automatic fix covers only after a fallback that stays refused,
-    so the fix does not keep them working (job id, name and model refs only). bound: the ids of those jobs whose own
-    model doctor binds on a 2026.11.2+ runtime (the precheck's info line covers them, not a WARN line)."""
+    so the fix does not keep them working (job id, name and model refs only). N2: on a 2026.11.2+ runtime the caller
+    leaves out the jobs whose own model doctor binds (their own model runs, their fallbacks to other providers are
+    refused: the precheck's info line on those jobs and cron_bound_line after the migration)."""
     models = ", ".join(dict.fromkeys(printable(r) for _a, refs in behind for r in refs))
     jobs = ", ".join(cron_job_label(a) for a, _r in behind[:CRON_REPORT_MAX])
     more = f" and {len(behind) - CRON_REPORT_MAX} more" if len(behind) > CRON_REPORT_MAX else ""
-    nb = sum(1 for a, _r in behind if a.get("id") in set(bound or ()))
-    where = ("the WARN lines below" if not nb else "the info line below on the jobs doctor binds" if nb == len(behind)
-             else "the WARN lines and the info line below")
-    return (f"{len(behind)} enabled cron job(s) reach {models} only after a fallback that stays refused ({where}): "
-            f"the automatic fix covers that model, but the job stops before it: {jobs}{more}")
+    return (f"{len(behind)} enabled cron job(s) reach {models} only after a fallback that stays refused (the WARN "
+            f"lines below): the automatic fix covers that model, but the job stops before it: {jobs}{more}")
 
 
 def _fixup_pass(phase):
@@ -5388,8 +5466,9 @@ def memory_search_scopes(cfg):
     """(shared memory search, [(agent id, its memory search)]) of openclaw.json as OpenClaw 2026.11.x reads it after
     doctor's memorySearch -> memory.search migration (legacy-config-migrations.runtime.agents.ts, mergeMissing: the
     explicit memory.search values win): shared = memory.search + agents.defaults.memorySearch + memorySearch; per
-    agent of agents.entries (or agents.list without entries) its memory.search + memorySearch. A 2026.10.4 config
-    (agents.defaults.memorySearch, agents.list[].memorySearch) and a migrated one give the same result."""
+    agent of agents.entries (or agents.list without entries) its memory.search + memorySearch. memory.search and
+    agents.entries.<id>.memory.search are already the form of 2026.10.4; a config with the legacy keys
+    (agents.defaults.memorySearch, an agent's memorySearch, agents.list), which doctor moves, gives the same result."""
     cfg = cfg if isinstance(cfg, dict) else {}
     shared = {}
     for src in (_cfg_get(cfg, "memory", "search"), _cfg_get(cfg, "agents", "defaults", "memorySearch"),
@@ -7376,9 +7455,10 @@ def cleanup_blocked(gp, cur):
 
 
 def run_captures(gp, j):
-    """The doctor capture directories a gate run created: parsed from its doctor logs and validated (inside
-    <state>.update-captures, OpenClaw's doctor-<uuid> name, a real directory). The owner's rule (no
-    plaintext copies of secrets) wins over OpenClaw's own retention, so captures with outcome.json go too."""
+    """The doctor capture directories a gate run created: parsed from its doctor logs (sealed captures and the
+    evidence of a failed capture, N1) and validated (inside <state>.update-captures, OpenClaw's doctor-<uuid> name,
+    a real directory). The owner's rule (no plaintext copies of secrets) wins over OpenClaw's own retention, so
+    captures with outcome.json go too."""
     root = captures_root(gp)
     found = set()
     for log in sorted((gp["RUNS"] / str(j.get("run_id"))).glob("doctor-pass*.log")):
@@ -7387,9 +7467,8 @@ def run_captures(gp, j):
         except OSError:
             continue
         for line in text.splitlines():
-            m = CAPTURE_RE.search(ANSI_RE.sub("", line))
-            if m:
-                found.add(m.group(1).rstrip("."))
+            for m in CAPTURE_RE.finditer(ANSI_RE.sub("", line)):
+                found.add(next(g for g in m.groups() if g).rstrip(".,;:"))
     keep, refused = [], []
     for c in sorted(found):
         pth = Path(c)
@@ -7943,10 +8022,11 @@ def _status_cron(j):
     inc = cron_include_line(rec)
     gone = cron_retired_review_line(rec)  # a forecast record: the jobs doctor deletes
     lw = cron_load_warn_line(rec)  # R6: only in the report after a 2026.11.2+ migration
+    bl = cron_bound_line(rec)  # N2: likewise
     if not aff:
         return fix + ([head + f"none affected ({rec['checked']} checked)"] if rec.get("checked") else []) \
-            + ([f"  {lw}"] if lw else []) + ([f"  {un}"] if un else []) + ([f"  {gone}"] if gone else []) \
-            + ([f"  {inc}"] if inc else [])
+            + ([f"  {lw}"] if lw else []) + ([f"  {bl}"] if bl else []) + ([f"  {un}"] if un else []) \
+            + ([f"  {gone}"] if gone else []) + ([f"  {inc}"] if inc else [])
     L = fix + [head + f"{len(aff)} affected of {rec.get('checked', 0)} checked"]
     for a in aff[:CRON_REPORT_MAX]:
         refs = [printable(r) for r in a.get("refs") or []]
@@ -7963,6 +8043,8 @@ def _status_cron(j):
              + _cron_remedy(aff, bool(_cron_key_fix(rec))))
     if lw:
         L.append(f"  {lw}")
+    if bl:
+        L.append(f"  {bl}")
     if un:
         L.append(f"  {un}")
     if gone:
@@ -8107,6 +8189,34 @@ def _status_held_and_plugins(gp, marker):
     return L
 
 
+def _status_captures(gp, caps):
+    """N1: only the captures a gate run's doctor log names (and leftover tombstones of an interrupted delete) are
+    deleted with their run; any other doctor-<uuid> directory (doctor run by hand, a capture no log line names) is
+    named as kept."""
+    mine = set()
+    for _rid, rj in sorted(_run_journals(gp)[0].items()):
+        try:
+            mine.update(c.name for c in run_captures(gp, rj)[0])
+        except OSError:
+            continue
+    n, other = 0, []
+    for x in sorted(caps.iterdir()):
+        if x.name.startswith(TOMB_PREFIX) and CAPTURE_NAME_RE.match(x.name[len(TOMB_PREFIX):]):
+            n += 1
+        elif CAPTURE_NAME_RE.match(x.name):
+            if x.name in mine:
+                n += 1
+            else:
+                other.append(x.name)
+    L = [f"Doctor captures: {n} in {caps} (pre-repair database copies; deleted with their gate run)"]
+    if other:
+        L.append(f"Doctor captures no gate run names: {len(other)} in {caps}: "
+                 + ", ".join(printable(x) for x in other[:4]) + (" …" if len(other) > 4 else "")
+                 + ": plaintext copies of the databases; kept, the add-on does not delete them: delete them yourself "
+                 "once you are satisfied")
+    return L
+
+
 def status_lines():
     gp = gpaths()
     L = []
@@ -8180,8 +8290,7 @@ def status_lines():
         L.append(f"  {printable(a)} ({C.human(st.st_size)}, {kind})")
     caps = captures_root(gp)
     if caps.is_dir():
-        n = sum(1 for x in caps.iterdir() if CAPTURE_NAME_RE.match(x.name.removeprefix(TOMB_PREFIX)))
-        L.append(f"Doctor captures: {n} in {caps} (pre-repair database copies; deleted with their gate run)")
+        L += _status_captures(gp, caps)
     qd = gp["QUAR"]
     if qd.exists():
         n = sum(1 for _p, st in C.walk_lstat(qd) if not stat.S_ISDIR(st.st_mode) and _p.name != "MANIFEST.json")

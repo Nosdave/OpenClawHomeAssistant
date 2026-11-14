@@ -1,6 +1,7 @@
 // Regression tests for the Telegram hotfix VOLT-TG-20261023 on OpenClaw 2026.11.3 (oc-patches/2026.11.3).
-// Copy of telegram_hotfix_2026.11.1.test.mjs (itself a copy of the 2026.10.10 port of the 2026.10.4 test written by
-// Volt, exported 2026-10-25). Changes for 2026.11.3: the version and the four chunk names only. The patched regions
+// Copy of telegram_hotfix_2026.11.1.test.mjs (removed with that patch set in 0.5.94-full5; itself a copy of the
+// 2026.10.10 port, also removed, of the 2026.10.4 test written by Volt, exported 2026-10-25). Changes for
+// 2026.11.3: the version and the four chunk names only. The patched regions
 // (extensions/telegram/src/send-message.ts and fetch.ts, src/channels/turn/lifecycle.ts and
 // pending-delivery-notice.ts) are unchanged from 2026.11.1 (no commit in v2026.11.1..v2026.11.3 touches them); the
 // chunks differ only in their import/export lines (export letters, resolved below from the send chunk).

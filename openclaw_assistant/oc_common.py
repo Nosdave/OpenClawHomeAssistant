@@ -831,7 +831,12 @@ def _kv_redact(m):
 
 # Long standalone tokens. A run next to "/" or "." (path segment, file name such as
 # openclaw.sqlite.<uuid>.bak or npm/projects/<hash>/) is not a token; a sentence-final "." is.
-_LONG_TOKEN_RULE = (re.compile(r"(?<![A-Za-z0-9_/.-])[A-Za-z0-9_-]{40,}(?![A-Za-z0-9_/-])(?!\.[A-Za-z0-9_-])"), "***")
+# N7: OpenClaw's own directory names (a doctor capture doctor-<uuid>, a pre-repair recovery directory
+# openclaw-<repair>-recovery-<6>) are no secrets; named on their own (a status or HOLD line) they stay readable.
+_LONG_TOKEN_RULE = (re.compile(r"(?<![A-Za-z0-9_/.-])"
+                               r"(?!(?:doctor-[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}"
+                               r"|openclaw-[a-z]+(?:-[a-z]+)*-recovery-[A-Za-z0-9]{6})(?![A-Za-z0-9_-]))"
+                               r"[A-Za-z0-9_-]{40,}(?![A-Za-z0-9_/-])(?!\.[A-Za-z0-9_-])"), "***")
 _REDACT_RES = [
     (re.compile(r"AGE-SECRET-KEY-1[0-9A-Za-z]{20,}"), "AGE-SECRET-KEY-***"),
     # the formats of OpenClaw's own literal-secret check (LITERAL_SECRET_PATTERN, skills/security/scan-evidence.ts),
@@ -882,7 +887,9 @@ _REDACT_RES = [
     # Authorization: <any other scheme> <credentials> (Token, Bot, Digest, ...; also Proxy-Authorization, "quoted")
     (re.compile(r"(?i)(\bAuthorization[\"']?:[^\S\r\n]*+[\"']?[A-Za-z][\w-]*+)[^\S\r\n]++[^\s\"'`,;]{8,}"),
      r"\1 ***"),
-    (re.compile(r"sk-[A-Za-z0-9_-]{10,}"), "***"),
+    # sk-… keys stand on their own: not the "sk-" inside a word (N7: "openclaw-task-delivery-recovery-38FuVU", the
+    # directory doctor names in its [doctor] line, became "openclaw-ta***"; also "risk-…", "desk-…")
+    (re.compile(r"(?<![A-Za-z0-9])sk-[A-Za-z0-9_-]{10,}"), "***"),
     (re.compile(r"(?i)\bbot\d{6,12}:[A-Za-z0-9_-]{30,}"), "bot***"),  # Telegram Bot API URL form
     (re.compile(r"\b\d{6,12}:[A-Za-z0-9_-]{30,}\b"), "***"),
     (re.compile(r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}"), "***"),  # JWT

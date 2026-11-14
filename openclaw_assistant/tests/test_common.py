@@ -838,6 +838,40 @@ class LiteralSecretRedactTests(unittest.TestCase):
                 self.assertNotIn(secret[-12:], text)
 
 
+class OpenClawNameRedactTests(unittest.TestCase):
+    """N7 (11.3 host rehearsal): the [doctor] line naming doctor's recovery directory of an orphan task delivery
+    repair became '…/openclaw-ta***' in the add-on log (the "sk-" inside "task-delivery" was taken for an sk- key).
+    OpenClaw's own directory names stay readable, also named on their own; real keys are still hidden."""
+
+    CAP = "doctor-370dde46-defe-4716-a978-6fc1f8b953ac"
+
+    def test_doctor_recovery_and_capture_names_stay_readable(self):
+        for line in (
+                "Preserved and recovered 1 orphan task delivery rows; backup and row export: "
+                "/config/.openclaw/state/openclaw-task-delivery-recovery-38FuVU",
+                "Saved pre-repair SQLite backup: /config/.openclaw/state/openclaw-task-delivery-recovery-38FuVU/"
+                "database.sqlite",
+                "directory openclaw-task-delivery-recovery-38FuVU and openclaw-media-persistence-recovery-AbC123",
+                "openclaw-transcript-directives-recovery-AbC123: kept",
+                f"Original update capture failed; evidence retained at /config/.openclaw.update-captures/{self.CAP}",
+                f"Doctor captures no gate run names: 1 in /config/.openclaw.update-captures: {self.CAP}: kept",
+                f"capture: {self.CAP}.",
+                "a risk-assessment-tool on the desk-organizer-2026 task-runner-0123456789"):
+            with self.subTest(line=line[:40]):
+                self.assertEqual(C.redact_text(line), line)
+                self.assertEqual(C.redact_text_counted(line), (line, 0))
+
+    def test_keys_and_long_tokens_still_hidden(self):
+        sk = "sk-" + "Ab1" * 8
+        for raw, want in ((f"key {sk}", "key ***"), (f'"{sk}"', '"***"'), (f"KEY={sk}", "KEY=***"),
+                          (f"({sk})", "(***)"), (f"Bearer:{sk}", "Bearer:***"), (f"x_{sk}", "x_***"),
+                          (f"sk-proj-{'x' * 20}", "***"), (f"{self.CAP}abcdef0123", "***"),
+                          ("doctor-" + "a" * 45, "***"), ("openclaw-x-recovery-" + "A" * 30, "***"),
+                          ("token-" + "Q" * 40, "***")):
+            with self.subTest(raw=raw[:20]):
+                self.assertEqual(C.redact_text(raw), want)
+
+
 class KeyValueRedactTests(unittest.TestCase):
     """full5 rehearsal (checker findings): the value of a key that names a secret is hidden whole, not only its first
     word ('password: "correct horse battery"' gave '"*** horse battery"'); German and other keywords count
