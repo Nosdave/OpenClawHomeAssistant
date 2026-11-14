@@ -1921,6 +1921,11 @@ them yourself once the update is confirmed. Copies that no gate run made (for ex
 from the 2026.7 gateway's own startup migrations) are left alone; `oc-upgrade status`
 counts all of them below `/config/.openclaw` (`Doctor pre-migration SQLite copies: …`),
 and you can delete those by hand. Never copy a `.bak` or `.scoped.bak` over a database.
+OpenClaw's own recovery records still name a copy after the add-on deleted it; that is
+harmless (see [`openclaw update cleanup` lists doctor's SQLite copies](#openclaw-update-cleanup-lists-doctors-sqlite-copies-as-protected-or-blocked)).
+The run's cleanup record (`/config/.openclaw-upgrade/gate/runs/<run>/cleanup.json`) lists
+every deleted item with its size, and for these copies also the file's identity at the
+moment it was deleted (device, inode, size, modification time).
 
 **Doctor's pre-repair cron backups.** Before each cron repair it commits, doctor saves a
 verified plaintext copy of the whole state database (with its device keys, tokens and
@@ -2766,6 +2771,36 @@ discovery failed` (without network), and then the next fallback being tried or r
 Codex looks up the account with the stored login before OpenClaw refuses the model, and
 a failed lookup counts as an ordinary failure of that fallback. With network the lookup
 is expected to work, and OpenClaw then stops at that fallback.
+
+### `openclaw update cleanup` lists doctor's SQLite copies as `protected` or `blocked`
+
+**Symptom**: `openclaw update cleanup --dry-run` lists files named
+`<database>.pre-startup-migration-<id>.bak` or `….scoped.bak` that no longer exist, as
+`protected: <path> (<n> bytes; awaiting-later-completed-update)`, `protected: <path> (<n>
+bytes; incomplete-recovery-operation)` or `blocked: <path> (<n> bytes;
+unexpectedly-missing-artifact)`. The byte counts are the sizes the copies had. With `--yes`,
+a `blocked` line makes the command end with exit code 1 after it removed everything else it
+could. In the add-on you only see this when you run OpenClaw's own entry directly (for
+example with support) or after moving the state to a plain OpenClaw install: the add-on's
+wrapper refuses `openclaw update`.
+
+**Cause**: before it migrates a database, doctor records its copy in OpenClaw's recovery
+records (`/config/.openclaw/session-sqlite-migration-runs/startup-migration-<id>.json`). The
+add-on deletes the copies of a gate run `gate_cleanup_hours` after the run ([Doctor's SQLite
+copies](#automatic-deletion-gate_cleanup_hours)) and leaves OpenClaw's records unchanged, so
+OpenClaw still expects the files. Which line you see depends only on OpenClaw's own
+bookkeeping: `awaiting-later-completed-update` as long as OpenClaw has recorded no successful
+`openclaw update` after the migration (always the case in the add-on),
+`incomplete-recovery-operation` when doctor never finished that migration, and `blocked …
+unexpectedly-missing-artifact` once a later OpenClaw update has completed.
+
+**Fix**: none needed. The gateway, doctor and restores do not depend on these lines, and the
+encrypted Home Assistant backup is the rollback point. Do not recreate the files. Do not edit
+or delete the record files by hand: an unreadable record makes OpenClaw protect every other
+recovery file. `oc-upgrade cleanup`, the cleanup log (`[cleanup] run …: deleted …`) and the
+run's `cleanup.json` (with each deleted copy's file identity) show what the add-on deleted
+and when. Doctor's captures in `/config/.openclaw.update-captures/`, its pre-repair cron
+backups and its recovery directories leave no such entries.
 
 ### Gateway exited with code 78
 

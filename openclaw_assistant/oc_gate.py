@@ -7750,10 +7750,13 @@ def _delete_recovery_dir(pfd, name):
     return size
 
 
-def _delete_doctor_copy(gp, parts):
+def _delete_doctor_copy(gp, parts, facts=None):
     """One of doctor's SQLite copies <state>/<parts...>: every directory below the state dir is opened without
     following links, and only a regular file with doctor's name pattern is unlinked (a pre-repair recovery directory:
-    _delete_recovery_dir)."""
+    _delete_recovery_dir). facts (a dict, optional): for a pre-migration copy (doctor_copy_kind full / scoped), which
+    OpenClaw's own recovery records (session-sqlite-migration-runs/startup-migration-<id>.json) still name after the
+    add-on deleted it, "identity" gets the file identity from the stat right before the unlink, so that the deletion
+    can be tied to such a record later by more than its path (cleanup.json; DOCS "openclaw update cleanup lists")."""
     dfd = open_dir_nofollow(gp["STATE"], *parts[:-1])
     try:
         if DOCTOR_RECOVERY_DIR_RE.fullmatch(parts[-1]):
@@ -7762,13 +7765,15 @@ def _delete_doctor_copy(gp, parts):
         if not stat.S_ISREG(st.st_mode):
             raise OSError(errno.EPERM, "not a regular file", "/".join(parts))
         os.unlink(parts[-1], dir_fd=dfd)
+        if facts is not None and doctor_copy_kind(parts[-1]) in ("full", "scoped"):
+            facts["identity"] = {"dev": st.st_dev, "ino": st.st_ino, "size": st.st_size, "mtime_ns": st.st_mtime_ns}
         return st.st_size
     finally:
         os.close(dfd)
 
 
-def _safe_delete(gp, p):
-    """Dispatch by the cleanup root a target belongs to; anything else is refused."""
+def _safe_delete(gp, p, facts=None):
+    """Dispatch by the cleanup root a target belongs to; anything else is refused. facts: _delete_doctor_copy."""
     base, name = p.parent, p.name
     if base == rehearsal_root(gp):
         return _delete_export(base, name)
@@ -7780,7 +7785,7 @@ def _safe_delete(gp, p):
         return _delete_entry(base, name)
     parts = _doctor_copy_parts(os.path.realpath(str(gp["STATE"])), str(p))
     if parts is not None:
-        return _delete_doctor_copy(gp, parts)
+        return _delete_doctor_copy(gp, parts, facts)
     raise OSError(errno.EPERM, "outside the cleanup roots", str(p))
 
 
@@ -8040,7 +8045,8 @@ def _cleanup_target(gp, now, rid, label, due, paths, kept, emit, errors=None):
             break
         key = f"{label}\0{p_}"
         try:
-            gone.append({"path": str(p_), "bytes": _safe_delete(gp, p_)})
+            facts = {}
+            gone.append({"path": str(p_), "bytes": _safe_delete(gp, p_, facts), **facts})
             errors.discard(key)
         except OSError as exc:
             if key not in errors:  # once per path, not at every hourly pass

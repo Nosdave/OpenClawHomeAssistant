@@ -315,6 +315,48 @@ class CleanupTests(CleanupEnv):
         self.assertEqual(self.record(rid), rec)
         self.assertNotIn("SECRET", self.out)
 
+    def test_deleted_pre_migration_copies_record_their_file_identity(self):
+        """B+ (the owner's choice for OpenClaw's recovery records): OpenClaw still names doctor's pre-migration copies
+        in session-sqlite-migration-runs/ after the add-on deleted them, so cleanup.json keeps each deleted full and
+        scoped copy's file identity (dev, ino, size, mtime_ns from the stat right before the unlink). Cron backups,
+        recovery directories and captures are in no such record and carry none. The cleanup log line is unchanged."""
+        st = self.gp["STATE"]
+        (st / "state").mkdir(parents=True, exist_ok=True)
+        (st / "state" / "openclaw.sqlite").write_bytes(b"SQLite format 3\x00")
+        (st / "agents" / "main").mkdir(parents=True, exist_ok=True)
+        full = st / "agents" / "main" / "sessions.sqlite.pre-startup-migration-g1abc.bak"
+        scoped = st / "state" / "openclaw.sqlite.pre-startup-migration-g1abc.scoped.bak"
+        cron = st / "state" / "openclaw.sqlite.doctor-cron-1763000000000-0b4e9f2c-1d2e-4f3a-9b8c-7d6e5f4a3b2c.bak"
+        rec_dir = st / "state" / "openclaw-index-recovery-Abc123"
+        rec_dir.mkdir()
+        (rec_dir / "database.sqlite").write_bytes(b"SQLite format 3\x00" + b"r" * 40)
+        full.write_bytes(b"SQLite format 3\x00" + b"f" * 300)
+        scoped.write_bytes(b"SQLite format 3\x00" + b"s" * 120)
+        cron.write_bytes(b"SQLite format 3\x00" + b"c" * 60)
+        self.age_old(full, T0 - timedelta(days=3))
+        want = {str(full): os.stat(full), str(scoped): os.stat(scoped)}
+        backups = [{"path": C.rel(x, st), "size": x.stat().st_size, "scope": k}
+                   for x, k in ((full, "full"), (scoped, "scoped"), (cron, "cron"))]
+        backups.append({"path": C.rel(rec_dir, st), "size": 56, "scope": "recovery"})
+        r = self.make_run(archive=None, doctor=[{"pass": 1, "pre_migration_backups": backups}])
+        self.assertEqual(self.cleanup(T0 + H48), 5, self.text)  # the 4 doctor copies and the capture
+        for x in (full, scoped, cron, rec_dir):
+            self.assertFalse(os.path.lexists(x), x)
+        self.assertEqual(len(self.lines), 1, self.text)
+        self.assertNotIn("identity", self.text)
+        self.assertNotIn("ino", self.text)
+        rec = self.record(r.rid)
+        by_path = {d["path"]: d for d in rec["deleted"]}
+        for path, before in want.items():
+            self.assertEqual(by_path[path]["identity"],
+                             {"dev": before.st_dev, "ino": before.st_ino, "size": before.st_size,
+                              "mtime_ns": before.st_mtime_ns}, path)
+            self.assertEqual(by_path[path]["identity"]["size"], by_path[path]["bytes"])
+        for path in (str(cron), str(rec_dir), *(str(c) for c in r.caps)):
+            self.assertEqual(set(by_path[path]), {"path", "bytes"}, path)
+        self.assertEqual(by_path[str(full)]["identity"]["mtime_ns"],
+                         int((T0 - timedelta(days=3)).timestamp()) * 1_000_000_000)
+
     def test_run_plaintext_copies_only_regular_files_of_a_real_run_dir(self):
         """A5/A7: only regular files named like the gate's config copies / models status output, in a real run
         directory; links (to a file or as the run directory) and other names are never listed or deleted."""
