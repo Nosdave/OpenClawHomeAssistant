@@ -19,7 +19,7 @@ This repository contains a Home Assistant add-on that runs **OpenClaw** inside *
 - **Browser Automation** — Chromium included for web scraping and automation skills
 - **Proxy Support** — optional outbound `http_proxy` setting for HTTP/HTTPS traffic
 - **Persistent Storage** — skills, config, and workspace survive add-on updates
-- **Bundled Tools** — git, vim, nano, bat, fd, ripgrep, curl, jq, python3, pnpm, Homebrew
+- **Bundled Tools** — git, vim, nano, bat, fd, ripgrep, curl, jq, python3, pnpm, ffmpeg, Homebrew
 
 ## Supported Architectures
 

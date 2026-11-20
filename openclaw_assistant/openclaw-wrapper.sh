@@ -113,9 +113,10 @@ if [ "${OC_ADDON_UNSAFE:-}" = "1" ]; then
   exec "$node_bin" "$entry" "$@"
 fi
 
-# Another OC_UPGRADE_DIR hides the add-on's hold.txt from the HOLD check below.
+# Another OC_UPGRADE_DIR hides the add-on's hold.txt from the HOLD check below: the check still runs, on the
+# hold.txt of that directory.
 if [ "${UPG_DIR%/}" != "/config/.openclaw-upgrade" ]; then
-  echo "openclaw: OC_UPGRADE_DIR=${UPG_DIR} — add-on safety checks bypassed (HOLD marker not read from /config/.openclaw-upgrade)" >&2
+  echo "openclaw: OC_UPGRADE_DIR=${UPG_DIR} — HOLD marker read from ${UPG_DIR}, not from /config/.openclaw-upgrade" >&2
 fi
 
 # True when `rest` contains one of the given flags (also as --flag=value).

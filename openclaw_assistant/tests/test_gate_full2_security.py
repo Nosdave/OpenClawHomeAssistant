@@ -521,10 +521,10 @@ class CleanupRobustnessTests(SecEnv):
         b = self.make_run(finished=T0 + SEC)
         real = G._safe_delete
 
-        def failing(gp, p):
+        def failing(gp, p, facts=None):
             if p == a.adir:
                 raise RuntimeError("simulated bug")
-            return real(gp, p)
+            return real(gp, p, facts)
         state = {}
         with mock.patch.object(G, "_safe_delete", side_effect=failing):
             self.assertEqual(self.cleanup(T0 + H48 + SEC, state=state), 1)
@@ -541,10 +541,10 @@ class CleanupRobustnessTests(SecEnv):
         b = self.make_run(finished=T0 + SEC)
         real = G._safe_delete
 
-        def failing(gp, p):
+        def failing(gp, p, facts=None):
             if p == a.adir:
                 raise PermissionError(errno.EACCES, os.strerror(errno.EACCES), str(p))
-            return real(gp, p)
+            return real(gp, p, facts)
         state = {}
         with mock.patch.object(G, "_safe_delete", side_effect=failing):
             self.assertEqual(self.cleanup(T0 + H48 + SEC, state=state), 1)
@@ -899,8 +899,8 @@ class RetentionBaseTests(SecEnv):
         self.assertEqual(G.run_due_base(r.j), cleared)
         due = cleared + H48
         self.assertEqual(self.cleanup(T0 + H48), 0)  # finished_at + 48 h is not enough any more
-        self.assertEqual(self.lines, [f"[cleanup] run {r.rid}: 1 item(s) (doctor captures / archive) will be deleted "
-                                      f"at {iso(due)}"])
+        self.assertEqual(self.lines, [f"[cleanup] run {r.rid}: 1 item(s) (doctor captures, doctor SQLite copies, "
+                                      f"plaintext config copies / archive) will be deleted at {iso(due)}"])
         self.assertEqual(self.cleanup(due - SEC), 0)
         self.assertTrue(r.adir.is_dir())
         self.assertEqual(self.cleanup(due), 1)

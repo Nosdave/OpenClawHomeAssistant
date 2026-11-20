@@ -68,7 +68,7 @@ EXTRA_ENV=()
 # Run the wrapper with a controlled environment; sets OUT, ERR, RC and
 # DIR_WARNED (the OC_UPGRADE_DIR override warning, which is not part of ERR:
 # every test points OC_UPGRADE_DIR at its own HOLD directory).
-DIR_WARNING="— add-on safety checks bypassed (HOLD marker not read from /config/.openclaw-upgrade)"
+DIR_WARNING=", not from /config/.openclaw-upgrade"
 invoke() {
   OUT="$(env -u OC_ADDON_UNSAFE PATH="$T/brewbin:/usr/bin:/bin" OC_UPGRADE_DIR="$T/upg" \
            ${EXTRA_ENV[@]+"${EXTRA_ENV[@]}"} "$OC" "$@" 2>"$T/stderr")"
@@ -277,7 +277,8 @@ printf '%s\n' "$T/fakebin/node" > "$T/oc-addon/openclaw-node"
 # --- OC_UPGRADE_DIR override: warned like OC_ADDON_UNSAFE (F14) ---------------
 invoke status
 check "upgrade dir: override not warned (err='$(cat "$T/stderr")')" [ "$DIR_WARNED" = "true" ]
-check "upgrade dir: warning lacks the directory" grep -qF "openclaw: OC_UPGRADE_DIR=$T/upg $DIR_WARNING" "$T/stderr"
+check "upgrade dir: warning lacks the directory" grep -qF "openclaw: OC_UPGRADE_DIR=$T/upg — HOLD marker read from $T/upg$DIR_WARNING" "$T/stderr"
+check "upgrade dir: warning still says the checks are bypassed" bash -c "! grep -qF 'safety checks bypassed (HOLD' \"\$1\"" _ "$T/stderr"
 for d in /config/.openclaw-upgrade /config/.openclaw-upgrade/; do
   EXTRA_ENV=(OC_UPGRADE_DIR="$d")
   allow status
@@ -715,6 +716,139 @@ printf '#!/bin/sh\necho "OpenClaw 2026.10.4 (383c124)"\n' > "$T/rv-bin/openclaw"
 printf '2026.9.9\n' > "$T/rv-pinned"
 got="$(PATH="$T/rv-bin:$PATH" PINNED="$T/rv-pinned" bash "$T/runtime-version.sh" 2>&1)"
 check "startup: a working version probe was overridden by the pinned version: $got" [ "$got" = "RESULT 2026.10.4" ]
+
+# The Brave plugin version comes from the image record, else from the runtime version; never from a
+# hard-coded release (that would pin a plugin built for another OpenClaw), and a malformed record is ignored.
+{
+  echo 'set -euo pipefail'
+  sed -n '/^BRAVE_PLUGIN_VERSION="\$(head -n 1/,/^fi$/p' "$RUN_SH" |
+    sed "s#/usr/local/libexec/oc-addon/brave-plugin-version#\$BRAVE_REC#"
+  echo 'echo "RESULT ${BRAVE_PLUGIN_VERSION:-<empty>}"'
+} > "$T/brave-version.sh"
+printf '2026.10.10\n' > "$T/brave-rec"
+got="$(BRAVE_REC="$T/brave-rec" OPENCLAW_RUNTIME_VERSION=2026.10.4 bash "$T/brave-version.sh" 2>&1)"
+check "startup: the recorded Brave plugin version was not used: $got" [ "$got" = "RESULT 2026.10.10" ]
+got="$(BRAVE_REC="$T/brave-missing" OPENCLAW_RUNTIME_VERSION=2026.10.10 bash "$T/brave-version.sh" 2>&1)"
+check "startup: without a record the Brave version did not follow the runtime: $got" [ "$got" = "RESULT 2026.10.10" ]
+got="$(BRAVE_REC="$T/brave-missing" OPENCLAW_RUNTIME_VERSION= bash "$T/brave-version.sh" 2>&1)"
+check "startup: an unknown runtime got a hard-coded Brave version: $got" [ "$got" = "RESULT <empty>" ]
+printf '../../x\n' > "$T/brave-rec"
+got="$(BRAVE_REC="$T/brave-rec" OPENCLAW_RUNTIME_VERSION=2026.10.10 bash "$T/brave-version.sh" 2>&1)"
+check "startup: a malformed Brave record was used: $got" [ "$got" = "RESULT 2026.10.10" ]
+{
+  echo 'set -euo pipefail'
+  echo 'openclaw() { echo "UNEXPECTED openclaw $*"; }'
+  echo 'runtime_at_least() { return 0; }'
+  extract_function ensure_brave_plugin
+  echo 'BRAVE_PLUGIN_VERSION=""'
+  echo 'ensure_brave_plugin'
+  echo 'echo "RESULT rc=$?"'
+} > "$T/brave-skip.sh"
+got="$(bash "$T/brave-skip.sh" 2>&1)"
+check "startup: ensure_brave_plugin ran openclaw or failed without a version: $got" \
+  [ "$got" = "$(printf '%s\n%s' 'WARN: Brave web-search plugin not ensured: the OpenClaw version is unknown (non-fatal).' 'RESULT rc=0')" ]
+
+# full5: the enabled official plugins follow the OpenClaw version (oc-upgrade plugins-sync), after Brave, in the
+# branch that never runs during a HOLD, once per version (marker), with the same validated runtime version.
+mkdir -p "$T/cohort-bin" "$T/cohort-state"
+cat > "$T/cohort-bin/oc-upgrade" <<'EOF'
+#!/bin/sh
+echo "CALLED $*" >> "$COHORT_LOG"
+exit "${COHORT_RC:-0}"
+EOF
+chmod +x "$T/cohort-bin/oc-upgrade"
+{
+  echo 'set -euo pipefail'
+  extract_function runtime_at_least
+  extract_function ensure_official_plugin_cohort | sed "s#/config/.openclaw/.plugin_cohort_#\$COHORT_STATE/.plugin_cohort_#"
+  echo 'ensure_official_plugin_cohort'
+  echo 'echo "RESULT rc=$?"'
+} > "$T/cohort.sh"
+cohort() {  # $1 = runtime version, $2 = rc of the fake oc-upgrade; sets got and calls
+  : > "$T/cohort.log"
+  got="$(PATH="$T/cohort-bin:$PATH" COHORT_LOG="$T/cohort.log" COHORT_RC="$2" COHORT_STATE="$T/cohort-state" \
+           OPENCLAW_RUNTIME_VERSION="$1" bash "$T/cohort.sh" 2>&1)"
+  calls="$(cat "$T/cohort.log")"
+}
+cohort 2026.10.10 0
+check "startup: the official plugin step did not run plugins-sync once: $calls / $got" \
+  bash -c '[ "$1" = "CALLED plugins-sync" ] && [ "$2" = "RESULT rc=0" ]' _ "$calls" "$got"
+cohort 2026.10.10 1
+check "startup: a failed plugins-sync stopped startup or was silent: $got" \
+  bash -c '[ "$1" = "CALLED plugins-sync" ] && [[ "$2" == *"WARN: Official plugin update step failed"*"RESULT rc=0" ]]' \
+  _ "$calls" "$got"
+: > "$T/cohort-state/.plugin_cohort_2026.10.10"
+cohort 2026.10.10 0
+check "startup: the official plugin step ran again for a version it already did: $calls" \
+  bash -c '[ -z "$1" ] && [ "$2" = "RESULT rc=0" ]' _ "$calls" "$got"
+cohort 2026.11.1 0
+check "startup: a new OpenClaw version did not sync the plugins again: $calls" [ "$calls" = "CALLED plugins-sync" ]
+cohort "" 0
+check "startup: an unknown OpenClaw version ran plugins-sync or failed: $calls / $got" \
+  bash -c '[ -z "$1" ] && [ "$2" = "$(printf "%s\n%s" "WARN: Official plugins not updated: the OpenClaw version is unknown (non-fatal)." "RESULT rc=0")" ]' \
+  _ "$calls" "$got"
+cohort 2026.7.35 0
+check "startup: a 2026.7 runtime ran plugins-sync: $calls" bash -c '[ -z "$1" ] && [ "$2" = "RESULT rc=0" ]' _ "$calls" "$got"
+# placement: right after the Brave step, inside the branch STATE_HOLD skips
+cohort_lines="$(awk '
+  /^if \[ "\$STATE_HOLD" = "true" \]; then$/ && !branch { hold = NR }
+  /^elif \[ -f "\$OPENCLAW_CONFIG_PATH" \]; then$/ && hold { branch = NR }
+  /^  ensure_brave_plugin \|\| true$/ && branch { brave = NR }
+  /^  ensure_official_plugin_cohort \|\| true$/ && branch { cohort = NR }
+  END { print hold, branch, brave, cohort }' "$RUN_SH")"
+read -r c_hold c_branch c_brave c_cohort <<<"$cohort_lines"
+check "startup: ensure_official_plugin_cohort is not called right after ensure_brave_plugin in the non-HOLD branch ($cohort_lines)" \
+  bash -c '[ -n "$4" ] && [ "$1" -lt "$2" ] && [ "$2" -lt "$3" ] && [ "$3" -lt "$4" ] && [ $(( $4 - $3 )) -le 3 ]' \
+  _ "${c_hold:-0}" "${c_branch:-0}" "${c_brave:-0}" "${c_cohort:-}"
+check "startup: ensure_official_plugin_cohort is called more than once" \
+  [ "$(grep -c '^[[:space:]]*ensure_official_plugin_cohort || true$' "$RUN_SH")" -eq 1 ]
+got="$(PATH="$T/cohort-bin:$PATH" COHORT_LOG="$T/cohort.log" COHORT_STATE="$T/cohort-state" SHUTTING_DOWN=true \
+         OPENCLAW_RUNTIME_VERSION=2026.11.1 bash -c ': > "$COHORT_LOG"; bash "$1"' _ "$T/cohort.sh" 2>&1)"
+check "startup: the official plugin step started although a stop was requested: $(cat "$T/cohort.log") / $got" \
+  bash -c '[ ! -s "$1" ] && [ "$2" = "RESULT rc=0" ]' _ "$T/cohort.log" "$got"
+# A stop request during a slow step: the real shutdown trap forwards SIGTERM through the real `timeout` (bash defers
+# a trap while a foreground command runs, and the step may take up to 1200 s, longer than the Supervisor's 300 s).
+mkdir -p "$T/cohort-slow-bin"
+cat > "$T/cohort-slow-bin/oc-upgrade" <<'EOF'
+#!/usr/bin/env bash
+trap 'echo TERM >> "$COHORT_LOG"; exit 0' TERM
+echo "CALLED $*" >> "$COHORT_LOG"
+for _ in $(seq 1 600); do sleep 0.1; done
+exit 0
+EOF
+chmod +x "$T/cohort-slow-bin/oc-upgrade"
+{
+  cat <<'EOF'
+set -euo pipefail
+HEALTH_PID=""; NGINX_PID=""; TTYD_PID=""; GW_PID=""; CLEANUP_PID=""
+CLEAN_LOCKS_ON_EXIT=false; STATE_HOLD=false; SHUTTING_DOWN=false
+find_gateway_daemon_pid() { return 1; }
+stop_gw_relay() { :; }
+cleanup_session_locks() { :; }
+EOF
+  extract_function runtime_at_least
+  grep -x 'PLUGINS_PID=""' "$RUN_SH"
+  extract_function ensure_official_plugin_cohort | sed "s#/config/.openclaw/.plugin_cohort_#\$COHORT_STATE/.plugin_cohort_#"
+  extract_function shutdown
+  echo 'trap shutdown INT TERM'
+  echo 'ensure_official_plugin_cohort'
+  echo 'echo "RESULT rc=$? SHUTTING_DOWN=$SHUTTING_DOWN"'
+} > "$T/cohort-stop.sh"
+: > "$T/cohort.log"
+PATH="$T/cohort-slow-bin:$PATH" COHORT_LOG="$T/cohort.log" COHORT_STATE="$T/cohort-state" \
+  OPENCLAW_RUNTIME_VERSION=2026.11.2 bash "$T/cohort-stop.sh" > "$T/cohort-stop.log" 2>&1 &
+runner=$!
+for _ in $(seq 1 100); do grep -q CALLED "$T/cohort.log" && break; sleep 0.05; done
+start=$SECONDS
+kill -TERM "$runner"
+wait "$runner" 2>/dev/null || true
+check "startup: a stop during the official plugin step waited for it ($((SECONDS - start)) s)" \
+  [ $((SECONDS - start)) -le 5 ]
+check "startup: the official plugin step did not get the forwarded SIGTERM: $(cat "$T/cohort.log")" \
+  grep -qx TERM "$T/cohort.log"
+check "startup: a stop during the official plugin step was not reported: $(cat "$T/cohort-stop.log")" \
+  bash -c 'grep -qx "INFO: Stop requested during the official plugin update step." "$1" &&
+           grep -qx "RESULT rc=0 SHUTTING_DOWN=true" "$1" && ! grep -q "WARN" "$1"' _ "$T/cohort-stop.log"
 
 # known_bug DESCRIPTION COMMAND...: asserts the correct behaviour, but the
 # current run.sh is known to fail it. A failure is a KNOWN-BUG skip (not counted

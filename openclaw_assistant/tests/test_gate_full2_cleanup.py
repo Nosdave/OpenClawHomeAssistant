@@ -257,7 +257,7 @@ class CleanupTests(CleanupEnv):
         self.assertEqual(G.run_due_base(j), datetime.strptime(j["finished_at"], "%Y-%m-%dT%H:%M:%SZ")
                          .replace(tzinfo=timezone.utc))
         # finalize names the same due time the cleanup uses (computed a moment after finished_at)
-        said = [x for x in self.out.splitlines() if "info: the doctor captures of this run are deleted after " in x]
+        said = [x for x in self.out.splitlines() if "info: the doctor captures of this run and the gate's plaintext copies " in x]
         self.assertEqual(len(said), 1, self.out)
         self.assertTrue(said[0].endswith(" (gate_cleanup_hours=48)"), said[0])
         announced = datetime.strptime(said[0].split(" deleted after ")[1].split(" ")[0], "%Y-%m-%dT%H:%M:%SZ") \
@@ -266,33 +266,47 @@ class CleanupTests(CleanupEnv):
 
         keep, refused = G.run_captures(self.gp, j)
         self.assertEqual((sorted(keep), refused), (caps, []))
-        self.assertEqual([t[2:4] for t in G.cleanup_targets(self.gp, due, 48) if t[0] == rid], [(due, caps)])
+        # A5/A7: the run's plaintext copies of openclaw.json and the saved models status output go with them
+        rd = self.gp["RUNS"] / rid
+        copies = G.run_plaintext_copies(self.gp, rid)
+        names = {c.name for c in copies}
+        self.assertTrue({"config.pre-gate.json", "config.pre-pass1.json", "config.post-pass1.json",
+                         "config.post-pass2.json", "config.final.json", "pc-models-status.json"} <= names, names)
+        self.assertTrue(all(G.RUN_PLAINTEXT_RE.match(n) and n.endswith(".json") for n in names))
+        self.assertEqual({p.name for p in rd.iterdir() if G.RUN_PLAINTEXT_RE.match(p.name)}, names)
+        self.assertEqual([t[2:4] for t in G.cleanup_targets(self.gp, due, 48) if t[0] == rid], [(due, caps + copies)])
+        n = len(caps) + len(copies)
 
         # one second before: nothing deleted, announced once
         self.assertEqual(self.cleanup(due - SEC), 0)
-        self.assertEqual(self.lines, [f"[cleanup] run {rid}: 2 item(s) (doctor captures / archive) will be deleted "
-                                      f"at {iso(due)}"])
+        self.assertEqual(self.lines, [f"[cleanup] run {rid}: {n} item(s) (doctor captures, doctor SQLite copies, "
+                                      f"plaintext config copies / archive) will be deleted at {iso(due)}"])
         rec = self.record(rid)
         self.assertEqual((rec["due_at"], rec["announced_at"]), (iso(due), iso(due - SEC)))
         self.assertTrue(all(c.is_dir() for c in caps))
+        self.assertTrue(all(c.is_file() for c in copies))
         self.assertEqual(self.cleanup(due - SEC), 0)
         self.assertEqual(self.lines, [])  # repeated passes are silent
 
-        # at the due time: both captures go, nothing else
-        self.assertEqual(self.cleanup(due), 2)
+        # at the due time: both captures and the plaintext copies go, nothing else
+        self.assertEqual(self.cleanup(due), n)
         self.assertEqual(len(self.lines), 1, self.text)
-        self.assertTrue(self.lines[0].startswith(f"[cleanup] run {rid}: deleted 2 item(s), "), self.text)
-        for c in caps:
+        self.assertTrue(self.lines[0].startswith(f"[cleanup] run {rid}: deleted {n} item(s), "), self.text)
+        for c in caps + copies:
             self.assertFalse(os.path.lexists(c), c)
         self.assertTrue(stray.is_dir())
         self.assertTrue(self.caps.is_dir())
         self.assertEqual([p.name for p in self.caps.iterdir()], [stray.name])  # no tombstone left behind
         rec = self.record(rid)
         self.assertEqual(rec["deleted_at"], iso(due))
-        self.assertEqual(sorted(d["path"] for d in rec["deleted"]), sorted(str(c) for c in caps))
+        self.assertEqual(sorted(d["path"] for d in rec["deleted"]), sorted(str(c) for c in caps + copies))
         self.assertTrue(all(d["bytes"] > 0 for d in rec["deleted"]), rec)
-        # the gate's own records survive (only the captures are deleted)
+        # the gate's own records survive (only the captures and the plaintext copies are deleted)
         self.assertTrue((self.gp["RUNS"] / rid / "doctor-pass1.log").exists())
+        for keep_name in ("journal.json", "transform-ledger.json", "events.log", "cleanup.json"):
+            if keep_name != "journal.json" or (rd / keep_name).exists():
+                self.assertTrue((rd / keep_name).exists(), keep_name)
+        self.assertEqual(G.run_plaintext_copies(self.gp, rid), [])
         self.assertTrue((self.upg / "gate" / "migrated.json").exists())
 
         # idempotent: a later pass is a silent no-op and leaves the record alone
@@ -301,20 +315,94 @@ class CleanupTests(CleanupEnv):
         self.assertEqual(self.record(rid), rec)
         self.assertNotIn("SECRET", self.out)
 
+    def test_deleted_pre_migration_copies_record_their_file_identity(self):
+        """B+ (the owner's choice for OpenClaw's recovery records): OpenClaw still names doctor's pre-migration copies
+        in session-sqlite-migration-runs/ after the add-on deleted them, so cleanup.json keeps each deleted full and
+        scoped copy's file identity (dev, ino, size, mtime_ns from the stat right before the unlink). Cron backups,
+        recovery directories and captures are in no such record and carry none. The cleanup log line is unchanged."""
+        st = self.gp["STATE"]
+        (st / "state").mkdir(parents=True, exist_ok=True)
+        (st / "state" / "openclaw.sqlite").write_bytes(b"SQLite format 3\x00")
+        (st / "agents" / "main").mkdir(parents=True, exist_ok=True)
+        full = st / "agents" / "main" / "sessions.sqlite.pre-startup-migration-g1abc.bak"
+        scoped = st / "state" / "openclaw.sqlite.pre-startup-migration-g1abc.scoped.bak"
+        cron = st / "state" / "openclaw.sqlite.doctor-cron-1763000000000-0b4e9f2c-1d2e-4f3a-9b8c-7d6e5f4a3b2c.bak"
+        rec_dir = st / "state" / "openclaw-index-recovery-Abc123"
+        rec_dir.mkdir()
+        (rec_dir / "database.sqlite").write_bytes(b"SQLite format 3\x00" + b"r" * 40)
+        full.write_bytes(b"SQLite format 3\x00" + b"f" * 300)
+        scoped.write_bytes(b"SQLite format 3\x00" + b"s" * 120)
+        cron.write_bytes(b"SQLite format 3\x00" + b"c" * 60)
+        self.age_old(full, T0 - timedelta(days=3))
+        want = {str(full): os.stat(full), str(scoped): os.stat(scoped)}
+        backups = [{"path": C.rel(x, st), "size": x.stat().st_size, "scope": k}
+                   for x, k in ((full, "full"), (scoped, "scoped"), (cron, "cron"))]
+        backups.append({"path": C.rel(rec_dir, st), "size": 56, "scope": "recovery"})
+        r = self.make_run(archive=None, doctor=[{"pass": 1, "pre_migration_backups": backups}])
+        self.assertEqual(self.cleanup(T0 + H48), 5, self.text)  # the 4 doctor copies and the capture
+        for x in (full, scoped, cron, rec_dir):
+            self.assertFalse(os.path.lexists(x), x)
+        self.assertEqual(len(self.lines), 1, self.text)
+        logged = self.text.replace(os.path.realpath(self.tmp), "<tmp>").replace(str(self.tmp), "<tmp>")
+        for word in ("identity", "ino", "mtime_ns", *(str(b.st_mtime_ns) for b in want.values())):
+            self.assertNotIn(word, logged)  # nothing of the identity is logged (the temp paths taken out first)
+        rec = self.record(r.rid)
+        by_path = {d["path"]: d for d in rec["deleted"]}
+        for path, before in want.items():
+            self.assertEqual(by_path[path]["identity"],
+                             {"dev": before.st_dev, "ino": before.st_ino, "size": before.st_size,
+                              "mtime_ns": before.st_mtime_ns}, path)
+            self.assertEqual(by_path[path]["identity"]["size"], by_path[path]["bytes"])
+        for path in (str(cron), str(rec_dir), *(str(c) for c in r.caps)):
+            self.assertEqual(set(by_path[path]), {"path", "bytes"}, path)
+        self.assertEqual(by_path[str(full)]["identity"]["mtime_ns"],
+                         int((T0 - timedelta(days=3)).timestamp()) * 1_000_000_000)
+
+    def test_run_plaintext_copies_only_regular_files_of_a_real_run_dir(self):
+        """A5/A7: only regular files named like the gate's config copies / models status output, in a real run
+        directory; links (to a file or as the run directory) and other names are never listed or deleted."""
+        r = self.make_run(finished=T0, archive=None, captures=1)
+        outside = self.tmp / "outside.json"
+        outside.write_text('{"gateway": {"auth": {"token": "SECRET-OUTSIDE"}}}')
+        for name in ("config.pre-pass1.json", "pc-models-status.json"):
+            (r.rd / name).write_text("{}")
+        (r.rd / "config.post-pass1.json").symlink_to(outside)
+        for name in ("transform-ledger.json", "pc-sessions.json", "config.pre-pass1.json.tmp", "doctor-pass1.log"):
+            (r.rd / name).write_text("{}") if not (r.rd / name).exists() else None
+        self.assertEqual([p.name for p in G.run_plaintext_copies(self.gp, r.rid)],
+                         ["config.pre-pass1.json", "pc-models-status.json"])
+        self.assertEqual(self.cleanup(T0 + H48), 3)  # the capture and the two copies
+        self.assertTrue(outside.exists())
+        self.assertTrue(os.path.islink(r.rd / "config.post-pass1.json"))
+        for name in ("transform-ledger.json", "pc-sessions.json", "config.pre-pass1.json.tmp", "doctor-pass1.log"):
+            self.assertTrue((r.rd / name).exists(), name)
+        # a run directory that is a link is never read through
+        rid2 = self.new_rid()
+        real = self.tmp / "real-run"
+        real.mkdir()
+        (real / "config.pre-pass1.json").write_text("{}")
+        (self.gp["RUNS"] / rid2).symlink_to(real, target_is_directory=True)
+        self.assertEqual(G.run_plaintext_copies(self.gp, rid2), [])
+        self.assertEqual(G.run_plaintext_copies(self.gp, "../x"), [])
+        with self.assertRaises(OSError):
+            G._safe_delete(self.gp, r.rd / "transform-ledger.json")
+        self.assertTrue((real / "config.pre-pass1.json").exists())
+
     def test_real_gate_run_with_stale_archive_options_deletes_only_the_captures(self):
         # options.json of an earlier add-on version may still hold gate_archive / gate_archive_age_recipient
         self.base_options = {"gate_archive": "encrypted", "gate_archive_age_recipient": FAKE_PUB}
         self.options()
         j, caps = self.real_gate_with_captures()
         self.assertNotIn("archive", j)
-        self.assertIn("info: the doctor captures of this run are deleted after", self.out)
+        self.assertIn("info: the doctor captures of this run and the gate's plaintext copies", self.out)
         self.assertFalse(os.path.lexists(self.arch / j["run_id"]))
         self.assertNotIn(FAKE_PUB, self.out + self.err)
         fin = G.run_due_base(j)
+        copies = G.run_plaintext_copies(self.gp, j["run_id"])
         self.assertEqual(self.cleanup(fin + H48 - SEC), 0)
-        self.assertIn("2 item(s)", self.text)
-        self.assertEqual(self.cleanup(fin + H48), 2)
-        for c in caps:
+        self.assertIn(f"{2 + len(copies)} item(s)", self.text)
+        self.assertEqual(self.cleanup(fin + H48), 2 + len(copies))
+        for c in caps + copies:
             self.assertFalse(os.path.lexists(c))
 
     def test_full3_run_journal_without_archive_key_due_time_and_hours_option(self):
@@ -328,8 +416,8 @@ class CleanupTests(CleanupEnv):
                          [(f"run {r.rid}", due, sorted(r.caps), [])])
         lines = []
         self.assertEqual(G.cleanup_pass(now=due - SEC, emit=lines.append), 0)
-        self.assertEqual(lines, [f"[cleanup] run {r.rid}: 2 item(s) (doctor captures / archive) will be deleted at "
-                                 f"{iso(due)}"])
+        self.assertEqual(lines, [f"[cleanup] run {r.rid}: 2 item(s) (doctor captures, doctor SQLite copies, "
+                                 f"plaintext config copies / archive) will be deleted at {iso(due)}"])
         self.assertEqual(self.cmd(), 0)
         self.assertEqual(self.lines[0], "gate_cleanup_hours=6")
         self.assertIn(f"  run {r.rid}: " + ("due now" if C.utc_now() >= due else f"due {iso(due)}"), self.lines)
@@ -436,6 +524,53 @@ class CleanupTests(CleanupEnv):
         keep, refused = G.run_captures(self.gp, r.j)
         self.assertEqual(sorted(keep), sorted(good))
         self.assertEqual(refused, [])
+
+    def test_failed_capture_named_only_by_its_evidence_lines_goes_with_its_run(self):
+        # N1 (11.3 rehearsal, state D): an orphan task_delivery_state row makes OpenClaw 2026.11.3's original
+        # capture fail at the start of doctor pass 1; it keeps the unsealed capture (no manifest.json, the database
+        # payload in database.databases/) and names it only in these two lines (synthetic paths, the rehearsal's
+        # wording). The sealed capture of the same pass and the one of pass 2 use the 2026.10 line.
+        failed = self.caps / f"doctor-{uuid.uuid4()}"
+        (failed / "database.databases" / "payload").mkdir(parents=True)
+        (failed / "database.databases" / "payload" / "openclaw-agent.sqlite").write_bytes(b"SQLite format 3\x00")
+        (failed / ".openclaw-private-update-capture").write_text("x")
+        sealed = self.capture()
+        st = self.state / "state" / "openclaw.sqlite"
+        lines = [
+            f"Original state capture was unavailable: Original update capture failed; evidence retained at {failed} "
+            f"| State schema inspection failed (exit): [redacted-diagnostic]; after 3.575 seconds during "
+            f"pre-migration database backup for {st} (scope: 7 source paths):",
+            f"Caused by: SQLite foreign_key_check failed for {st}: repairable task_delivery_state.task_id "
+            "references task_runs.task_id cascade-owned orphans (1 rows). Run openclaw doctor --fix to migrate "
+            f"this legacy state before retrying... Database backup files retained at {failed}/database.databases.. "
+            "Doctor will continue; take a verified backup and run openclaw doctor --fix after resolving the "
+            "capture failure. Inspect retained evidence manually before restoring state.",
+            self.capture_line(sealed)]
+        r = self.make_run(captures=0, archive=None, extra_lines=lines)
+        stray = self.capture()  # a doctor run by hand: no log of a gate run names it
+        keep, refused = G.run_captures(self.gp, r.j)
+        self.assertEqual((sorted(keep), refused), (sorted([failed, sealed]), []))
+        # only one of the two failure lines: still found (each names the capture on its own)
+        for only in (lines[0], lines[1]):
+            (r.rd / "doctor-pass1.log").write_text(only + "\n")
+            self.assertEqual(G.run_captures(self.gp, r.j), ([failed], []))
+        (r.rd / "doctor-pass1.log").write_text("\n".join(lines) + "\n")
+        # a failure line naming something that is no capture in the root is refused, never deleted
+        outside = self.capture(root=self.ws)
+        (r.rd / "doctor-pass2.log").write_text(
+            f"Original update capture failed; evidence retained at {outside}\n"
+            f"x. Database backup files retained at {self.caps}/doctor-not-a-uuid/database.databases.\n")
+        keep, refused = G.run_captures(self.gp, r.j)
+        self.assertEqual(sorted(keep), sorted([failed, sealed]))
+        self.assertEqual(dict(refused), {str(outside): "not inside " + str(self.caps),
+                                         f"{self.caps}/doctor-not-a-uuid": "unexpected name"})
+        (r.rd / "doctor-pass2.log").unlink()
+
+        self.assertEqual(self.cleanup(T0 + H48), 2)
+        self.assertFalse(os.path.lexists(failed))
+        self.assertFalse(os.path.lexists(sealed))
+        self.assertTrue(stray.is_dir())
+        self.assertTrue(outside.is_dir())
 
     def test_capture_paths_outside_the_root_symlinks_and_odd_names_are_never_deleted(self):
         victim = self.tmp / "victim"
@@ -1047,9 +1182,10 @@ class CleanupTests(CleanupEnv):
             timer.join()
         self.assertLess(time.monotonic() - t, 10)
         self.assertEqual(rc, 143)
-        self.assertEqual(lines[0], "[cleanup] doctor captures are deleted 48 h after their gate run; gate archives "
-                                   "and rehearsal exports of earlier add-on versions and the 2026.7 plaintext "
-                                   "archives the same time after their run, export or migration (checked hourly)")
+        self.assertEqual(lines[0], "[cleanup] doctor captures, doctor's SQLite copies and the gate's config copies are "
+                                   "deleted 48 h after their gate run; gate archives and rehearsal exports of earlier add-on versions and the "
+                                   "2026.7 plaintext archives the same time after their run, export or migration "
+                                   "(checked hourly)")
         self.assertFalse(os.path.lexists(r.adir))  # the first pass runs at once
 
     def test_loop_exits_143_on_sigterm(self):
@@ -1200,7 +1336,8 @@ class CleanupTests(CleanupEnv):
 
 
 class StatusTests(CleanupEnv):
-    OPTIONS_LINE = "Gate options: delete doctor captures 48 h after a run (0 = never); backup max age 24 h"
+    OPTIONS_LINE = ("Gate options: delete doctor captures, SQLite copies and the gate's config copies 48 h after a run "
+                    "(0 = never); backup max age 24 h")
 
     def status(self):
         self.st = "\n".join(G.status_lines())
@@ -1329,7 +1466,9 @@ class StatusTests(CleanupEnv):
         self.options(gate_cleanup_hours=0, gate_backup_max_age_hours=72)
         self.status()
         self.assertEqual(self.line("Gate options: "),
-                         "Gate options: delete doctor captures 0 h after a run (0 = never); backup max age 72 h")
+                         "Gate options: delete doctor captures, SQLite copies "
+                         "and the gate's config copies 0 h after a run "
+                         "(0 = never); backup max age 72 h")
         # out of range / not an integer: the defaults (the precheck warns about it, never with the value)
         self.options(gate_cleanup_hours=721, gate_backup_max_age_hours="72")
         self.status()
@@ -1337,13 +1476,69 @@ class StatusTests(CleanupEnv):
         self.assertEqual(sorted(C.gate_options()), ["backup_max_age_hours", "cleanup_hours", "problems"])
 
     def test_doctor_captures_count_only_doctor_uuid_dirs(self):
-        for _ in range(3):
-            self.capture()
+        strays = sorted(self.capture().name for _ in range(3))  # no gate run names them: kept
         self.capture(name="doctor-not-a-uuid")
         (self.caps / "README").write_text("x")
         (self.caps / f".oc-addon-deleting-doctor-{uuid.uuid4()}").mkdir()  # still a copy on disk until deleted
         self.status()
-        self.assertTrue(self.line("Doctor captures: ").startswith(f"Doctor captures: 4 in {self.caps} "), self.st)
+        self.assertTrue(self.line("Doctor captures: ").startswith(f"Doctor captures: 1 in {self.caps} "), self.st)
+        self.assertEqual(self.line("Doctor captures no gate run names: "),
+                         f"Doctor captures no gate run names: 3 in {self.caps}: {', '.join(strays)}: plaintext copies "
+                         "of the databases; kept, the add-on does not delete them: delete them yourself once you are "
+                         "satisfied")
+
+    def test_doctor_captures_of_a_run_counted_with_a_failed_capture_and_strays_named_as_kept(self):
+        # N1: status says "deleted with their gate run" only for the captures the run's doctor logs name, the
+        # evidence of a failed capture included
+        failed = self.caps / f"doctor-{uuid.uuid4()}"
+        (failed / "database.databases").mkdir(parents=True)
+        r = self.make_run(captures=2, archive=None, current=True, extra_lines=[
+            f"Original state capture was unavailable: Original update capture failed; evidence retained at {failed} "
+            "| State schema inspection failed (exit): [redacted-diagnostic]"])
+        stray = self.capture()
+        self.status()
+        self.assertTrue(self.line("Doctor captures: ").startswith(f"Doctor captures: 3 in {self.caps} "), self.st)
+        self.assertTrue(self.line("Doctor captures no gate run names: ").startswith(
+            f"Doctor captures no gate run names: 1 in {self.caps}: {stray.name}: "), self.st)
+        self.assertEqual(len(r.caps), 2)
+        stray.rename(self.tmp / stray.name)
+        self.status()
+        self.no_line("Doctor captures no gate run names: ")
+
+    def test_captures_of_a_run_that_did_not_finish_are_named_as_kept(self):
+        # wf4 N1-R1: a run closed without finished_at (abandoned: the state dir was wiped during a HOLD after a doctor
+        # pass) keeps its captures for good (cleanup_targets skips it); status must not count them as deleted with
+        # their gate run, and names them on a line of their own, not as captures no gate run names
+        left = self.make_run(finished=None, status="abandoned", captures=1, archive=None)
+        done = self.make_run(finished=T0 + timedelta(days=1), captures=1, archive=None, current=True)
+        stray = self.capture()
+        self.status()
+        self.assertEqual(self.line("Doctor captures: "),
+                         f"Doctor captures: 1 in {self.caps} (pre-repair database copies; deleted with their gate run)")
+        self.assertEqual(self.line("Doctor captures of a gate run that did not finish: "),
+                         f"Doctor captures of a gate run that did not finish: 1 in {self.caps}: {left.caps[0].name}: "
+                         "plaintext copies of the databases; kept, the add-on does not delete them: delete them "
+                         "yourself once you are satisfied")
+        self.assertEqual(self.line("Doctor captures no gate run names: "),
+                         f"Doctor captures no gate run names: 1 in {self.caps}: {stray.name}: plaintext copies of the "
+                         "databases; kept, the add-on does not delete them: delete them yourself once you are "
+                         "satisfied")
+        self.cleanup(T0 + timedelta(days=400))
+        self.assertFalse(done.caps[0].exists())
+        self.assertTrue(left.caps[0].is_dir())  # never deleted, as the status line says
+        self.status()
+        self.assertTrue(self.line("Doctor captures: ").startswith(f"Doctor captures: 0 in {self.caps} "), self.st)
+        self.assertTrue(self.line("Doctor captures of a gate run that did not finish: ").startswith(
+            f"Doctor captures of a gate run that did not finish: 1 in {self.caps}: {left.caps[0].name}: "), self.st)
+
+    def test_captures_of_the_current_held_run_count_as_deleted_with_it(self):
+        # wf4 N1-R1: the current run, still held (no finished_at yet), finishes later and then deletes its captures
+        r = self.make_run(finished=None, status="hold", captures=1, archive=None, current=True)
+        self.status()
+        self.assertTrue(self.line("Doctor captures: ").startswith(f"Doctor captures: 1 in {self.caps} "), self.st)
+        self.no_line("Doctor captures of a gate run that did not finish: ")
+        self.no_line("Doctor captures no gate run names: ")
+        self.assertTrue(r.caps[0].is_dir())
 
     def test_no_run_recorded(self):
         self.status()

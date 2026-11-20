@@ -41,6 +41,15 @@
       "stock_sha256": "a80535e5f42a89bd0daf6252c40c6ebc63471272781b59b4b71fc8694cb14bad",
       "patched_sha256": "1d525bd5e41960977a388460817671a3bbd3195fa40fe62a409c0aee11412958",
       "diff": "telegram-fetch-fresh-audio.patch"
+    },
+    {
+      "name": "telegram-reply-self-audio",
+      "file": "dist/bot-message-CpKgMHf_.mjs",
+      "region": "//#region extensions/telegram/src/bot-message-context.session.ts",
+      "stock_sha256": "170c38676be1ff2335640df6f221e90c6f089d5c45f8dc736e343dfca0619942",
+      "patched_sha256": "6acd5d1bced99a57e2471185707bdf3e13318fd40c50bdc8390d3c1ed3ba1bd3",
+      "diff": "telegram-reply-self-audio.patch",
+      "note": "Telegram hotfix VOLT-TG-20261112: voice and audio of a replied-to message the bot itself sent (a reply-chain entry, or the reply target, whose sender id is the bot's own, ctx.me.id) are no longer merged into the user's turn media; they stay in the reply chain under the bot's name ([media_path] under '<bot name> (you)'). Audio as OpenClaw counts it for hasInboundAudio: kind audio or an audio content type, i.e. Telegram voice and audio messages, plus a downloaded file with an audio/* type deeper in the reply chain; a document the user replies to directly takes the reply target's kind document (stock head merge of the reply target into the first chain entry) and stays attached as before. The bot's other media (images, documents, stickers, video), all media of other senders and the reply-chain text are unchanged; without the bot's id on the update nothing changes. Before, a reply to one of the bot's own voice messages (also an unintended one, for example a notification quick reply) attached the bot's TTS audio to the user's turn ('[Audio attachment could not be analyzed]', or with audio transcription '[Audio] User text: ... Transcript: <the bot's words>'), as if the user had sent it. Stock behaviour since at least 2026.10.4, still in 2026.11.5-beta.2."
     }
   ]
 }

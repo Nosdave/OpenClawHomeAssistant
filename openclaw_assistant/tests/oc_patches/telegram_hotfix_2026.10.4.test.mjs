@@ -97,7 +97,7 @@ function mediaHarness({long=true,voice=true,failure,signalAborted=false,textFail
     sendChunkedText:async()=>{events.push('text');if(textFailure)throw textFailure;parts.push({messageId:++id,result:{message_id:id,chat:{id:'synthetic'}}});return {messageId:String(id),chatId:'synthetic',receipt:realReceipt({results:[{messageId:String(id),chatId:'synthetic'}],kind:'text'})};},
     sender:{parts,sendMedia:async()=>{events.push('voice');if(failure)throw failure;return media;},acceptMany:async(ps,observe)=>{parts.push(...ps);for(const p of ps)await observe(p);}},
     isTelegramPhotoLimitError:()=>false,isTelegramVoiceMessagesForbiddenError:e=>e.forbidden===true,
-    isRecoverableTelegramNetworkError:realNetworkError,findTelegramRequestAuthorityError:()=>null,
+    isRecoverableTelegramNetworkError:realNetworkError,findTelegramRequestAuthorityError:e=>e?.authority?e:null,
     sendLogger$1:{warn:()=>events.push('audio-warning')},logVerbose:()=>{},
     resolveAcceptedReplyToMessageId:p=>p?.reply?99:undefined,toAcceptedThreadScopedParams:x=>x,
     recordDeliveredPromptContext:async()=>{},recordSentMessage:async()=>{},
@@ -130,7 +130,10 @@ test('text rejection stops before optional voice; no hidden partial text replay'
   const h=mediaHarness({textFailure:new Error('text failed')});await assert.rejects(h.run(),/text failed/);assert.deepEqual(h.events,['text']);
 });
 test('cancellation/authority and non-network failures are never swallowed',async()=>{
-  for(const options of [{failure:networkFailure(),signalAborted:true},{failure:new Error('permission failure')}]){
+  // authority: a network-shaped failure (ECONNRESET) that carries a request-authority rejection (OpenClaw revoked
+  // the send authority): it must reject, not be kept as delivered text.
+  for(const options of [{failure:networkFailure(),signalAborted:true},{failure:Object.assign(networkFailure(),{authority:true})},
+    {failure:new Error('permission failure')}]){
     const h=mediaHarness(options);await assert.rejects(h.run());assert(!h.events.includes('audio-warning'));
   }
 });

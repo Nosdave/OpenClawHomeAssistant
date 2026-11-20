@@ -73,6 +73,8 @@ if cmd[:2] == ["models", "status"]:
 if cmd[:1] == ["sessions"]:
     out({"sessions": []})
 if cmd[:2] == ["plugins", "list"]:
+    if os.environ.get("FAKE_PLUGINS_LIST"):  # a whole `plugins list --json` output (plugins_list_output)
+        out(json.load(open(os.environ["FAKE_PLUGINS_LIST"], encoding="utf-8")))
     out({"plugins": []})
 sys.stderr.write("fake node: unhandled %r\n" % (cmd,))
 sys.exit(3)
@@ -115,6 +117,110 @@ print("│")
 print("◇  Doctor changes ───╮")
 print("│  - Migrated shared state tables │")
 print("└  Doctor complete.")
+'''
+
+# Scriptable fake doctor (GateEnv.doctor_script): argv[1] is a JSON script, either one step for every pass or
+# {"passes": [step, ...]} (pass n uses step n, the last one repeats; the counter is <script>.count).
+# A step (every key optional):
+#   state_uv / agent_uv   migrate the state DB / every agent DB below agents/ to this user_version (schema_meta
+#                         primary, agent_databases.schema_version and the agent schema_meta follow)
+#   app_version           schema_meta app_version and openclaw.json meta.lastTouchedVersion
+#   drop_tables           state DB tables to drop          remove   state-relative paths to delete
+#   sql / agent_sql       SQL statements run on the state DB / on every agent DB after the migration
+#   write                 {state-relative path: text} files doctor writes (parents are created)
+#   canonicalize_codex    openai-codex/ -> openai/ in openclaw.json (default true)
+#   skip_agents           agent ids whose DB (and agent_databases row) the migration leaves alone (held stores)
+#   baks                  state-relative DBs doctor copies to <db>.pre-startup-migration-<stamp>.bak first
+#   box                   print the clack box ending in "Doctor complete." (default true)
+#   print                 extra lines (inside the box when box is true)        rc   exit code (default 0)
+SCRIPT_DOCTOR = r'''#!/usr/bin/env python3
+import glob, json, os, shutil, sqlite3, sys
+script = sys.argv[1]
+with open(script, encoding="utf-8") as f:
+    spec = json.load(f)
+counter = script + ".count"
+n = int(open(counter).read()) if os.path.exists(counter) else 0
+with open(counter, "w") as f:
+    f.write(str(n + 1))
+passes = spec.get("passes")
+step = passes[min(n, len(passes) - 1)] if passes else spec
+state = os.environ["OPENCLAW_STATE_DIR"]
+cfgp = os.environ["OPENCLAW_CONFIG_PATH"]
+sdb = os.path.join(state, "state", "openclaw.sqlite")
+for rel in step.get("baks") or []:
+    src = os.path.join(state, rel)
+    if os.path.exists(src):
+        shutil.copyfile(src, src + ".pre-startup-migration-20261101T000000Z.bak")
+s_uv, a_uv, app = step.get("state_uv"), step.get("agent_uv"), step.get("app_version")
+if os.path.exists(sdb):
+    c = sqlite3.connect(sdb)
+    if s_uv is not None:
+        c.execute("PRAGMA user_version=%d" % int(s_uv))
+        c.execute("UPDATE schema_meta SET schema_version=? WHERE meta_key='primary'", (s_uv,))
+    if app is not None:
+        c.execute("UPDATE schema_meta SET app_version=? WHERE meta_key='primary'", (app,))
+    for t in step.get("drop_tables") or []:
+        c.execute('DROP TABLE IF EXISTS "%s"' % t.replace('"', ''))
+    for q in step.get("sql") or []:
+        c.execute(q)
+    if a_uv is not None:
+        skip = [str(x) for x in step.get("skip_agents") or []]
+        try:
+            c.execute("UPDATE agent_databases SET schema_version=? WHERE agent_id NOT IN (%s)"
+                      % ",".join("?" * len(skip)) if skip else "UPDATE agent_databases SET schema_version=?",
+                      (a_uv, *skip))
+        except sqlite3.OperationalError:
+            pass
+    c.commit()
+    c.close()
+if a_uv is not None:
+    for a in glob.glob(os.path.join(state, "agents/*/agent/openclaw-agent.sqlite")):
+        if os.path.basename(os.path.dirname(os.path.dirname(a))) in (step.get("skip_agents") or []):
+            continue
+        c = sqlite3.connect(a)
+        c.execute("PRAGMA user_version=%d" % int(a_uv))
+        c.execute("UPDATE schema_meta SET schema_version=? WHERE meta_key='primary'", (a_uv,))
+        c.commit()
+        c.close()
+for a in glob.glob(os.path.join(state, "agents/*/agent/openclaw-agent.sqlite")) if step.get("agent_sql") else []:
+    c = sqlite3.connect(a)
+    for q in step["agent_sql"]:
+        c.execute(q)
+    c.commit()
+    c.close()
+for rel, body in (step.get("write") or {}).items():
+    p = os.path.join(state, rel)
+    os.makedirs(os.path.dirname(p), exist_ok=True)
+    with open(p, "w", encoding="utf-8") as f:
+        f.write(body)
+for rel in step.get("remove") or []:
+    p = os.path.join(state, rel)
+    if os.path.lexists(p):
+        os.remove(p)
+text = open(cfgp, encoding="utf-8").read()
+if step.get("canonicalize_codex", True):
+    text2 = text.replace("openai-codex/", "openai/")
+else:
+    text2 = text
+cfg = json.loads(text2)
+if app is not None:
+    cfg.setdefault("meta", {})["lastTouchedVersion"] = app
+new = json.dumps(cfg, indent=2, ensure_ascii=False) + "\n"
+if new != text:
+    with open(cfgp, "w", encoding="utf-8") as f:
+        f.write(new)
+lines = [str(x) for x in step.get("print") or []]
+if step.get("box", True):
+    print("┌  OpenClaw doctor")
+    print("│")
+    print("◇  Doctor changes ───╮")
+    for ln in lines:
+        print("│  " + ln + " │")
+    print("└  Doctor complete.")
+else:
+    for ln in lines:
+        print(ln)
+sys.exit(int(step.get("rc", 0)))
 '''
 
 
@@ -185,6 +291,155 @@ def make_99_state(state, s=19, a=24, app=RUNTIME):
     make_agent_db(state, "main", a, auth=False)
 
 
+# --- 2026.10.x shapes (full5 prep) ---------------------------------------------------------------
+FIXTURES = Path(__file__).resolve().parent / "fixtures"
+DDL_1004_STATE = FIXTURES / "openclaw-state-schema-2026.10.4.sql"  # verbatim OpenClaw v2026.10.4 DDL
+DDL_1004_AGENT = FIXTURES / "openclaw-agent-schema-2026.10.4.sql"
+# Synthetic content of make_1004_state(content=True): no real prompts, ids or tokens.
+CRON_1004_JOBS = [
+    {"id": "job-morning", "name": "Morning summary", "enabled": True, "agentId": "main", "sessionTarget": "isolated",
+     "schedule": {"kind": "cron", "expr": "0 7 * * *"},
+     "payload": {"kind": "agentTurn", "message": "synthetic prompt", "model": "openai/gpt-5.5",
+                 "fallbacks": ["anthropic/claude-sonnet-4-6"]}},
+    {"id": "job-local", "name": "Local digest", "enabled": True, "agentId": "main", "sessionTarget": "isolated",
+     "schedule": {"kind": "every", "everyMs": 3600000},
+     "payload": {"kind": "agentTurn", "message": "synthetic prompt"}},
+    {"id": "job-off", "name": "Paused reminder", "enabled": False, "agentId": "main", "sessionTarget": "main",
+     "schedule": {"kind": "cron", "expr": "30 18 * * 5"},
+     "payload": {"kind": "systemEvent", "text": "synthetic event"}},
+]
+AUTH_1004_STORE = {"version": 1, "profiles": {
+    "openai:default": {"type": "oauth", "provider": "openai", "access": "SECRET-ACCESS", "refresh": "SECRET-REFRESH",
+                       "expires": 4102444800000},
+    "anthropic:default": {"type": "token", "provider": "anthropic", "token": "SECRET-ANTHROPIC-TOKEN"}}}
+SW_1004_PROPOSALS = [
+    ("prop-1", "create", "pending", {"name": "weather-brief", "draft": "synthetic draft"}),
+    ("prop-2", "update", "applied", {"name": "shopping-list", "draft": "synthetic draft"}),
+]
+
+
+# `openclaw plugins list --json` in the real shape (full5 rehearsal D2): tests/fixtures/plugins-list-2026.10.10.json
+# is OpenClaw 2026.10.10's output for a state with codex, acpx and Brave installed from npm, cut to three bundled
+# entries, with the paths and generation hashes replaced by synthetic ones. Every entry keeps the field set OpenClaw
+# writes (PluginRecord): no packageName, no packageVersion. Tests build their entries from it, never invent keys.
+PLUGINS_LIST_1010 = FIXTURES / "plugins-list-2026.10.10.json"
+
+
+def plugins_list_output(plugins=None):
+    """The fixture's whole output, with `plugins` instead of its entries when given."""
+    data = json.loads(PLUGINS_LIST_1010.read_text(encoding="utf-8"))
+    if plugins is not None:
+        data["plugins"] = plugins
+    return data
+
+
+def plugin_project_dir(state, pkg, ver):
+    """OpenClaw's generation project of an npm install: <state>/npm/projects/<name>-<hash>__openclaw-generation__g-<16
+    hex> (synthetic hashes; a new version gets a new generation)."""
+    h = hashlib.sha256(pkg.encode()).hexdigest()
+    g = hashlib.sha256(f"{pkg}@{ver}".encode()).hexdigest()
+    return f"{state}/npm/projects/{pkg.lstrip('@').replace('/', '-')}-{h[:10]}__openclaw-generation__g-{g[:16]}"
+
+
+def listed_plugin(pid, pkg, ver, enabled=True, origin="global", spec=None, state="/config/.openclaw"):
+    """One `plugins list --json` entry shaped like the fixture's. origin 'global': an npm install of `pkg` (its
+    rootDir/source in its generation project, trust.installSpec `spec` or the package name; trusted-official for
+    @openclaw/ packages, provenance-invalid for others, as OpenClaw's resolvePluginTrust says); 'bundled': a plugin of
+    the OpenClaw package; 'config'/'workspace': a load path (no install record, trust origin-path)."""
+    entries = {x["id"]: x for x in plugins_list_output()["plugins"]}
+    if origin == "bundled":
+        x = copy.deepcopy(entries["alibaba"])
+        root = f"/usr/local/lib/node_modules/openclaw/dist/extensions/{pid}"
+        x.update(id=pid, name=pkg, rootDir=root, source=f"{root}/index.js")
+    else:
+        x = copy.deepcopy(entries[pid] if pid in entries else entries["acpx"])
+        base = plugin_project_dir(state, pkg, ver) if origin == "global" else f"/config/plugins-dev/{pid}"
+        root = f"{base}/node_modules/{pkg}" if origin == "global" else base
+        old = x["rootDir"]
+        text = json.dumps(x).replace(old, root)  # rootDir, source
+        text = text.replace(old.rsplit("/node_modules/", 1)[0] + "/node_modules/", base + "/node_modules/")  # deps
+        x = json.loads(text)
+        x.update(id=pid, rootDir=root, source=f"{root}/dist/index.js", origin=origin)
+        x["trust"] = {"reason": "trusted-official", "registryPath": f"{state}/state/openclaw.sqlite", "origin": origin,
+                      "installSource": "npm", "installSpec": spec or pkg}
+        if origin != "global":
+            x["trust"] = {"reason": "origin-path", "registryPath": x["trust"]["registryPath"], "origin": origin}
+        elif not pkg.startswith("@openclaw/"):
+            x["trust"]["reason"] = "provenance-invalid"
+        if x["trust"]["reason"] != "trusted-official":
+            x.pop("trustedOfficialInstall", None)
+        else:
+            x["trustedOfficialInstall"] = True
+    x.update(version=ver, enabled=enabled, status="loaded" if enabled else "disabled")
+    return x
+
+
+def write_install_records(state, records):
+    """OpenClaw's npm install records (state DB config_machine_state 'plugins.installedIndex', as 2026.10.x and
+    2026.11.1 write them) for {plugin id: (package, version, spec or None)}; installPath is listed_plugin's rootDir."""
+    recs = {}
+    for pid, (pkg, ver, spec) in records.items():
+        recs[pid] = {"source": "npm", "spec": spec or pkg,
+                     "installPath": f"{plugin_project_dir(state, pkg, ver)}/node_modules/{pkg}", "version": ver,
+                     "resolvedName": pkg, "resolvedVersion": ver, "resolvedSpec": f"{pkg}@{ver}",
+                     "integrity": "sha512-synthetic", "shasum": "0" * 40, "resolvedAt": "2026-11-01T00:00:00.000Z",
+                     "installedAt": "2026-11-01T00:00:00.000Z"}
+    c = sqlite3.connect(str(Path(state) / "state" / "openclaw.sqlite"))
+    c.execute("DELETE FROM config_machine_state WHERE state_key='plugins.installedIndex'")
+    c.execute("INSERT INTO config_machine_state VALUES ('plugins.installedIndex', ?, 0)",
+              (json.dumps({"revision": 1, "index": {"version": 1, "installRecords": recs, "plugins": [],
+                                                    "diagnostics": []}}),))
+    c.commit()
+    c.close()
+
+
+def make_1004_agent_db(state, aid, uv=24, app="2026.10.4", auth_store=None):
+    """Agent DB with the 2026.10.4 agent DDL at user_version `uv` (optional auth_profile_store 'primary')."""
+    d = state / "agents" / aid / "agent"
+    d.mkdir(parents=True, exist_ok=True)
+    c = sqlite3.connect(str(d / "openclaw-agent.sqlite"))
+    c.executescript(DDL_1004_AGENT.read_text(encoding="utf-8"))
+    c.execute("INSERT INTO schema_meta VALUES ('primary','agent',?,?,?,0,0)", (uv, aid, app))
+    if auth_store is not None:
+        c.execute("INSERT INTO auth_profile_store VALUES ('primary', ?, 0)", (json.dumps(auth_store),))
+    c.execute(f"PRAGMA user_version={int(uv)}")
+    c.commit()
+    c.close()
+
+
+def make_1004_state(state, s=20, a=24, app="2026.10.4", agents=("main",), content=False):
+    """State DB + agent DBs with the 2026.10.4 DDL (tests/fixtures/openclaw-*-schema-2026.10.4.sql).
+
+    s/a/app are the recorded versions: the defaults are a state 2026.10.4 left behind (the source of a
+    10.4 -> 10.10/11.1 bump); s=19, app="2026.9.9" gives a state that still needs the 10.4 migration.
+    content=True adds synthetic rows: cron jobs (job_json), Skill Workshop proposals and an auth profile
+    store with an OAuth and a token profile in the first agent DB."""
+    (state / "state").mkdir(parents=True, exist_ok=True)
+    c = sqlite3.connect(str(state / "state" / "openclaw.sqlite"))
+    c.executescript(DDL_1004_STATE.read_text(encoding="utf-8"))
+    c.execute("INSERT INTO schema_meta VALUES ('primary','global',?,NULL,?,0,0)", (s, app))
+    for aid in agents:
+        c.execute("INSERT INTO agent_databases VALUES (?, ?, ?, 0, NULL)",
+                  (aid, f"agents/{aid}/agent/openclaw-agent.sqlite", a))
+    c.execute("INSERT INTO device_identities VALUES ('primary', 'dev-synthetic', 'PUB', 'SECRET-PRIVATE-KEY', 0, 0)")
+    if content:
+        for i, job in enumerate(CRON_1004_JOBS):
+            c.execute("INSERT INTO cron_jobs (store_key, job_id, name, enabled, agent_id, payload_kind, job_json, "
+                      "sort_order, updated_at) VALUES ('default', ?, ?, ?, ?, ?, ?, ?, 0)",
+                      (job["id"], job["name"], int(job["enabled"]), job["agentId"], job["payload"]["kind"],
+                       json.dumps(job), i))
+        for pid, kind, status, rec in SW_1004_PROPOSALS:
+            c.execute("INSERT INTO skill_workshop_proposals (proposal_id, record_json, owner_agent_id, kind, status, "
+                      "created_at, updated_at, draft_hash) VALUES (?, ?, 'main', ?, ?, '2026-10-01T00:00:00Z', "
+                      "'2026-10-01T00:00:00Z', ?)",
+                      (pid, json.dumps(dict(rec, id=pid, status=status)), kind, status, "sha256:" + pid))
+    c.execute(f"PRAGMA user_version={int(s)}")
+    c.commit()
+    c.close()
+    for n, aid in enumerate(agents):
+        make_1004_agent_db(state, aid, a, app, auth_store=AUTH_1004_STORE if content and n == 0 else None)
+
+
 CFG_735 = {
     "meta": {"lastTouchedVersion": "2026.7.35"},
     "agents": {"defaults": {"model": {"primary": "openai-codex/gpt-5.5", "fallbacks": ["vllm/qwen3.5-122b"]},
@@ -212,20 +467,23 @@ class GateEnv(unittest.TestCase):
         pkg = self.tmp / "pkg" / "openclaw"
         pkg.mkdir(parents=True)
         (pkg / "openclaw.mjs").write_text("")
-        (pkg / "package.json").write_text(json.dumps({"version": RUNTIME,
-                                                      "openclaw": {"schemaVersions": {"state": 19, "agent": 24}}}))
+        self.pkg_dir = pkg
+        self.set_runtime(RUNTIME, 19, 24, doctor=False)
         (self.tmp / "entry").write_text(str(pkg / "openclaw.mjs") + "\n")
         self.bin = self.tmp / "bin"
         self.bin.mkdir()
-        for name, body in (("node", FAKE_NODE), ("fake-doctor", FAKE_DOCTOR)):
+        for name, body in (("node", FAKE_NODE), ("fake-doctor", FAKE_DOCTOR), ("script-doctor", SCRIPT_DOCTOR)):
             (self.bin / name).write_text(body)
             (self.bin / name).chmod(0o755)
+        self.doctor_cmd = [str(self.bin / "fake-doctor")]
+        self.features_file = self.tmp / "openclaw-features.json"  # absent unless a test writes it (features())
         self.env = mock.patch.dict(os.environ, {
             "OPENCLAW_STATE_DIR": str(self.state), "OC_UPGRADE_DIR": str(self.upg),
             "OC_UPGRADE_SHARE_DIR": str(self.share), "OC_CONFIG_ROOT": str(self.root),
             "OC_ADDON_ENTRY_FILE": str(self.tmp / "entry"), "PATH": f"{self.bin}:{os.environ.get('PATH', '')}",
             "OC_GATE_TEST_HOOKS": "1", "TMPDIR": str(self.tmp), "ADDON_VERSION": "0.5.94-test",
-            "OC_ADDON_OPTIONS_FILE": str(self.tmp / "options.json")})
+            "OC_ADDON_OPTIONS_FILE": str(self.tmp / "options.json"),
+            "OC_ADDON_FEATURES_FILE": str(self.features_file)})
         self.env.start()
         for k in ("OPENCLAW_CONFIG_PATH", "OPENCLAW_WORKSPACE_DIR", "OPENCLAW_RUNTIME_VERSION", "FAKE_OC_MODE",
                   "SQLITE_TMPDIR", "OC_GATE_FROM_RUNSH"):
@@ -248,10 +506,41 @@ class GateEnv(unittest.TestCase):
 
     def hooks(self, **kw):
         base = {"skip_network_check": True, "skip_space_check": True, "skip_backup_check": True,
-                "doctor_cmd": [str(self.bin / "fake-doctor")]}
+                "doctor_cmd": list(self.doctor_cmd)}
         base.update(kw)
         (self.upg / "gate").mkdir(parents=True, exist_ok=True)
         (self.upg / "gate" / "test-hooks.json").write_text(json.dumps(base))
+
+    def set_runtime(self, version, state_schema, agent_schema, doctor=True):
+        """Bundled OpenClaw `version` with schema targets state/agent (package.json of the fake package).
+
+        With doctor=True the scriptable fake doctor migrates every DB to these targets from now on (the
+        2026.9.9 FAKE_DOCTOR stays the default of runtime RUNTIME); doctor_script() adjusts its steps."""
+        self.runtime = version
+        (self.pkg_dir / "package.json").write_text(json.dumps({
+            "version": version, "openclaw": {"schemaVersions": {"state": state_schema, "agent": agent_schema}}}))
+        if doctor:
+            self.doctor_script(state_uv=state_schema, agent_uv=agent_schema, app_version=version,
+                               drop_tables=["cron_run_logs"], remove=["identity/device.json"])
+
+    def doctor_script(self, passes=None, **step):
+        """Use the scriptable fake doctor (SCRIPT_DOCTOR) with one step for every pass or `passes`."""
+        script = self.tmp / "doctor-script.json"
+        script.write_text(json.dumps({"passes": passes} if passes else step))
+        try:
+            os.unlink(f"{script}.count")
+        except FileNotFoundError:
+            pass
+        self.doctor_cmd = [str(self.bin / "script-doctor"), str(script)]
+        hk = self.upg / "gate" / "test-hooks.json"
+        if hk.exists():  # hooks() already ran: switch its doctor too
+            cur = json.loads(hk.read_text())
+            cur["doctor_cmd"] = list(self.doctor_cmd)
+            hk.write_text(json.dumps(cur))
+
+    def features(self, version=None, **caps):
+        """The image's build-time capability record (oc_common.runtime_caps reads it for this runtime only)."""
+        self.features_file.write_text(json.dumps({"openclaw_version": version or self.runtime, **caps}))
 
     def journal(self):
         return json.loads((self.upg / "gate" / "journal.json").read_text())
@@ -747,7 +1036,8 @@ class DoctorNotesTests(unittest.TestCase):
         text = "\n".join(n[1] for n in notes)
         self.assertEqual(levels, ["info", "warn", "warn", "warn", "warn", "warn"])
         self.assertIn("agents.entries.mail_reader.model has no explicit \"fallbacks\"", text)
-        self.assertIn("memory search of agent main uses provider openai without an API key", text)
+        self.assertIn("memory search of agent main uses provider openai without an API key, so semantic recall does "
+                      "not work until one is configured", text)  # not cut by the "API key: value" redaction
         self.assertIn("31 skill(s) of agent main", text)
         self.assertEqual(text.count("heartbeat monitor"), 1, "deduplicated")
         self.assertIn("~/clawd/TOOLS.md", text)
@@ -930,6 +1220,36 @@ class DoctorEvalTests(unittest.TestCase):
         self.assertIsNone(G.evaluate_doctor(0, cron)["code"])
         ev = G.evaluate_doctor(0, cron, final=True)
         self.assertEqual((ev["code"], ev["cls"]), ("doctor-warnings", "acceptable"))
+
+    def test_optional_step_retired_refusal_is_its_own_code(self):
+        """2026.10.5+: doctor:sandbox refuses the retired sandbox registries after the database migration but only
+        prints a "Doctor warnings" line and exits 0. Own acceptable code, only when runtime_caps says the runtime
+        retires these files (2026.10.4: unchanged)."""
+        sandbox = ("◇  Doctor warnings ──╮\n│  doctor:sandbox run failed: Sandbox registries: retired files whose last "
+                   "writer predates July 1, 2026: /config/.openclaw/sandbox/containers.json. The files were left "
+                   "unchanged. │\nDoctor complete.\n")
+        self.assertIsNone(G.evaluate_doctor(0, sandbox)["code"])
+        ev = G.evaluate_doctor(0, sandbox, retired_warning=True)
+        self.assertEqual((ev["code"], ev["cls"]), ("doctor-retired-warning", "acceptable"))
+        self.assertIn("sandbox/containers.json", ev["message"])
+        uninspectable = ("doctor:sandbox run failed: Cannot inspect potentially retired state at /x/sandbox/browsers: "
+                         "EACCES\nDoctor complete.\n")
+        self.assertEqual(G.evaluate_doctor(0, uninspectable, retired_warning=True)["code"], "doctor-retired-warning")
+        # accepting one code never accepts the others in the same pass
+        both = "Preserved retired model ids.\n" + sandbox
+        self.assertEqual([e["code"] for e in G.acceptable_doctor(G.evaluate_doctor(0, both, retired_warning=True))],
+                         ["doctor-warnings", "doctor-retired-warning"])
+        self.assertEqual([e["code"] for e in G.acceptable_doctor(G.evaluate_doctor(0, both))], ["doctor-warnings"])
+        held = "1 store held back.\n" + both
+        self.assertEqual([e["code"] for e in G.acceptable_doctor(G.evaluate_doctor(0, held, retired_warning=True))],
+                         ["doctor-held-back", "doctor-warnings", "doctor-retired-warning"])
+        # rc != 0: the admission refusal stays doctor-retired-format
+        refusal = ("Runtime JSON sidecars: retired files whose last writer predates July 1, 2026: /y/restart-sentinel"
+                   ".json. The files were left unchanged. Upgrade through OpenClaw 2026.9.7")
+        for flag in (False, True):
+            self.assertEqual(G.evaluate_doctor(1, refusal, retired_warning=flag)["code"], "doctor-retired-format")
+        self.assertIn("doctor-retired-warning", G.ACCEPTABLE)
+        self.assertIn("doctor-retired-warning", G.ADVICE)
 
     def test_wrapped_clack_box(self):
         text = "│  Doctor stopped     │\n│  because the step refused │\n"
@@ -1297,6 +1617,21 @@ class GateRunTests(GateEnv):
         self.assertEqual([d["pass"] for d in self.journal()["doctor"]], [1, 1, 2])
         self.assertFalse((self.share / "openclaw-upgrade").exists())  # no gate archive, not even on a retry
 
+    def test_interrupt_doctor_killed_after_the_grace_period_says_so(self):
+        """Rehearsal A2: a doctor that does not stop within DOCTOR_STOP_GRACE is killed (rc -9); the line says so
+        instead of "doctor was asked to stop"."""
+        self.build_735()
+        stubborn = self.bin / "stubborn-doctor"
+        stubborn.write_text("#!/bin/sh\ntrap '' TERM\nsleep 30\n")
+        stubborn.chmod(0o755)
+        self.hooks(doctor_cmd=[str(stubborn)])
+        threading.Timer(3.0, lambda: os.kill(os.getpid(), 15)).start()
+        with mock.patch.object(G, "DOCTOR_STOP_GRACE", 1):
+            self.assertEqual(self.run_gate(), 143, self.out)
+        self.assertIn("4/8 doctor pass 1: stop requested; doctor did not stop within ", self.out)
+        self.assertIn(" and was killed (rc -9)\n", self.out)
+        self.assertNotIn("doctor was asked to stop", self.out)
+
     def test_interrupt_resume_once_then_interrupted_twice(self):
         self.build_735()
         slow = self.bin / "slow-doctor"
@@ -1306,6 +1641,7 @@ class GateRunTests(GateEnv):
         threading.Timer(3.0, lambda: os.kill(os.getpid(), 15)).start()
         rc = self.run_gate()
         self.assertEqual(rc, 143, self.out)
+        self.assertIn("4/8 doctor pass 1: stop requested; doctor was asked to stop and stopped (rc -15)", self.out)
         j = self.journal()
         self.assertEqual((j["status"], j["phase"]), ("interrupted", "doctor1"))
         d = self.plan()
@@ -2187,11 +2523,14 @@ class NoGateArchiveTests(GateEnv):
         self.assertEqual((m["mode"], m["run_id"]), ("from-7x", j["run_id"]))
         self.assertNotIn("archive", self.out)
         self.assertNotIn("sha256", self.out)
-        self.assertRegex(self.out, r"\[gate\] info: the doctor captures of this run are deleted after \S+ "
-                                   r"\(gate_cleanup_hours=48\)\n")
+        self.assertRegex(self.out, r"\[gate\] info: the doctor captures of this run and the gate's plaintext copies "
+                                   r"of openclaw.json in its run directory \(config.\*.json, with the saved models "
+                                   r"status output\) are deleted after \S+ \(gate_cleanup_hours=48\)\n")
         self.assertNotIn("archive", (self.upg / "gate" / "runs" / j["run_id"] / "events.log").read_text())
         st = G.status_lines()
-        self.assertIn("Gate options: delete doctor captures 48 h after a run (0 = never); backup max age 24 h", st)
+        self.assertIn("Gate options: delete doctor captures, SQLite copies "
+                      "and the gate's config copies 48 h after a run "
+                      "(0 = never); backup max age 24 h", st)
         self.assertEqual([x for x in st if "archive" in x.lower()], [])
 
     def test_finalize_with_cleanup_off_keeps_the_doctor_captures(self):
@@ -2199,8 +2538,9 @@ class NoGateArchiveTests(GateEnv):
         self.hooks()
         self.options(gate_cleanup_hours=0)
         self.assertEqual(self.run_gate(), 0, self.out)
-        self.assertIn("[gate] info: the doctor captures of this run are kept (gate_cleanup_hours=0): delete them "
-                      "yourself", self.out)
+        self.assertIn("[gate] info: the doctor captures of this run and the gate's plaintext copies of openclaw.json "
+                      "in its run directory (config.*.json, with the saved models status output) are kept "
+                      "(gate_cleanup_hours=0): delete them yourself", self.out)
         self.assertEqual(list(self.share.iterdir()), [])
 
     def test_precheck_space_check_needs_no_share(self):
@@ -2579,6 +2919,239 @@ class UnencryptedBackupCountTests(unittest.TestCase):
             g.ha_backup_check([], {"backup_max_age_hours": 24})
         self.assertEqual(sum("UNENCRYPTED in" in w for w in warned), 3)
         self.assertTrue(any("... and 2 more Home Assistant backup(s)" in w for w in warned), warned)
+
+
+# --- full5 prep: foundation (runtime caps, codes, hooks, 2026.10.x fixtures) ----------------------
+
+FULL5_ACCEPTABLE = ("acp-ledger-unimported", "voicewake-unimported", "conversation-bindings-unimported",
+                    "plugin-approvals-unimported", "restart-sentinel-unimported", "sandbox-registry-unimported",
+                    "skill-workshop-export-failed")
+FULL5_HARD = ("sqlite-fk-violation", "agent-db-held")
+# hooks in the order a gate run calls them, with the existing steps they are anchored to
+HOOK_ANCHORS = ("measure", "quick_checks", "ha_backup_check", "info_items", "mark_first_write", "run_doctor_pass",
+                "config_validate", "oc_json")
+HOOKS = ("skill_workshop_precheck", "fk_checks", "skill_workshop_info", "cron_binding_forecast",
+         "skill_workshop_export", "cron_binding_postcheck", "skill_workshop_postcheck", "_finalize_skill_lines",
+         "_finalize_cron_lines")
+
+
+class Full5CodesTests(unittest.TestCase):
+    def test_new_codes_and_their_advice(self):
+        for code in FULL5_ACCEPTABLE + FULL5_HARD:
+            with self.subTest(code=code):
+                self.assertIn(code, G.ADVICE)
+                self.assertEqual(code in G.ACCEPTABLE, code in FULL5_ACCEPTABLE)
+        for code in FULL5_ACCEPTABLE[:6]:
+            self.assertEqual(G.ADVICE[code], G.RETIRED_RUNTIME_ADVICE)
+        self.assertEqual(G.advice_for(["voicewake-unimported"]),
+                         G.RETIRED_RUNTIME_ADVICE + ", or accept: oc-upgrade retry --accept voicewake-unimported "
+                                                    "(then restart the add-on)")
+        self.assertTrue(G.advice_for(["sqlite-fk-violation", "voicewake-unimported"]).startswith(
+            G.ADVICE["sqlite-fk-violation"]))
+        # 2026.10.4 imports these files only in a doctor run: going back to 0.5.94-full4 keeps nothing once its gate
+        # ran; --accept keeps the file in the quarantine; a rollback only to retry a transiently failed doctor run
+        adv = G.RETIRED_RUNTIME_ADVICE
+        self.assertNotIn("stay on it", adv)
+        self.assertIn("only in a doctor run", adv)
+        self.assertIn("keeps nothing", adv)
+        self.assertIn("/config/.openclaw-upgrade/gate/quarantine/<run>/", adv)
+        self.assertIn("transient reason", adv)
+        self.assertIn("oc-upgrade retry --doctor there, then update again", adv)
+
+    def test_decisions_reflected(self):
+        # agent-db-held is a precheck HOLD on the new image: never advise bypassing the wrapper's HOLD guard
+        self.assertNotIn("OC_ADDON_UNSAFE", G.ADVICE["agent-db-held"])
+        self.assertIn("previous add-on version", G.ADVICE["agent-db-held"])
+        # cron inference accounts are report-only: no cron HOLD codes
+        self.assertFalse([c for c in set(G.ACCEPTABLE) | set(G.ADVICE) if c.startswith("cron-binding")])
+        # the gate never deletes rows: an FK violation has no accept path
+        self.assertNotIn("--accept", G.ADVICE["sqlite-fk-violation"])
+
+
+class Full5FixtureTests(GateEnv):
+    def test_set_runtime_and_image_record(self):
+        self.set_runtime("2026.10.10", 22, 27)
+        pkg = C.runtime_package()
+        self.assertEqual((pkg["version"], pkg["schema_state"], pkg["schema_agent"]), ("2026.10.10", 22, 27))
+        g = G.Gate(emit=lambda s: None)
+        self.assertEqual(g.caps(), dict.fromkeys(C.CAP_NAMES, False))  # package not read yet
+        g.pkg = pkg
+        self.assertTrue(g.caps()["cron_refusal"])
+        self.assertFalse(g.caps()["cron_doctor_migration"])
+        self.set_runtime("2026.11.1", 22, 27)
+        self.features(cron_doctor_migration=True)
+        g.pkg = C.runtime_package()
+        self.assertTrue(g.caps()["cron_doctor_migration"])
+        self.features(version="2026.10.10", cron_doctor_migration=True)
+        self.assertFalse(C.runtime_caps(C.runtime_package())["cron_doctor_migration"])
+
+    def test_make_1004_state(self):
+        make_1004_state(self.state, content=True)
+        sdb = self.state / "state" / "openclaw.sqlite"
+        adb = self.state / "agents" / "main" / "agent" / "openclaw-agent.sqlite"
+        self.assertEqual((C.user_version(sdb), C.user_version(adb)), (20, 24))
+        tables = G.table_names(sdb)
+        for t in ("cron_jobs", "skill_workshop_proposals", "agent_deletion_journal", "operator_approvals",
+                  "config_machine_state", "agent_databases", "schema_meta"):
+            self.assertIn(t, tables)
+        self.assertEqual(len(C.query_ro(sdb, "SELECT job_id FROM cron_jobs")), len(CRON_1004_JOBS))
+        self.assertEqual(json.loads(C.query_ro(sdb, "SELECT job_json FROM cron_jobs WHERE job_id='job-morning'")[0][0])
+                         ["payload"]["fallbacks"], ["anthropic/claude-sonnet-4-6"])
+        self.assertEqual(len(C.query_ro(sdb, "SELECT 1 FROM skill_workshop_proposals")), 2)
+        self.assertEqual(G.schema_meta_primary(sdb)["app_version"], "2026.10.4")
+        profiles = G.read_auth_profiles(self.state, {"main": "agents/main/agent/openclaw-agent.sqlite"})
+        self.assertEqual({(p["id"], p["type"]) for p in profiles},
+                         {("openai:default", "oauth"), ("anthropic:default", "token")})
+        # a 10.4 state is current for 2026.10.4 and needs the gate for 2026.10.10 (22/27)
+        self.assertEqual(G.classify(self.state, {}, 20, 24, "2026.10.4")["verdict"], "ok")
+        c = G.classify(self.state, {}, 22, 27, "2026.10.10")
+        self.assertEqual(c["verdict"], "gate")
+        self.assertEqual(c["gate"], ["state schema 20 < 22", "agents/main/agent/openclaw-agent.sqlite: agent schema "
+                                                              "24 < 27"])
+
+    def test_scripted_doctor_per_pass_lines_and_failure(self):
+        make_1004_state(self.state, content=True)
+        self.write_cfg({"meta": {"lastTouchedVersion": "2026.10.4"}, "gateway": {"mode": "local"}})
+        self.set_runtime("2026.10.10", 22, 27)
+        self.hooks()
+        step = {"state_uv": 22, "agent_uv": 27, "app_version": "2026.10.10"}
+        self.doctor_script(passes=[dict(step, print=["Retired the Skill Workshop proposal tables"],
+                                        drop_tables=["skill_workshop_proposals"],
+                                        sql=["DELETE FROM cron_jobs WHERE enabled=0"],
+                                        agent_sql=["DELETE FROM auth_profile_store"],
+                                        write={"skill-workshop/.retired/x.json": "{}"}),
+                                   dict(step, print=["second pass"])])
+        self.assertEqual(self.run_gate(), 0, self.out)
+        sdb = self.state / "state" / "openclaw.sqlite"
+        self.assertNotIn("skill_workshop_proposals", G.table_names(sdb))
+        self.assertEqual(len(C.query_ro(sdb, "SELECT 1 FROM cron_jobs")), len(CRON_1004_JOBS) - 1)
+        self.assertEqual(G.read_auth_profiles(self.state, {"main": "agents/main/agent/openclaw-agent.sqlite"}), [])
+        self.assertTrue((self.state / "skill-workshop" / ".retired" / "x.json").is_file())
+        self.assertIn("[doctor] │  Retired the Skill Workshop proposal tables │", self.out)
+        self.assertIn("[doctor] │  second pass │", self.out)
+        self.assertEqual(G.classify(self.state, {}, 22, 27, "2026.10.10")["verdict"], "ok")
+        m = json.loads((self.upg / "gate" / "migrated.json").read_text())
+        self.assertEqual((m["runtime"], m["mode"]), ("2026.10.10", "bump"))
+        self.assertEqual(G.schema_meta_primary(self.state / "state" / "openclaw.sqlite")["app_version"], "2026.10.10")
+        self.assertNotIn("SECRET", self.out)
+        # a refusing doctor: rc 1 without the box
+        self.doctor_script(box=False, rc=1, print=["Failing check core/doctor/x"])
+        self.assertEqual(G.retry_cmd(["--doctor"], emit=lambda s: None), 0)
+        self.assertEqual(self.run_gate(), 20, self.out)
+        self.assertEqual((self.journal()["hold"]["code"], self.journal()["phase"]), ("doctor-failed", "doctor1"))
+
+
+class Full5HookTests(GateEnv):
+    def setUp(self):
+        super().setUp()
+        make_1004_state(self.state, content=True)
+        self.write_cfg({"meta": {"lastTouchedVersion": "2026.10.4"}, "gateway": {"mode": "local"},
+                        "agents": {"list": [{"id": "main", "default": True}]}})
+        (self.upg / "gate").mkdir(parents=True)
+        (self.upg / "gate" / "migrated.json").write_text(json.dumps({"runtime": "2026.10.4", "mode": "bump"}))
+        self.set_runtime("2026.10.10", 22, 27)
+        self.hooks()
+        self.calls = []
+
+    def spy(self, name, orig, result=None):
+        calls = self.calls
+
+        def wrapper(gate, *a, **kw):
+            tag = a[0] if name == "config_validate" else (a[2] if name == "oc_json" else None)
+            calls.append((name, tag, bool((gate.j or {}).get("first_write_at")), gate.phase))
+            if result is not None:
+                return result(gate, *a, **kw)
+            return orig(gate, *a, **kw)
+        return wrapper
+
+    def patched(self, **results):
+        ps = [mock.patch.object(G.Gate, n, new=self.spy(n, getattr(G.Gate, n), results.get(n)))
+              for n in HOOK_ANCHORS + HOOKS]
+        for p in ps:
+            p.start()
+            self.addCleanup(p.stop)
+
+    def test_call_sites_in_the_fixed_order(self):
+        """The critic's order: precheck 7 -> 9 -> 9b -> 10b -> 11 -> 11b -> 11c; the export before the first
+        write; pc-config -> cron -> lint ... -> Skill Workshop -> plugin WARNs; finalize skills -> cron -> done."""
+        self.patched()
+        self.assertEqual(self.run_gate(), 0, self.out)
+        keep = {"oc_json": ("pc-lint", "pc-plugins"), "config_validate": ("pc-config",)}
+        names = [f"{n}:{t}" if t else n for n, t, _fw, _ph in self.calls if n not in keep or t in keep[n]]
+        self.assertEqual(names, [
+            "measure", "skill_workshop_precheck", "quick_checks", "fk_checks", "ha_backup_check", "info_items",
+            "skill_workshop_info", "cron_binding_forecast",
+            "skill_workshop_export", "mark_first_write", "run_doctor_pass", "run_doctor_pass",
+            "config_validate:pc-config", "cron_binding_postcheck", "oc_json:pc-lint", "skill_workshop_postcheck",
+            "oc_json:pc-plugins", "_finalize_skill_lines", "_finalize_cron_lines"])
+        export = [c for c in self.calls if c[0] == "skill_workshop_export"]
+        self.assertEqual(export, [("skill_workshop_export", None, False, "doctor1")])  # before the first write
+        self.assertIn("[gate] done: MIGRATED 2026.10.10", self.out)
+
+    def test_readiness_and_status_helpers_are_called(self):
+        seen = []
+        orig = {n: getattr(G, n) for n in ("_readiness_skills", "_readiness_cron", "_status_cron", "_status_skills")}
+
+        def rec(n):
+            def f(arg):
+                seen.append(n)
+                return orig[n](arg) + [f"<{n}>"]
+            return f
+        with mock.patch.multiple(G, **{n: rec(n) for n in orig}):
+            lines = []
+            self.assertEqual(self.quiet(G.dry_run, emit=lines.append), 0, "\n".join(lines))
+            text = "\n".join(lines)
+            self.assertLess(text.index("cleanup plan:"), text.index("<_readiness_skills>"))
+            self.assertLess(text.index("<_readiness_skills>"), text.index("<_readiness_cron>"))
+            self.assertLess(text.index("<_readiness_cron>"), text.rindex("doctor budget"))
+            self.assertEqual(self.run_gate(), 0, self.out)
+            st = G.status_lines()
+        self.assertEqual(seen, ["_readiness_skills", "_readiness_cron", "_status_cron", "_status_skills"])
+        self.assertLess(st.index("<_status_cron>"), next(i for i, x in enumerate(st) if x.startswith("Migrated marker")))
+        self.assertLess(next(i for i, x in enumerate(st) if x.startswith("Quarantine:")), st.index("<_status_skills>"))
+
+    def test_hook_results_reach_the_precheck(self):
+        needs, sizes = [], []
+        orig_measure = G.Gate.measure
+
+        def space(n):
+            needs.append(n)
+            return [], "ok"
+
+        def measure(gate):
+            sizes.append(dict(orig_measure(gate)))
+            return gate.sizes
+        self.hooks(skip_space_check=False)
+        self.patched(fk_checks=lambda g, F, db: "foreign keys ok (2/2)",
+                     skill_workshop_precheck=lambda g: 7 * C.MIB, measure=measure)
+        with mock.patch.object(G, "space_check", side_effect=space):
+            self.assertEqual(self.run_gate(), 0, self.out)
+        line = next(x for x in self.out.splitlines() if x.startswith("[gate] 1/8 precheck:"))
+        self.assertRegex(line, r"quick_check ok \(2/2\); foreign keys ok \(2/2\); network not checked")
+        label, _path, need, code = needs[0][0]
+        self.assertEqual((label, code), ("/config", "low-disk-config"))
+        sz = sizes[0]
+        self.assertEqual(need - (2 * sz["sqlite_total"] + 2 * sz["transcripts_total"] + 2 * C.GIB), 7 * C.MIB)
+
+    def test_export_hold_comes_before_the_first_write(self):
+        def export(gate):
+            if "skill-workshop-export-failed" in gate.accepted:
+                return
+            raise G.HoldError([G.finding("skill-workshop-export-failed", "acceptable",
+                                         "could not export the Skill Workshop proposals: OSError", "doctor1")],
+                              "doctor1")
+        self.patched(skill_workshop_export=export)
+        self.assertEqual(self.run_gate(), 20, self.out)
+        j = self.journal()
+        self.assertEqual((j["hold"]["code"], j["phase"], j["hold"]["acceptable"]),
+                         ("skill-workshop-export-failed", "doctor1", True))
+        self.assertIsNone(j.get("first_write_at"))
+        self.assertFalse(j.get("doctor_started"))
+        self.assertEqual(C.user_version(self.state / "state" / "openclaw.sqlite"), 20)  # doctor never ran
+        self.assertIn("oc-upgrade retry --accept skill-workshop-export-failed", self.out)
+        G.retry_cmd(["--accept", "skill-workshop-export-failed"], emit=lambda s: None)
+        self.assertEqual(self.run_gate(), 0, self.out)
+        self.assertEqual(C.user_version(self.state / "state" / "openclaw.sqlite"), 22)
 
 
 if __name__ == "__main__":
