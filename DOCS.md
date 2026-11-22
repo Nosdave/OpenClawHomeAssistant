@@ -2307,7 +2307,11 @@ Telegram outage; it makes replies more robust against one. Three changes:
    answer when the outcome of a reply stayed unknown. Without the hotfix this could also
    happen while the reply was still being sent (for example when you wrote again during
    a voice upload). Now the notice waits until that delivery has ended; a reply whose
-   outcome really stayed unknown is still reported once. OpenClaw fixed this on its main
+   outcome really stayed unknown is still reported once. With 2026.11.4 the notice can
+   also come on its own, without a new message from you: when OpenClaw's delivery recovery
+   gives up on a reply (its retries used up, outcome unknown, for example after a Telegram
+   outage or a restart during a reply). The hotfix lets that hand-over through, as stock
+   2026.11.4 does. OpenClaw fixed this on its main
    branch (openclaw/openclaw#154417); it is in 2026.11.5 (and its betas 1 to 4) and
    2026.11.6, not in 2026.10.10, 2026.11.1, 2026.11.3 or 2026.11.4. 2026.11.4
    has a narrower guard of its own (it stops the notice only while the send is under way,
@@ -2320,7 +2324,9 @@ Telegram outage; it makes replies more robust against one. Three changes:
 The notice can still appear although the text arrived: when Telegram definitively
 rejects the audio after the text (for example "file is too big"), when Volt already
 answered your next message before the upload of the previous one ended, or when the
-session was reset during the upload. Replies that do not go through the queued delivery
+session was reset during the upload. With 2026.11.4 it can also arrive on its own, after a
+Telegram outage or a restart during a reply, for a reply whose delivery could not be
+confirmed (expected, not a failure of the hotfix). Replies that do not go through the queued delivery
 (some fallback paths of the Telegram channel) still send the audio before the text. An
 upload that failed before the connection was made is not sent again successfully either
 (as before the hotfix). The
@@ -2400,7 +2406,10 @@ repository keeps two patch sets:
   changed in cf9a023c222a). `telegram-notice-live-guard` was re-derived: the notice code
   moved into its own chunk (`pending-delivery-notice-*.mjs`), and the condition now also
   carries OpenClaw's own `expectedIntentId` and `hasActiveDirectPendingFinalDelivery`
-  checks; the add-on's check follows them. That upstream guard ends at the custody
+  checks; the add-on's check follows them and applies only to calls without
+  `expectedIntentId`, so OpenClaw's own recovery hand-over (a queued final reply settled as
+  unknown after its retries) sends the notice at once, as stock 2026.11.4 does. That
+  upstream guard ends at the custody
   release, before the reply is recorded as delivered, so both custody patches stay.
   openclaw/openclaw#154417 is not in 2026.11.4; none of the problems is fixed upstream in
   2026.11.4. `telegram-reply-self-audio` was derived from each version's stock

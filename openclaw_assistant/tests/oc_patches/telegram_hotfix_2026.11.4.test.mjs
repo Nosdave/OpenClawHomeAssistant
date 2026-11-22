@@ -4,9 +4,10 @@
 // Changes for 2026.11.4: the version and the chunk names; the notice code is read from its own chunk
 // (src/channels/turn/pending-delivery-notice.ts moved out of the execution chunk, together with the new
 // src/channels/turn/direct-delivery-active.ts), and the notice cases run with that real upstream guard
-// (hasActiveDirectPendingFinalDelivery, commit cf9a023c222a in v2026.11.3..v2026.11.4); three cases are new: the
+// (hasActiveDirectPendingFinalDelivery, commit cf9a023c222a in v2026.11.3..v2026.11.4); four cases are new: the
 // upstream guard still defers, the add-on's live custody covers the gap from the upstream custody release to the
-// canonical settlement, and a negative control for that gap. extensions/telegram/src/send-message.ts and fetch.ts are
+// canonical settlement, a negative control for that gap, and the queue recovery's own hand-over (the expectedIntentId
+// that cf9a023c222a also added) is sent while the live custody is held. extensions/telegram/src/send-message.ts and fetch.ts are
 // unchanged from 2026.11.3 (no commit in v2026.11.3..v2026.11.4 touches them); src/channels/turn/lifecycle.ts is
 // unchanged too, its chunk also carries direct-delivery-custody.ts, which now tracks the live direct send.
 // They exercise the patched function bodies with synthetic fake transports (no bot token, no gateway).
@@ -182,6 +183,22 @@ test('live custody covers the gap from the upstream custody release to the canon
   s.trackActiveDirectPendingFinalDelivery({...completion})();
   await s.deliverPendingDeliveryNotice('synthetic','store');assert.equal(counter.notices,0);
   releaseLive();await s.deliverPendingDeliveryNotice('synthetic','store');assert.equal(counter.notices,1);
+});
+test('queue recovery hand-over (expectedIntentId) sends the notice once during the live delivery; other calls still defer',async()=>{
+  // 2026.11.4 (cf9a023c222a): settleFailedQueuedDeliveryCompletion passes the intent once a queued pending final settles
+  // "unknown" after exhausted retries. On Telegram that runs inside the live delivery (sendPayload durable, deliver-queue,
+  // recoverLiveFinalDelivery, settleQueuedFailure), while the add-on's live custody for that intent is still held.
+  const s=liveHarness();const counter={notices:0};const entry=owedEntry();
+  Object.assign(s,noticeStubs(entry,counter));
+  s.updateSessionEntry=async(_target,update)=>{const next=update(entry);if(next)Object.assign(entry,next);}; // the real updater
+  vm.runInContext(noticeCode,s);
+  const releaseLive=s.voltAcquireDelivery(completion);
+  await s.deliverPendingDeliveryNotice('synthetic','store');assert.equal(counter.notices,0); // next-message path: deferred
+  await s.deliverPendingDeliveryNotice('synthetic','store','other');assert.equal(counter.notices,0); // another intent's hand-over
+  await s.deliverPendingDeliveryNotice('synthetic','store','intent');assert.equal(counter.notices,1); // the hand-over
+  assert.equal(entry.pendingDeliveryNotice.state,'acknowledged');
+  await s.deliverPendingDeliveryNotice('synthetic','store','intent');
+  releaseLive();await s.deliverPendingDeliveryNotice('synthetic','store');assert.equal(counter.notices,1); // no second notice
 });
 test('negative control: unpatched 2026.11.4 notice is sent after the custody release, before the settlement',{skip:!stockDir && 'set OC_STOCK_DIST'},async()=>{
   const stock=fs.readFileSync(path.join(stockDir,NOTICE),'utf8');
