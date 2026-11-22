@@ -3176,10 +3176,13 @@ class Gate:
         delegated_change_approval."""
         if not self.caps()["delegated_change_approval"]:
             return None
-        grants = delegation_grants(self.cfg)
+        grants, dormant = delegation_grant_split(self.cfg)
         if grants:
             self.warn(f"{self.pn('precheck')} {delegation_grant_text(grants, self.pkg['version'])}. The migration "
                       "continues")
+        if dormant:
+            self.say(f"{self.pn('precheck')} info: "
+                     f"{delegation_dormant_text(dormant, openclaw_tool_denies(self.cfg), self.pkg['version'])}")
         return None
 
     def _finalize_delegation_lines(self, cfg):
@@ -3187,10 +3190,12 @@ class Gate:
         and an info line when tools.deny still blocks the openclaw tool (the interim measure against the advisory)."""
         if not self.caps()["delegated_change_approval"]:
             return
-        grants = delegation_grants(cfg)
+        grants, dormant = delegation_grant_split(cfg)
+        denies = openclaw_tool_denies(cfg)
         if grants:
             self.warn(delegation_grant_text(grants, self.pkg["version"]))
-        denies = openclaw_tool_denies(cfg)
+        if dormant:
+            self.say(f"info: {delegation_dormant_text(dormant, denies, self.pkg['version'])}")
         if denies:
             self.say(f"info: {openclaw_deny_text(denies, self.pkg['version'])}")
 
@@ -5308,16 +5313,18 @@ def cron_codex_clause(a, ref, primary=False):
     with the first openai login of the auth order and reads the account and its models (model-catalog.ts; for a
     ChatGPT login at chatgpt.com), and a failed lookup is an ordinary candidate failure, no chain stop
     (model-fallback-attempt.ts): the chain goes on to the next fallback. What a failed lookup of a job's own model does
-    to its fallbacks is not traced, hence "may"."""
+    to its fallbacks is not traced, hence "may". Without network the lookup does not fail fast: in the 11.4 host
+    rehearsal (expired synthetic login, egress blocked) the run waited on it for over 10 minutes."""
     if ref not in {printable(r) for r in a.get("codex") or []}:
         return ""
     look = (f"Codex {_cron_codex_login(a)} and looks up the account and its models unless it has them already (for a "
             "ChatGPT login at chatgpt.com)")
     if primary:
-        return (f"; {ref} runs on the Codex runtime, so before that refusal {look}; if that lookup fails (for example "
-                "without network), OpenClaw may try the fallbacks instead")
-    return (f"; {ref} runs on the Codex runtime, so before that refusal {look}, and if that lookup fails (for example "
-            "without network) OpenClaw counts the fallback as failed and tries the next one")
+        return (f"; {ref} runs on the Codex runtime, so before that refusal {look}; if that lookup fails, OpenClaw "
+                "may try the fallbacks instead (without network the run can first wait on it for many minutes)")
+    return (f"; {ref} runs on the Codex runtime, so before that refusal {look}, and if that lookup fails OpenClaw "
+            "counts the fallback as failed and tries the next one (without network the run can first wait on it for "
+            "many minutes)")
 
 
 def cron_own_runtime_clause(a, rec):
@@ -5768,14 +5775,22 @@ def output_cap_text(rows, runtime):
             "real limits")
 
 
-# GHSA-pw3x-g8v8-fvj2 (runtime_caps delegated_change_approval, OpenClaw 2026.11.4+): the openclaw tool applies a
-# persistent delegated change (config set/unset, plugin installs, gateway restarts, ...) without a human approval only
-# when the run has explicit Full Access (exec security full, ask off) or proven unrestricted Gateway execution, or the
-# effective tools.openclaw.autoApproveChanges is true: the agent's agents.entries.<id>.tools.openclaw value, else the
-# global one (openclaw-delegate-tool.ts assertAutoApproveChangesCurrent). true "authorizes changes without individual
-# approval, even when direct execution tools are denied" (schema.help.runtime.ts): the advisory's path, opened on
-# purpose; only a workspace-only file policy or a sandbox still stops it. Before 2026.11.4 the key does not exist (the
-# strict schema of 2026.10.4 and 2026.11.3 refuses it).
+# GHSA-pw3x-g8v8-fvj2 (runtime_caps delegated_change_approval, OpenClaw 2026.11.4+; openclaw-delegate-tool.ts
+# assertAutoApproveChangesCurrent): the openclaw tool applies a persistent delegated change (config set/unset, plugin
+# installs, gateway restarts, ...) without a human approval only when the effective tools.openclaw.autoApproveChanges
+# (the agent's agents.entries.<id>.tools.openclaw value, else the global one) is true, or, when it is not set, in an
+# explicit Full Access session (session permission mode "full", chosen by an admin operator, with exec security full
+# and ask off; exec settings alone are no grant), or with proven unrestricted Gateway execution (execution-authority.ts
+# hasUnrestrictedGatewayExecution: the agent may call the core exec tool, not sandboxed, not workspace-only, host
+# gateway, security full, ask off, no before_tool_call hook on exec; OpenClaw's defaults without a sandbox). false
+# always asks, also in Full Access. Before the setting, containment always asks (a session permission mode other than
+# "full", a workspace-only file policy, a sandbox setting changed after the run was admitted): true cannot override it.
+# true "authorizes changes without individual approval, even when direct execution tools are denied"
+# (schema.help.runtime.ts): the advisory's path, opened on purpose. The fix therefore changes the outcome for agents
+# whose exec is denied or restricted; an agent with unrestricted exec still gets such changes applied (it could edit
+# the config through exec anyway). A tools.deny entry for the openclaw tool removes it (deny wins over an agent's
+# allow), so a grant in that scope has no effect. Before 2026.11.4 the key does not exist (the strict schema of
+# 2026.10.4 and 2026.11.3 refuses it).
 _CFG_IDENT_RE = re.compile(r"[A-Za-z_$][A-Za-z0-9_$:-]*")
 
 
@@ -5805,6 +5820,17 @@ def delegation_grants(cfg):
     return out
 
 
+def delegation_grant_split(cfg):
+    """delegation_grants split into (active, dormant): a grant has no effect while the openclaw tool is denied in its
+    scope (tools.deny for every grant; an agent's own tools.deny for that agent's grant). Paths only."""
+    grants, denies = delegation_grants(cfg), openclaw_tool_denies(cfg)
+    if "tools.deny" in denies:
+        return [], grants
+    dormant = [g for g in grants if g.endswith(".tools.openclaw.autoApproveChanges") and g.startswith("agents.entries")
+               and g[:-len(".openclaw.autoApproveChanges")] + ".deny" in denies]
+    return [g for g in grants if g not in dormant], dormant
+
+
 def openclaw_tool_denies(cfg):
     """The config paths whose tools.deny lists the openclaw tool itself ("openclaw" in any case: OpenClaw compares tool
     names lower-cased), the interim measure against GHSA-pw3x-g8v8-fvj2 before 2026.11.4: tools.deny first, then each
@@ -5828,21 +5854,36 @@ def _cfg_paths_text(paths):
 
 
 def delegation_grant_text(paths, runtime):
-    """The WARN text for delegation_grants (precheck, finalize, `oc-upgrade status`): config paths only."""
+    """The WARN text for active delegation grants (precheck, finalize, `oc-upgrade status`): config paths only."""
     return (f"delegated changes: {_cfg_paths_text(paths)} is true, so OpenClaw {printable(runtime)} applies every "
-            "change an agent asks the openclaw tool for (configuration, plugins, gateway restarts) without asking "
-            "anyone, also for an agent whose exec tools are denied (only a workspace-only file policy or a sandbox "
-            "still stops it): the path GHSA-pw3x-g8v8-fvj2 closed. Unless you want that, remove the setting or set "
-            "it to false (openclaw config unset <path>; an agent's own setting takes precedence over the global one)")
+            "permitted change an agent asks the openclaw tool for (configuration, plugins, gateway restarts) without "
+            "asking anyone, also for an agent whose exec tools are denied: the path GHSA-pw3x-g8v8-fvj2 closed (an "
+            "agent's own setting takes precedence over the global one). Only containment still stops it: a session "
+            "permission mode other than Full Access or a workspace-only file policy (tools.fs.workspaceOnly). Unless "
+            "you want that, set it to false (then every such change waits for a human approval, also in Full Access) "
+            "or remove it (openclaw config unset <path>; then such changes are automatic only in Full Access sessions "
+            "and for agents that may run exec on the gateway host unrestricted)")
+
+
+def delegation_dormant_text(paths, denies, runtime):
+    """The info text for delegation grants the openclaw tool's deny entry keeps without effect: config paths only."""
+    return (f"delegated changes: {_cfg_paths_text(paths)} is true, but has no effect while "
+            f"{_cfg_paths_text(denies)} denies the openclaw tool. Without that deny entry OpenClaw "
+            f"{printable(runtime)} would apply every permitted change an agent asks the openclaw tool for without "
+            "asking anyone, also for an agent whose exec tools are denied (the path GHSA-pw3x-g8v8-fvj2 closed): set "
+            "it to false or remove it before you remove the deny entry")
 
 
 def openclaw_deny_text(paths, runtime):
     """The finalize info text for openclaw_tool_denies: config paths only."""
-    return (f"delegated changes: OpenClaw {printable(runtime)} contains the fix for GHSA-pw3x-g8v8-fvj2 (a change an "
-            "agent asks the openclaw tool for now waits for a human approval unless the run has Full Access or "
-            f"tools.openclaw.autoApproveChanges is true). The \"openclaw\" entry in {_cfg_paths_text(paths)} still "
-            "blocks that tool completely (the interim measure); it can stay, or go if agents should propose such "
-            "changes for approval again")
+    return (f"delegated changes: OpenClaw {printable(runtime)} contains the fix for GHSA-pw3x-g8v8-fvj2: for an agent "
+            "whose exec tool is denied or restricted, a change it asks the openclaw tool for (configuration, plugins, "
+            "gateway restarts) now waits for a human approval. Without approval OpenClaw still applies such changes in "
+            "a Full Access session, for an agent that may run exec on the gateway host unrestricted (security full, "
+            "ask off, no sandbox: OpenClaw's default) and when tools.openclaw.autoApproveChanges is true. The "
+            f"\"openclaw\" entry in {_cfg_paths_text(paths)} still blocks that tool completely (the interim measure). "
+            "It can stay; if you remove it, set tools.openclaw.autoApproveChanges to false (global or the agent's own) "
+            "where every such change should wait for a human approval")
 
 
 def _db_bytes(pth):
@@ -8502,8 +8543,10 @@ def _status_delegation():
         return []
     if not C.runtime_caps(pkg)["delegated_change_approval"]:
         return []
-    grants = delegation_grants(_read_cfg_lenient())
-    return [f"WARN: {delegation_grant_text(grants, pkg['version'])}"] if grants else []
+    cfg = _read_cfg_lenient()
+    grants, dormant = delegation_grant_split(cfg)
+    return ([f"WARN: {delegation_grant_text(grants, pkg['version'])}"] if grants else []) + \
+        ([f"info: {delegation_dormant_text(dormant, openclaw_tool_denies(cfg), pkg['version'])}"] if dormant else [])
 
 
 def status_lines():

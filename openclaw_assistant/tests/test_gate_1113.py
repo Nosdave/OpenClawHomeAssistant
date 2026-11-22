@@ -509,8 +509,8 @@ CFG_CODEX = {"meta": {"lastTouchedVersion": "2026.10.4"}, "gateway": {"mode": "l
 CODEX_CLAUSE = ("; openai/gpt-5.5 runs on the Codex runtime, so before that refusal Codex signs in with the stored "
                 "login and looks up the account and its models unless it has them already (for a ChatGPT login at "
                 "chatgpt.com), and if that "
-                "lookup fails (for example without network) OpenClaw counts the fallback as failed and tries the next "
-                "one")
+                "lookup fails OpenClaw counts the fallback as failed and tries the next one (without network the run "
+                "can first wait on it for many minutes)")
 LOCAL_EMBEDDED = ("WARN [gate] cron job 'Local digest' (job-local): its model lan/q needs no stored login and keeps "
                   "working, but when it fails OpenClaw 2026.11.4 stops at the fallback openai/gpt-5.5 (stored login, "
                   "no recorded inference account; openclaw/openclaw#192195) instead of trying further models")
@@ -610,8 +610,8 @@ class CronCodexRuntimeTests(T.GateEnv):
                       "has no recorded inference account (openclaw/openclaw#192195); openai/gpt-5.5 runs on the Codex "
                       "runtime, so before that refusal Codex signs in with the stored login and looks up the account "
                       "and its models unless it has them already (for a ChatGPT login at chatgpt.com); if that lookup "
-                      "fails (for example without "
-                      "network), OpenClaw may try the fallbacks instead; its model is set to the codex runtime "
+                      "fails, OpenClaw may try the fallbacks instead (without network the run can first wait on it for "
+                      "many minutes); its model is set to the codex runtime "
                       "(agents.defaults.models[\"openai/gpt-5.5\"].agentRuntime), so OpenClaw 2026.11.4 doctor records "
                       "no inference account for it (doctor: 'runtime codex inference ownership was left unchanged') "
                       "and every run stays refused" + ALSO_ANTH, lines)
@@ -1115,12 +1115,20 @@ def del_cfg(tools=None, agents=None):
 GRANT_CFG = del_cfg(tools={"openclaw": {"autoApproveChanges": True}, "deny": ["exec", "OpenClaw"]},
                     agents={"haus": {"openclaw": {"autoApproveChanges": True}, "deny": ["openclaw"]},
                             "main": {"openclaw": {"autoApproveChanges": False}}})
+# both grants take effect: the openclaw tool is not denied anywhere
+ACTIVE_CFG = del_cfg(tools={"openclaw": {"autoApproveChanges": True}, "deny": ["exec"]},
+                     agents={"haus": {"openclaw": {"autoApproveChanges": True}},
+                             "main": {"openclaw": {"autoApproveChanges": False}}})
+# the global grant takes effect, haus's own grant not (haus denies the tool)
+MIXED_CFG = del_cfg(tools={"openclaw": {"autoApproveChanges": True}},
+                    agents={"haus": {"openclaw": {"autoApproveChanges": True}, "deny": ["openclaw"]}})
 
 
 class DelegationTests(T.GateEnv):
     """GHSA-pw3x-g8v8-fvj2 is fixed in the bundled 2026.11.4: a WARN only when tools.openclaw.autoApproveChanges is true
-    (global or an agent's override: it re-enables automatic delegated changes), an info line in the finalize when
-    tools.deny still blocks the openclaw tool (the interim measure); nothing on a default config or before 2026.11.4."""
+    (global or an agent's override: it re-enables automatic delegated changes) in a scope that does not deny the
+    openclaw tool, an info line for a grant such a deny keeps without effect, an info line in the finalize when tools.deny
+    still blocks the openclaw tool (the interim measure); nothing on a default config or before 2026.11.4."""
 
     def test_cap_floor(self):
         for v, want in (("2026.10.4", False), ("2026.11.3", False), ("2026.11.3-2", False), (RT, True),
@@ -1131,6 +1139,13 @@ class DelegationTests(T.GateEnv):
         self.assertEqual(G.delegation_grants(GRANT_CFG), ["tools.openclaw.autoApproveChanges",
                                                           "agents.entries.haus.tools.openclaw.autoApproveChanges"])
         self.assertEqual(G.openclaw_tool_denies(GRANT_CFG), ["tools.deny", "agents.entries.haus.tools.deny"])
+        # a deny of the openclaw tool keeps the grants of its scope without effect (tools.deny: every grant)
+        both = ["tools.openclaw.autoApproveChanges", "agents.entries.haus.tools.openclaw.autoApproveChanges"]
+        self.assertEqual(G.delegation_grant_split(GRANT_CFG), ([], both))
+        self.assertEqual(G.delegation_grant_split(ACTIVE_CFG), (both, []))
+        self.assertEqual(G.delegation_grant_split(MIXED_CFG), (both[:1], both[1:]))
+        odd_id = del_cfg(agents={"1x": {"openclaw": {"autoApproveChanges": True}, "deny": ["openclaw"]}})
+        self.assertEqual(G.delegation_grant_split(odd_id), ([], ['agents.entries["1x"].tools.openclaw.autoApproveChanges']))
         # only the boolean true counts; groups are a choice of their own; odd ids are bracketed; bad shapes are ignored
         odd = del_cfg(tools={"openclaw": {"autoApproveChanges": "true"}, "deny": ["group:openclaw", "group:automation"]},
                       agents={"1x": {"openclaw": {"autoApproveChanges": True}, "deny": [" openclaw "]}})
@@ -1154,21 +1169,34 @@ class DelegationTests(T.GateEnv):
         return lines
 
     def test_precheck_warns_on_a_grant_only(self):
-        lines = self.precheck(GRANT_CFG)
+        lines = self.precheck(ACTIVE_CFG)
         warn = [ln for ln in lines if "delegated changes:" in ln]
         self.assertEqual(warn, [
             "WARN [gate] 1/8 delegated changes: tools.openclaw.autoApproveChanges, "
-            "agents.entries.haus.tools.openclaw.autoApproveChanges is true, so OpenClaw 2026.11.4 applies every change "
-            "an agent asks the openclaw tool for (configuration, plugins, gateway restarts) without asking anyone, also "
-            "for an agent whose exec tools are denied (only a workspace-only file policy or a sandbox still stops it): "
-            "the path GHSA-pw3x-g8v8-fvj2 closed. Unless you want that, remove the setting or set it to false (openclaw "
-            "config unset <path>; an agent's own setting takes precedence over the global one). The migration "
-            "continues"])
+            "agents.entries.haus.tools.openclaw.autoApproveChanges is true, so OpenClaw 2026.11.4 applies every "
+            "permitted change an agent asks the openclaw tool for (configuration, plugins, gateway restarts) without "
+            "asking anyone, also for an agent whose exec tools are denied: the path GHSA-pw3x-g8v8-fvj2 closed (an "
+            "agent's own setting takes precedence over the global one). Only containment still stops it: a session "
+            "permission mode other than Full Access or a workspace-only file policy (tools.fs.workspaceOnly). Unless "
+            "you want that, set it to false (then every such change waits for a human approval, also in Full Access) "
+            "or remove it (openclaw config unset <path>; then such changes are automatic only in Full Access sessions "
+            "and for agents that may run exec on the gateway host unrestricted). The migration continues"])
         text = "\n".join(lines)
         self.assertIn("[gate] dry-run: the precheck would pass", text)  # a WARN, never a HOLD
         self.assertNotIn(SECRET, text)
+        # grants the deny entries keep without effect: an info line, no WARN
+        fresh_state(self)
+        lines = [ln for ln in self.precheck(GRANT_CFG) if "delegated changes" in ln]
+        self.assertEqual(lines, [
+            "[gate] 1/8 info: delegated changes: tools.openclaw.autoApproveChanges, "
+            "agents.entries.haus.tools.openclaw.autoApproveChanges is true, but has no effect while tools.deny, "
+            "agents.entries.haus.tools.deny denies the openclaw tool. Without that deny entry OpenClaw 2026.11.4 would "
+            "apply every permitted change an agent asks the openclaw tool for without asking anyone, also for an agent "
+            "whose exec tools are denied (the path GHSA-pw3x-g8v8-fvj2 closed): set it to false or remove it before "
+            "you remove the deny entry"])
         # the deny entries alone, a default config, and every runtime before the fix: no line
-        for cfg, rt in ((del_cfg(tools={"deny": ["openclaw"]}), RT), (DEL_BASE, RT), (GRANT_CFG, "2026.11.3")):
+        for cfg, rt in ((del_cfg(tools={"deny": ["openclaw"]}), RT), (DEL_BASE, RT), (ACTIVE_CFG, "2026.11.3"),
+                        (GRANT_CFG, "2026.11.3")):
             with self.subTest(rt=rt, cfg=cfg.get("tools")):
                 fresh_state(self)
                 self.assertFalse([ln for ln in self.precheck(cfg, rt) if "delegated changes" in ln])
@@ -1184,19 +1212,27 @@ class DelegationTests(T.GateEnv):
         return self.out[self.out.index("[gate] 7/8 postconditions OK"):], G.status_lines()
 
     def test_finalize_and_status(self):
-        fin, st = self.run_migration(GRANT_CFG)
-        grant = G.delegation_grant_text(G.delegation_grants(GRANT_CFG), RT)
-        self.assertIn(f"WARN [gate] {grant}", fin.splitlines())
-        info = ("[gate] info: delegated changes: OpenClaw 2026.11.4 contains the fix for GHSA-pw3x-g8v8-fvj2 (a change "
-                "an agent asks the openclaw tool for now waits for a human approval unless the run has Full Access or "
-                "tools.openclaw.autoApproveChanges is true). The \"openclaw\" entry in tools.deny, "
-                "agents.entries.haus.tools.deny still blocks that tool completely (the interim measure); it can stay, "
-                "or go if agents should propose such changes for approval again")
+        fin, st = self.run_migration(MIXED_CFG)
+        grant = G.delegation_grant_text(["tools.openclaw.autoApproveChanges"], RT)
+        dormant = G.delegation_dormant_text(["agents.entries.haus.tools.openclaw.autoApproveChanges"],
+                                            ["agents.entries.haus.tools.deny"], RT)
         lines = fin.splitlines()
+        self.assertIn(f"WARN [gate] {grant}", lines)
+        self.assertIn(f"[gate] info: {dormant}", lines)
+        info = ("[gate] info: delegated changes: OpenClaw 2026.11.4 contains the fix for GHSA-pw3x-g8v8-fvj2: for an "
+                "agent whose exec tool is denied or restricted, a change it asks the openclaw tool for (configuration, "
+                "plugins, gateway restarts) now waits for a human approval. Without approval OpenClaw still applies "
+                "such changes in a Full Access session, for an agent that may run exec on the gateway host "
+                "unrestricted (security full, ask off, no sandbox: OpenClaw's default) and when "
+                "tools.openclaw.autoApproveChanges is true. The \"openclaw\" entry in agents.entries.haus.tools.deny "
+                "still blocks that tool completely (the interim measure). It can stay; if you remove it, set "
+                "tools.openclaw.autoApproveChanges to false (global or the agent's own) where every such change should "
+                "wait for a human approval")
         self.assertIn(info, lines)
         done = next(i for i, ln in enumerate(lines) if ln.startswith("[gate] done: MIGRATED"))
         self.assertLess(lines.index(info), done)
         self.assertIn(f"WARN: {grant}", st)
+        self.assertIn(f"info: {dormant}", st)
         for ln in [fin] + st:
             self.assertNotIn(SECRET, ln)
 

@@ -1073,7 +1073,11 @@ Home Assistant backup system.
 are those of the runbook from `0.5.93-full2` below. An installation that already runs
 `0.5.94-full5` (OpenClaw 2026.11.3) updates to `0.5.94-full6` with the same steps, but
 without a database change (the schemas are the same): the gate still runs, because the
-OpenClaw version changes, and its backup check expects a backup that holds `0.5.94-full5`.
+OpenClaw version changes, and its backup check needs an encrypted backup taken before the
+update. It refuses only a backup that already holds `0.5.94-full6` and accepts any other
+version inside `gate_backup_max_age_hours` (for example an older `0.5.94-full4` backup), so
+create the backup on `0.5.94-full5` right before the update and check that the precheck line
+names `add-on 0.5.94-full5`.
 
 1. On the version you run now: `oc-upgrade check` → exit code `0` or `4`, and
    `migrated: 2026.10.4 (…)`. Exit code `2` or `3`: do not update, ask first. This
@@ -1535,9 +1539,10 @@ never holds. With OpenClaw 2026.10.4 it prints and changes nothing.
   endpoint; the gate leaves such a model unmarked. Before OpenClaw refuses a model on the
   Codex runtime, Codex signs in with the stored login and looks up the account and its
   models (for a ChatGPT login at chatgpt.com), unless an earlier lookup of the gateway
-  already loaded them. If that lookup fails (for example without network), OpenClaw counts
-  the model as failed, not as refused, and goes on to the next fallback, so the job can then
-  stop at a later fallback instead (`… openai/gpt-5.5 runs on the Codex runtime, so before
+  already loaded them. If that lookup fails, OpenClaw counts the model as failed, not as
+  refused, and goes on to the next fallback, so the job can then stop at a later fallback
+  instead. Without network the lookup does not fail fast: in the 11.4 host rehearsal the run
+  waited on it for over 10 minutes (with an expired login) before the gateway was stopped (`… openai/gpt-5.5 runs on the Codex runtime, so before
   that refusal Codex signs in with the stored login …`; in the list of the other models
   `openai/gpt-5.5 (Codex runtime)`; in `oc-upgrade status` `stops at the fallback
   openai/gpt-5.5 (Codex runtime: …)`). With
@@ -1893,50 +1898,77 @@ The security advisory GHSA-pw3x-g8v8-fvj2 affects OpenClaw 2026.9.2 up to before
 `0.5.94-full4`) and 2026.11.3 (`0.5.94-full5`). In these versions the `openclaw` tool
 applied a persistent change an agent asked for (configuration set or unset, plugin
 installs, gateway restarts) without asking anyone whenever the exec defaults amounted to
-full access, whatever the tool policy said. 2026.11.4 fixes it
-(openclaw/openclaw#196984): such a change now waits for a human approval unless the run
-has explicit Full Access (exec `security` `full` and `ask` `off`) or proven unrestricted
-Gateway execution, and OpenClaw checks the grant again at each persistent change.
+full access, also for an agent whose tool policy denied it the exec tools. 2026.11.4 fixes
+it (openclaw/openclaw#196984). Without a setting of its own (below), such a change is now
+applied without approval only
+
+- in an explicit **Full Access** session: the session permission mode Full Access, which
+  only an operator with admin rights can choose for a session (Control UI), together with
+  exec `security` `full` and `ask` `off`; exec settings alone are no longer a grant;
+- with **unrestricted Gateway execution**: the agent may call its exec tool on the gateway
+  host with `security` `full` and `ask` `off`, without a sandbox, without a workspace-only
+  file policy and without a plugin hook on exec. These are OpenClaw's defaults, and the
+  add-on sets nothing else, so an agent with the exec tool still gets such changes
+  applied: it could make them through a shell command anyway.
+
+Otherwise, in particular for an agent whose exec tool is denied or restricted, a human
+approves each change. OpenClaw checks this again at each persistent change.
 
 The new setting `tools.openclaw.autoApproveChanges` (global) and
 `agents.entries.<id>.tools.openclaw.autoApproveChanges` (one agent; it takes precedence
 over the global one) has three states:
 
-- **not set** (the default): automatic only with explicit Full Access or unrestricted
-  Gateway execution, as above; otherwise a human approves each change;
-- **`false`**: every change needs an approval, also with Full Access;
+- **not set** (the default): automatic only in the two cases above;
+- **`false`**: every change waits for a human approval, also in Full Access and for an
+  agent with unrestricted exec;
 - **`true`**: every permitted change is applied without approval, even for an agent whose
-  exec tools are denied; only a workspace-only file policy (`tools.fs.workspaceOnly`) or a
-  sandbox still stops it. This reopens the advisory's path on purpose.
+  exec tools are denied. Only containment still stops it: a session permission mode other
+  than Full Access or a workspace-only file policy (`tools.fs.workspaceOnly`). This reopens
+  the advisory's path on purpose.
 
 A change of this setting that an agent asks the `openclaw` tool for always needs a human
-approval, unless it only sets the setting to `false`.
+approval, unless it only sets the setting to `false`. A `tools.deny` entry `"openclaw"`
+removes the tool (`tools.deny`: for every agent; an agent's own list: for that agent), so a
+setting in that scope has no effect.
 
-The gate reports it (read-only; never a HOLD; only with OpenClaw 2026.11.4 and later):
+The gate reports it (read-only; never a HOLD; only with OpenClaw 2026.11.4 and later; only
+config paths are printed):
 
-- **`true` anywhere:** the precheck, the end of the run and `oc-upgrade status` warn
-  `WARN [gate] 1/8 delegated changes: tools.openclaw.autoApproveChanges is true, so
-  OpenClaw 2026.11.4 applies every change an agent asks the openclaw tool for
-  (configuration, plugins, gateway restarts) without asking anyone, also for an agent
-  whose exec tools are denied (only a workspace-only file policy or a sandbox still stops
-  it): the path GHSA-pw3x-g8v8-fvj2 closed. Unless you want that, remove the setting or set
-  it to false (openclaw config unset <path>; …)`. Only the config paths are printed. Since
-  2026.10.4 does not know the key, this shows up only for a configuration you changed for
-  the new version (a retry, or `oc-upgrade check` after an edit).
+- **`true` where the tool is not denied:** the precheck, the end of the run and
+  `oc-upgrade status` warn `WARN [gate] 1/8 delegated changes:
+  tools.openclaw.autoApproveChanges is true, so OpenClaw 2026.11.4 applies every permitted
+  change an agent asks the openclaw tool for (configuration, plugins, gateway restarts)
+  without asking anyone, also for an agent whose exec tools are denied: the path
+  GHSA-pw3x-g8v8-fvj2 closed (…). Only containment still stops it: … Unless you want that,
+  set it to false (then every such change waits for a human approval, also in Full Access)
+  or remove it (openclaw config unset <path>; then such changes are automatic only in Full
+  Access sessions and for agents that may run exec on the gateway host unrestricted)`.
+  Since 2026.10.4 does not know the key, this shows up only for a configuration you changed
+  for the new version (a retry, or `oc-upgrade check` after an edit).
+- **`true` where `tools.deny` denies the tool:** an info line instead, `delegated changes:
+  … is true, but has no effect while tools.deny denies the openclaw tool …: set it to false
+  or remove it before you remove the deny entry`.
 - **`openclaw` still in `tools.deny`** (global, or an agent's `agents.entries.<id>.tools.deny`;
   group entries such as `group:openclaw` are not counted): the end of the run adds
   `[gate] info: delegated changes: OpenClaw 2026.11.4 contains the fix for
-  GHSA-pw3x-g8v8-fvj2 (…). The "openclaw" entry in tools.deny still blocks that tool
-  completely (the interim measure); it can stay, or go if agents should propose such
-  changes for approval again`.
+  GHSA-pw3x-g8v8-fvj2: for an agent whose exec tool is denied or restricted, a change it
+  asks the openclaw tool for (…) now waits for a human approval. Without approval OpenClaw
+  still applies such changes in a Full Access session, for an agent that may run exec on
+  the gateway host unrestricted (security full, ask off, no sandbox: OpenClaw's default)
+  and when tools.openclaw.autoApproveChanges is true. The "openclaw" entry in tools.deny
+  still blocks that tool completely (the interim measure). It can stay; if you remove it,
+  set tools.openclaw.autoApproveChanges to false (global or the agent's own) where every
+  such change should wait for a human approval`.
 
 A default configuration prints nothing, and nothing changes with OpenClaw 2026.10.4.
 
 **Before the update (2026.10.4 or 2026.11.3).** These versions do not know
 `tools.openclaw.autoApproveChanges`: setting it there makes the configuration invalid, and
 the add-on holds. The interim measure there is to add `"openclaw"` to `tools.deny` (keep
-the entries already there), which blocks the tool completely; after the update you can
-remove it again.
+the entries already there), which blocks the tool completely. After the update it can stay;
+if you remove it, an agent with the exec tool gets the changes it asks for applied
+automatically again (see above), unless you set `tools.openclaw.autoApproveChanges` to
+`false`.
 
 #### Automatic deletion (`gate_cleanup_hours`)
 
@@ -2276,8 +2308,8 @@ Telegram outage; it makes replies more robust against one. Three changes:
    happen while the reply was still being sent (for example when you wrote again during
    a voice upload). Now the notice waits until that delivery has ended; a reply whose
    outcome really stayed unknown is still reported once. OpenClaw fixed this on its main
-   branch (openclaw/openclaw#154417); it is in 2026.11.6 and the betas 2026.11.5-beta.1
-   and 2026.11.5-beta.2, not in 2026.10.10, 2026.11.1, 2026.11.3 or 2026.11.4. 2026.11.4
+   branch (openclaw/openclaw#154417); it is in 2026.11.5 (and its betas 1 to 4) and
+   2026.11.6, not in 2026.10.10, 2026.11.1, 2026.11.3 or 2026.11.4. 2026.11.4
    has a narrower guard of its own (it stops the notice only while the send is under way,
    not until the reply is recorded as delivered), so the hotfix stays.
 3. **Voice and audio uploads use a fresh connection** (all Telegram requests), like text
