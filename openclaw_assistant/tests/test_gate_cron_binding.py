@@ -597,6 +597,96 @@ class CronKeyCopyGateTests(T.GateEnv):
         self.assertEqual(ids(self.report(cfg)), ["job-cat-haus"])
         self.assertNotIn("sk-synthetic-cat", json.dumps(self.report(cfg)) + "\n".join(G.cron_job_lines(rec)))
 
+    def set_store(self, aid, profiles):
+        """auth_profile_store 'primary' of agent aid: main keeps T.AUTH_1004_STORE (the shared store, legacy-main)."""
+        store = json.loads(json.dumps(T.AUTH_1004_STORE)) if aid == "main" else {"version": 1, "profiles": {}}
+        store["profiles"].update(profiles)
+        con = sqlite3.connect(str(self.state / "agents" / aid / "agent" / "openclaw-agent.sqlite"))
+        con.execute("DELETE FROM auth_profile_store")
+        con.execute("INSERT INTO auth_profile_store VALUES ('primary', ?, 0)", (json.dumps(store),))
+        con.commit()
+        con.close()
+
+    def test_no_catalog_copy_beside_a_stored_secret_ref_on_2026_11_4(self):
+        """OpenClaw 2026.11.4 doctor (#179802, doctor-model-catalog-credentials.ts hasProviderSecretRef) copies no
+        catalog key of a provider whose effective auth store (the shared one; for agent haus the shared one merged
+        with its own, its own ids winning) holds an api_key profile with a keyRef or a token profile with a tokenRef:
+        no key_fix and no line that doctor copies the key; the job stays refused on that stored login. 2026.11.3
+        copies it as before. A null or malformed ref is dropped by OpenClaw's store load: the copy is made."""
+        add_jobs(self.state, [
+            ("job-cat-haus", {"agentId": "haus", "sessionTarget": "isolated",
+                              "payload": {"kind": "agentTurn", "message": PROMPT, "model": "cat/m", "fallbacks": []}}),
+            ("job-cat-main", {"agentId": "main", "sessionTarget": "isolated",
+                              "payload": {"kind": "agentTurn", "message": PROMPT, "model": "cat/m",
+                                          "fallbacks": []}})], start=50)
+        cfg = self.glm(apiKey=GLM_KEY, auth="api-key")
+        models = json.dumps({"providers": {"cat": {"apiKey": "sk-synthetic-cat"}}})
+        haus = self.state / "agents" / "haus" / "agent"
+        main = self.state / "agents" / "main" / "agent"
+        (haus / "models.json").write_text(models)
+        ref = {"source": "env", "provider": "default", "id": "CAT_SYNTH_REF"}
+        api_ref = {"cat:vault": {"type": "api_key", "provider": "Cat", "keyRef": ref}}
+        token_ref = {"cat:vault": {"type": "token", "provider": "cat", "tokenRef": "${CAT_SYNTH_REF}", "expires": 1}}
+
+        def run(rt):
+            rec = G.cron_account_report(self.state, cfg, rt, pending_copies=True)
+            cat = [a for a in rec["affected"] if a["id"].startswith("job-cat")]
+            lines = G.cron_job_lines(rec)
+            for blob in (json.dumps(rec), "\n".join(lines)):
+                for secret in ("sk-synthetic-cat", "CAT_SYNTH_REF", "SECRET-"):
+                    self.assertNotIn(secret, blob)
+            return ([(a["id"], a.get("key_copy")) for a in cat], [k for k in rec["key_fix"] if k["provider"] == "cat"],
+                    [ln for ln in lines if ln.startswith("provider cat:") or "doctor copies" in ln])
+        old_fix = [{"provider": "cat", "path": "models.providers.cat", "auth": None, "where": "catalog",
+                    "pending": False}]
+        both = [("job-cat-haus", None), ("job-cat-main", None)]  # on the shared ref login: refused, no key copy
+        for name, shared in (("api_key keyRef", api_ref), ("token tokenRef", token_ref)):
+            with self.subTest(shared=name):
+                self.set_store("main", shared)
+                self.assertEqual(run("2026.11.4"), (both, [], []))
+                aff, fix, said = run("2026.11.3")
+                self.assertEqual((aff, fix), (both, old_fix))
+                self.assertTrue(said[0].startswith("provider cat: an agent's model catalog (models.json) holds a "
+                                                   "literal API key for cat"), said)
+                self.assertIn("OpenClaw's doctor copies such a key into its auth store", said[0])
+        # the precheck (dry run): no WARN that doctor copies the catalog key on the bundled runtime
+        for rt, warned in (("2026.11.4", False), ("2026.11.3", True)):
+            with self.subTest(dry_run=rt):
+                self.set_runtime(rt, 22, 27)
+                lines = self.dry()
+                self.assertEqual(bool([ln for ln in lines if ln.startswith("WARN [gate] provider cat:")]), warned,
+                                 lines)
+                self.assertNotIn("sk-synthetic-cat", "\n".join(lines))
+                self.assertNotIn("CAT_SYNTH_REF", "\n".join(lines))
+        # the ref only in haus's own store: no copy into it; the main agent dir's catalog is checked against the
+        # shared store alone, so its copy (into the shared store, which haus inherits) is still made
+        self.set_store("main", {})
+        self.set_store("haus", api_ref)
+        self.assertEqual(run("2026.11.4"), ([("job-cat-haus", None)], [], []))
+        self.assertEqual(run("2026.11.3")[1], old_fix)
+        (main / "models.json").write_text(models)
+        aff, fix, _said = run("2026.11.4")
+        self.assertEqual((aff, [(k["where"], k["pending"]) for k in fix]),
+                         ([("job-cat-haus", None), ("job-cat-main", ["cat/m"])], [("catalog", True)]))
+        (main / "models.json").unlink()
+        # haus's own profile of the same id without a ref replaces the shared ref profile (mergeAuthProfileStores)
+        self.set_store("main", api_ref)
+        self.set_store("haus", {"cat:vault": {"type": "api_key", "provider": "cat", "key": "sk-synthetic-cat-own"}})
+        self.assertEqual(run("2026.11.4")[1], old_fix)
+        self.set_store("haus", {})
+        # what OpenClaw's store load drops is no ref: a null keyRef or one that is no SecretRef, a tokenRef on an
+        # api_key profile, a ref on an oauth profile (the shared store has none of these: the copy goes into haus's)
+        for prof in ({"type": "api_key", "provider": "cat", "keyRef": None},
+                     {"type": "api_key", "provider": "cat", "keyRef": "CAT_SYNTH_REF"},
+                     {"type": "api_key", "provider": "cat", "keyRef": {"source": "env", "provider": "default",
+                                                                       "id": "CAT_SYNTH_REF", "extra": 1}},
+                     {"type": "api_key", "provider": "cat", "tokenRef": ref},
+                     {"type": "oauth", "provider": "cat", "keyRef": ref},
+                     {"type": ["api_key"], "provider": "cat", "keyRef": ref}):
+            with self.subTest(prof=prof):
+                self.set_store("main", {"cat:vault": prof})
+                self.assertEqual(run("2026.11.4")[1], old_fix)
+
     def test_postconditions_finalize_and_status_after_doctors_copy(self):
         """After the migration doctor's copy glm:default is in the shared store (state DB); the literal key still
         names the fix, before the binding as the last resort (openclaw.json with $include: no automatic fixup)."""

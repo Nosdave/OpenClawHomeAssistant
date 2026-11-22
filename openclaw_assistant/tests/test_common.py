@@ -285,8 +285,9 @@ class RuntimeCapsTests(TmpCase):
     # the doctor cron inference-account migration was backported to 2026.11.2 (9716cc4c964e)
     AT_1112 = dict(AT_1111, cron_doctor_migration=True)
     AT_1113 = dict(AT_1112, memory_remote_scoped=True, output_cap_raised=True)
-    # GHSA-pw3x-g8v8-fvj2 fixed on the release line in 2026.11.4 (#196984): the bundled runtime of 0.5.94-full6
-    AT_1114 = dict(AT_1113, delegated_change_approval=True)
+    # GHSA-pw3x-g8v8-fvj2 fixed on the release line in 2026.11.4 (#196984), and doctor no longer copies a catalog key
+    # beside a stored SecretRef login (#179802): the bundled runtime of 0.5.94-full6
+    AT_1114 = dict(AT_1113, delegated_change_approval=True, doctor_catalog_skips_store_refs=True)
 
     def setUp(self):
         super().setUp()
@@ -303,7 +304,7 @@ class RuntimeCapsTests(TmpCase):
                  ("2026.10.5-beta.1", self.AT_1005), ("2026.10.6", self.AT_1006), ("2026.10.9", self.AT_1006),
                  ("2026.10.10", self.AT_1010), ("2026.11.0", self.AT_1010), ("2026.11.1", self.AT_1111),
                  ("2026.11.2", self.AT_1112), ("2026.11.3", self.AT_1113), ("2026.11.3-1", self.AT_1113),
-                 ("2026.11.4", self.AT_1114), ("2026.11.5-beta.1", self.AT_1114),
+                 ("2026.11.4", self.AT_1114), ("2026.11.5-beta.3", self.AT_1114),
                  ("2026.12.1", self.AT_1114)]
         for version, want in table:
             with self.subTest(version=version):

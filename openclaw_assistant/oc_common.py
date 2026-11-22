@@ -680,8 +680,16 @@ RUNTIME_CAPS = (
     # GHSA-pw3x-g8v8-fvj2 fixed (#196984, release line 2026.11.4; main line from 2026.11.5-beta.3, 0016d9fc8dd0): the
     # openclaw tool's persistent delegated changes need a human approval unless the run has explicit Full Access or
     # unrestricted Gateway execution, or tools.openclaw.autoApproveChanges (global, or the agent's override in
-    # agents.entries.<id>.tools.openclaw) is true; that key is new in this release (openclaw-delegate-tool.ts)
+    # agents.entries.<id>.tools.openclaw) is true; that key is new in this release (openclaw-delegate-tool.ts).
+    # version_tuple ignores "-beta.N", so this floor also counts 2026.11.5-beta.1 and -beta.2 (without the fix) as
+    # fixed; no image can bundle them (oc-patches/ holds released versions only, and the build checks the pin)
     ("delegated_change_approval", (2026, 11, 4, 0)),
+    # doctor's model-catalog credential step no longer copies a key of an agent's model catalog (models.json, generated
+    # plugin catalogs) for a provider whose effective auth store (the shared one; for another agent, the shared one
+    # merged with its own) holds an api_key profile with a keyRef or a token profile with a tokenRef; a
+    # models.providers key of openclaw.json is still copied (#179802, 0b973c8beb22, release line 2026.11.4; main line
+    # from 2026.11.5-beta.1, 3f016b19e313; doctor-model-catalog-credentials.ts hasProviderSecretRef)
+    ("doctor_catalog_skips_store_refs", (2026, 11, 4, 0)),
 )
 CAP_NAMES = tuple(n for n, _v in RUNTIME_CAPS)
 # Build-time record (Dockerfile): {"openclaw_version": ..., <cap>: true|false} for capabilities the image can

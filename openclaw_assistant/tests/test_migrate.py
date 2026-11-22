@@ -3142,6 +3142,31 @@ class TestDoctorKeyCopies(unittest.TestCase):
         self.assertNotIn("sk-synth", json.dumps(res))
         self.assertEqual(m.doctor_key_copies({}, [], None), {"shared": [], "agents": {}})
 
+    def test_doctor_key_copies_skip_catalog_keys_beside_a_stored_secret_ref(self):
+        """OpenClaw 2026.11.4 (#179802, hasProviderSecretRef): no catalog copy for a provider whose effective store
+        holds a keyRef/tokenRef profile (store_refs_for: None for the main agent dir, the agent id otherwise); a key
+        of openclaw.json is still copied; 2026.11.3 and callers without caps or the callback copy as before."""
+        cfg = {"models": {"providers": {"cfgkey": {"apiKey": "sk-synth-1"}}}}
+        catalogs = [("main", True, {"Cat": "sk-synth-2", "cfgkey": "sk-synth-3", "free": "sk-synth-4"}),
+                    ("haus", False, {"cat": "sk-synth-5", "own": "sk-synth-6", "free": "sk-synth-7"})]
+        refs = {None: {"cat", "cfgkey"}, "haus": {"cat", "own"}}
+        args = (cfg, catalogs, lambda aid: set(), lambda aid: refs.get(aid, set()))
+        on = m.doctor_key_copies(*args, _caps("2026.11.4"))
+        self.assertEqual(on, {"shared": [{"id": "cfgkey:default", "provider": "cfgkey", "copy": "config"},
+                                         {"id": "free:default", "provider": "free", "copy": "catalog"}],
+                              "agents": {"haus": [{"id": "free:default", "provider": "free", "copy": "catalog"}]}})
+        before = m.doctor_key_copies(cfg, catalogs, lambda aid: set())
+        self.assertEqual([x["provider"] for x in before["shared"]], ["cfgkey", "cat", "free"])
+        self.assertEqual([x["provider"] for x in before["agents"]["haus"]], ["cat", "own", "free"])
+        for caps in (_caps("2026.11.3"), _caps("2026.10.10"), None):
+            with self.subTest(caps=caps):
+                self.assertEqual(m.doctor_key_copies(*args, caps), before)
+        self.assertEqual(m.doctor_key_copies(cfg, catalogs, None, None, _caps("2026.11.4")), before)
+        asked = []
+        m.doctor_key_copies(cfg, catalogs, None, lambda aid: asked.append(aid) or set(), _caps("2026.11.4"))
+        self.assertEqual(asked, [None, "haus"])
+        self.assertNotIn("sk-synth", json.dumps([on, before]))
+
 
 class TestCronKeyCopyForecast(unittest.TestCase):
     """Rehearsal D1 (report only): the precheck forecast counts the stored login doctor creates from a literal
@@ -3240,6 +3265,25 @@ class TestCronKeyCopyForecast(unittest.TestCase):
         # an env SecretRef in openclaw.json stops the catalog copy too
         cfg = self.cfg(apiKey={"source": "env", "provider": "default", "id": "GLM_API_KEY"})
         self.assertEqual(self.forecast(cfg, *jobs, catalogs=[("main", True, {"glm": "sk-synth-cat"})])["affected"], [])
+
+    def test_no_catalog_key_fix_beside_a_stored_secret_ref_on_2026_11_4(self):
+        """#179802: OpenClaw 2026.11.4 doctor copies no catalog key of a provider whose effective store holds a
+        keyRef/tokenRef profile. The job is still refused on that stored login, but no key fix names the catalog key
+        (cron_key_fix_lines would say doctor copies it); 2026.11.3 copies it as before."""
+        cfg = self.cfg()
+        stored = self.PROFILES + [{"id": "glm:vault", "provider": "glm", "ref": True}]
+        catalogs = [("haus", False, {"glm": "sk-synth-cat"})]
+        old_fix = [{"provider": "glm", "path": "models.providers.glm", "auth": None, "where": "catalog",
+                    "pending": False}]
+        for rt, want in (("2026.11.4", []), ("2026.11.3", old_fix)):
+            with self.subTest(runtime=rt):
+                copies = m.doctor_key_copies(cfg, catalogs, lambda aid: set(), lambda aid: {"glm"}, _caps(rt))
+                res = m.cron_account_forecast([self.job("h", fallbacks=[])], cfg, lambda aid: stored, "main",
+                                              lambda aid: copies["shared"] + copies["agents"].get(aid, []), True)
+                self.assertEqual(res["key_fix"], want)
+                self.assertEqual([(a["id"], a["refs"], a.get("key_copy")) for a in res["affected"]],
+                                 [("h", ["glm/glm-5"], None)])
+                self.assertNotIn("sk-synth", json.dumps([copies, res]))
 
     def test_bracket_path_for_a_provider_key_that_is_no_identifier(self):
         cfg = self.cfg()

@@ -1973,12 +1973,14 @@ def auth_order_adjust(cfg, profiles, store_order):
 # (embedded-agent-runner/run/auth-plan.ts), and
 # the refusal stops the fallback chain (recordModelFallbackStop). OpenClaw's own doctor migration (#172792)
 # was backported into 2026.11.2 (9716cc4c964e; main line from 2026.11.5-beta.1; oc_common.RUNTIME_CAPS
-# cron_doctor_migration), so it runs in the gate's doctor passes with the bundled 2026.11.4 (auth-plan.ts,
-# scheduled-unrecorded-account.ts and inference-binding-migration.ts are unchanged from 2026.11.3); it records
-# only the account of a job's own model, so a job that only stops at a fallback stays refused there. The gate
-# only forecasts which jobs are affected; it writes nothing. The stored logins include
-# the ones OpenClaw's doctor creates during the migration from literal provider keys (doctor_key_copies; found in the
-# add-on's 10.10 rehearsal): a job on such a provider is refused unless the key is a SecretRef or has auth "api-key".
+# cron_doctor_migration), so it runs in the gate's doctor passes with the bundled 2026.11.4 (unchanged from
+# 2026.11.3: the refusal in embedded-agent-runner/run/auth-plan.ts, cli-runner/prepare.ts,
+# auto-reply/reply/agent-runner-cli-candidate.ts and cron/isolated-agent/run-prompt-executor.ts, and the migration in
+# doctor/cron/inference-binding-migration.ts); it records only the account of a job's own model, so a job that only
+# stops at a fallback stays refused there. The gate only forecasts which jobs are affected; it writes nothing.
+# The stored logins include the ones OpenClaw's doctor creates during the migration from literal provider keys
+# (doctor_key_copies; found in the add-on's 10.10 rehearsal): a job on such a provider is refused unless the key is a
+# SecretRef or has auth "api-key".
 
 _PROFILE_SUFFIX_NOT_PROFILE = (re.compile(r"[0-9]{8}(?:@|\Z)", re.A),
                                re.compile(r"(?:i?q[0-9]+(?:_[a-z0-9]+)*|[0-9]+bit)(?:@|\Z)", re.A | re.I))
@@ -2093,8 +2095,9 @@ def env_substituted(value, env):
 
 def doctor_copies(value, cfg_entry=None, store_ids=()):
     """True when OpenClaw's doctor copies this provider apiKey value into an auth store as an api_key profile (its
-    plaintext model-credential step since 2026.8.1, unchanged in 2026.10.10 and 2026.11.1 and run by
-    `doctor --fix` without a prompt: doctor-model-catalog-credentials.ts collectCredentials).
+    plaintext model-credential step since 2026.8.1, unchanged in 2026.10.10 to 2026.11.4 and run by
+    `doctor --fix` without a prompt: doctor-model-catalog-credentials.ts collectCredentials; the store check 2026.11.4
+    adds for catalog keys, hasProviderSecretRef, is in doctor_key_copies).
 
     value: the apiKey of a models.providers entry in openclaw.json or of an agent's model catalog; cfg_entry: the
     openclaw.json entry of the same provider (None without one); store_ids: ids of the profiles of the store the copy
@@ -2133,19 +2136,28 @@ def config_path(provider_key):
     return f"models.providers[{json.dumps(provider_key, ensure_ascii=False)}]"
 
 
-def doctor_key_copies(cfg, catalogs=(), store_ids_for=None):
+def doctor_key_copies(cfg, catalogs=(), store_ids_for=None, store_refs_for=None, caps=None):
     """The auth profiles OpenClaw's doctor creates from plaintext provider keys (pure; port of
-    maybeMigrateModelCatalogCredentials, 2026.10.10 = 2026.11.1): {"shared": [...], "agents": {agent id: [...]}},
-    each {"id", "provider", "copy"}, no key value.
+    maybeMigrateModelCatalogCredentials, 2026.10.10 to 2026.11.3, and 2026.11.4 with caps
+    doctor_catalog_skips_store_refs): {"shared": [...], "agents": {agent id: [...]}}, each {"id", "provider", "copy"},
+    no key value.
 
     copy "config": models.providers.<p>.apiKey of openclaw.json, into the shared store every agent inherits.
     copy "catalog": a provider of an agent's model catalog (models.json, generated plugin catalogs); the main agent's
-    (agents/main/agent) go to the shared store, any other agent's to that agent's own store.
+    (agents/main/agent) go to the shared store, any other agent's to that agent's own store. With
+    doctor_catalog_skips_store_refs (oc_common.runtime_caps, 2026.11.4+; #179802 hasProviderSecretRef) none for a
+    provider whose effective store holds an api_key profile with a keyRef or a token profile with a tokenRef: the
+    shared store for the main agent dir, the shared store merged with the agent's own for any other agent (a "config"
+    copy is still made).
     catalogs: [(agent id, is the main agent dir, {provider key: apiKey value})]; store_ids_for(agent id, or None for
-    the shared store) -> the ids of its stored profiles. The id is allocateProfileId's first choice,
-    "<provider>:default"; one entry per provider and store (doctor stores a second key as "<provider>:models-json")."""
+    the shared store) -> the ids of its stored profiles; store_refs_for(agent id, or None for the main agent dir) ->
+    the providers (lower case) with such a SecretRef profile in that effective store (flags only, no ref or key).
+    The id is allocateProfileId's first choice, "<provider>:default"; one entry per provider and store (doctor
+    stores a second key as "<provider>:models-json")."""
     cfg = cfg if isinstance(cfg, dict) else {}
     ids = store_ids_for or (lambda _aid: ())
+    refs = store_refs_for if store_refs_for is not None and _cap(caps, "doctor_catalog_skips_store_refs") \
+        else (lambda _aid: ())
     res = {"shared": [], "agents": {}}
 
     def add(dest, key, how):
@@ -2160,8 +2172,10 @@ def doctor_key_copies(cfg, catalogs=(), store_ids_for=None):
             add(res["shared"], k, "config")
     for aid, is_main, providers in catalogs or ():
         own = shared_ids if is_main else shared_ids | set(ids(aid))
+        ref = set(refs(None if is_main else aid))
         for k, value in providers.items() if isinstance(providers, dict) else []:
-            if isinstance(k, str) and k.strip() and doctor_copies(value, _provider_cfg(cfg, k.strip().lower()), own):
+            if isinstance(k, str) and k.strip() and k.strip().lower() not in ref \
+                    and doctor_copies(value, _provider_cfg(cfg, k.strip().lower()), own):
                 add(res["shared"] if is_main else res["agents"].setdefault(str(aid).lower(), []), k, "catalog")
     return res
 

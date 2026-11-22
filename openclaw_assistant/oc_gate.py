@@ -4799,20 +4799,32 @@ def cron_jobs_inventory(state_db):
     return out
 
 
+def _store_profile_ref(p):
+    """True for an api_key profile with a keyRef or a token profile with a tokenRef, as OpenClaw 2026.11.4 doctor's
+    hasProviderSecretRef sees the loaded store (doctor-model-catalog-credentials.ts): the store load keeps such a ref
+    only when it parses as a SecretRef (persisted-credential.ts normalizeRawCredentialEntry, parseSecretRef), so a
+    null or malformed ref does not count. Only this flag is kept, never the ref. Not modelled: a legacy ref without
+    a provider that doctor's auth repair turns into a keyRef first (the forecast then over-reports the copy)."""
+    kind = p.get("type")
+    field = {"api_key": "keyRef", "token": "tokenRef"}.get(kind) if isinstance(kind, str) else None
+    return bool(field) and mig().is_secret_ref(p.get(field))
+
+
 def _store_profiles(text):
-    """[{id, provider}] of an auth profile store JSON (ids and providers only, never credentials)."""
+    """[{id, provider, ref}] of an auth profile store JSON (ids, providers and the _store_profile_ref flag only,
+    never credentials)."""
     try:
         store = json.loads(text) if isinstance(text, str) else None
     except ValueError:
         return []
     profiles = store.get("profiles") if isinstance(store, dict) else None
-    return [{"id": str(pid), "provider": str(p.get("provider") or "")}
+    return [{"id": str(pid), "provider": str(p.get("provider") or ""), "ref": _store_profile_ref(p)}
             for pid, p in sorted(profiles.items()) if isinstance(p, dict)] if isinstance(profiles, dict) else []
 
 
 def auth_profile_index(state_dir, targets, state_db, tables):
-    """{"agents": {agent id: [{id, provider}]}, "shared": [...]} of the auth stores: each agent database's
-    auth_profile_store, and the shared store every agent inherits (the state DB's config_machine_state
+    """{"agents": {agent id: [{id, provider, ref}]}, "shared": [...]} of the auth stores (_store_profiles): each agent
+    database's auth_profile_store, and the shared store every agent inherits (the state DB's config_machine_state
     'authProfiles.store' when 'auth.sharedStore' says state-db, else the main agent's store)."""
     agents = {}
     for aid, pth in targets:
@@ -4843,7 +4855,7 @@ PLUGIN_CATALOG_GENERATED_BY = "openclaw-plugin-model-catalog-v1"
 
 def doctor_catalogs(state_dir, targets, orphans):
     """[(agent id, is the main agent dir, {provider key: apiKey value})] of the model catalogs OpenClaw's doctor reads
-    for plaintext credentials (doctor-model-catalog-credentials.ts, 2026.10.10 = 2026.11.1): <agentDir>/models.json
+    for plaintext credentials (doctor-model-catalog-credentials.ts, 2026.10.10 to 2026.11.4): <agentDir>/models.json
     (oc_migrate.parse_model_catalog_json; unreadable or invalid files are skipped, as doctor does) and the agent
     database's generated plugin catalogs (cache_entries, scope plugin-model-catalog-v1, generatedBy
     openclaw-plugin-model-catalog-v1), for agents/main/agent, every agents/*/agent and the directory of each
@@ -4896,7 +4908,8 @@ def doctor_catalogs(state_dir, targets, orphans):
 def cron_account_report(state_dir, cfg, runtime=None, doctor_migration=False, pending_copies=False):
     """Forecast for openclaw/openclaw#192195 on the current state (read-only): oc_migrate.cron_account_forecast
     with the auth profiles of the stores and of auth.profiles in openclaw.json, and the profiles OpenClaw's doctor
-    creates from literal provider keys (oc_migrate.doctor_key_copies over openclaw.json and doctor_catalogs);
+    creates from literal provider keys (oc_migrate.doctor_key_copies over openclaw.json and doctor_catalogs; from
+    2026.11.4 no catalog copy for a provider with a stored SecretRef login, _store_profile_ref);
     pending_copies (precheck, before doctor ran): those copies are not in the stores yet. Names and ids are cut for
     the journal; no prompt, profile id or credential is kept."""
     state_dir = Path(state_dir)
@@ -4905,7 +4918,8 @@ def cron_account_report(state_dir, cfg, runtime=None, doctor_migration=False, pe
     rec = {"runtime": runtime, "doctor_migration": bool(doctor_migration), "checked": 0, "bound": 0, "affected": [],
            "key_fix": []}
     jobs = cron_jobs_inventory(state_db)
-    if C.runtime_caps(runtime)["retires_skill_proposals"]:  # OpenClaw deletes these jobs (doctor pass 1): no forecast
+    caps = C.runtime_caps(runtime)
+    if caps["retires_skill_proposals"]:  # OpenClaw deletes these jobs (doctor pass 1): no forecast
         gone = [x for x in jobs if x.get("retired_review") and x.get("enabled")]
         jobs = [x for x in jobs if not x.get("retired_review")]
         if gone:
@@ -4927,7 +4941,14 @@ def cron_account_report(state_dir, cfg, runtime=None, doctor_migration=False, pe
 
     def store_ids(aid):
         return {p["id"] for p in (index["shared"] if aid is None else index["agents"].get(aid, []))}
-    copies = mig().doctor_key_copies(cfg, doctor_catalogs(state_dir, targets, orphans), store_ids)
+
+    def store_refs(aid):
+        # the store doctor checks a catalog key of aid against (hasProviderSecretRef, 2026.11.4+): the shared one for
+        # the main agent dir (None), else the shared one merged with aid's own (mergeAuthProfileStores: own ids win)
+        merged = {p["id"]: p for p in index["shared"]}
+        merged.update((p["id"], p) for p in ([] if aid is None else index["agents"].get(aid, [])))
+        return {p["provider"].strip().lower() for p in merged.values() if p.get("ref")}
+    copies = mig().doctor_key_copies(cfg, doctor_catalogs(state_dir, targets, orphans), store_ids, store_refs, caps)
 
     def copies_for(aid):
         return copies["shared"] + copies["agents"].get(aid, [])
