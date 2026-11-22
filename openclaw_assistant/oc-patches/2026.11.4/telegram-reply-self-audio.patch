@@ -1,5 +1,5 @@
---- a/dist/bot-message-zuOD8Xt7.mjs
-+++ b/dist/bot-message-zuOD8Xt7.mjs
+--- a/dist/bot-message-CA5l5gzv.mjs
++++ b/dist/bot-message-CA5l5gzv.mjs
 @@ -962,10 +962,18 @@
  		} : {},
  		...resolveReplyChainMediaType(entry)

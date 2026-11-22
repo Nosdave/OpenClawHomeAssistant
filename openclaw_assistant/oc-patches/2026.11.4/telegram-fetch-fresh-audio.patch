@@ -1,5 +1,5 @@
---- a/dist/fetch-D2PTX0QD.mjs
-+++ b/dist/fetch-D2PTX0QD.mjs
+--- a/dist/fetch-CbMOee_S.mjs
++++ b/dist/fetch-CbMOee_S.mjs
 @@ -679,7 +679,7 @@
  	const resolvedFetch = (async (input, init) => {
  		if (closed) throw new TelegramRequestNotStartedError("Telegram transport is closed");

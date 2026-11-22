@@ -1,0 +1,22 @@
+--- a/dist/pending-delivery-notice-C9L5X9zk.mjs
++++ b/dist/pending-delivery-notice-C9L5X9zk.mjs
+@@ -20,6 +20,10 @@
+ }
+ //#endregion
+ //#region src/channels/turn/pending-delivery-notice.ts
++// VOLT-TG-20261023: skip only live sends; genuine settled ambiguity stays owed.
++function voltHasLiveDelivery(sessionId, intentId) {
++    return (globalThis[Symbol.for("volt.telegram.live-final.v1")]?.get(JSON.stringify([sessionId, intentId])) ?? 0) > 0;
++}
+ const PENDING_DELIVERY_NOTICE = "I couldn’t confirm whether my previous reply reached this chat, so I won’t resend it automatically. Please ask for any missing remainder.";
+ async function deliverPendingDeliveryNotice(sessionKey, storePath, expectedIntentId) {
+ 	const entry = await readSessionEntryReadOnlyInWorker({
+@@ -31,7 +35,7 @@
+ 	const notice = entry?.pendingDeliveryNotice;
+ 	const context = normalizeDeliveryContext(notice?.context);
+ 	const runtime = getGatewayRecoveryRuntime();
+-	if (!entry || !runtime || !notice || notice.state !== "owed" || expectedIntentId !== void 0 && notice.intentId !== expectedIntentId || hasActiveDirectPendingFinalDelivery(entry.sessionId, notice.intentId) || !context?.channel || !context.to || deliveryContextKey(context) !== deliveryContextKey(deliveryContextFromSession(entry))) return;
++	if (!entry || !runtime || !notice || notice.state !== "owed" || expectedIntentId !== void 0 && notice.intentId !== expectedIntentId || hasActiveDirectPendingFinalDelivery(entry.sessionId, notice.intentId) || voltHasLiveDelivery(entry.sessionId, notice.intentId) || !context?.channel || !context.to || deliveryContextKey(context) !== deliveryContextKey(deliveryContextFromSession(entry))) return;
+ 	const idempotencyKey = `main-session-restart-recovery:pending-final:${notice.intentId}`;
+ 	let delivered;
+ 	try {

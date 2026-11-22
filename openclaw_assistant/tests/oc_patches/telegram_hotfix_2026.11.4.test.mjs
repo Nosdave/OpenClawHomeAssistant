@@ -1,16 +1,20 @@
-// Regression tests for the Telegram hotfix VOLT-TG-20261023 on OpenClaw 2026.11.3 (oc-patches/2026.11.3).
-// Copy of telegram_hotfix_2026.11.1.test.mjs (removed with that patch set in 0.5.94-full5; itself a copy of the
-// 2026.10.10 port, also removed, of the 2026.10.4 test written by Volt, exported 2026-10-25). Changes for
-// 2026.11.3: the version and the four chunk names only. The patched regions
-// (extensions/telegram/src/send-message.ts and fetch.ts, src/channels/turn/lifecycle.ts and
-// pending-delivery-notice.ts) are unchanged from 2026.11.1 (no commit in v2026.11.1..v2026.11.3 touches them); the
-// chunks differ only in their import/export lines (export letters, resolved below from the send chunk).
+// Regression tests for the Telegram hotfix VOLT-TG-20261023 on OpenClaw 2026.11.4 (oc-patches/2026.11.4).
+// Copy of telegram_hotfix_2026.11.3.test.mjs (removed with that patch set in 0.5.94-full6; itself a copy of the
+// 2026.11.1 and 2026.10.10 ports, also removed, of the 2026.10.4 test written by Volt, exported 2026-10-25).
+// Changes for 2026.11.4: the version and the chunk names; the notice code is read from its own chunk
+// (src/channels/turn/pending-delivery-notice.ts moved out of the execution chunk, together with the new
+// src/channels/turn/direct-delivery-active.ts), and the notice cases run with that real upstream guard
+// (hasActiveDirectPendingFinalDelivery, commit cf9a023c222a in v2026.11.3..v2026.11.4); three cases are new: the
+// upstream guard still defers, the add-on's live custody covers the gap from the upstream custody release to the
+// canonical settlement, and a negative control for that gap. extensions/telegram/src/send-message.ts and fetch.ts are
+// unchanged from 2026.11.3 (no commit in v2026.11.3..v2026.11.4 touches them); src/channels/turn/lifecycle.ts is
+// unchanged too, its chunk also carries direct-delivery-custody.ts, which now tracks the live direct send.
 // They exercise the patched function bodies with synthetic fake transports (no bot token, no gateway).
-// Run in a container of the image built with OPENCLAW_VERSION=2026.11.3 (needs Node 24: the modules use
+// Run in a container of the image built with OPENCLAW_VERSION=2026.11.4 (needs Node 24: the modules use
 // `using` declarations):
-//   node --test tests/oc_patches/telegram_hotfix_2026.11.3.test.mjs
+//   node --test tests/oc_patches/telegram_hotfix_2026.11.4.test.mjs
 // or against an unpacked package patched by oc_dist_patch.py whose runtime dependencies resolve:
-//   OC_DIST=<copy>/dist OC_STOCK_DIST=<package>/dist node --test tests/oc_patches/telegram_hotfix_2026.11.3.test.mjs
+//   OC_DIST=<copy>/dist OC_STOCK_DIST=<package>/dist node --test tests/oc_patches/telegram_hotfix_2026.11.4.test.mjs
 // Limits (as for 2026.10.4): the transport harness's sourceFetch ignores init.body, so the two fetch cases
 // about fallbacks do not model grammY's one-shot multipart upload body; sendChunkedText and the lifecycle
 // wiring are stubbed.
@@ -22,16 +26,16 @@ import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { pathToFileURL } from 'node:url';
 
-const OPENCLAW_VERSION = '2026.11.3';
-// Patched chunks (tests/test_dist_patch.py checks these names against oc-patches/2026.11.3/manifest.json).
-const LIFECYCLE = 'lifecycle-lOXd0phk.mjs';
-const EXECUTION = 'execution-DtXHTgfn.mjs';
-const SEND = 'send-BC9R9yeb.mjs';
-const FETCH = 'fetch-D2PTX0QD.mjs';
+const OPENCLAW_VERSION = '2026.11.4';
+// Patched chunks (tests/test_dist_patch.py checks these names against oc-patches/2026.11.4/manifest.json).
+const LIFECYCLE = 'lifecycle-BZUtlfJ8.mjs';
+const NOTICE = 'pending-delivery-notice-C9L5X9zk.mjs';
+const SEND = 'send-CvWi3zfv.mjs';
+const FETCH = 'fetch-CbMOee_S.mjs';
 
 // OC_DIST: the patched dist of the image (default: $(npm root -g)/openclaw/dist).
-// OC_STOCK_DIST: a directory with the unpatched 2026.11.3 modules for the two negative controls
-// (skipped when unset), e.g. package/dist of `npm pack openclaw@2026.11.3`.
+// OC_STOCK_DIST: a directory with the unpatched 2026.11.4 modules for the three negative controls
+// (skipped when unset), e.g. package/dist of `npm pack openclaw@2026.11.4`.
 const distDir = process.env.OC_DIST || path.join(execFileSync('npm', ['root', '-g'], { encoding: 'utf8' }).trim(), 'openclaw', 'dist');
 const stockDir = process.env.OC_STOCK_DIST || '';
 const pkgJson = path.join(distDir, '..', 'package.json');
@@ -41,7 +45,7 @@ if (fs.existsSync(pkgJson)) {
 }
 const read = name => fs.readFileSync(path.join(distDir, name), 'utf8');
 const life = read(LIFECYCLE);
-const execution = read(EXECUTION);
+const notice = read(NOTICE);
 const send = read(SEND);
 const fetchSource = read(FETCH);
 // Export letters change with every build: resolve what the send chunk imports under these local names.
@@ -64,14 +68,16 @@ const realSafeRetry = await load(safeImport);
 const realReceipt = await load(importOf(send, 'createMessageReceiptFromOutboundResults'));
 const slice = (s,a,b) => { const start=s.indexOf(a); assert(start>=0,a); const end=s.indexOf(b,start+a.length);assert(end>=0,b);return s.slice(start,end); };
 const registry = slice(life,'const voltLiveDeliveries =','function resolvePendingFinalCompletion');
-const guard = slice(execution,'function voltHasLiveDelivery','const PENDING_DELIVERY_NOTICE');
-const noticeCode = slice(execution,'const PENDING_DELIVERY_NOTICE =','//#endregion\n//#region src/channels/turn/execution.ts');
+const guard = slice(notice,'function voltHasLiveDelivery','const PENDING_DELIVERY_NOTICE');
+const noticeCode = slice(notice,'const PENDING_DELIVERY_NOTICE =','//#endregion');
+// Upstream guard of 2026.11.4 (direct-delivery-active.ts): live from onPlatformSendDispatch to the custody release.
+const upstreamActive = source => slice(source,'const activeDeliveries =','//#endregion');
 const defer = () => { let resolve,reject;const promise=new Promise((a,b)=>{resolve=a;reject=b});return {promise,resolve,reject}; };
 const completion = {sessionId:'session',intentId:'intent'};
 
 function liveHarness() {
-  const scope=vm.createContext({Map,Symbol,JSON,globalThis:{},resolvePendingFinalCompletion:p=>p.completion});
-  vm.runInContext(registry+guard,scope);
+  const scope=vm.createContext({Map,Set,Symbol,JSON,globalThis:{},resolvePendingFinalCompletion:p=>p.completion});
+  vm.runInContext(registry+guard+upstreamActive(notice),scope);
   return scope;
 }
 function noticeStubs(entryOrRead, counter) {
@@ -153,6 +159,39 @@ test('notice decision uses the live state after the asynchronous session read',a
   release();
 });
 
+test('upstream 2026.11.4 guard still defers the notice while the direct send is dispatched',async()=>{
+  const s=liveHarness();const counter={notices:0};
+  Object.assign(s,noticeStubs(owedEntry(),counter));
+  vm.runInContext(noticeCode,s);
+  const releaseUpstream=s.trackActiveDirectPendingFinalDelivery({...completion});
+  await s.deliverPendingDeliveryNotice('synthetic','store');assert.equal(counter.notices,0);
+  releaseUpstream();await s.deliverPendingDeliveryNotice('synthetic','store');assert.equal(counter.notices,1);
+});
+test('live custody covers the gap from the upstream custody release to the canonical settlement',async()=>{
+  // 2026.11.4 releases its custody in deliverReply's finally (or when result.finalization settles); the canonical
+  // settlement (settleChannelDeliveryAttempt) writes "delivered" only after that, for deferred finalization at the
+  // end of the dispatch. The add-on's live custody is released only after that settlement.
+  const tail=slice(life,'    async function voltDeliverReply(','\n\t\treturn result;\n\t}');
+  const release=tail.indexOf('\t\t\telse releaseCustody?.();'), settle=tail.indexOf('else await settleChannelDeliveryAttempt(attempt, delivery.onDelivered);');
+  assert(release>0 && settle>release,'2026.11.4 no longer releases its custody before the canonical settlement: re-check this patch');
+  assert(tail.includes('if (releaseCustody && result?.finalization) result.finalization.then(releaseCustody, releaseCustody);'));
+  const s=liveHarness();const counter={notices:0};
+  Object.assign(s,noticeStubs(owedEntry(),counter));
+  vm.runInContext(noticeCode,s);
+  const releaseLive=s.voltAcquireDelivery(completion);
+  s.trackActiveDirectPendingFinalDelivery({...completion})();
+  await s.deliverPendingDeliveryNotice('synthetic','store');assert.equal(counter.notices,0);
+  releaseLive();await s.deliverPendingDeliveryNotice('synthetic','store');assert.equal(counter.notices,1);
+});
+test('negative control: unpatched 2026.11.4 notice is sent after the custody release, before the settlement',{skip:!stockDir && 'set OC_STOCK_DIST'},async()=>{
+  const stock=fs.readFileSync(path.join(stockDir,NOTICE),'utf8');
+  assert(!stock.includes('voltHasLiveDelivery'));
+  const s=vm.createContext({Set,JSON});const counter={notices:0};
+  Object.assign(s,noticeStubs(owedEntry(),counter));
+  vm.runInContext(upstreamActive(stock)+slice(stock,'const PENDING_DELIVERY_NOTICE =','//#endregion'),s);
+  s.trackActiveDirectPendingFinalDelivery({...completion})();
+  await s.deliverPendingDeliveryNotice('synthetic','store');assert.equal(counter.notices,1);
+});
 const mediaStart='\t\tconst sendMediaBatch = async (batch) => {', mediaEnd='\n\t\tif (mediaUrls.length > 0)';
 function mediaHarness({long=true,voice=true,failure,signalAborted=false,textFailure,source=send}={}) {
   const events=[],parts=[];let id=100;

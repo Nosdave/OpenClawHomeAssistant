@@ -193,14 +193,14 @@ class CronForecastGateTests(T.GateEnv):
             self.assertNotIn("@<profileId>", ln)
         # a runtime whose doctor records the accounts does so only for a stored login: the jobs on AWS SDK
         # credentials keep their WARN lines (2026.11.2+ wording, tests/test_gate_1113.py)
-        self.set_runtime("2026.11.3", 22, 27)
+        self.set_runtime("2026.11.4", 22, 27)
         text = self.quiet_dry()
         self.assertNotIn("doctor records that account", text)
-        self.assertIn("WARN [gate] cron job 'Job Bedrock' (job-bedrock): OpenClaw 2026.11.3 refuses every run", text)
+        self.assertIn("WARN [gate] cron job 'Job Bedrock' (job-bedrock): OpenClaw 2026.11.4 refuses every run", text)
         self.assertIn("WARN [gate] 2 cron job(s) above: the add-on changes nothing for these jobs. "
                       + G.CRON_AWS_SDK, text)
         self.assertIn("[gate]   cron inference accounts: 2 enabled cron job(s) stop at AWS SDK credentials on "
-                      "OpenClaw 2026.11.3 and doctor records no account for them (the WARN lines above, "
+                      "OpenClaw 2026.11.4 and doctor records no account for them (the WARN lines above, "
                       "openclaw/openclaw#192195); report only, the gate changes nothing", text)
 
     def test_bump_reports_in_precheck_finalize_and_status(self):

@@ -1,4 +1,5 @@
-"""OpenClaw 2026.11.2 / 2026.11.3 (maintenance releases on the 2026.11.1 line; PR #7 retargeted to 2026.11.3).
+"""OpenClaw 2026.11.2 / 2026.11.3 / 2026.11.4 (maintenance releases on the 2026.11.1 line; PR #7 retargeted to
+2026.11.3, 0.5.94-full6 bundles 2026.11.4, which keeps every behaviour below: RT models the bundled runtime).
 
 - R3/R4: OpenClaw's doctor migration of cron inference accounts (#172792) was backported to 2026.11.2
   (runtime_caps cron_doctor_migration from 2026.11.2). It records only the account of a job's own model on a stored
@@ -22,6 +23,7 @@ Synthetic fixtures only (10.4-layout state from test_gate, synthetic keys and jo
 
 import json
 import os
+import shutil
 import sqlite3
 import sys
 import threading
@@ -42,7 +44,7 @@ import test_gate as T  # noqa: E402
 import test_gate_cron_binding as CB  # noqa: E402
 import test_gate_skill_workshop as SW  # noqa: E402
 
-RT = "2026.11.3"
+RT = "2026.11.4"
 UUID_NEW = "0b4e9f2c-1d2e-4f3a-9b8c-7d6e5f4a3b2c"
 UUID_OLD = "11111111-2222-4333-8444-555555555555"
 OLD_MS = 1700000000000  # 2023: a copy OpenClaw made long before any gate run
@@ -65,6 +67,7 @@ def future_ms():
 class CapabilityTests(unittest.TestCase):
     def test_floors(self):
         for v, dm, mem in (("2026.11.1", False, False), ("2026.11.2", True, False), ("2026.11.3", True, True),
+                           ("2026.11.4", True, True),
                            ("2026.11.5-beta.2", True, True)):
             caps = C.runtime_caps(v)
             self.assertEqual((caps["cron_doctor_migration"], caps["memory_remote_scoped"],
@@ -78,7 +81,7 @@ class CapabilityTests(unittest.TestCase):
             self.assertIn("2026.11.2", text)
 
 
-# --- R3/R4/R6: cron on 2026.11.3 ------------------------------------------------------------------------------
+# --- R3/R4/R6: cron on 2026.11.4 ------------------------------------------------------------------------------
 
 GLM_OFF = [("job-glm-off", {"agentId": "main", "sessionTarget": "isolated", "enabled": False,
                             "payload": {"kind": "agentTurn", "message": CB.PROMPT, "model": "glm/glm-5"}})]
@@ -92,7 +95,7 @@ CODEX_JOBS = [("job-codex", {"agentId": "main", "sessionTarget": "isolated", "pa
 
 
 class CronOn1113Tests(T.GateEnv):
-    """The owner's layout on 2026.11.3: glm (literal placeholder key) as primary, kept on its configured key by the
+    """The owner's layout on 2026.11.4: glm (literal placeholder key) as primary, kept on its configured key by the
     gate's auth "api-key" fixup; openai/anthropic stored logins as fallbacks; one job (job-morning) on openai."""
 
     def setUp(self):
@@ -113,7 +116,7 @@ class CronOn1113Tests(T.GateEnv):
         return lines
 
     def doctor_binds_morning(self, extra_sql=(), **extra):
-        """Like OpenClaw 2026.11.3 doctor: stores the literal glm key as glm:default, records job-morning's account
+        """Like OpenClaw 2026.11.4 doctor: stores the literal glm key as glm:default, records job-morning's account
         (its own model is on the openai login) after a pre-repair copy of the state database."""
         store = json.loads(json.dumps(T.AUTH_1004_STORE))
         store["profiles"]["glm:default"] = {"type": "api_key", "provider": "glm", "key": CB.GLM_KEY}
@@ -130,7 +133,7 @@ class CronOn1113Tests(T.GateEnv):
         lines = self.dry()
         text = "\n".join(lines)
         self.assertIn("[gate] 1/8 info: 1 enabled cron job(s) without a recorded inference account run their own model "
-                      "on a stored login: 'Morning summary' (job-morning); OpenClaw 2026.11.3 doctor records that "
+                      "on a stored login: 'Morning summary' (job-morning); OpenClaw 2026.11.4 doctor records that "
                       "account during the migration when exactly one fits (openclaw/openclaw#172792), but then refuses "
                       "their fallbacks to other providers (as with openclaw/openclaw#192463); the gate reports the jobs "
                       "doctor leaves after the migration", lines)
@@ -139,12 +142,12 @@ class CronOn1113Tests(T.GateEnv):
         for jid in ("'Local digest' (job-local)", "'Job Lan Fb' (job-lan-fb)"):
             self.assertIn(f"WARN [gate] cron job {jid}: its model ", text)
         self.assertIn("WARN [gate] 2 cron job(s) above: the add-on changes nothing for these jobs apart from the config "
-                      f"fixup above; OpenClaw 2026.11.3 doctor {FB_ONLY}. " + G.CRON_FALLBACK, lines)
+                      f"fixup above; OpenClaw 2026.11.4 doctor {FB_ONLY}. " + G.CRON_FALLBACK, lines)
         self.assertIn("[gate]   cron inference accounts: 1 enabled cron job(s) run their own model on a stored login "
-                      "without a recorded account; OpenClaw 2026.11.3 doctor records it when exactly one account fits "
+                      "without a recorded account; OpenClaw 2026.11.4 doctor records it when exactly one account fits "
                       "(openclaw/openclaw#172792), then refuses their fallbacks to other providers", lines)
         self.assertIn("[gate]   cron inference accounts: 2 enabled cron job(s) stop at a stored login on OpenClaw "
-                      "2026.11.3 and doctor records no account for them (the WARN lines above, "
+                      "2026.11.4 and doctor records no account for them (the WARN lines above, "
                       "openclaw/openclaw#192195); apart from the config fixup above, the gate changes nothing for cron",
                       lines)
         # the earlier single line that promised doctor's account for every affected job is gone
@@ -163,9 +166,9 @@ class CronOn1113Tests(T.GateEnv):
         self.assertNotIn("records that account", text)
         self.assertNotIn("records it when", text)
         self.assertIn("WARN [gate] 2 cron job(s) above: the add-on changes nothing for these jobs apart from the config "
-                      f"fixup above; OpenClaw 2026.11.3 doctor {FB_ONLY}. " + G.CRON_FALLBACK, lines)
+                      f"fixup above; OpenClaw 2026.11.4 doctor {FB_ONLY}. " + G.CRON_FALLBACK, lines)
         self.assertEqual([ln for ln in lines if ln.startswith("[gate]   cron inference accounts:")], [
-            "[gate]   cron inference accounts: 2 enabled cron job(s) stop at a stored login on OpenClaw 2026.11.3 and "
+            "[gate]   cron inference accounts: 2 enabled cron job(s) stop at a stored login on OpenClaw 2026.11.4 and "
             "doctor records no account for them (the WARN lines above, openclaw/openclaw#192195); apart from the "
             "config fixup above, the gate changes nothing for cron"])
 
@@ -229,7 +232,7 @@ class CronOn1113Tests(T.GateEnv):
         text = "\n".join(lines)
         self.assertNotIn("keeps 0 enabled cron job(s)", text)
         none = ("for no enabled cron job: the 1 enabled cron job(s) that reach glm only as a fallback run their own "
-                "model on another provider's stored login, so OpenClaw 2026.11.3 refuses glm for them either way (with "
+                "model on another provider's stored login, so OpenClaw 2026.11.4 refuses glm for them either way (with "
                 "the account doctor records for them, or without it)")
         self.assertIn("[gate] 1/8 config fixup: would set models.providers.glm.auth = \"api-key\" before doctor pass 1 "
                       f"({G.cron_fixup_why('glm', RT)}); {none}", lines)
@@ -303,7 +306,7 @@ class CronOn1113Tests(T.GateEnv):
         self.assertIn(" and 2 more. To keep", line)
         self.assertNotIn("openai:x", line)
         self.assertEqual(G.cron_bound_warn_lines(rec), [
-            "cron job 'noprov' (noprov): its recorded inference account names no provider: OpenClaw 2026.11.3 treats "
+            "cron job 'noprov' (noprov): its recorded inference account names no provider: OpenClaw 2026.11.4 treats "
             "such a record as invalid ('Invalid automation inference binding; explicitly select an account again.'); "
             "to fix: openclaw automations edit <id> --model <provider/model>@<profileId>"])
 
@@ -338,11 +341,11 @@ class CronOn1113Tests(T.GateEnv):
         fix = "; to fix: openclaw automations edit <id> --model <provider/model>@<profileId>"
         self.assertEqual(G.cron_bound_warn_lines(rec), [
             "cron job 'inh' (inh): its own model anthropic/claude-x is on anthropic, not on its recorded inference "
-            "account's provider openai: OpenClaw 2026.11.3 refuses it ('The selected model uses a different provider "
+            "account's provider openai: OpenClaw 2026.11.4 refuses it ('The selected model uses a different provider "
             "from this job's stored account') and tries only fallbacks on openai; the job has none, so every run "
             "fails" + fix,
             "cron job 'edited' (edited): its own model anthropic/claude-sonnet-4-6 is on anthropic, not on its "
-            "recorded inference account's provider openai: OpenClaw 2026.11.3 refuses it ('The selected model uses a "
+            "recorded inference account's provider openai: OpenClaw 2026.11.4 refuses it ('The selected model uses a "
             "different provider from this job's stored account') and tries only fallbacks on openai "
             "(openai/gpt-5.5-mini)" + fix])
         # only odd jobs: no info line, only the WARN lines
@@ -362,7 +365,7 @@ class CronOn1113Tests(T.GateEnv):
         self.assertEqual(self.run_gate(), 0, self.out)
         fin = self.out[self.out.index("[gate] 7/8 postconditions OK"):]
         warn = ("cron job 'Local digest' (job-local): its own model anthropic/claude-x is on anthropic, not on its "
-                "recorded inference account's provider openai: OpenClaw 2026.11.3 refuses it ('The selected model uses "
+                "recorded inference account's provider openai: OpenClaw 2026.11.4 refuses it ('The selected model uses "
                 "a different provider from this job's stored account') and tries only fallbacks on openai "
                 "(openai/gpt-5.5); to fix: openclaw automations edit <id> --model <provider/model>@<profileId>")
         self.assertIn(f"WARN [gate] {warn}", fin)
@@ -383,12 +386,12 @@ class CronOn1113Tests(T.GateEnv):
         self.assertEqual(rec["bound"], 1)
         self.assertNotIn("WARN [gate] cron job 'Morning summary'", fin)
         self.assertIn("WARN [gate] 2 cron job(s) above still have no recorded inference account after the migration: "
-                      f"OpenClaw 2026.11.3 doctor {FB_ONLY}. " + G.CRON_FALLBACK, fin)
+                      f"OpenClaw 2026.11.4 doctor {FB_ONLY}. " + G.CRON_FALLBACK, fin)
         # R6: the jobs on glm's configured key (also the disabled one), not the keyless local lan job
         self.assertEqual([(a["id"], a["enabled"], a["provider"]) for a in rec["load_warn"]],
                          [("job-local", True, "glm"), ("job-glm-haus", True, "glm"), ("job-glm-off", False, "glm")])
         lw = ("3 cron job(s) (1 of them disabled) run their own model on a configured key (glm: "
-              "models.providers.<provider>.apiKey) and have no recorded inference account: OpenClaw 2026.11.3 doctor "
+              "models.providers.<provider>.apiKey) and have no recorded inference account: OpenClaw 2026.11.4 doctor "
               "leaves such jobs unbound on purpose, but its gateway writes 'cron: automation has no recorded inference "
               "account; run openclaw doctor --fix before its next scheduled run ...' for each of them to OpenClaw's own "
               "log (openclaw logs, the Control UI's Logs page; not the add-on log) at every start and cron reload. "
@@ -401,7 +404,7 @@ class CronOn1113Tests(T.GateEnv):
         self.assertIn(f"  {lw}", st)
         i = next(i for i, x in enumerate(st) if x.startswith("  cron jobs without a recorded inference account"))
         self.assertIn("after the migration): 2 affected of 3 checked", st[i])
-        self.assertIn(f"    OpenClaw 2026.11.3 doctor {FB_ONLY}. " + G.CRON_FALLBACK, st)
+        self.assertIn(f"    OpenClaw 2026.11.4 doctor {FB_ONLY}. " + G.CRON_FALLBACK, st)
         for ln in [fin] + st:
             self.assertNotIn(CB.GLM_KEY, ln)
             self.assertNotIn("SECRET", ln)
@@ -474,7 +477,7 @@ class CronOn1113Tests(T.GateEnv):
         self.assertTrue(line.startswith(
             "2 cron job(s) (1 of them disabled) run their own model on a configured key (glm: "
             "models.providers.<provider>.apiKey) or on a key from the environment (google: a gateway_env_vars entry "
-            "such as OPENAI_API_KEY or GEMINI_API_KEY) and have no recorded inference account: OpenClaw 2026.11.3 "
+            "such as OPENAI_API_KEY or GEMINI_API_KEY) and have no recorded inference account: OpenClaw 2026.11.4 "
             "doctor leaves such jobs unbound on purpose"), line)
         self.assertIn("(a fallback on a stored login that stays refused is reported separately). For the jobs on a key "
                       "from the environment this holds only while that variable is set for the gateway (a gate run "
@@ -509,7 +512,7 @@ CODEX_CLAUSE = ("; openai/gpt-5.5 runs on the Codex runtime, so before that refu
                 "lookup fails (for example without network) OpenClaw counts the fallback as failed and tries the next "
                 "one")
 LOCAL_EMBEDDED = ("WARN [gate] cron job 'Local digest' (job-local): its model lan/q needs no stored login and keeps "
-                  "working, but when it fails OpenClaw 2026.11.3 stops at the fallback openai/gpt-5.5 (stored login, "
+                  "working, but when it fails OpenClaw 2026.11.4 stops at the fallback openai/gpt-5.5 (stored login, "
                   "no recorded inference account; openclaw/openclaw#192195) instead of trying further models")
 ALSO_ANTH = "; also on a stored login: anthropic/claude-sonnet-4-6"
 
@@ -543,7 +546,7 @@ class CronCodexRuntimeTests(T.GateEnv):
         lines = self.dry()
         self.assertIn(LOCAL_EMBEDDED + CODEX_CLAUSE + ALSO_ANTH, lines)
         self.assertIn("WARN [gate] cron job 'Job Anth First' (job-anth-first): its model lan/q needs no stored login "
-                      "and keeps working, but when it fails OpenClaw 2026.11.3 stops at the fallback "
+                      "and keeps working, but when it fails OpenClaw 2026.11.4 stops at the fallback "
                       "anthropic/claude-sonnet-4-6 (stored login, no recorded inference account; "
                       "openclaw/openclaw#192195) instead of trying further models; also on a stored login: "
                       "openai/gpt-5.5 (Codex runtime)", lines)
@@ -602,14 +605,14 @@ class CronCodexRuntimeTests(T.GateEnv):
         lines = self.dry()
         text = "\n".join(lines)
         self.assertNotIn("records that account", text)  # doctor binds no job: no info line promises it
-        self.assertIn("WARN [gate] cron job 'Morning summary' (job-morning): OpenClaw 2026.11.3 refuses every run and "
+        self.assertIn("WARN [gate] cron job 'Morning summary' (job-morning): OpenClaw 2026.11.4 refuses every run and "
                       "tries no fallback: its model openai/gpt-5.5 would use a stored login (auth profile) and the job "
                       "has no recorded inference account (openclaw/openclaw#192195); openai/gpt-5.5 runs on the Codex "
                       "runtime, so before that refusal Codex signs in with the stored login and looks up the account "
                       "and its models unless it has them already (for a ChatGPT login at chatgpt.com); if that lookup "
                       "fails (for example without "
                       "network), OpenClaw may try the fallbacks instead; its model is set to the codex runtime "
-                      "(agents.defaults.models[\"openai/gpt-5.5\"].agentRuntime), so OpenClaw 2026.11.3 doctor records "
+                      "(agents.defaults.models[\"openai/gpt-5.5\"].agentRuntime), so OpenClaw 2026.11.4 doctor records "
                       "no inference account for it (doctor: 'runtime codex inference ownership was left unchanged') "
                       "and every run stays refused" + ALSO_ANTH, lines)
         self.assertEqual(G._cron_doctor_binds([{"primary_affected": True, "refs": ["openai/gpt-5.5"],
@@ -1030,7 +1033,7 @@ class MemoryRemoteTests(T.GateEnv):
         lines = self.precheck(MS_104, RT)
         warn = [ln for ln in lines if "memory search:" in ln]
         self.assertEqual(warn, [
-            "WARN [gate] 1/8 memory search: OpenClaw 2026.11.3 no longer gives an agent whose memory search provider "
+            "WARN [gate] 1/8 memory search: OpenClaw 2026.11.4 no longer gives an agent whose memory search provider "
             "differs from the shared one (memory.search.provider) the shared memory.search.remote apiKey/headers when "
             "the agent sets its own remote.baseUrl or the shared remote.baseUrl is empty (openclaw/openclaw#184966). "
             "3 agent(s) lose shared fields: agent lan: remote.apiKey, remote.headers; agent own: remote.headers; "
@@ -1083,7 +1086,7 @@ class OutputCapTests(T.GateEnv):
             self.assertEqual(bool(info), want, rt)
             self.assertFalse([ln for ln in lines if SECRET in ln])
         self.assertEqual(info, [
-            "[gate] 1/8 info: model output caps: OpenClaw 2026.11.3 gives a model row without maxTokens (row or "
+            "[gate] 1/8 info: model output caps: OpenClaw 2026.11.4 gives a model row without maxTokens (row or "
             "provider level) an output cap of min(32768, max(8192, window/2)) instead of 8192 "
             "(openclaw/openclaw#193899; a window under 8192 stays the cap): glm/glm-a (no contextWindow, so 200000 "
             "is assumed; output cap 8192 -> 32768), glm/glm-b (contextWindow 32768; output cap 8192 -> 16384), "
@@ -1091,6 +1094,122 @@ class OutputCapTests(T.GateEnv):
             "(contextWindow 4096; output cap 4096, unchanged). A model OpenClaw's own catalog knows keeps the "
             "catalog's limit. For a local server, set contextWindow (and maxTokens, if it limits the output) to its "
             "real limits"])
+
+
+
+# --- GHSA-pw3x-g8v8-fvj2 (OpenClaw 2026.11.4, runtime_caps delegated_change_approval) ---------------------------------
+
+DEL_BASE = {"meta": {"lastTouchedVersion": "2026.10.4"}, "gateway": {"mode": "local", "auth": {"token": SECRET}},
+            "agents": {"entries": {"main": {"default": True}, "haus": {}}}}
+
+
+def del_cfg(tools=None, agents=None):
+    cfg = json.loads(json.dumps(DEL_BASE))
+    if tools is not None:
+        cfg["tools"] = tools
+    for aid, t in (agents or {}).items():
+        cfg["agents"]["entries"].setdefault(aid, {})["tools"] = t
+    return cfg
+
+
+GRANT_CFG = del_cfg(tools={"openclaw": {"autoApproveChanges": True}, "deny": ["exec", "OpenClaw"]},
+                    agents={"haus": {"openclaw": {"autoApproveChanges": True}, "deny": ["openclaw"]},
+                            "main": {"openclaw": {"autoApproveChanges": False}}})
+
+
+class DelegationTests(T.GateEnv):
+    """GHSA-pw3x-g8v8-fvj2 is fixed in the bundled 2026.11.4: a WARN only when tools.openclaw.autoApproveChanges is true
+    (global or an agent's override: it re-enables automatic delegated changes), an info line in the finalize when
+    tools.deny still blocks the openclaw tool (the interim measure); nothing on a default config or before 2026.11.4."""
+
+    def test_cap_floor(self):
+        for v, want in (("2026.10.4", False), ("2026.11.3", False), ("2026.11.3-2", False), (RT, True),
+                        ("2026.11.6", True)):
+            self.assertEqual(C.runtime_caps(v)["delegated_change_approval"], want, v)
+
+    def test_paths(self):
+        self.assertEqual(G.delegation_grants(GRANT_CFG), ["tools.openclaw.autoApproveChanges",
+                                                          "agents.entries.haus.tools.openclaw.autoApproveChanges"])
+        self.assertEqual(G.openclaw_tool_denies(GRANT_CFG), ["tools.deny", "agents.entries.haus.tools.deny"])
+        # only the boolean true counts; groups are a choice of their own; odd ids are bracketed; bad shapes are ignored
+        odd = del_cfg(tools={"openclaw": {"autoApproveChanges": "true"}, "deny": ["group:openclaw", "group:automation"]},
+                      agents={"1x": {"openclaw": {"autoApproveChanges": True}, "deny": [" openclaw "]}})
+        self.assertEqual(G.delegation_grants(odd), ['agents.entries["1x"].tools.openclaw.autoApproveChanges'])
+        self.assertEqual(G.openclaw_tool_denies(odd), ['agents.entries["1x"].tools.deny'])
+        for bad in ({}, None, [], {"tools": "x", "agents": {"entries": []}},
+                    {"tools": {"openclaw": True, "deny": "openclaw"}},
+                    {"agents": {"entries": {"__proto__": {"tools": {"openclaw": {"autoApproveChanges": True}}}}}}):
+            self.assertEqual((G.delegation_grants(bad), G.openclaw_tool_denies(bad)), ([], []), bad)
+        self.assertEqual((G.delegation_grants(DEL_BASE), G.openclaw_tool_denies(DEL_BASE)), ([], []))
+
+    def precheck(self, cfg, rt=RT):
+        T.make_1004_state(self.state, content=True)
+        self.write_cfg(cfg)
+        (self.upg / "gate").mkdir(parents=True, exist_ok=True)
+        (self.upg / "gate" / "migrated.json").write_text(json.dumps({"runtime": "2026.10.4", "mode": "bump"}))
+        self.set_runtime(rt, 22, 27)
+        self.hooks()
+        lines = []
+        self.assertEqual(self.quiet(G.dry_run, emit=lines.append), 0, "\n".join(lines))
+        return lines
+
+    def test_precheck_warns_on_a_grant_only(self):
+        lines = self.precheck(GRANT_CFG)
+        warn = [ln for ln in lines if "delegated changes:" in ln]
+        self.assertEqual(warn, [
+            "WARN [gate] 1/8 delegated changes: tools.openclaw.autoApproveChanges, "
+            "agents.entries.haus.tools.openclaw.autoApproveChanges is true, so OpenClaw 2026.11.4 applies every change "
+            "an agent asks the openclaw tool for (configuration, plugins, gateway restarts) without asking anyone, also "
+            "for an agent whose exec tools are denied (only a workspace-only file policy or a sandbox still stops it): "
+            "the path GHSA-pw3x-g8v8-fvj2 closed. Unless you want that, remove the setting or set it to false (openclaw "
+            "config unset <path>; an agent's own setting takes precedence over the global one). The migration "
+            "continues"])
+        text = "\n".join(lines)
+        self.assertIn("[gate] dry-run: the precheck would pass", text)  # a WARN, never a HOLD
+        self.assertNotIn(SECRET, text)
+        # the deny entries alone, a default config, and every runtime before the fix: no line
+        for cfg, rt in ((del_cfg(tools={"deny": ["openclaw"]}), RT), (DEL_BASE, RT), (GRANT_CFG, "2026.11.3")):
+            with self.subTest(rt=rt, cfg=cfg.get("tools")):
+                fresh_state(self)
+                self.assertFalse([ln for ln in self.precheck(cfg, rt) if "delegated changes" in ln])
+
+    def run_migration(self, cfg):
+        T.make_1004_state(self.state, content=True)
+        self.write_cfg(cfg)
+        (self.upg / "gate").mkdir(parents=True, exist_ok=True)
+        (self.upg / "gate" / "migrated.json").write_text(json.dumps({"runtime": "2026.10.4", "mode": "bump"}))
+        self.set_runtime(RT, 22, 27)
+        self.hooks()
+        self.assertEqual(self.run_gate(), 0, self.out)
+        return self.out[self.out.index("[gate] 7/8 postconditions OK"):], G.status_lines()
+
+    def test_finalize_and_status(self):
+        fin, st = self.run_migration(GRANT_CFG)
+        grant = G.delegation_grant_text(G.delegation_grants(GRANT_CFG), RT)
+        self.assertIn(f"WARN [gate] {grant}", fin.splitlines())
+        info = ("[gate] info: delegated changes: OpenClaw 2026.11.4 contains the fix for GHSA-pw3x-g8v8-fvj2 (a change "
+                "an agent asks the openclaw tool for now waits for a human approval unless the run has Full Access or "
+                "tools.openclaw.autoApproveChanges is true). The \"openclaw\" entry in tools.deny, "
+                "agents.entries.haus.tools.deny still blocks that tool completely (the interim measure); it can stay, "
+                "or go if agents should propose such changes for approval again")
+        lines = fin.splitlines()
+        self.assertIn(info, lines)
+        done = next(i for i, ln in enumerate(lines) if ln.startswith("[gate] done: MIGRATED"))
+        self.assertLess(lines.index(info), done)
+        self.assertIn(f"WARN: {grant}", st)
+        for ln in [fin] + st:
+            self.assertNotIn(SECRET, ln)
+
+    def test_default_config_says_nothing(self):
+        fin, st = self.run_migration(DEL_BASE)
+        self.assertNotIn("delegated changes", fin + "\n".join(st))
+        self.assertNotIn("GHSA", fin + "\n".join(st))
+
+
+def fresh_state(tc):
+    """An empty state directory for the next precheck of the same test (make_1004_state builds it again)."""
+    shutil.rmtree(tc.state, ignore_errors=True)
+    tc.state.mkdir(parents=True)
 
 
 if __name__ == "__main__":

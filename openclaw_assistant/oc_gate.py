@@ -2301,9 +2301,11 @@ class Gate:
         self.cron_binding_forecast(F, mode)
         # 11d session sizes (full5, openclaw/openclaw#191847; information only)
         self.large_session_info()
-        # 11e memory search remote inheritance (#184966, WARN only), 11f output caps (#193899, information only)
+        # 11e memory search remote inheritance (#184966, WARN only), 11f output caps (#193899, information only),
+        # 11g standing delegation grants (GHSA-pw3x-g8v8-fvj2, WARN only)
         self.memory_remote_check()
         self.output_cap_info()
+        self.delegation_check()
         b = self.budget()
         if self.j is not None:
             self.j["budget"] = b
@@ -3166,6 +3168,32 @@ class Gate:
             self.say(f"{self.pn('precheck')} info: {output_cap_text(rows, self.pkg['version'])}")
         return None
 
+    def delegation_check(self):
+        """Precheck 11g (GHSA-pw3x-g8v8-fvj2; WARN, never a HOLD): a tools.openclaw.autoApproveChanges true in
+        openclaw.json (global or an agent's) re-enables automatic delegated changes on the fixed runtime. A 2026.10.4
+        config cannot hold the key, so this only shows for a config edited for the new runtime (a retry, or
+        `oc-upgrade check` after an edit). Nothing on a default config. Read-only; runtime_caps
+        delegated_change_approval."""
+        if not self.caps()["delegated_change_approval"]:
+            return None
+        grants = delegation_grants(self.cfg)
+        if grants:
+            self.warn(f"{self.pn('precheck')} {delegation_grant_text(grants, self.pkg['version'])}. The migration "
+                      "continues")
+        return None
+
+    def _finalize_delegation_lines(self, cfg):
+        """Finalize (runtime_caps delegated_change_approval): the WARN of delegation_check on the config doctor left,
+        and an info line when tools.deny still blocks the openclaw tool (the interim measure against the advisory)."""
+        if not self.caps()["delegated_change_approval"]:
+            return
+        grants = delegation_grants(cfg)
+        if grants:
+            self.warn(delegation_grant_text(grants, self.pkg["version"]))
+        denies = openclaw_tool_denies(cfg)
+        if denies:
+            self.say(f"info: {openclaw_deny_text(denies, self.pkg['version'])}")
+
     def phase_precheck(self):
         mode = self.j["mode"]
         generic = bool(self.j.get("first_write_at")) or mode != "from-7x"
@@ -4007,8 +4035,9 @@ class Gate:
                 self.say(f"info: {text}")
             else:
                 self.warn(text)
-        self._finalize_skill_lines()  # full5: doctor notes -> Skill Workshop -> cron -> done
+        self._finalize_skill_lines()  # full5: doctor notes -> Skill Workshop -> cron -> delegation -> done
         self._finalize_cron_lines()
+        self._finalize_delegation_lines(cfg)
         total = _elapsed_since(self.j.get("started_at"))
         self.say(f"done: MIGRATED {self.pkg['version']} (run {self.j['run_id']}, mode {self.j['mode']}, "
                  f"total {C.fmt_duration(total)})")
@@ -5737,6 +5766,83 @@ def output_cap_text(rows, runtime):
             "window under 8192 stays the cap): " + shown + more + ". A model OpenClaw's own catalog knows keeps the "
             "catalog's limit. For a local server, set contextWindow (and maxTokens, if it limits the output) to its "
             "real limits")
+
+
+# GHSA-pw3x-g8v8-fvj2 (runtime_caps delegated_change_approval, OpenClaw 2026.11.4+): the openclaw tool applies a
+# persistent delegated change (config set/unset, plugin installs, gateway restarts, ...) without a human approval only
+# when the run has explicit Full Access (exec security full, ask off) or proven unrestricted Gateway execution, or the
+# effective tools.openclaw.autoApproveChanges is true: the agent's agents.entries.<id>.tools.openclaw value, else the
+# global one (openclaw-delegate-tool.ts assertAutoApproveChangesCurrent). true "authorizes changes without individual
+# approval, even when direct execution tools are denied" (schema.help.runtime.ts): the advisory's path, opened on
+# purpose; only a workspace-only file policy or a sandbox still stops it. Before 2026.11.4 the key does not exist (the
+# strict schema of 2026.10.4 and 2026.11.3 refuses it).
+_CFG_IDENT_RE = re.compile(r"[A-Za-z_$][A-Za-z0-9_$:-]*")
+
+
+def _cfg_seg(prefix, key):
+    """prefix + one path segment as OpenClaw prints it (appendConfigPathSegment: bracketed and JSON-quoted when it is
+    no identifier)."""
+    key = str(key)
+    return f"{prefix}.{key}" if _CFG_IDENT_RE.fullmatch(key) else f"{prefix}[{json.dumps(key, ensure_ascii=False)}]"
+
+
+def _agent_entries(cfg):
+    """[(agent key, entry)] of agents.entries (the form of 2026.10.4 and 2026.11.x), blocked object keys left out."""
+    ent = _cfg_get(cfg if isinstance(cfg, dict) else {}, "agents", "entries")
+    return [(k, v) for k, v in ent.items() if isinstance(k, str) and isinstance(v, dict) and k not in _MS_BLOCKED] \
+        if isinstance(ent, dict) else []
+
+
+def delegation_grants(cfg):
+    """The config paths whose tools.openclaw.autoApproveChanges is true (exactly the boolean, as OpenClaw's schema
+    takes it): the global one first, then each agent's override. Paths only, never another value."""
+    cfg = cfg if isinstance(cfg, dict) else {}
+    out = ["tools.openclaw.autoApproveChanges"] if _cfg_get(cfg, "tools", "openclaw", "autoApproveChanges") is True \
+        else []
+    for aid, entry in _agent_entries(cfg):
+        if _cfg_get(entry, "tools", "openclaw", "autoApproveChanges") is True:
+            out.append(_cfg_seg("agents.entries", aid) + ".tools.openclaw.autoApproveChanges")
+    return out
+
+
+def openclaw_tool_denies(cfg):
+    """The config paths whose tools.deny lists the openclaw tool itself ("openclaw" in any case: OpenClaw compares tool
+    names lower-cased), the interim measure against GHSA-pw3x-g8v8-fvj2 before 2026.11.4: tools.deny first, then each
+    agent's agents.entries.<id>.tools.deny. Group entries (group:openclaw, group:automation) are not counted: they also
+    block cron, gateway and plugin tools, which is a choice of its own."""
+    cfg = cfg if isinstance(cfg, dict) else {}
+
+    def names(deny):
+        return any(isinstance(x, str) and x.strip().lower() == "openclaw" for x in deny) \
+            if isinstance(deny, list) else False
+    out = ["tools.deny"] if names(_cfg_get(cfg, "tools", "deny")) else []
+    for aid, entry in _agent_entries(cfg):
+        if names(_cfg_get(entry, "tools", "deny")):
+            out.append(_cfg_seg("agents.entries", aid) + ".tools.deny")
+    return out
+
+
+def _cfg_paths_text(paths):
+    shown = ", ".join(printable(p)[:160] for p in paths[:CRON_REPORT_MAX])
+    return shown + (f" and {len(paths) - CRON_REPORT_MAX} more" if len(paths) > CRON_REPORT_MAX else "")
+
+
+def delegation_grant_text(paths, runtime):
+    """The WARN text for delegation_grants (precheck, finalize, `oc-upgrade status`): config paths only."""
+    return (f"delegated changes: {_cfg_paths_text(paths)} is true, so OpenClaw {printable(runtime)} applies every "
+            "change an agent asks the openclaw tool for (configuration, plugins, gateway restarts) without asking "
+            "anyone, also for an agent whose exec tools are denied (only a workspace-only file policy or a sandbox "
+            "still stops it): the path GHSA-pw3x-g8v8-fvj2 closed. Unless you want that, remove the setting or set "
+            "it to false (openclaw config unset <path>; an agent's own setting takes precedence over the global one)")
+
+
+def openclaw_deny_text(paths, runtime):
+    """The finalize info text for openclaw_tool_denies: config paths only."""
+    return (f"delegated changes: OpenClaw {printable(runtime)} contains the fix for GHSA-pw3x-g8v8-fvj2 (a change an "
+            "agent asks the openclaw tool for now waits for a human approval unless the run has Full Access or "
+            f"tools.openclaw.autoApproveChanges is true). The \"openclaw\" entry in {_cfg_paths_text(paths)} still "
+            "blocks that tool completely (the interim measure); it can stay, or go if agents should propose such "
+            "changes for approval again")
 
 
 def _db_bytes(pth):
@@ -8387,6 +8493,19 @@ def _status_captures(gp, caps):
     return L
 
 
+def _status_delegation():
+    """`oc-upgrade status` (runtime_caps delegated_change_approval): the WARN of Gate.delegation_check on the current
+    openclaw.json; nothing on a default config, an unreadable one or a runtime before 2026.11.4."""
+    try:
+        pkg = C.runtime_package()
+    except C.RuntimePackageError:
+        return []
+    if not C.runtime_caps(pkg)["delegated_change_approval"]:
+        return []
+    grants = delegation_grants(_read_cfg_lenient())
+    return [f"WARN: {delegation_grant_text(grants, pkg['version'])}"] if grants else []
+
+
 def status_lines():
     gp = gpaths()
     L = []
@@ -8444,6 +8563,7 @@ def status_lines():
     L.append(f"Migrated marker: {m.get('runtime')} ({m.get('mode')}, run {m.get('run_id')}, {m.get('completed_at')})"
              if m else "Migrated marker: none")
     L += _status_held_and_plugins(gp, m)  # full5
+    L += _status_delegation()  # GHSA-pw3x-g8v8-fvj2 (2026.11.4+)
     r = load_retry()
     if r:
         L.append(f"Pending retry request: doctor={r.get('doctor')} accept={','.join(r.get('accept') or []) or '-'} "

@@ -1,6 +1,6 @@
---- a/dist/lifecycle-lOXd0phk.mjs
-+++ b/dist/lifecycle-lOXd0phk.mjs
-@@ -38,6 +38,22 @@
+--- a/dist/lifecycle-BZUtlfJ8.mjs
++++ b/dist/lifecycle-BZUtlfJ8.mjs
+@@ -39,6 +39,22 @@
  	onPlatformSendDispatch: () => Promise.resolve(),
  	release: () => void 0
  };
@@ -23,7 +23,7 @@
  function resolvePendingFinalCompletion(payload) {
  	const identity = getReplyPayloadMetadata(payload)?.pendingFinalDeliveryCompletion;
  	return identity ? {
-@@ -182,6 +198,10 @@
+@@ -188,6 +204,10 @@
  	else await settlePendingFinalDelivery(completion, "unknown", ["queued", "unknown"]);
  }
  async function settleChannelDeliveryAttempt(attempt, onDelivered, onFinalizationError) {
@@ -34,7 +34,7 @@
  	const emitFailure = (error) => {
  		const partial = isChannelPartialDeliveryError(error) ? error.deliveryResult : void 0;
  		if (!isPlatformMessageNotDispatchedError(error)) attempt.emitMessageSent?.({
-@@ -318,6 +338,11 @@
+@@ -324,6 +344,11 @@
  		})
  	};
  	async function deliverReply(payload, info, operation) {
@@ -46,7 +46,7 @@
  		const preparedPayloadResult = delivery.preparePayload ? await delivery.preparePayload(payload, info) : payload;
  		const preparedValue = preparedPayloadResult === null ? null : operation.prepare(copyReplyPayloadMetadata(payload, preparedPayloadResult));
  		if (preparedValue === null) return await suppressReply(payload, info, "no_visible_payload");
-@@ -407,9 +432,11 @@
+@@ -413,9 +438,11 @@
  			payload: effectivePayload,
  			info: directInfo,
  			result,

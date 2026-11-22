@@ -7,7 +7,7 @@
 // reply chains (no bot token, no network, no gateway). No runtime dependencies; Node 22 or 24.
 // In a container of the image (the version is read from the package):
 //   node --test tests/oc_patches/telegram_reply_self_audio.test.mjs
-// or against an unpacked package (2026.10.4 or 2026.11.3) patched by oc_dist_patch.py:
+// or against an unpacked package (2026.10.4 or 2026.11.4) patched by oc_dist_patch.py:
 //   OC_DIST=<copy>/dist node --test tests/oc_patches/telegram_reply_self_audio.test.mjs
 // Negative control: OC_DIST=<stock package>/dist makes the bot-audio cases fail (stock merges the bot's audio).
 import fs from 'node:fs';
@@ -20,7 +20,7 @@ import { execFileSync } from 'node:child_process';
 // Patched chunk per OpenClaw version (tests/test_dist_patch.py checks these names against the manifests).
 const CHUNKS = {
   '2026.10.4': 'bot-message-CpKgMHf_.mjs',
-  '2026.11.3': 'bot-message-zuOD8Xt7.mjs',
+  '2026.11.4': 'bot-message-CA5l5gzv.mjs',
 };
 
 // OC_DIST: the dist to test (default: the image's $(npm root -g)/openclaw/dist).

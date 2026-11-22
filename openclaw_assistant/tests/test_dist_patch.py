@@ -380,9 +380,12 @@ class MainTests(DistPatchCase):
 _HOTFIX_2026_10 = {"memory-search-half-life", "telegram-voice-text-first", "telegram-delivery-live-custody",
                    "telegram-notice-live-guard", "telegram-fetch-fresh-audio",
                    "telegram-reply-self-audio"}  # VOLT-TG-20261112, not fixed upstream through 2026.11.5-beta.2
+# 2026.11.4 keeps all six: its own live-send guard (hasActiveDirectPendingFinalDelivery, cf9a023c222a) ends at the
+# custody release, before the canonical settlement, so telegram-delivery-live-custody and telegram-notice-live-guard
+# stay (openclaw/openclaw#154417 is not in 2026.11.4); the other four regions are unchanged from 2026.11.3.
 EXPECTED_PATCHES = {
     "2026.10.4": _HOTFIX_2026_10,  # 0.5.94-full4 (the version users update from): rollback and emergency builds
-    "2026.11.3": _HOTFIX_2026_10,  # the image default (Dockerfile ARG OPENCLAW_VERSION), from 0.5.94-full5
+    "2026.11.4": _HOTFIX_2026_10,  # the image default (Dockerfile ARG OPENCLAW_VERSION), from 0.5.94-full6
 }
 # Telegram patches whose regression tests are one file for all versions (it maps each version to the patched chunk)
 # instead of a part of tests/oc_patches/telegram_hotfix_<version>.test.mjs.

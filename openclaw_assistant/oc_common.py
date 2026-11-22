@@ -677,6 +677,11 @@ RUNTIME_CAPS = (
     # a model row without maxTokens (row, provider level, catalog) gets min(32768, max(min(8192, W), floor(W/2)))
     # instead of min(8192, W) as its output cap (#193899, release line 2026.11.3; not in its changelog)
     ("output_cap_raised", (2026, 11, 3, 0)),
+    # GHSA-pw3x-g8v8-fvj2 fixed (#196984, release line 2026.11.4; main line from 2026.11.5-beta.3, 0016d9fc8dd0): the
+    # openclaw tool's persistent delegated changes need a human approval unless the run has explicit Full Access or
+    # unrestricted Gateway execution, or tools.openclaw.autoApproveChanges (global, or the agent's override in
+    # agents.entries.<id>.tools.openclaw) is true; that key is new in this release (openclaw-delegate-tool.ts)
+    ("delegated_change_approval", (2026, 11, 4, 0)),
 )
 CAP_NAMES = tuple(n for n, _v in RUNTIME_CAPS)
 # Build-time record (Dockerfile): {"openclaw_version": ..., <cap>: true|false} for capabilities the image can

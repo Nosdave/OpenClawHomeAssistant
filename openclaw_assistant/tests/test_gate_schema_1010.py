@@ -15,6 +15,7 @@
 
 import json
 import os
+import re
 import shutil
 import sqlite3
 import sys
@@ -619,17 +620,24 @@ class DocsWordingTests(unittest.TestCase):
         docs = self.text("DOCS.md")
         self.assertIn("`sqlite-fk-violation`, `orphan-agent-db` and `agent-db-held` apply with every OpenClaw\n"
                       "version", docs)
-        nxt = docs.split("**OpenClaw 2026.11.3 (this add-on version, `0.5.94-full5`).**", 1)[1]
-        nxt = nxt.split("With OpenClaw 2026.10.4", 1)[0]
+        # the heading of the bundled release line (2026.11.3 in 0.5.94-full5, 2026.11.4 in 0.5.94-full6)
+        head = re.search(r"\*\*OpenClaw 2026\.11\.\d+ \(this add-on version, `0\.5\.94-full\d+`\)\.\*\*", docs)
+        self.assertIsNotNone(head)
+        nxt = docs[head.end():].split("With OpenClaw 2026.10.4", 1)[0]
         self.assertNotIn("agent databases outside the configured agents", nxt)
 
     def test_memory_half_life_still_selects_the_returned_results(self):
-        # 2026.10.10 to 2026.11.3 manager-search-orchestration.ts: minScore filter, decay, sort, slice(0, maxResults)
+        # 2026.10.10 to 2026.11.4 manager-search-orchestration.ts: minScore filter, decay, sort, slice(0, maxResults)
         docs = self.text("DOCS.md")
         section = docs.split("#### Memory search recency", 1)[1].split("\n#### ", 1)[0]
         self.assertNotIn("only sets the order", section)
         self.assertIn("`maxResults` (default 6)", section)
-        note = json.loads(self.text("openclaw_assistant/oc-patches/2026.11.3/manifest.json"))
+        # the newest patch set with a manifest (the bundled runtime's; 2026.11.3 until 2026.11.4 has one)
+        sets = [d for d in (self.REPO / "openclaw_assistant" / "oc-patches").iterdir()
+                if (d / "manifest.json").is_file() and C.version_tuple(d.name)]
+        newest = max(sets, key=lambda d: C.version_tuple(d.name))
+        self.assertGreaterEqual(C.version_tuple(newest.name), (2026, 11, 3, 0))
+        note = json.loads((newest / "manifest.json").read_text(encoding="utf-8"))
         half = next(e for e in note["patches"] if e["name"] == "memory-search-half-life")
         self.assertIn("maxResults", half["note"])
 

@@ -1,5 +1,5 @@
---- a/dist/send-BC9R9yeb.mjs
-+++ b/dist/send-BC9R9yeb.mjs
+--- a/dist/send-CvWi3zfv.mjs
++++ b/dist/send-CvWi3zfv.mjs
 @@ -4190,10 +4190,19 @@
  			const { media, mediaPlan, mediaSender, documentSender } = first;
  			const batchReplyMarkup = first.index === 0 ? replyMarkup : void 0;
