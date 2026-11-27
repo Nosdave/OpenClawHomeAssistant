@@ -2,6 +2,15 @@
 
 All notable changes to the OpenClaw Assistant Home Assistant Add-on will be documented in this file.
 
+## [0.5.71-trim1] - 2026-05-03 (Nosdave fork)
+
+### Added
+- **`extensions_drop` option**: comma-separated list of bundled extension folder names to remove from `dist/extensions/` BEFORE the gateway starts. Prevents the plugin-runtime-deps staging spike (npm install storm) for extensions that are not used. Default removes 11 stage-flagged channels and LLM providers most users do not need (`acpx, slack, discord, whatsapp, feishu, matrix, qqbot, nostr, webhooks, amazon-bedrock, amazon-bedrock-mantle`). Users can override via add-on options. Fix is reversible by removing entries and updating the add-on (rebuilds image fresh from upstream OpenClaw).
+- Path-traversal guard: only `[a-zA-Z0-9_-]` characters allowed per extension name.
+
+### Changed
+- Bump OpenClaw to 2026.4.29.
+
 ## [0.5.70] - 2026-04-30
 
 - Bump OpenClaw to 2026.4.27.
