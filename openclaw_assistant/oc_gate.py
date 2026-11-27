@@ -69,7 +69,7 @@ ACCEPTABLE = frozenset({
     "doctor-not-idempotent", "doctor-warnings",
     "pc-schema-meta", "pc-legacy-files", "pc-lint-errors", "pc-lint-failed", "pc-legacy-refs",
     "pc-codex-runtime", "pc-runtime-pin", "pc-models-status", "pc-sessions-runtime", "pc-auth-order",
-    "pc-probe", "pc-legacy-state", "pins-invalid",
+    "pc-probe", "pc-legacy-state", "pins-invalid", "pc-cron-partition",
     # retired pre-July-2026 state that OpenClaw 2026.10 refuses (oc_migrate.classify_retired_state)
     "cron-json-unimported", "oauth-sidecar-referenced", "plugin-index-unimported", "plugins-installs-unindexed",
     "device-pair-subscribers", "voice-call-log", "telegram-spool-invalid", "dreaming-json-unmigrated",
@@ -111,9 +111,18 @@ SAFE_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,79}")  # one path componen
 # failed (2026.11: update-recovery-baseline-capture, update-database-backup) is kept by OpenClaw unsealed and named
 # only as "Original update capture failed; evidence retained at <dir>" and "Database backup files retained at
 # <dir>/database.<kind>." (N1: it holds plaintext copies of the databases too and goes with its gate run).
+# 2026.11.5+ logs a sealed capture only at debug level ("Recovery copy saved before repair. No action needed. For manual
+# recovery: <dir>/manifest.json."; the "Unchanged original recovery copy verified and retained" variant names a capture
+# doctor only reused, possibly another run's, and is not matched), so a gate
+# run also records the doctor-<uuid> directories that appeared under <state>.update-captures during its doctor
+# passes (capture_baseline / doctor_captures in the journal, run_captures). 2026.11.10 removes the incomplete copy of a
+# failed capture ("... incomplete copy removed from <dir>") and names it only when that removal failed too ("Original
+# update capture failed; incomplete copy cleanup failed; evidence retained at <dir>",
+# update-recovery-baseline-capture.ts).
 CAPTURE_RE = re.compile(r"Pre-repair state retained for manual recovery at (\S+)/manifest\.json"
-                        r"|Original update capture failed; evidence retained at (\S+)"
-                        r"|Database backup files retained at (\S+?)/database\.\S*")
+                        r"|Original update capture failed; (?:incomplete copy cleanup failed; )?evidence retained at (\S+)"
+                        r"|Database backup files retained at (\S+?)/database\.\S*"
+                        r"|Recovery copy saved before repair\. No action needed\. For manual recovery: (\S+)/manifest\.json")
 CAPTURE_NAME_RE = re.compile(r"^doctor-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\Z")
 # A5/A7: the plaintext files a gate run keeps in runs/<id>/: its copies of openclaw.json (gateway token, literal
 # provider and channel keys) and the saved output of `openclaw models status` / `models auth` (OpenClaw's masked key
@@ -198,6 +207,15 @@ ADVICE = {
     "doctor-migration-refused": "fix the item doctor reported (oc-upgrade log), then oc-upgrade retry",
     "doctor-maintenance-refused": "oc-upgrade retry (doctor resumes from its last committed step); if the reason mentions "
                                   "a different PID namespace, wait 90 s after the previous stop first",
+    "doctor-plugin-source-unprepared": "oc-upgrade retry (the held run continues at its doctor pass). Doctor stopped "
+                                       "before its config repair because it would have loaded a plugin's setup code "
+                                       "it had not prepared (OpenClaw 2026.11.10, openclaw/openclaw#205695; the "
+                                       "add-on's dist patch doctor-restore-env-refs-deferral fixes it). If the same "
+                                       "reason comes back after the retry, the image lacks the fix: update the "
+                                       "add-on to a build that carries it, then oc-upgrade retry, or restore the "
+                                       "encrypted Home Assistant backup. Not openclaw update repair, which doctor "
+                                       "suggests: the wrapper refuses it, and it leaves a plaintext copy of "
+                                       "openclaw.json the gate does not track",
     "doctor-plugin-load": "make sure the network is available, then oc-upgrade retry",
     "no-network": "make the npm registry reachable (network, DNS, proxy), then oc-upgrade retry; accepting it makes "
                   "doctor retry npm for a long time (see the reason)",
@@ -208,8 +226,9 @@ ADVICE = {
                                   ".bak or .scoped.bak over a database by hand), or oc-upgrade retry to let doctor "
                                   "try again",
     "doctor-incomplete": "oc-upgrade retry (doctor resumes from its last committed step)",
-    "doctor-blocked": "fix what doctor's [error] lines name (the reason lists them; oc-upgrade log shows each with its "
-                      "fix: hint): edit the openclaw.json values it rejects (openclaw config validate lists them; "
+    "doctor-blocked": "fix what doctor's findings name (the reason lists them; oc-upgrade log shows each with its "
+                      "hint: \"fix:\" after an [error] line, from OpenClaw 2026.11.5 \"Next step:\" under \"Fix "
+                      "now:\"): edit the openclaw.json values it rejects (openclaw config validate lists them; "
                       "openclaw config set/unset are refused during a HOLD), or remove the blocker of a deferred "
                       "migration, then oc-upgrade retry (doctor resumes from its last committed step)",
     "doctor-failed": "see oc-upgrade log, fix the reported check, then oc-upgrade retry",
@@ -217,6 +236,20 @@ ADVICE = {
     "doctor-interrupted": "oc-upgrade retry",
     "doctor-crashed": "doctor was killed (out of memory?): free memory (stop other add-ons), then oc-upgrade retry",
     "doctor-invocation": "the doctor command line was refused (broken image?): reinstall the add-on, then oc-upgrade retry",
+    "doctor-cron-partition": "the cron rows belong to stores none of which is the default, so OpenClaw cannot tell "
+                             "which one to run and doctor stops: in the add-on terminal run OC_ADDON_UNSAFE=1 openclaw "
+                             "doctor --fix; at \"Select the default cron partition\" the cursor starts on \"Leave cron "
+                             "paused and decide later\": press the down arrow to the store your jobs run from, then "
+                             "Enter (doctor first saves a plaintext copy of the state database: with OpenClaw 2026.11.10 "
+                             "openclaw.sqlite.pre-startup-migration-<uuid>.bak, earlier "
+                             "openclaw.sqlite.doctor-cron-<ms>-<uuid>.bak; oc-upgrade status lists it); then "
+                             "oc-upgrade retry. Only the jobs of the selected store run afterwards; those of the other "
+                             "stores stay in the database but no longer run",
+    "doctor-config-unparsed": "doctor could not parse openclaw.json: fix it (openclaw config validate shows where), "
+                              "then oc-upgrade retry",
+    "doctor-database-unresolved": "doctor could not resolve the database target: check the database settings in "
+                                  "openclaw.json (and their credentials) and that /config/.openclaw/state is readable, "
+                                  "then oc-upgrade retry",
     "interrupted-twice": "the gate was interrupted twice: make sure nothing stops the add-on during the migration, then oc-upgrade retry",
     "fixups-invalid": "the post-doctor fixups produced an invalid config (restored): see oc-upgrade status, then oc-upgrade retry",
     "pc-schema": "the databases are not at the target schema: oc-upgrade retry --doctor; if the reason names a store "
@@ -225,6 +258,14 @@ ADVICE = {
     "orphan-agent-db": "move agent folders you no longer need out of /config/.openclaw/agents (they are in your "
                        "encrypted backup), then oc-upgrade retry",
     "pc-config": "fix the configuration (openclaw config validate), then oc-upgrade retry",
+    "pc-cron-partition": "to resume cron, select the default partition: in the add-on terminal run "
+                         "OC_ADDON_UNSAFE=1 openclaw doctor --fix; at \"Select the default cron partition\" press the "
+                         "down arrow to the store your jobs run from (the cursor starts on \"Leave cron paused and "
+                         "decide later\"), then Enter (doctor first saves a plaintext copy of the state database: with "
+                         "OpenClaw 2026.11.10 openclaw.sqlite.pre-startup-migration-<uuid>.bak, earlier "
+                         "openclaw.sqlite.doctor-cron-<ms>-<uuid>.bak; oc-upgrade status lists it); then oc-upgrade retry. Only the jobs of the selected "
+                         "store run afterwards. Or oc-upgrade retry --accept pc-cron-partition: the gateway starts and "
+                         "cron stays paused until you select one",
     "internal-error": "see the traceback in the gate events.log (oc-upgrade status), then oc-upgrade retry",
     "bump-repeat": "the gate already ran for this runtime but the state still needs migration: check oc-upgrade check, then oc-upgrade retry",
     "exit78": "see the reason above, fix it, then oc-upgrade retry",
@@ -250,6 +291,24 @@ ADVICE = {
                      "to keep it, restore the encrypted Home Assistant backup of the previous add-on version, run "
                      "openclaw agents add <id> --workspace <ws> --agent-dir <dir> --non-interactive there, then "
                      "update again",
+    # OpenClaw 2026.11.10+ (runtime_caps startup_state_upgrade): the gateway start's own copy-and-swap upgrade
+    "startup-upgrade-pending": "the gateway start would copy the state and upgrade the copy outside the gate (plaintext "
+                               "copies, see the reason). For an agent folder you no longer use (neither configured nor "
+                               "registered, e.g. restored from an older backup): move it out of /config/.openclaw/agents "
+                               "(it is in your encrypted backup). Otherwise, and for a leftover .upgrade-* folder: "
+                               "oc-upgrade retry --doctor, so that the gate's doctor migrates in place",
+    "startup-upgrade-unfinished": "an interrupted OpenClaw state upgrade left a .upgrade-* folder with its swap plan "
+                                  "(plan.json) in /config/.openclaw: some live files may already be replaced. Do not "
+                                  "delete it. Let OpenClaw finish the swap: in the add-on terminal run OC_ADDON_UNSAFE=1 "
+                                  "openclaw gateway run, wait for \"Finished an interrupted state upgrade\", stop it with "
+                                  "Ctrl+C, then oc-upgrade retry. Or restore the encrypted Home Assistant backup",
+    "startup-upgrade-leftover": "delete the listed .upgrade-* folder in /config/.openclaw by hand (it holds no swap "
+                                "plan: an unfinished plaintext copy of the state; the live files are untouched), then "
+                                "oc-upgrade retry",
+    "pc-startup-upgrade": "after the migration the gateway start would still copy and upgrade the state (see the "
+                          "reason): move an agent folder you no longer use out of /config/.openclaw/agents (it is in "
+                          "your encrypted backup), or fix what doctor reported for it (oc-upgrade log), then oc-upgrade "
+                          "retry --doctor",
 }
 
 # Doctor output classification (spec §7.5 with critique B3/B8)
@@ -264,6 +323,9 @@ RETIRED_FORMAT_MARKERS = (
     "unreleased session schema", "unsupported agent database registry schema",
     "Unsupported Telegram spool directory", "Telegram state must be a directory",
     "Cannot inspect potentially retired state",
+    # 2026.11.5+ (installed-plugin-index-store-path.ts): "Plugin install index <p> uses a retired JSON format and was
+    # left unchanged. Run openclaw doctor --fix to archive ..."
+    "uses a retired JSON format and was left unchanged",
 )
 # Held agent stores: 9.9 failed doctor on them; 2026.10 only warns and exits 0 (doctor-health-BmFjJGcU.mjs:185-187).
 # "Held agent <id> database ... (retained-by-deletion)" is an agent deleted with its files kept: not a problem
@@ -275,6 +337,18 @@ DOCTOR_BLOCKED_MARKER = "Doctor blocked; required repairs remain incomplete"
 _BLOCKED_FINDING_RE = re.compile(r"\[error\] (core/doctor/[A-Za-z0-9._:/-]{1,120})((?: [^ ]{1,300})?) - (.{1,400}?)"
                                  r"(?= fix: | \[(?:error|warning|warn|info)\] |" + re.escape(DOCTOR_BLOCKED_MARKER)
                                  + r"|$)")
+# 2026.11.5+ (doctor-health-contribution.ts showDoctorHealthSummary): the errors and fix-now warnings follow "Fix now:" as
+# "- <message>", "  Location: <path>[:line]", "  Next step: <hint>", "  Docs: <url>" (normalized to one line; every
+# finding ends with its Docs line)
+_FIX_NOW_MARKER = "Fix now:"
+# (a deferred required migration joins all its warnings into one message: no short length cap on the message)
+_FIX_NOW_FINDING_RE = re.compile(r"- (.{1,4000}?) (?:Location: (\S{1,300}) )?(?:Next step: (.{1,1000}?) )?Docs: \S{1,300}")
+# Hygiene: doctor's cron inference-account findings (check core/doctor/cron-inference-accounts, a fix-now warning in
+# 2026.11.10: "Automation <job>: retain <profile id> for <model> ...", flows/doctor-cron-checks.ts,
+# cron/inference-binding-migration.ts) name auth profile ids, which can be e-mail addresses that C.redact_text does not
+# hide. A HOLD reason only counts them; oc-upgrade log shows them.
+CRON_ACCOUNT_CHECK = "core/doctor/cron-inference-accounts"
+CRON_ACCOUNT_HINT = "record the planned eligible account"
 _HELD_AGENT_RE = re.compile(r"Held agent (?:(?!\(retained-by-deletion\)).){1,300}?(?:deletion history needs repair|"
                             r"deletion journal|unverified)", re.I)
 FATAL_MARKERS = (
@@ -283,9 +357,19 @@ FATAL_MARKERS = (
     ("doctor-incomplete", ("Agent deletion journal changed before quarantine",), None),
     ("doctor-migration-refused", ("Doctor stopped because",), None),
     # specific failures before "Doctor could not complete ...", which 2026.10 prints as a wrapper around them
+    # 2026.11.10 (PluginSetupPreparationRequiredError, plugin-setup-module.ts:58-86): the config repair after the
+    # plugin refresh loads a refreshed plugin's (codex) configRepair contract outside the plan's deferral scope
+    # (automatic-config-repair.ts:148-150, openclaw/openclaw#205695); oc-patches doctor-restore-env-refs-deferral
+    ("doctor-plugin-source-unprepared", ("Doctor source must be prepared before loading",), None),
     ("doctor-plugin-load", ("plugin load errors",), None),
     ("doctor-config-write", ("config fixes were not applied",), None),
-    ("doctor-backup-unverifiable", ("Cannot verify pre-migration SQLite backup", "backup group is missing"), None),
+    # 2026.11.5+ also: "Doctor could not verify its admitted original recovery copy: ... State repair has not started"
+    ("doctor-backup-unverifiable", ("Cannot verify pre-migration SQLite backup", "backup group is missing",
+                                    "Doctor could not verify its admitted original recovery copy"), None),
+    # 2026.11.5+ (state schema 34): no default cron partition can be proven and the non-interactive doctor never
+    # selects one; doctor ends "Doctor blocked" with "Doctor could not complete State integrity: Default cron partition
+    # selection is unresolved" (rehearsal 118, variant P). Before the generic refusal: only a terminal doctor resolves it
+    ("doctor-cron-partition", ("Default cron partition selection is unresolved",), None),
     ("doctor-maintenance-refused", ("Doctor could not enter maintenance", "Doctor could not complete",
                                     "Doctor could not acquire", "Doctor could not reacquire",
                                     "Doctor could not promote"), None),
@@ -296,7 +380,9 @@ FATAL_MARKERS = (
     # after the specific failures: 2026.10 prints held-back warnings on otherwise normal runs
     ("doctor-held-back", HELD_BACK_MARKERS + ("Held agent ", "unverified-agent-databases", "Agent deletion journal"),
      None),
-    ("doctor-incomplete", ("schema migration required",), re.compile(r"SQLite .{0,200}?timed out after", re.I)),
+    # 2026.11.5+: "Doctor startup timed out after 60000ms (<phase>)" (doctor-health-startup.ts): a retry resumes
+    ("doctor-incomplete", ("schema migration required", "Doctor startup timed out after"),
+     re.compile(r"SQLite .{0,200}?timed out after", re.I)),
     ("doctor-failed", ("Failing check ",), None),
 )
 SUSPICIOUS_MARKERS = ("Preserved retired", "may contain unmigrated data", "Pre-June OAuth credentials")
@@ -348,18 +434,49 @@ SW_JSON_COLUMNS = frozenset({"record_json", "actor_json", "payload_json", "suppo
 # OpenClaw 2026.10.10, <db>.pre-startup-migration-<id>.scoped.bak (only the tables of a declared migration)
 DOCTOR_COPY_RE = re.compile(r"[^/]{1,240}\.pre-startup-migration-([A-Za-z0-9][A-Za-z0-9-]{0,63})(?:\.scoped)?\.bak")
 # "Saved/Reused pre-migration SQLite backup: <db>.pre-startup-migration-<group id>[.scoped].bak" in a doctor log, matched
-# with every blank and box character removed (a long path can wrap inside doctor's box): the id names the group
-SAVED_COPY_ID_RE = re.compile(r"(?:Saved|Reused)pre-migrationSQLitebackup:\S*?\.pre-startup-migration-"
-                              r"([A-Za-z0-9][A-Za-z0-9-]{0,63}?)(?:\.scoped)?\.bak")
+# with every blank and box character removed (a long path can wrap inside doctor's box): the id names the group.
+# OpenClaw 2026.11.10 (runtime_caps cron_backup_premigration) also names its pre-repair cron backup of the state
+# database so on SQLite: "Saved pre-repair cron backup: <state db>.pre-startup-migration-<uuid>.bak" and "Cron Doctor
+# repair failed; verified backup retained at <path>: ..." (cron/store-repair.ts backupCronStoreForDoctor), and the
+# memory-core dreaming cron repair, which takes the same backup, as "Repaired N historical dreaming cron row(s); ...
+# SQLite backup: <path>." or "Retired N managed dreaming cron row(s) because dreaming is disabled. SQLite backup: <path>."
+# (doctor-dreaming-cron.ts:195-196; anchored on "dreaming cron row(s)", since "Discarded incomplete / Cannot verify
+# pre-migration SQLite backup:" also end in "SQLite backup:"); these stop at the next ":" (the text after the path is
+# an error message, and the next line begins with a prefix)
+SAVED_COPY_ID_RE = re.compile(r"(?:(?:Saved|Reused)pre-migrationSQLitebackup:\S*?"
+                              r"|(?:Savedpre-repaircronbackup:|verifiedbackupretainedat"
+                              r"|dreamingcronrow\(s\)[^:]{0,300}?SQLitebackup:)[^:]{0,600}?)"
+                              r"\.pre-startup-migration-([A-Za-z0-9][A-Za-z0-9-]{0,63}?)(?:\.scoped)?\.bak")
+# full7: doctor's verified pre-repair snapshots of a whole SQLite database before some state migrations (since 2026.11.4
+# at least, also 2026.11.8 and 2026.11.10): <db>.auth-profile-migration-<uuid>.bak (auth profile repair: the auth
+# profile store, i.e. keys and OAuth tokens), <db>.pre-acp-key-migration-<uuid>.bak /
+# .pre-acp-metadata-migration-<uuid>.bak (plugin doctor context) and <db>.pre-exec-approvals-migration-<uuid>.bak
+# (createVerifiedSqliteSnapshot), and
+# <state db>.doctor-gateway-token.<uuid>.bak before doctor moves the gateway token into its secret store (2026.11.4,
+# 2026.11.8 and 2026.11.10: doctor-gateway-auth-token.ts, doctor-health-contributions.ts). OpenClaw never deletes them;
+# the gate treats them like its other doctor copies (scope "snapshot").
+_UUID = r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
+# OpenClaw 2026.11.10 doctor (doctor-plugin-model-catalog.ts removeRootProviderCopies, not in 2026.11.4): before it
+# removes provider blocks of an agent's root models.json that exactly copy a plugin's generated catalog, it keeps the
+# file's previous bytes as <agentDir>/models.json.bak-<Date.now()>, with every other provider block, literal apiKey
+# values included (scope "catalog"); its log line "Removed provider "<id>" (a copy of plugin <p>'s generated
+# catalog) from <models.json>; backup: <path>." (the path may start with ~). OpenClaw never deletes it.
+DOCTOR_CATALOG_COPY_RE = re.compile(r"models\.json\.bak-(\d{10,16})")
+SAVED_CATALOG_COPY_RE = re.compile(r"generatedcatalog\)from[^;]{0,600}?;backup:[^;]{0,600}?models\.json\.bak-(\d{10,16})\.")
+DOCTOR_SNAPSHOT_RE = re.compile(r"[^/]{1,240}\.(?:(?:auth-profile-migration|pre-acp-key-migration|pre-acp-metadata-migration|"
+                                r"pre-exec-approvals-migration)-|doctor-gateway-token\.)(" + _UUID + r")\.bak")
 # R5: doctor's pre-repair copy of the whole state database before every cron store repair it commits
 # (store-repair.ts backupCronStoreForDoctor: <state>/state/openclaw.sqlite.doctor-cron-<Date.now()>-<uuid>.bak, a
 # verified plaintext snapshot without the lease rows; 2026.10.4 legacy owner/store repairs and the memory-core dreaming
 # cron repair, 2026.10.10 also provider renames, 2026.11.2+ also the inference account migration). OpenClaw never
-# deletes it.
+# deletes it. From 2026.11.10 (runtime_caps cron_backup_premigration) that name is used only on PostgreSQL: on SQLite the
+# backup is a pre-migration copy <state db>.pre-startup-migration-<uuid>.bak (DOCTOR_COPY_RE, SAVED_COPY_ID_RE). The
+# pattern stays for PostgreSQL and for the copies of earlier runtimes.
 _DOCTOR_CRON_ID = r"(\d{10,16}-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})"
 DOCTOR_CRON_COPY_RE = re.compile(r"[^/]{1,240}\.doctor-cron-" + _DOCTOR_CRON_ID + r"\.bak")
 # its log lines, matched like SAVED_COPY_ID_RE: "Saved pre-repair cron backup: <path>", the dreaming repair's
-# "... SQLite backup: <path>." and "Cron Doctor repair failed; verified backup retained at <path>: ..."
+# "... SQLite backup: <path>." and "Cron Doctor repair failed; verified backup retained at <path>: ..." (on 2026.11.10
+# SQLite the same lines name a .pre-startup-migration copy, which SAVED_COPY_ID_RE matches)
 SAVED_CRON_COPY_ID_RE = re.compile(r"(?:Savedpre-repaircronbackup:|SQLitebackup:|verifiedbackupretainedat)"
                                    r"[^:]{0,600}?\.doctor-cron-" + _DOCTOR_CRON_ID + r"\.bak")
 # doctor's pre-repair recovery directories beside a database (sqlite-index-recovery.ts backupDoctorSqliteRepair: mkdtemp
@@ -367,9 +484,13 @@ SAVED_CRON_COPY_ID_RE = re.compile(r"(?:Savedpre-repaircronbackup:|SQLitebackup:
 # the index repair with every version, from the 2026.10.10 line also the media-persistence, transcript-directives,
 # transcript-headers, transcript-labels and session-window repairs; the orphan task delivery repair, which the
 # precheck lets doctor make, with every version, adding orphan-rows.jsonl and manifest.json,
-# state-db-task-delivery-recovery.ts). OpenClaw never deletes them.
+# state-db-task-delivery-recovery.ts; from 2026.11.10 the cold transcript navigation step, per doctor run and agent
+# database that still has archives without navigation, before its first write (a run stops after a 10-minute work
+# budget, the next resumes), state-migrations.cold-navigation.ts: chat cold storage is on by default
+# there, session.maintenance.coldStorage). OpenClaw never deletes them.
 DOCTOR_RECOVERY_DIR_RE = re.compile(r"openclaw-(?:index|session-window|transcript-directives|media-persistence|"
-                                    r"transcript-headers|transcript-labels|task-delivery)-recovery-[A-Za-z0-9]{6}")
+                                    r"transcript-headers|transcript-labels|task-delivery|cold-navigation)"
+                                    r"-recovery-[A-Za-z0-9]{6}")
 DOCTOR_RECOVERY_FILES = ("orphan-rows.jsonl", "manifest.json", "database.sqlite")  # deleted in this order
 # their log lines, matched like SAVED_COPY_ID_RE: "Saved pre-repair SQLite backup: <dir>/database.sqlite", a failed
 # index repair's "Preserved pre-repair database: <dir>/database.sqlite.", the task delivery repair's "backup and row
@@ -770,6 +891,320 @@ def held_reason_text(reason):
     return f"held back by doctor: {reason}"
 
 
+# --- the gateway start's own state upgrade (OpenClaw 2026.11.10+, runtime_caps startup_state_upgrade) -----------------
+# `openclaw gateway run` upgrades the state by copy and swap before it opens it (state-upgrade.ts,
+# state-upgrade-startup.ts). When a database it finds is older than the bundled schemas, it copies the state to
+# <state>/.upgrade-<version>-<pid>-<ms>/state, runs its own doctor there and renames the result over the live files
+# (a `.upgrade-*` entry an earlier start left only makes it apply that entry's plan.json, if any, and delete it). Each replaced file stays as <file>.pre-<version>, the copy's doctor log as
+# logs/state-upgrade-<version>.log. These are plaintext copies made outside the gate (rule: none outside the
+# encrypted Home Assistant backup). The gate's doctor migrates in place first, so after a clean gate run nothing is
+# pending: the gate checks that before the gateway starts (plan, pc-startup-upgrade) and deletes what such a start left
+# behind (cleanup, design decision D2).
+UPGRADE_WORK_PREFIX = ".upgrade-"  # state-upgrade.ts WORK_PREFIX
+UPGRADE_PLAN_FILE = "plan.json"  # state-upgrade-tree.ts PLAN_FILE: a durable swap plan, applied by the next start
+_OC_VERSION = r"\d{4}\.\d{1,2}\.\d{1,3}(?:-[0-9A-Za-z][0-9A-Za-z.]{0,40})?"
+# <file>.pre-<OpenClaw version> (state-upgrade-tree.ts applyPlan; pruneGenerations matches ^(.*)\.pre-(\d[^/]*)$). Only a
+# version-shaped suffix, so doctor's .pre-startup-migration-, .pre-acp-* and .pre-exec-approvals-* copies never match
+STARTUP_GENERATION_RE = re.compile(r"[^/]{1,240}\.pre-(" + _OC_VERSION + r")")
+STARTUP_UPGRADE_LOG_RE = re.compile(r"state-upgrade-" + _OC_VERSION + r"\.log")  # in <state>/logs/
+UPGRADE_WORK_RE = re.compile(r"\.upgrade-" + _OC_VERSION + r"-(\d{1,10})-\d{10,16}")  # <ver>-<pid>-<Date.now()>
+# the staged copy of a non-database op beside its live file, .<name><work dir name> (state-upgrade.ts:664-673, e.g.
+# .openclaw.json.upgrade-2026.11.10-<pid>-<ms>, the migrated config with the gateway token): written before plan.json,
+# removed by OpenClaw only when the upgrade fails with an error, so a crash before the plan leaves it; the next start
+# removes only the work dir. While a work dir of the same name exists, the file is the `next` of its swap (or of a
+# start that is upgrading now) and must stay. Group 1 is the work dir's name, group 2 its pid.
+STARTUP_STAGED_RE = re.compile(r"\.[^/]{1,200}?(\.upgrade-" + _OC_VERSION + r"-(\d{1,10})-\d{10,16})")
+# what startup never copies (state-upgrade.ts excludedRoots): no generation can appear below these
+STARTUP_UNCOPIED_DIRS = ("knowledge", "browser", "backups", "cache", "locks", "tmp")
+STARTUP_LEFTOVER_WALK_MAX = 300_000
+# the stores doctor's reconstruction of a lost deletion journal holds (agent-deletion-journal-recovery.kernel.ts)
+DELETION_RECOVERY_KEY = "agent-deletion-journal-reconstruction"
+# run.sh: a gateway that stayed up this long is not part of a crash loop (GW_FAIL_STREAK)
+GATEWAY_HEALTHY_S = 120
+
+
+def _is_sqlite_file(path):
+    """state-upgrade-tree.ts isSqliteFile: the 16-byte SQLite header (a link is followed, as there)."""
+    try:
+        with open(path, "rb") as f:
+            return f.read(16) == b"SQLite format 3\x00"
+    except OSError:
+        return False
+
+
+def _can_swap(state_dir, path):
+    """canSwap of state-upgrade.ts discoverDatabases: no symlinked directory between the state dir and the database's
+    directory (the swap cannot rename across one)."""
+    d = os.path.dirname(os.path.abspath(str(path)))
+    try:
+        return (os.path.relpath(os.path.realpath(d), os.path.realpath(str(state_dir)))
+                == os.path.relpath(d, os.path.abspath(str(state_dir))))
+    except (OSError, ValueError):
+        return False
+
+
+def deletion_recovery_holds(state_dir):
+    """{realpath: agent_id} of the stores held by doctor's reconstruction of a lost deletion journal: the
+    migration_sources receipt DELETION_RECOVERY_KEY, report_json "held": [{agentId, path}], a relative path below the
+    state dir (readAgentDeletionRecoveryHolds). Doctor reports them as "deletion journal reconstructed". Read-only; {}
+    when there is none or it cannot be read (never raises; a stop request still does)."""
+    state_dir = Path(state_dir)
+    sdb = state_dir / "state" / "openclaw.sqlite"
+    try:
+        if not sdb.is_file() or "migration_sources" not in table_names(sdb):
+            return {}
+        rows = q(sdb, "SELECT report_json FROM migration_sources WHERE source_key=?", (DELETION_RECOVERY_KEY,))
+        report = json.loads(rows[0][0]) if rows and isinstance(rows[0][0], str) else None
+    except (sqlite3.Error, C.NodeQueryError, C.SchemaUnknown, OSError, ValueError):
+        return {}
+    entries = report.get("held") if isinstance(report, dict) else None
+    held = {}
+    for h in entries if isinstance(entries, list) else []:
+        if isinstance(h, dict) and isinstance(h.get("agentId"), str) and isinstance(h.get("path"), str) \
+                and h["path"].strip():
+            pth = Path(h["path"])
+            held.setdefault(os.path.realpath(pth if pth.is_absolute() else state_dir / pth), h["agentId"])
+    return held
+
+
+def _startup_state_version(sdb):
+    """state-upgrade.ts readVersion for the state database: max(user_version, contentVersion); a contentVersion that
+    is no number counts as 0 there (Number(...) || 0)."""
+    uv = db_uv(sdb) or 0
+    try:
+        rows = q(sdb, "SELECT value_json FROM config_machine_state WHERE state_key=?", (CONTENT_VERSION_KEY,))
+    except sqlite3.Error:
+        return uv
+    try:
+        v = json.loads(rows[0][0]) if rows and isinstance(rows[0][0], str) else (rows[0][0] if rows else 0)
+    except ValueError:
+        v = 0
+    v = int(v) if isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v) else 0
+    return max(uv, v)
+
+
+def startup_upgrade_pending(state_dir, s_target, a_target, cfg=None):
+    """What the next gateway start of OpenClaw 2026.11.10+ would upgrade by copy and swap: a mirror of
+    isStateUpgradePending and discoverDatabases (state-upgrade.ts). Read-only; never raises (a stop request still
+    does). Returns {"work_dirs": [{"name", "plan"}], "outdated": [{"path", "kind", "id", "uv", "role"}]}; nothing in
+    either means the gateway starts on the state as it is. As there:
+    - every `.upgrade-*` entry of the state dir counts; plan: it holds plan.json (an interrupted swap, which the next
+      start applies over the live files before anything else);
+    - the state database counts below its target (max of user_version and contentVersion); one at version 0 turns the
+      whole upgrade off;
+    - agents/<name>/agent/openclaw-agent.sqlite counts below its target unless startup leaves it to its lifecycle owner:
+      a store held by the deletion journal reconstruction, or one that a deletion journal entry (retained or pending)
+      names, while no configured or registered store of another agent is that file. Startup matches by path only
+      (discoverDatabases asks with the path, no agent id). A store whose deletion history is unavailable (no journal,
+      an unreadable one) stays a target;
+    - a database below a symlinked directory is no target (canSwap); version 0 is never upgraded; a database that
+      cannot be read counts (uv None: that start would fail on it).
+    role of an agent store: "configured" (openclaw.json), "registered" (agent_databases) or "orphan"."""
+    state_dir = Path(state_dir)
+    cfg = cfg if isinstance(cfg, dict) else {}
+    res = {"work_dirs": [], "outdated": []}
+    try:
+        names = sorted(os.listdir(state_dir))
+    except OSError:
+        return res
+    for n in names:
+        if n.startswith(UPGRADE_WORK_PREFIX):
+            res["work_dirs"].append({"name": n, "plan": os.path.lexists(str(state_dir / n / UPGRADE_PLAN_FILE))})
+    try:
+        agents = sorted(os.listdir(state_dir / "agents"))
+    except OSError:
+        agents = []
+    sdb = state_dir / "state" / "openclaw.sqlite"
+    errors = (sqlite3.Error, C.NodeQueryError, C.SchemaUnknown, OSError, ValueError, TypeError)
+    snapshot = False  # startup reads the deletion journal only from a readable state database at a version above 0
+    if _is_sqlite_file(sdb):
+        swap = _can_swap(state_dir, sdb)
+        if swap or agents:
+            try:
+                sv = _startup_state_version(sdb)
+            except errors:
+                sv = None
+            if swap and sv == 0:
+                return res  # "an uninitialized shared store keeps the normal bootstrap path"
+            if swap and (sv is None or sv < s_target):
+                res["outdated"].append({"path": "state/openclaw.sqlite", "kind": "state", "id": None, "uv": sv,
+                                        "role": "state"})
+            snapshot = sv is not None and sv != 0 and bool(agents)
+    journal = deletion_journal_held(state_dir, pending=True) if snapshot else {}
+    holds = deletion_recovery_holds(state_dir) if snapshot else {}
+    try:
+        tables = table_names(sdb) if sdb.is_file() else set()
+        targets, _orphans = agent_databases(state_dir, cfg, tables)
+    except errors:
+        targets = []
+    owners = {os.path.realpath(pth): norm_agent_id(aid) for aid, pth in targets}
+    deleted = {norm_agent_id(aid) for aid, _reason in journal.values()}
+    configured = {norm_agent_id(a) for a in configured_agent_ids(cfg)}
+    for name in agents:
+        pth = state_dir / "agents" / name / "agent" / "openclaw-agent.sqlite"
+        real = os.path.realpath(pth)
+        if real in holds:
+            continue
+        if real in journal and (real not in owners or owners[real] in deleted):
+            continue  # a surviving owner of another agent keeps it a target (createAgentDatabaseDeletionClassifier)
+        if not _is_sqlite_file(pth) or not _can_swap(state_dir, pth):
+            continue
+        try:
+            v = db_uv(pth)
+        except errors:
+            v = None
+        if v is not None and not 0 < v < a_target:
+            continue
+        role = "configured" if norm_agent_id(name) in configured else ("registered" if real in owners else "orphan")
+        res["outdated"].append({"path": C.rel(pth, state_dir), "kind": "agent", "id": name, "uv": v, "role": role})
+    return res
+
+
+def startup_upgrade_items(pend, s_target, a_target, held=None):
+    """The items of a startup_upgrade_pending result as short texts (HOLD reasons). held: {realpath: (id, reason)},
+    to say which of them doctor held back."""
+    items = []
+    for w in pend.get("work_dirs") or []:
+        items.append(f"{printable(w['name'])} (" + ("an interrupted swap: its plan.json is applied over the live files at "
+                                                    "the next start" if w.get("plan") else
+                                                    "an unfinished copy of the state without a swap plan") + ")")
+    roles = {"configured": "configured", "registered": "registered, not configured",
+             "orphan": "neither configured nor registered"}
+    for o in pend.get("outdated") or []:
+        uv = o["uv"] if o.get("uv") is not None else "unreadable"
+        if o.get("kind") == "state":
+            items.append(f"{o['path']} (state schema {uv} < {s_target})")
+            continue
+        h = (held or {}).get(os.path.realpath(str(C.paths()["STATE"] / o["path"])))
+        why = f"; {held_reason_text(h[1])}" if h else ""
+        items.append(f"{printable(o['path'])} (agent {printable(o.get('id'))}, {roles.get(o.get('role'), 'agent')}; "
+                     f"schema {uv} < {a_target}{why})")
+    return items
+
+
+def startup_upgrade_text(pend, runtime, s_target, a_target, held=None):
+    """'the gateway start of OpenClaw <runtime> would upgrade the state by copy and swap: <items>' (HOLD reasons)."""
+    items = startup_upgrade_items(pend, s_target, a_target, held)
+    return (f"the gateway start of OpenClaw {runtime} would upgrade the state by copy and swap (a full plaintext copy "
+            f"in {UPGRADE_WORK_PREFIX}*, then the replaced files kept as *.pre-{runtime}): " + "; ".join(items[:6])
+            + (f" (+{len(items) - 6} more)" if len(items) > 6 else ""))
+
+
+def _pid_alive(pid):
+    try:
+        return os.path.isdir(f"/proc/{int(pid)}")
+    except (ValueError, OSError):
+        return False
+
+
+def startup_upgrade_leftovers(state_dir, cfg=None, walk_max=STARTUP_LEFTOVER_WALK_MAX):
+    """What gateway starts of OpenClaw 2026.11.10+ left in the state dir, all plaintext copies. Read-only; links are
+    never followed. {"work_dirs": [{"path", "plan", "live", "size"}], "generations": {path: size}, "logs": {path: size},
+    "staged": {path: size}, "staged_held": [path], "tombs": [path], "partial": bool}, paths state-relative:
+    - work_dirs: the `.upgrade-*` entries. plan: it holds plan.json, an interrupted swap the next start finishes (never
+      deleted); live: the process its name records still runs (a start that is upgrading now);
+    - generations: <file>.pre-<version>, regular files anywhere below the state dir except node_modules, the folders
+      startup never copies (STARTUP_UNCOPIED_DIRS) and workspaces inside the state dir;
+    - logs: logs/state-upgrade-<version>.log; tombs: work dirs whose delete by the add-on was interrupted;
+    - staged: regular files .<name>.upgrade-<version>-<pid>-<ms> directly in the state dir (STARTUP_STAGED_RE, the
+      staged copy of openclaw.json and other non-database files); staged_held: those whose work dir holds plan.json or
+      belongs to a running process, or whose own process still runs (the `next` of a swap the next start finishes, or
+      of a start that is upgrading now: never deleted). Staged copies beside
+      `$include` files elsewhere are not looked for.
+    The walk stops after walk_max entries (partial)."""
+    state_dir = Path(state_dir)
+    res = {"work_dirs": [], "generations": {}, "logs": {}, "staged": {}, "staged_held": [], "tombs": [],
+           "partial": False}
+    try:
+        top = sorted(os.listdir(state_dir))
+    except OSError:
+        return res
+    tomb = TOMB_PREFIX + UPGRADE_WORK_PREFIX
+    for n in top:
+        pth = state_dir / n
+        if n.startswith(UPGRADE_WORK_PREFIX):
+            m = UPGRADE_WORK_RE.fullmatch(n)
+            size = _dir_bytes(pth) if os.path.isdir(pth) and not os.path.islink(pth) else None
+            res["work_dirs"].append({"path": n, "plan": os.path.lexists(str(pth / UPGRADE_PLAN_FILE)),
+                                     "live": bool(m) and _pid_alive(m.group(1)), "size": size})
+        elif n.startswith(tomb):
+            res["tombs"].append(n)
+        elif n.startswith(".") and STARTUP_STAGED_RE.fullmatch(n):
+            try:
+                st = os.lstat(pth)
+            except OSError:
+                continue
+            if stat.S_ISREG(st.st_mode):
+                res["staged"][n] = st.st_size
+    held_work = {w["path"] for w in res["work_dirs"] if w["plan"] or w["live"]}
+    for n in res["staged"]:
+        m = STARTUP_STAGED_RE.fullmatch(n)
+        if m.group(1) in held_work or _pid_alive(m.group(2)):
+            res["staged_held"].append(n)
+    real = os.path.realpath(str(state_dir))
+    skip = {os.path.realpath(str(w)) for w in workspaces(cfg if isinstance(cfg, dict) else {})}
+    seen = 0
+    for root, dirs, files in os.walk(state_dir, followlinks=False):
+        if root == str(state_dir):
+            dirs[:] = [d for d in dirs if not d.startswith((UPGRADE_WORK_PREFIX, TOMB_PREFIX))
+                       and d not in STARTUP_UNCOPIED_DIRS]
+        dirs[:] = [d for d in dirs if d != "node_modules" and os.path.realpath(os.path.join(root, d)) not in skip]
+        seen += len(dirs) + len(files)
+        if seen > walk_max:
+            res["partial"] = True
+            break
+        for name in files:
+            is_log = STARTUP_UPGRADE_LOG_RE.fullmatch(name) and os.path.realpath(root) == os.path.join(real, "logs")
+            if not is_log and not STARTUP_GENERATION_RE.fullmatch(name):
+                continue
+            pth = Path(root) / name
+            try:
+                st = os.lstat(pth)
+            except OSError:
+                continue
+            if stat.S_ISREG(st.st_mode):
+                res["logs" if is_log else "generations"][C.rel(pth, state_dir)] = st.st_size
+    return res
+
+
+def leftover_paths(left, deletable=True):
+    """The state-relative paths of a startup_upgrade_leftovers result; deletable: without the work dirs that hold
+    plan.json or belong to a running process."""
+    paths = [w["path"] for w in left["work_dirs"] if not deletable or not (w["plan"] or w["live"])]
+    staged = sorted(r for r in left.get("staged", {}) if not deletable or r not in left.get("staged_held", ()))
+    return paths + list(left["tombs"]) + sorted(left["generations"]) + sorted(left["logs"]) + staged
+
+
+def gateway_started_at(proc_dir="/proc"):
+    """When the longest-running OpenClaw gateway process of this container started (UTC), None when none runs: argv
+    `<node> <.../openclaw.mjs> gateway ...` or the process title openclaw-gateway (/proc/<pid>/cmdline and stat; the boot
+    time from /proc/stat btime). Read-only."""
+    try:
+        with open(os.path.join(proc_dir, "stat"), encoding="utf-8") as f:
+            btime = next(int(x.split()[1]) for x in f if x.startswith("btime "))
+        tick = os.sysconf("SC_CLK_TCK")
+        names = os.listdir(proc_dir)
+    except (OSError, ValueError, StopIteration, IndexError):
+        return None
+    best = None
+    for name in names:
+        if not name.isdigit() or int(name) == os.getpid():
+            continue
+        try:
+            with open(os.path.join(proc_dir, name, "cmdline"), "rb") as f:
+                args = [a.decode("utf-8", "replace") for a in f.read().split(b"\0") if a]
+            with open(os.path.join(proc_dir, name, "stat"), encoding="utf-8", errors="replace") as f:
+                ticks = int(f.read().rsplit(")", 1)[1].split()[19])
+        except (OSError, ValueError, IndexError):
+            continue
+        first = args[0].strip().split(" ")[0] if args else ""
+        oc = any(a.endswith("/openclaw.mjs") for a in args) or os.path.basename(first) == "openclaw"
+        if first == "openclaw-gateway" or (oc and "gateway" in args[1:4]):
+            started = btime + ticks / tick
+            best = started if best is None else min(best, started)
+    return None if best is None else datetime.fromtimestamp(best, timezone.utc)
+
+
 def legacy_files(state_dir, cfg, state_tables):
     """§6.2 files verdict sources (+ B5: attestations under the legacy .clawdbot state dir)."""
     import hashlib as _h
@@ -780,6 +1215,14 @@ def legacy_files(state_dir, cfg, state_tables):
     has_row = False
     if state_db.exists() and "device_identities" in state_tables:
         has_row = bool(q(state_db, "SELECT 1 FROM device_identities WHERE identity_key='primary'"))
+    # 2026.11.5+ (state schema 29, client-credential-paths.ts): the device identity moved to client/credentials.sqlite
+    cdb = state_dir / "client" / "credentials.sqlite"
+    if not has_row and cdb.is_file():
+        try:
+            has_row = "device_identities" in table_names(cdb) and bool(
+                q(cdb, "SELECT 1 FROM device_identities WHERE identity_key='primary'"))
+        except (sqlite3.Error, C.NodeQueryError):
+            has_row = False
     if not has_row:
         dev = state_dir / "identity" / "device.json"
         for c in (dev, Path(f"{dev}.doctor-importing"), Path(f"{dev}.native-importing")):
@@ -966,7 +1409,12 @@ def binding_equal(a, b):
 # --- plan decision table (§6.3 + B1/B2/B4/B11) ------------------------------------------------
 
 def decide(ctx):
-    """Pure decision table. ctx: fresh, runtime, cls, journal, marker, retry, cfg, binding.
+    """Pure decision table. ctx: fresh, runtime, cls, journal, marker, retry, cfg, binding, startup.
+
+    startup (OpenClaw 2026.11.10+, runtime_caps startup_state_upgrade): None, or {"plan": bool, "message": str} when
+    the gateway start would upgrade the state by copy and swap (plan_startup_upgrade). Where no gate would run, that
+    is a HOLD startup-upgrade-pending (startup-upgrade-unfinished for a `.upgrade-*` with plan.json) instead of
+    starting OpenClaw; it is decided again at every start, like bump-repeat (no journal entry).
 
     Returns {"rc","action","reason","mode","resume_phase","new_run","hold","marker","warnings","bk"}.
     bk (bookkeeping the gate run applies; `--plan` never writes the journal):
@@ -1077,6 +1525,18 @@ def decide(ctx):
     if has_retry and not bk["consume_retry"]:
         bk["consume_retry"] = True
         warnings.append("discarding a pending retry request: there is nothing to retry")
+    startup = ctx.get("startup")
+    d = _decide_settled(ctx, cls, runtime, marker, marker_rt, cfg, mode_new, warnings, R)
+    if startup and d["rc"] == 0:
+        # instead of starting OpenClaw (migrated, adopted, unversioned): the gateway start would copy the state
+        code = "startup-upgrade-unfinished" if startup.get("plan") else "startup-upgrade-pending"
+        return R(11, "hold", "the gateway start would upgrade the state outside the gate",
+                 hold={"code": code, "phase": "plan", "message": startup.get("message") or ""})
+    return d
+
+
+def _decide_settled(ctx, cls, runtime, marker, marker_rt, cfg, mode_new, warnings, R):
+    """decide() when no gate run is open and the predicate needs none: migrated, a version bump or adopted."""
     if marker_rt:
         mk = None
         if not binding_equal(marker.get("binding"), ctx.get("binding")):
@@ -1154,11 +1614,11 @@ def plan(apply=False, emit=out):
         journal = load_journal()
         retry = load_retry()
         # full5: stores OpenClaw holds back (deletion journal, the marker of this runtime) do not ask for a gate
-        cls = classify(gp["STATE"], cfg, pkg["schema_state"], pkg["schema_agent"], pkg["version"],
-                       held=planning_held(gp["STATE"], marker, pkg))
+        held = planning_held(gp["STATE"], marker, pkg)
+        cls = classify(gp["STATE"], cfg, pkg["schema_state"], pkg["schema_agent"], pkg["version"], held=held)
         binding = current_binding(gp["STATE"], cls)
         d = decide({"fresh": False, "runtime": pkg["version"], "cls": cls, "journal": journal, "marker": marker,
-                    "retry": retry, "cfg": cfg, "binding": binding})
+                    "retry": retry, "cfg": cfg, "binding": binding, "startup": plan_startup_upgrade(gp, pkg, cfg, held)})
     except C.Stopped:
         raise
     except Exception as exc:  # B11: a planning bug must not brick a migrated install
@@ -1213,6 +1673,27 @@ def plan(apply=False, emit=out):
     if apply:
         apply_bookkeeping(d)
     return d
+
+
+def plan_startup_upgrade(gp, pkg, cfg, held=None):
+    """decide()'s ctx "startup" (runtime_caps startup_state_upgrade): None, or {"plan", "message"} when the gateway
+    start of the bundled OpenClaw would upgrade the state by copy and swap. A `.upgrade-*` folder without plan.json
+    alone is no reason: that start only removes it (state-upgrade.ts) and copies nothing. A check that fails counts as
+    pending: that start would copy the state outside the gate (rule), so the gate holds instead (B11 does not
+    apply)."""
+    if not C.runtime_caps(pkg)["startup_state_upgrade"]:
+        return None
+    try:
+        pend = startup_upgrade_pending(gp["STATE"], pkg["schema_state"], pkg["schema_agent"], cfg)
+    except C.Stopped:
+        raise
+    except Exception as exc:  # noqa: BLE001 - see the docstring
+        return {"plan": False, "message": f"could not check what the gateway start of OpenClaw {pkg['version']} would "
+                                          f"upgrade ({type(exc).__name__}: {C.redact_text(str(exc))[:200]})"}
+    if not (pend["outdated"] or any(w["plan"] for w in pend["work_dirs"])):
+        return None
+    return {"plan": any(w["plan"] for w in pend["work_dirs"]),
+            "message": startup_upgrade_text(pend, pkg["version"], pkg["schema_state"], pkg["schema_agent"], held)}
 
 
 def plan_fixup_lines(d, gp):
@@ -1584,28 +2065,94 @@ def _snippet(norm, idx, width=160):
 
 
 def blocked_message(rc, norm, idx):
-    """HOLD reason of doctor-blocked: the [error] findings doctor listed before "Doctor blocked" (path and message,
-    each redacted on its own, at most 5), else the text around the marker. The path and the message are redacted
+    """HOLD reason of doctor-blocked: the [error] findings doctor listed before "Doctor blocked" (2026.11.5+: the
+    findings of its "Fix now:" block; path and message, each redacted on its own, at most 5), else the text around
+    the marker. The path and the message are redacted
     apart: joined, a path that ends in a secret-like key (…apiKey, …botToken) reads as "key: value" and the
-    redaction would hide doctor's message (its zod messages do not echo config values)."""
-    found = []
+    redaction would hide doctor's message (its zod messages do not echo config values). Cron inference-account
+    findings are only counted (CRON_ACCOUNT_CHECK: they name auth profile ids)."""
+    found, accounts = [], 0
     for m in _BLOCKED_FINDING_RE.finditer(norm[:idx]):
+        if m.group(1) == CRON_ACCOUNT_CHECK or m.group(3).startswith("Automation "):
+            accounts += 1
+            continue
         where = m.group(2).strip()
         item = f"{C.redact_text(where or m.group(1))}: {C.redact_text(m.group(3).strip())}"
         if item not in found:
             found.append(item)
-    if not found:
+    fix = norm.rfind(_FIX_NOW_MARKER, 0, idx)  # 2026.11.5+: the summary block printed just before the marker
+    if not found and fix >= 0:
+        for m in _FIX_NOW_FINDING_RE.finditer(norm[fix + len(_FIX_NOW_MARKER):idx]):
+            if m.group(1).startswith("Automation ") or CRON_ACCOUNT_HINT in (m.group(3) or ""):
+                accounts += 1
+                continue
+            msg = C.redact_text(m.group(1).strip())
+            item = f"{C.redact_text(m.group(2))}: {msg}" if m.group(2) else msg
+            if item not in found:
+                found.append(item)
+    acc = (f"{accounts} cron inference-account finding(s), only in oc-upgrade log (they name auth profile ids)"
+           if accounts else "")
+    if not found and not acc:
         return f"doctor rc {rc}: ...{_snippet(norm, idx)}..."
-    shown = "; ".join(f[:200] for f in found[:5])  # redacted before the cut: a cut never exposes more
+    shown = "; ".join([f[:200] for f in found[:5]] + ([acc] if acc else []))  # redacted before the cut
     more = f" (+{len(found) - 5} more in oc-upgrade log)" if len(found) > 5 else ""
     return f"doctor rc {rc}: doctor blocked, required repairs remain incomplete: {shown}{more}"
 
 
-def evaluate_doctor(rc, text, *, timed_out=False, stopping=False, final=False, retired_warning=False):
+_FAILING_CHECK_RE = re.compile(r"Failing check (\S{1,80}) \(([a-z-]{1,40})\): (.{1,300}?)(?= Failing check |$)")
+
+
+def failing_check_text(norm):
+    """'; failing check <name> (<reason>): <message>' for the first check doctor names as failing (a step-refused one
+    first: the others are usually blocked by it), else ''. The cause behind "Doctor stopped because a state migration
+    refused to continue" (2026.11.8 and 2026.11.10 plugin-doctor-state); redacted, cut."""
+    found = list(_FAILING_CHECK_RE.finditer(norm))
+    if not found:
+        return ""
+    m = next((x for x in found if x.group(2) == "step-refused"), found[0])
+    msg = m.group(3).strip()
+    if msg.startswith("Automation "):  # a cron inference-account text names profile ids (CRON_ACCOUNT_CHECK)
+        msg = "an automation's inference account (oc-upgrade log names it)"
+    return C.redact_text(f"; failing check {m.group(1)} ({m.group(2)}): {msg}")[:400]
+
+
+# OpenClaw 2026.11.10+ (runtime_caps doctor_exit_watchdog): when a handle keeps doctor alive 10 s after its command
+# settled, doctor writes this line and SIGTERMs itself, whatever exit code it meant (one-shot-exit.ts
+# armSettledExitWatchdog; the gate sees rc -15). Its outro says what it meant (doctor-health-startup.ts,
+# doctor-health.ts, doctor-engine-selection.ts); the first outro of this list that the log shows decides.
+SETTLED_EXIT_MARKER = "command settled but the process is still alive after"
+SETTLED_OUTRO_RC = (
+    ("Doctor blocked. Database checks remain unknown", 2),  # exit 2: unresolved database engine
+    (DOCTOR_BLOCKED_MARKER, 1),
+    ("config fixes were not applied", 1),  # "Doctor finished, but (some) config fixes were not applied."
+    ("Doctor finished with plugin load errors", 1),
+    ("Doctor complete.", 0),
+    ("Doctor maintenance deferred; pending repairs remain unchanged", 0),
+)
+RC2_TEXTS = ("config could not be parsed", "database target could not be resolved")
+
+
+def settled_rc(rc, norm):
+    """The exit code doctor meant when its settled-exit watchdog SIGTERMed it (rc -15, or 143 through a shell). Needs
+    both the watchdog line and one of doctor's outros in the normalized log `norm`; an rc-1 outro next to an rc-2 text
+    gives 2. Anything else keeps rc, so a crash without an outro stays doctor-crashed."""
+    if rc not in (-15, 143) or SETTLED_EXIT_MARKER not in norm:
+        return rc
+    low = norm.lower()
+    for text, code in SETTLED_OUTRO_RC:
+        if text.lower() in low:
+            return 2 if code == 1 and any(s in low for s in RC2_TEXTS) else code
+    return rc
+
+
+def evaluate_doctor(rc, text, *, timed_out=False, stopping=False, final=False, retired_warning=False,
+                    settled_exit=False):
     """Classify one doctor pass (B3: markers only when rc != 0, except held-back stores, which 2026.10
     reports with rc 0; B8: signals/OOM -> doctor-crashed). final: the pass that should leave nothing
     pending (pass 2 or 3). retired_warning: the runtime retires the pre-July runtime files (2026.10.5+), so a
-    RETIRED_WARNING_MARKERS hit with rc 0 is doctor-retired-warning."""
+    RETIRED_WARNING_MARKERS hit with rc 0 is doctor-retired-warning. settled_exit: the runtime's doctor ends itself
+    with SIGTERM after it settled (2026.11.10+): the rc is read from its outro first (settled_rc; res "settled_from"
+    keeps the signal rc)."""
     norm = normalize_doctor_text(text)
     low = norm.lower()
     complete = "Doctor complete." in norm
@@ -1616,6 +2163,17 @@ def evaluate_doctor(rc, text, *, timed_out=False, stopping=False, final=False, r
     if timed_out:
         res.update(code="doctor-timeout", cls="hard", message="doctor exceeded its time budget and was stopped")
         return res
+    if settled_exit:
+        meant = settled_rc(rc, norm)
+        if meant != rc:
+            res.update(rc=meant, settled_from=rc)
+            rc = meant
+        elif rc in (-15, 143) and SETTLED_EXIT_MARKER in norm:
+            res.update(code="doctor-crashed", cls="hard",
+                       message=f"doctor ended its command, but a handle kept it running, so it stopped itself with "
+                               f"SIGTERM (rc {rc}, OpenClaw's settled-exit watchdog); its log shows no outro that says "
+                               "how it ended: see oc-upgrade log")
+            return res
     if rc == 0:
         if not complete:
             res.update(code="doctor-incomplete", cls="hard", message="doctor exited 0 without 'Doctor complete.'")
@@ -1659,6 +2217,14 @@ def evaluate_doctor(rc, text, *, timed_out=False, stopping=False, final=False, r
         res.update(code="doctor-interrupted", cls="hard", message=f"doctor was interrupted (rc {rc})")
         return res
     if rc == 2:
+        # 2026.11.5+ (doctor-engine-selection.ts reportDoctorUnresolvedEngine): exit 2 is also an unresolved database
+        # engine, with one of these two texts; otherwise the command line was refused
+        for code, s_ in (("doctor-config-unparsed", "config could not be parsed"),
+                         ("doctor-database-unresolved", "database target could not be resolved")):
+            idx = low.find(s_)
+            if idx >= 0:
+                res.update(code=code, cls="hard", markers=[s_], message=f"doctor rc 2: ...{_snippet(norm, idx)}...")
+                return res
         res.update(code="doctor-invocation", cls="hard", message="doctor refused its command line (rc 2)")
         return res
     for code, subs, rx in FATAL_MARKERS:
@@ -1669,6 +2235,8 @@ def evaluate_doctor(rc, text, *, timed_out=False, stopping=False, final=False, r
                            message=f"doctor rc {rc}: ...{_snippet(norm, idx)}...")
                 if code == "doctor-blocked":
                     res["message"] = blocked_message(rc, norm, idx)
+                elif code != "doctor-failed":
+                    res["message"] += failing_check_text(norm)
                 return res
         if rx is not None:
             m = rx.search(norm)
@@ -1697,8 +2265,46 @@ _NOTE_RES = (
     ("warn", re.compile(r'Agent "([^"]{1,80})": (\d+) allowed skills? (?:is|are) not usable in this environment'),
      lambda m: f"{m.group(2)} skill(s) of agent {m.group(1)} are not usable in this environment and were disabled "
                "(openclaw skills check)"),
+    # OpenClaw 2026.9.9 (not printed by the 2026.11 lines)
     ("warn", re.compile(r'Create heartbeat monitor for agent "([^"]{1,80})" at (\S{1,20}?)\.(?:\s|$)'),
      lambda m: f"doctor created a heartbeat monitor cron job for agent {m.group(1)} (every {m.group(2)})"),
+    # 2026.11.5+ (runtime_caps heartbeat_retired; doctor-heartbeat-retirement.ts)
+    ("info", re.compile(r"Converted legacy heartbeat cadence to ordinary editable automations"),
+     lambda m: "doctor turned the heartbeat settings into ordinary cron jobs (openclaw automations list shows them; "
+               "they run on the agent's model chain as cron runs)"),
+    # 2026.11.10 (state-migrations.cold-navigation.ts): chat cold storage is on by default there; doctor adds the
+    # navigation of cold-archived chats within a 10 min budget per run, the rest resumes at its next run
+    ("info", re.compile(r"Cold transcript navigation in (\S{1,300}?): migrated (\d+), pending (\d+);"),
+     lambda m: f"doctor added the navigation of {m.group(2)} cold-archived chat(s) in {m.group(1)}; {m.group(3)} more "
+               "follow at its next run (oc-upgrade retry --doctor); until then they open through the cold restore as "
+               "before"),
+    # 2026.11.5+ doctor "Scheduled-run access review" (cron/execution-context-report.ts, read-only): automations whose
+    # scheduled runs change what they may do from this version on; the job list stays in oc-upgrade log
+    ("warn", re.compile(r"(\d+) automations? will lose access at the next run:"),
+     lambda m: f"{m.group(1)} automation(s) will lose access at their next run (doctor's \"Scheduled-run access "
+               "review\" in oc-upgrade log names each and what it loses, e.g. owner-only tools or sessions_yield)"),
+    ("warn", re.compile(r"(\d+) automations? will pause at the next run because the conversation that created"),
+     lambda m: f"{m.group(1)} automation(s) will pause at their next run: the conversation that created them is "
+               "unavailable (restore it and run openclaw automations enable <id>, or recreate the automation; the list "
+               "is in oc-upgrade log)"),
+    ("warn", re.compile(r"(\d+) automations? runs? on a CLI backend, where scheduled runs now get the owner-only tools"),
+     lambda m: f"{m.group(1)} automation(s) on a CLI backend now get the owner-only tools in their scheduled runs (as "
+               "embedded runs already did; list in oc-upgrade log)"),
+    ("warn", re.compile(r"(\d+) automations? could not be evaluated"),
+     lambda m: f"doctor could not evaluate the scheduled-run access of {m.group(1)} automation(s) (oc-upgrade log)"),
+    ("info", re.compile(r"(\d+) automations? (?:is|are) not bound to the conversation that created"),
+     lambda m: f"{m.group(1)} automation(s) are recorded with their creating conversation by key only (they keep "
+               "their behaviour, without that conversation's board, memory or workspace)"),
+    ("info", re.compile(r"(\d+) automations? (?:has|have) a creating conversation with no stored chat type"),
+     lambda m: f"{m.group(1)} automation(s) get no conversation memory in their runs (their creating conversation, "
+               "from OpenClaw 2026.10.6 or earlier, has no stored chat type)"),
+    ("info", re.compile(r"(\d+) tool-bearing cron jobs? keeps? legacy sender-policy resolution"),
+     lambda m: f"{m.group(1)} cron job(s) with tools keep the restrictive legacy sender policy (no explicit tool cap); "
+               "to set one: openclaw automations edit <id> --tools <tool,...> (doctor's note in oc-upgrade log)"),
+    # 2026.11.5+ doctor-original-capture.ts: a fix-now warning when its pre-repair capture failed (no admitted baseline)
+    ("warn", re.compile(r"Pre-repair recovery copy was unavailable: (.{1,160}?)\.(?:\s|$)"),
+     lambda m: f"doctor could not save its pre-repair recovery copy ({m.group(1)}); the encrypted Home Assistant "
+               "backup stays the rollback point"),
     ("warn", re.compile(r"Removed untouched (\S{1,200}TOOLS\.md) after archiving it"),
      lambda m: f"doctor archived and removed the untouched {m.group(1)}"),
     ("warn", re.compile(r"Migrated (\S{1,200}HEARTBEAT\.md) into cron scratch"),
@@ -1717,7 +2323,12 @@ _SW_ID = r"([a-z0-9][a-z0-9-]{5,120})"
 _SW_NOTE_RES = (
     ("info", re.compile(r"Exported (\d+) pending Skill Workshop proposal drafts?\b"),
      lambda m: f"doctor archived {m.group(1)} pending/quarantined Skill Workshop draft(s) in the owner agent's "
-               "workshop-skills/.archive/.retired-proposals/"),
+               "workshop-skills/ (.drafts/ from OpenClaw 2026.11.5, .archive/.retired-proposals/ before; /learn drafts "
+               "lists them)"),
+    # 2026.11.5+ moves the exports of an earlier doctor from .archive/.retired-proposals/ to .drafts/
+    ("info", re.compile(r"Moved (\d+) exported Skill Workshop proposal drafts?\b"),
+     lambda m: f"doctor moved {m.group(1)} earlier exported Skill Workshop draft(s) to the owner agent's "
+               "workshop-skills/.drafts/ (/learn drafts lists them)"),
     ("info", re.compile(r"Retired the Skill Workshop proposal tables"),
      lambda m: "doctor retired the Skill Workshop proposal tables (OpenClaw no longer has the applied, rejected and "
                "stale proposals, their history and undo records)"),
@@ -2196,6 +2807,7 @@ class Gate:
         if self.cls["verdict"] == "newer":
             F.append(finding("newer-state", "hard", "; ".join(self.cls["newer"]), "precheck"))
         F += self.agent_store_findings()
+        F += self.startup_upgrade_precheck(bool(procs))  # 5b (OpenClaw 2026.11.10+)
         state_db = p["STATE"] / "state" / "openclaw.sqlite"
         checkpoint = startup_checkpoint(state_db)
         if self.j is not None and not self.j.get("first_write_at"):
@@ -2299,6 +2911,8 @@ class Gate:
         # 11b Skill Workshop, 11c cron inference accounts (full5; information only)
         self.skill_workshop_info(F)
         self.cron_binding_forecast(F, mode)
+        self.cron_partition_forecast()
+        self.heartbeat_retired_info()
         # 11d session sizes (full5, openclaw/openclaw#191847; information only)
         self.large_session_info()
         # 11e memory search remote inheritance (#184966, WARN only), 11f output caps (#193899, information only),
@@ -2339,8 +2953,10 @@ class Gate:
                                "that agent's database (a plaintext copy that is kept), and otherwise refuses it, "
                                "which stops doctor after the other databases are migrated (hard HOLD "
                                "doctor-migration-refused): move such a folder out of agents/ instead of accepting. "
-                               "The gateway does not open it. "
-                               "The gate checks that it is readable (quick_check, foreign keys) but not its schema "
+                               + ("The gateway opens it read-only at each start; if it is still below the target, every "
+                                  "start copies the state to upgrade it, so the gate holds then (pc-startup-upgrade). "
+                                  if self.caps()["startup_state_upgrade"] else "The gateway does not open it. ")
+                               + "The gate checks that it is readable (quick_check, foreign keys) but not its schema "
                                "afterwards; what doctor did is in the gate's final lines and oc-upgrade status",
                              "precheck"))
         for h in [o for o in cls["orphans"] if o.get("held")] + list(cls.get("held") or []):
@@ -2374,6 +2990,77 @@ class Gate:
                              f"{h['uv']}) {why}: doctor will not migrate it and OpenClaw {ver} refuses the agent "
                              "(the default agent: the gateway does not start or stays not ready)", "precheck"))
         return F
+
+    def startup_upgrade_precheck(self, running):
+        """Precheck 5b (runtime_caps startup_state_upgrade): the `.upgrade-*` entries a gateway start of OpenClaw
+        2026.11.10+ left in the state dir (state-upgrade.ts). One with plan.json is an interrupted swap: the next start
+        applies it over the live files, after the gate's doctor would already have run on a half-swapped state
+        (hard startup-upgrade-unfinished). One without is a crash leftover beside an untouched live tree, a plaintext
+        copy of the state: a gate run deletes it (journal startup_upgrade_removed; the next start would remove it
+        too), with the staged copies of the same attempt beside the live files (STARTUP_STAGED_RE, which OpenClaw
+        never removes after a crash), unless an OpenClaw process runs. Dry-run and oc-upgrade check only say so."""
+        if not self.caps()["startup_state_upgrade"]:
+            return []
+        state = self.gp["STATE"]
+        try:
+            names = sorted(n for n in os.listdir(state) if n.startswith(UPGRADE_WORK_PREFIX))
+        except OSError:
+            return []
+        F = []
+        plans = [n for n in names if os.path.lexists(str(state / n / UPGRADE_PLAN_FILE))]
+        if plans:
+            F.append(finding("startup-upgrade-unfinished", "hard",
+                             f"{', '.join(printable(n) for n in plans)} in {state}: an interrupted state upgrade of "
+                             f"OpenClaw (copy and swap) with its swap plan; the next gateway start applies it over the "
+                             "live files, so the gate's doctor must not run on this state first", "precheck"))
+        for n in names:
+            if n in plans:
+                continue
+            what = (f"{printable(n)} in {state}: an unfinished state-upgrade copy of OpenClaw without a swap plan (a "
+                    "plaintext copy of the state; the live files are untouched)")
+            if self.dry_run or self.j is None or running:
+                self.say(f"{self.pn('precheck')} info: {what}; a gate run deletes it")
+                continue
+            try:
+                size = _delete_startup_work(state, n)
+            except OSError as exc:
+                F.append(finding("startup-upgrade-leftover", "hard", f"{what} could not be deleted: "
+                                 f"{printable(exc.strerror or exc)}", "precheck"))
+                continue
+            self.j.setdefault("startup_upgrade_removed", []).append({"name": n, "bytes": size, "at": C.utc_iso()})
+            self.history(f"deleted {n} (unfinished state-upgrade copy)")
+            self.say(f"{self.pn('precheck')} deleted {what} ({C.human(size)})")
+            for f in self.staged_copies_of(n):
+                try:
+                    size = _delete_state_leftover(self.gp, [f])
+                except OSError as exc:
+                    F.append(finding("startup-upgrade-leftover", "hard", f"{printable(f)} in {state}: the staged copy "
+                                     f"of the same attempt (a plaintext copy beside the live files) could not be "
+                                     f"deleted: {printable(exc.strerror or exc)}", "precheck"))
+                    continue
+                self.j["startup_upgrade_removed"].append({"name": f, "bytes": size, "at": C.utc_iso()})
+                self.history(f"deleted {f} (staged copy of {n})")
+                self.say(f"{self.pn('precheck')} deleted {printable(f)} in {state}: the staged copy of the same "
+                         f"attempt ({C.human(size)})")
+        return F
+
+    def staged_copies_of(self, work):
+        """The regular files .<name><work> directly in the state dir: what the attempt of work dir `work` staged
+        beside its live files (STARTUP_STAGED_RE)."""
+        state = self.gp["STATE"]
+        try:
+            names = sorted(os.listdir(state))
+        except OSError:
+            return []
+        out_ = []
+        for f in names:
+            m = STARTUP_STAGED_RE.fullmatch(f) if f.startswith(".") else None
+            try:
+                if m and m.group(1) == work and stat.S_ISREG(os.lstat(state / f).st_mode):
+                    out_.append(f)
+            except OSError:
+                continue
+        return out_
 
     def ha_backup_check(self, F, opt):
         """Precheck 10b (read-only): an encrypted full/partial Home Assistant backup that contains this add-on, is
@@ -2573,12 +3260,30 @@ class Gate:
         data = C.parse_json_output(outp.read_text(encoding="utf-8", errors="replace") if outp.exists() else "")
         if res.rc == 0 and data == self.pkg["version"]:
             return "network ok"
+        low = self.plugins_below_floor()
         F.append(finding("no-network", "acceptable",
                          f"npm registry not reachable (rc {res.rc}); doctor installs/updates official plugins from it. "
                          "Accepted, doctor keeps retrying npm for many minutes per plugin (over 10 minutes were seen) "
                          f"and can run into its time budget per pass ({C.fmt_duration(self.budget()['doctor_pass_seconds'])}"
-                         "; then the gate holds with doctor-timeout); prefer fixing the network", "precheck"))
+                         "; then the gate holds with doctor-timeout)"
+                         + (f"; {', '.join(low)} is enabled and below the minimum OpenClaw {self.pkg['version']} loads: "
+                            "without npm doctor cannot update it, so the gate then holds (doctor-plugin-load, or "
+                            "doctor-warnings at the last pass)" if low else "")
+                         + "; prefer fixing the network", "precheck"))
         return "network FAILED"
+
+    def plugins_below_floor(self):
+        """["<package> <version>"] of the enabled official plugins the bundled OpenClaw does not load at their
+        installed version (oc_upgrade.below_plugin_floor, e.g. @openclaw/codex 2026.11.4 on 2026.11.10). Read-only;
+        [] on any error."""
+        try:
+            import oc_upgrade as U  # noqa: PLC0415 - oc_upgrade imports this module
+            cfg = self.cfg if isinstance(self.cfg, dict) else _read_cfg_lenient()
+            return [f"{x['package']} {x['version']}" for x in official_plugin_installs(self.gp["STATE"], cfg)
+                    if x.get("enabled") is not False and x.get("version")
+                    and U.below_plugin_floor(x["package"], x["version"], self.pkg["version"])]
+        except Exception:  # noqa: BLE001 - a precheck text must never fail the gate
+            return []
 
     def info_items(self, mode, generic_only):
         state = self.gp["STATE"]
@@ -2747,8 +3452,9 @@ class Gate:
         self.say(f"{self.pn('precheck')} info: Skill Workshop proposals: {inv['proposals']} ({sw_status_text(bs)}; "
                  f"{inv['events']} events, {inv['rollbacks']} rollback records, {inv['reviews']} collection reviews, "
                  f"{inv['files']} files{legacy}). OpenClaw {self.pkg['version']} doctor keeps only the {keep} "
-                 "pending/quarantined drafts (as files in the owner agent's workshop-skills/.archive/"
-                 f".retired-proposals/) and drops the rest; {tail}")
+                 "pending/quarantined drafts (as files in the owner agent's workshop-skills/"
+                 + (".drafts/" if self.caps()["workshop_drafts_dir"] else ".archive/.retired-proposals/")
+                 + f") and drops the rest; {tail}")
         warns = [f"doctor will keep the proposal storage (the migration continues; the gate reports it afterwards): "
                  f"{h}" for h in inv["holdbacks"]] + list(inv["unfinished"])
         for w in warns[:10]:
@@ -2771,8 +3477,9 @@ class Gate:
         Before the first write only (a resumed run reports after doctor, cron_binding_postcheck). On a runtime
         whose doctor records the accounts itself (cron_doctor_migration, 2026.11.2+) one info line for the jobs whose
         own model is on a stored login (doctor binds them, and their fallbacks to other providers are refused from then
-        on); the jobs doctor leaves (a fallback on a stored login, AWS SDK credentials) keep their WARN lines, and the
-        jobs it does not bind are reported again after the migration."""
+        on; from 2026.11.10, cron_bound_live_fallbacks, they run on live credentials); the jobs doctor leaves (a
+        fallback on a stored login, AWS SDK credentials) keep their WARN lines, and the jobs it does not bind are
+        reported again after the migration."""
         caps = self.caps()
         if not caps["cron_refusal"] or (self.j or {}).get("first_write_at"):
             return None
@@ -2798,10 +3505,12 @@ class Gate:
         if after is not None:
             behind, bound_behind = [], []
             kept = cron_fixup_kept_jobs(rec, after, {f["provider"] for f in plan["fix"]}, behind)
-            if behind and dm:  # N2: doctor binds such a job's own model; its fallbacks to other providers are refused
+            # N2: doctor binds such a job's own model; its fallbacks to other providers are refused (from 2026.11.10
+            # they run on live credentials: cron_fixup_none_text)
+            if behind and dm:
                 now = {a.get("id"): a for a in after.get("affected") or []}
                 bound = {a.get("id") for a in _cron_doctor_binds([now[a.get("id")] for a, _r in behind
-                                                                  if a.get("id") in now])}
+                                                                  if a.get("id") in now], after)}
                 bound_behind = [(a, r) for a, r in behind if a.get("id") in bound]
                 behind[:] = [(a, r) for a, r in behind if a.get("id") not in bound]
 
@@ -2814,14 +3523,20 @@ class Gate:
                 # N2-R2: reach it only as a fallback of their own model on another provider's stored login, which
                 # doctor binds: the fixup keeps none of them working
                 gone = [x for x in on(bound_behind, f["provider"]) if x not in ent["jobs"] and x not in late]
+                # of the jobs kept: the ones whose own model is on f's provider (doctor would bind them to its copy
+                # instead: cron_fixup_kept_text, 2026.11.10 readiness line)
+                own = [str(a.get("id"))[:120] for a, refs in kept if caps["cron_bound_live_fallbacks"]
+                       and _cron_kept_own((a, refs))
+                       and str((a.get("refs") or [""])[0]).split("/", 1)[0] == f["provider"]]
                 rec["autofix"].append(dict(ent, **({"behind": late} if late else {}),
-                                           **({"bound": gone} if gone else {})))
+                                           **({"bound": gone} if gone else {}), **({"own": own} if own else {})))
             for a in rec["autofix"]:
                 none = "" if a["jobs"] or a.get("behind") else f"; {cron_fixup_none_text(a, rt)}"
                 self.say(f"{pn} config fixup: {'would set' if self.dry_run else 'will set'} {printable(a['path'])} = "
                          f"\"api-key\" before doctor pass 1 ({cron_fixup_why(a['provider'], rt)}){none}")
             if kept:
-                self.say(f"{pn} info: {cron_fixup_kept_text(kept, plan['fix'], rt)}")
+                still = {a.get("id") for a in after.get("affected") or []}
+                self.say(f"{pn} info: {cron_fixup_kept_text(kept, plan['fix'], rt, still)}")
             if behind:
                 self.say(f"{pn} info: {cron_fixup_behind_text(behind)}")
         elif plan["fix"]:
@@ -2839,7 +3554,7 @@ class Gate:
         if n and caps["cron_doctor_migration"]:
             # 2026.11.2+: doctor records the account of a job's own model on a stored login only; the jobs it leaves
             # (a fallback on a stored login, AWS SDK credentials) keep their WARN lines
-            binds = _cron_doctor_binds(rec["affected"])
+            binds = _cron_doctor_binds(rec["affected"], rec)
             if binds:
                 self.say(f"{pn} info: {cron_doctor_binds_text(binds, rec, rt)}")
             rest = cron_doctor_rest(rec)
@@ -3064,9 +3779,11 @@ class Gate:
         since_ms = int(since.timestamp() * 1000) if since is not None else None
 
         def this_run(r, scope):
-            if scope == "recovery":
+            # snapshots carry no time in their name: by modification time, like the recovery directories (a baseline
+            # of an earlier add-on version does not list them)
+            if scope in ("recovery", "snapshot"):
                 return _made_since(Path(self.gp["STATE"]) / r, since)
-            if scope != "cron":
+            if scope not in ("cron", "catalog"):
                 return True
             ms = doctor_cron_copy_ms(Path(r).name)
             return since_ms is not None and ms is not None and ms >= since_ms
@@ -3081,7 +3798,8 @@ class Gate:
                      for e in d.get("pre_migration_backups_outside") or [] if isinstance(e, dict)}
         outside = [{"path": x, "size": size, "scope": scope} for x, (size, scope) in
                    sorted(outside_doctor_copies(outside_agent_dirs(self.gp["STATE"], self.cfg)).items())
-                   if x not in out_base and x not in out_known and (scope != "recovery" or _made_since(x, since))]
+                   if x not in out_base and x not in out_known
+                   and (scope not in ("recovery", "snapshot", "catalog") or _made_since(x, since))]
         if outside:
             rec["pre_migration_backups_outside"] = outside
         self.save()
@@ -3168,6 +3886,54 @@ class Gate:
             self.say(f"{self.pn('precheck')} info: {output_cap_text(rows, self.pkg['version'])}")
         return None
 
+    def cron_partition_forecast(self):
+        """Precheck 11c' (runtime_caps cron_partition_binding; WARN, never a HOLD here): whether the schema-34 migration
+        records the default cron partition. If it cannot, cron stays paused after the migration and the
+        postconditions hold on pc-cron-partition. Before the first write only; read-only."""
+        if not self.caps()["cron_partition_binding"] or (self.j or {}).get("first_write_at") \
+                or (self.pkg.get("schema_state") or 0) < CRON_PARTITION_SCHEMA:
+            return None
+        sdb = self.gp["STATE"] / "state" / "openclaw.sqlite"
+        try:
+            uv = db_uv(sdb) if sdb.is_file() else 0
+            st = cron_partition_state(sdb, self.cfg, migrated=uv >= CRON_PARTITION_SCHEMA)
+        except (sqlite3.Error, C.NodeQueryError, C.SchemaUnknown, OSError, ValueError, TypeError) as exc:
+            self.warn(f"could not check the cron partitions ({type(exc).__name__}: {C.redact_text(str(exc))[:200]}); "
+                      "the postconditions check again")
+            return None
+        if self.j is not None:
+            self.j["cron_partition_forecast"] = {"status": st["status"], "partitions": len(st["partitions"])}
+        if st["status"] in ("unresolved", "invalid"):
+            self.warn(f"{self.pn('precheck')} {cron_partition_text(st, True)}. The migration starts; the gate then "
+                      "holds with doctor-cron-partition (its advice says how to select the store)")
+        return None
+
+    def heartbeat_retired_info(self):
+        """Precheck info (runtime_caps heartbeat_retired, 2026.11.5+): doctor turns the heartbeat settings and the
+        heartbeat cron rows into one ordinary cron job per enrolled agent (payload agentTurn; HEARTBEAT.md moves into
+        its cron scratch and is archived under <state>/backups/heartbeat-migration/). Its model chain is then a cron
+        chain: the post-migration cron report covers it. Before the first write only; read-only."""
+        if not self.caps()["heartbeat_retired"] or (self.j or {}).get("first_write_at"):
+            return None
+        paths = heartbeat_config_paths(self.cfg)
+        rows = 0
+        sdb = self.gp["STATE"] / "state" / "openclaw.sqlite"
+        try:
+            if sdb.is_file() and "cron_jobs" in table_names(sdb):
+                rows = q(sdb, "SELECT COUNT(*) FROM cron_jobs WHERE payload_kind='heartbeat'")[0][0] or 0
+        except (sqlite3.Error, C.NodeQueryError, OSError, IndexError):
+            rows = 0
+        if not paths and not rows:
+            return None
+        what = ", ".join(paths[:6]) + (" …" if len(paths) > 6 else "")
+        if rows:
+            what = (what + "; " if what else "") + f"{rows} heartbeat cron row(s)"
+        self.say(f"{self.pn('precheck')} info: heartbeat ({what}): OpenClaw {self.pkg['version']} retires the heartbeat "
+                 "settings; doctor turns them into one ordinary cron job per agent (HEARTBEAT.md goes into its cron "
+                 "scratch, a copy under /config/.openclaw/backups/heartbeat-migration/). Its model chain is a cron "
+                 "chain from then on: the cron report after the migration includes it")
+        return None
+
     def delegation_check(self):
         """Precheck 11g (GHSA-pw3x-g8v8-fvj2; WARN, never a HOLD): a tools.openclaw.autoApproveChanges true in
         openclaw.json (global or an agent's) re-enables automatic delegated changes on the fixed runtime. A 2026.10.4
@@ -3233,13 +3999,18 @@ class Gate:
             if e.get("proof") and e["proof"].startswith("nothing to import"):
                 self.say(f"{self.pn('precheck')} info: nothing for OpenClaw to import, goes to quarantine: "
                          f"{e['rel']} ({e['proof']})")
+            elif e.get("proof") and e["proof"].startswith("archived, not imported"):
+                self.say(f"{self.pn('precheck')} info: OpenClaw {self.pkg['version']} would only archive it, goes to "
+                         f"quarantine: {e['rel']} ({e['proof'].split(': ', 1)[-1]})")
             elif e.get("proof"):
                 self.say(f"{self.pn('precheck')} info: already imported by OpenClaw, goes to quarantine: "
                          f"{e['rel']} ({e['proof']})")
         n = sum(1 for e in rs["plan"] if e["action"] == "quarantine")
         if n:
             self.say(f"{self.pn('precheck')} info: {n} retired pre-July-2026 file(s) will be moved to quarantine "
-                     "(OpenClaw 2026.10 refuses them; their content is in SQLite or disposable)")
+                     + ("(OpenClaw no longer reads them; their content is in SQLite or disposable)"
+                        if self.caps()["retired_state_migrated"] else
+                        "(OpenClaw 2026.10 refuses them; their content is in SQLite or disposable)"))
         dbs = [(aid, str(self.gp["STATE"] / rel), (self.cls.get("agents") or {}).get(aid), self.pkg["schema_agent"])
                for aid, rel in sorted((self.cls.get("agent_paths") or {}).items())]
         F += [dict(f) for f in M.retired_db_findings(dbs, str(self.gp["STATE"] / "state" / "openclaw.sqlite"),
@@ -3401,6 +4172,11 @@ class Gate:
                          f"{mirror.lines} log lines; last: \"{mirror.last[:100]}\")")
         started = C.utc_iso()
         sha_before = _sha_or_none(self.gp["CONFIG_PATH"])
+        if not isinstance(self.j.get("capture_baseline"), list):  # the captures that predate this run's doctor
+            self.j["capture_baseline"] = capture_dirs(self.gp)
+        else:
+            self.note_doctor_captures()  # a pass of this run the gate did not see end (stopped, killed)
+        self.save()
         self.say(f"{label} started (limit {C.fmt_duration(limit)}; log {log})")
         res = C.run_process(argv, timeout=limit, log_path=log, stop_event=STOP, kill_grace=DOCTOR_KILL_AFTER,
                             stop_grace=DOCTOR_STOP_GRACE, env=C.openclaw_env(), on_tick=tick)
@@ -3410,12 +4186,18 @@ class Gate:
             text = f.read().decode("utf-8", "replace")
         caps = self.caps()
         ev = evaluate_doctor(res.rc, text, timed_out=res.timed_out, stopping=STOP.is_set(), final=n >= 2,
-                             retired_warning=caps["runtime_files_retired"] or caps["sandbox_registry_retired"])
+                             retired_warning=caps["runtime_files_retired"] or caps["sandbox_registry_retired"],
+                             settled_exit=caps["doctor_exit_watchdog"])
         rec = {"pass": n, "started": started, "ended": C.utc_iso(), "rc": res.rc, "duration_s": round(res.duration),
                "complete": ev["complete"], "markers": ev["markers"], "code": ev["code"],
                "log": str(log.relative_to(self.gp["GATE"])) if str(log).startswith(str(self.gp["GATE"])) else str(log),
                "config_sha256_before": sha_before, "config_sha256_after": _sha_or_none(self.gp["CONFIG_PATH"])}
+        if "settled_from" in ev:  # 2026.11.10+: doctor's settled-exit watchdog, the rc its outro says
+            rec["settled_rc"] = ev["rc"]
+            self.say(f"{label}: doctor finished, but a handle kept it running, so it stopped itself with SIGTERM 10 s "
+                     f"later (rc {res.rc}, OpenClaw's settled-exit watchdog); its outro says exit {ev['rc']}")
         self.j.setdefault("doctor", []).append(rec)
+        self.note_doctor_captures()
         # contract addendum 2 item 7: doctor's retired-model replacements of every pass, in order
         pairs, removed = doctor_retirements(text)
         if pairs:
@@ -3441,6 +4223,19 @@ class Gate:
         ev["duration"] = res.duration
         ev["text"] = text
         return ev
+
+    def note_doctor_captures(self):
+        """Record the doctor-<uuid> capture directories that appeared since this run's first doctor pass: after each
+        pass, before a later one and at finalize. While the gate runs it holds its lock and the wrapper refuses a
+        writing doctor; a doctor run by hand while the run is held (OC_ADDON_UNSAFE=1, e.g. the doctor-cron-partition
+        advice) counts as part of the run: its captures are deleted with it like the gate's own (rule).
+        Nothing before the first pass."""
+        if not isinstance(self.j.get("capture_baseline"), list):
+            return
+        base = set(self.j["capture_baseline"])
+        mine = self.j.setdefault("doctor_captures", [])
+        mine += [x for x in capture_dirs(self.gp) if x not in base and x not in mine]
+        del mine[500:]
 
     def doctor_failure(self, ev, phase, n):
         if ev["code"] and ev["cls"] == "hard":
@@ -3664,12 +4459,12 @@ class Gate:
         fixed = self.cron_config_fixup("doctor2")  # full5: only when pass 1 ran without it (earlier add-on version)
         if fixed is not None:  # the baseline of changed_paths: pass 2's diff must not list the gate's own write
             C.atomic_write_json(rd / "config.post-fixups.json", fixed)
-        sha0 = _sha_or_none(p["CONFIG_PATH"])
+        sha0 = _config_digest(p["CONFIG_PATH"])
         ev = self.run_doctor_pass(2, "doctor2")
         self.after_later_pass(ev, 2)
         self.doctor_failure(ev, "doctor2", 2)
         warnings = acceptable_doctor(ev)
-        sha1 = _sha_or_none(p["CONFIG_PATH"])
+        sha1 = _config_digest(p["CONFIG_PATH"])  # without doctor's wizard.lastRunAt stamp (CONFIG_STAMP_PATHS)
         result = "config unchanged"
         hold = None
         if sha1 != sha0:
@@ -3677,7 +4472,9 @@ class Gate:
         # F1b also after pass 2 (contract addendum 2 rule 4: a re-added codex plugin entry is removed again)
         self.post_pass_fixups(2)
         if sha1 != sha0:
-            sha1f = _sha_or_none(p["CONFIG_PATH"])
+            # the config pass 3 starts from, for the diagnosis of a doctor-not-idempotent HOLD
+            self.save_copy(p["CONFIG_PATH"], rd / "config.post-pass2.json")
+            sha1f = _config_digest(p["CONFIG_PATH"])
             ev3 = self.run_doctor_pass(3, "doctor2")
             self.after_later_pass(ev3, 3)
             self.doctor_failure(ev3, "doctor2", 3)
@@ -3685,13 +4482,19 @@ class Gate:
             warnings = [w for w in warnings if w["code"] != "doctor-warnings"
                         or set(w.get("markers") or []) - set(FINAL_PASS_SUSPICIOUS)]
             warnings += acceptable_doctor(ev3)
-            sha2 = _sha_or_none(p["CONFIG_PATH"])
-            self.post_pass_fixups(3)
+            sha2 = _config_digest(p["CONFIG_PATH"])
+            # doctor's own pass-3 change, before F1b re-applies the fixups (it may revert exactly that change)
+            paths3 = self.changed_paths(rd, rd / "config.post-pass2.json") if sha2 != sha1f else []
+            refixed = self.post_pass_fixups(3)
             result = "config changed in pass 2, unchanged in pass 3" if sha2 == sha1f else "config changed again in pass 3"
             if sha2 != sha1f:
                 hold = finding("doctor-not-idempotent", "acceptable",
-                               "doctor changed openclaw.json in pass 2 and again in pass 3", "doctor2")
-        self.save_copy(p["CONFIG_PATH"], rd / "config.post-pass2.json")
+                               "doctor changed openclaw.json in pass 2 and again in pass 3: "
+                               + (", ".join(paths3[:20]) or "(no config leaf)")
+                               + ("; F1b re-applied its fixups after pass 3" if refixed else ""), "doctor2")
+            self.save_copy(p["CONFIG_PATH"], rd / "config.post-pass3.json")
+        else:
+            self.save_copy(p["CONFIG_PATH"], rd / "config.post-pass2.json")
         before = set(self.j.get("plugins_before") or [])
         new = sorted(set(plugin_snapshot(p["STATE"])) - before)
         codex = [x for x in new if x.startswith("npm/projects/openclaw-codex-")]
@@ -3724,7 +4527,7 @@ class Gate:
         a later pass (the other doctor notes come from pass 1 only)."""
         new = self.record_doctor_copies(n)
         # R5: a cron repair doctor committed in this pass; a pre-repair recovery directory of another repair
-        cron = [e for e in new if e.get("scope") in ("cron", "recovery")]
+        cron = [e for e in new if e.get("scope") in ("cron", "recovery", "snapshot", "catalog")]
         if len(new) > len(cron) or "Saved pre-migration SQLite backup" in normalize_doctor_text(ev["text"]):
             self.warn(f"doctor pass {n} saved another pre-migration SQLite copy (doctor's own; not the rollback "
                       "point)")
@@ -3736,14 +4539,17 @@ class Gate:
             notes += add
             self.save()
 
-    def changed_paths(self, rd):
+    def changed_paths(self, rd, base=None):
+        """Config leaves that differ from `base` (default: post-fixups, else post-pass1), without the run stamp."""
+        if base is None:
+            base = rd / "config.post-fixups.json" if (rd / "config.post-fixups.json").exists() \
+                else rd / "config.post-pass1.json"
         try:
-            a = _flatten_leaves(C.read_json_strict(rd / "config.post-fixups.json")) if (rd / "config.post-fixups.json").exists() \
-                else _flatten_leaves(C.read_json_strict(rd / "config.post-pass1.json"))
+            a = _flatten_leaves(C.read_json_strict(base))
             b = _flatten_leaves(self.read_config())
         except C.ConfigReadError:
             return ["(unreadable)"]
-        return sorted(k for k in set(a) | set(b) if a.get(k) != b.get(k))
+        return sorted(k for k in set(a) | set(b) if a.get(k) != b.get(k) and k not in CONFIG_STAMP_PATHS)
 
     # ----- phase 7: postconditions -----
     def phase_postconditions(self):
@@ -3766,13 +4572,18 @@ class Gate:
             res, data = self.oc_json(["models", "auth", "list", "--provider", "openai", "--json"], 180, "pc-auth-list")
             profiles = data.get("profiles") if isinstance(data, dict) and isinstance(data.get("profiles"), list) else None
             if profiles is None:
-                self.warn(f"models auth list failed (rc {res.rc}); auth order not adjusted")
-                profiles = []
-            o_ids = [x.get("id") for x in profiles if isinstance(x, dict) and x.get("type") in ("oauth", "token")]
-            res2, data2 = self.oc_json(["models", "auth", "order", "get", "--provider", "openai", "--json"], 180,
-                                       "pc-auth-order")
+                self.warn(f"models auth list failed (rc {res.rc}){cli_error_text(data)}; auth order not adjusted, "
+                          "and the live OpenAI probe is skipped")
+            o_ids = [x.get("id") for x in profiles or [] if isinstance(x, dict) and x.get("type") in ("oauth", "token")]
+            res2, data2 = (self.oc_json(["models", "auth", "order", "get", "--provider", "openai", "--json"], 180,
+                                        "pc-auth-order") if profiles is not None else (None, None))
             store_order = data2.get("order") if isinstance(data2, dict) else None
-            new_cfg, f, led = M.auth_order_adjust(cfg, profiles, store_order)
+            if profiles is not None and is_cli_error(data2):  # OpenClaw's JSON error envelope: not "no store order"
+                self.warn(f"models auth order get failed (rc {res2.rc}){cli_error_text(data2)}; auth order not "
+                          "adjusted")
+                profiles = None
+            new_cfg, f, led = (M.auth_order_adjust(cfg, profiles, store_order) if profiles is not None
+                               else (None, None, None))
             if f:
                 f = dict(f)
                 f.setdefault("cls", "acceptable")
@@ -3792,15 +4603,29 @@ class Gate:
                     self.say("7/8 auth.order.openai written (subscription first, API key as fallback)")
         # pc-schema (hard; full5: stores doctor held back of agents that are not configured are listed, not
         # required, on runtimes whose gateway skips them; classify)
+        held_map = self.held_map(True)
         cls = classify(p["STATE"], cfg, self.pkg["schema_state"], self.pkg["schema_agent"], self.pkg["version"],
-                       held=self.held_map(True))
+                       held=held_map)
         if cls["schema_verdict"] != "ok":
             hard("pc-schema", "; ".join(self.pc_schema_items(cls, cfg) + cls["newer"]) or "schema verdict not ok")
+        # pc-startup-upgrade (hard; OpenClaw 2026.11.10+): nothing left that the gateway start would copy and upgrade
+        # outside the gate. Hard only for what that start upgrades: an orphan doctor left below the target, a store
+        # whose deletion history is unavailable ("deletion journal unavailable", "deletion history needs repair"),
+        # any .upgrade-* entry. Stores the deletion journal or its reconstruction holds stay information below.
+        pend = startup_upgrade_pending(p["STATE"], self.pkg["schema_state"], self.pkg["schema_agent"], cfg) \
+            if self.caps()["startup_state_upgrade"] else {"work_dirs": [], "outdated": []}
+        if pend["work_dirs"] or pend["outdated"]:
+            hard("pc-startup-upgrade", startup_upgrade_text(pend, self.pkg["version"], self.pkg["schema_state"],
+                                                            self.pkg["schema_agent"], held_map))
         if cls["held"]:
             self.say("7/8 info: held agent database(s) left at their schema, not checked: "
                      + ", ".join(f"{h['path']} (agent {h['id']}, schema {h['uv']}: {held_reason_text(h['reason'])})"
-                                 for h in cls["held"]) + "; the gateway does not open them")
+                                 for h in cls["held"])
+                     + ("; the gateway does not open them, and its start does not upgrade them"
+                        if self.caps()["startup_state_upgrade"] else "; the gateway does not open them"))
         summary.append(f"schema {self.pkg['schema_state']}/{self.pkg['schema_agent']}")
+        if self.caps()["startup_state_upgrade"]:
+            summary.append("no gateway-start upgrade pending")
         # pc-schema-meta
         sm = schema_meta_problems(p["STATE"], cls, self.pkg)
         if sm:
@@ -3808,6 +4633,16 @@ class Gate:
         # pc-legacy-files
         if cls["files"]:
             pol("pc-legacy-files", "legacy files remain: " + ", ".join(cls["files"][:5]))
+        # pc-cron-partition (runtime_caps cron_partition_binding): cron paused without a default partition
+        if self.caps()["cron_partition_binding"] and (self.pkg.get("schema_state") or 0) >= CRON_PARTITION_SCHEMA:
+            try:
+                st = cron_partition_state(p["STATE"] / "state" / "openclaw.sqlite", cfg, migrated=True)
+            except (sqlite3.Error, C.NodeQueryError, OSError, ValueError, TypeError) as exc:
+                st = None
+                self.warn(f"7/8 could not check the default cron partition ({type(exc).__name__}: "
+                          f"{C.redact_text(str(exc))[:200]})")
+            if st and st["status"] in ("unresolved", "invalid"):
+                pol("pc-cron-partition", cron_partition_text(st, False))
         # pc-config (hard)
         ok, detail = self.config_validate("pc-config")
         if not ok:
@@ -3976,8 +4811,12 @@ class Gate:
         except C.ConfigReadError as exc:
             raise HoldError([finding("pc-config", "hard", f"openclaw.json cannot be read before the pins: {exc}",
                                      "pins")], "pins")
+        # skill_workshop_plugin (2026.11.10+): the schema refuses skills.workshop, so the mode pin goes to the
+        # plugin config (with its migration marker), or is skipped (oc_migrate.apply_pins)
         new_cfg, written, skipped = M.apply_pins(base, set(ledgered),
-                                                 retires_skill_proposals=self.caps()["retires_skill_proposals"])
+                                                 retires_skill_proposals=self.caps()["retires_skill_proposals"],
+                                                 heartbeat_retired=self.caps()["heartbeat_retired"],
+                                                 skill_workshop_plugin=self.caps()["skill_workshop_plugin_config"])
         try:
             self.write_config(new_cfg)
         except ValueError as exc:
@@ -4020,6 +4859,7 @@ class Gate:
         write_marker(mode=self.j["mode"], run_id=self.j["run_id"], binding=current_binding(p["STATE"], cls),
                      runtime=self.pkg["version"], accepted=sorted(self.accepted), orphans=orphans,
                      held=held_marker_entries(p["STATE"], cls))
+        self.note_doctor_captures()  # before finished_at: cleanup deletes them with this run
         self.j["status"] = "done"
         self.j["hold"] = None
         self.j["finished_at"] = C.utc_iso()
@@ -4035,7 +4875,7 @@ class Gate:
             self.say(C.redact_text(f"info: doctor removed retired model {old} from {path} (it inherits the default "
                                    "model)"))
         for o in outcomes:  # D11: a WARN where something is left for the user
-            text = orphan_outcome_text(o, self.pkg["schema_agent"])
+            text = orphan_outcome_text(o, self.pkg["schema_agent"], self.caps()["startup_state_upgrade"])
             if o["outcome"] in ("migrated", "gone") and not o["set_aside"]:
                 self.say(f"info: {text}")
             else:
@@ -4267,6 +5107,25 @@ def _sha_or_none(p):
         return C.sha256_file(p)
     except OSError:
         return None
+
+
+# Doctor stamps wizard.lastRunAt on every config write it makes (2026.11.4 to 2026.11.10:
+# doctor-health-contribution-runners.config.ts applyWizardMetadata, onboard-helpers.ts lastRunAt = now), so a pass that
+# changed nothing else still rewrites openclaw.json. The pass-3 trigger and doctor-not-idempotent compare this digest.
+CONFIG_STAMP_PATHS = ("wizard.lastRunAt",)
+
+
+def _config_digest(p):
+    """sha256 of openclaw.json without doctor's run stamp; the raw sha256 when the file is not one JSON object."""
+    try:
+        cfg = C.read_json_strict(p)
+    except (C.ConfigReadError, OSError):
+        return _sha_or_none(p)
+    wiz = cfg.get("wizard")
+    if isinstance(wiz, dict) and "lastRunAt" in wiz:
+        wiz = {k: v for k, v in wiz.items() if k != "lastRunAt"}
+        cfg = {**cfg, "wizard": wiz} if wiz else {k: v for k, v in cfg.items() if k != "wizard"}
+    return hashlib.sha256(json.dumps(cfg, sort_keys=True).encode()).hexdigest()  # ASCII: lone surrogates too (F5)
 
 
 
@@ -4550,6 +5409,16 @@ CRON_MANUAL_EDIT = ("openclaw automations edit <id> --model <provider/model>@<pr
 CRON_MANUAL = "Manual alternative after the start: " + CRON_MANUAL_EDIT
 # after a key fix line (cron_key_fix_lines): the binding is the last resort, it costs the cross-provider fallbacks
 CRON_MANUAL_LAST = "Otherwise (last resort), after the start: " + CRON_MANUAL_EDIT
+# 2026.11.10+ (runtime_caps cron_bound_live_fallbacks, e8ff306f741): the record holds one account, which only the
+# candidates on its provider use; every candidate on another provider chooses its credentials live
+# (cron/run-inference.ts runParams). There is no account per fallback, so the binding no longer costs the
+# fallbacks and is no last resort.
+CRON_LIVE_ISSUE = "openclaw/openclaw#196539"
+CRON_MANUAL_EDIT_LIVE = ("openclaw automations edit <id> --model <provider/model>@<profileId>; it records that one "
+                         "account, which only the job's candidates on that provider use: its fallbacks on other "
+                         "providers then run on live credentials, as in an interactive run (" + CRON_LIVE_ISSUE + ")")
+CRON_MANUAL_LIVE = "Manual alternative after the start: " + CRON_MANUAL_EDIT_LIVE
+CRON_MANUAL_LAST_LIVE = "Otherwise, after the start: " + CRON_MANUAL_EDIT_LIVE
 CRON_ENV_REF = '{"source":"env","provider":"default","id":"<VAR>"}'
 # AWS SDK credentials are no stored account: model@profile cannot record them (prepare-auth.ts refuses an aws-sdk
 # profile as the job's account), and OpenClaw's own migration (2026.11.2) leaves such a job unbound as well.
@@ -4566,6 +5435,16 @@ CRON_FALLBACK = ("For a job that only stops at a fallback, after the start: drop
                  "as an env SecretRef, or a literal key with models.providers.<provider>.auth \"api-key\"): every run "
                  "of that provider, not only cron, then uses that key instead of its stored login (for a subscription "
                  "login: the metered API key)")
+
+
+def _cron_caps(rec):
+    """runtime_caps of a cron_account_report record's runtime (all off for a record without one)."""
+    return C.runtime_caps((rec or {}).get("runtime"))
+
+
+def _cron_live(rec):
+    """The record's runtime runs a bound job's candidates on other providers on live credentials (2026.11.10+)."""
+    return _cron_caps(rec)["cron_bound_live_fallbacks"]
 
 
 def _cron_kinds(aff):
@@ -4588,16 +5467,20 @@ def _cron_fallback_only(aff):
             and set(a.get("refs") or []) - set(a.get("aws_sdk") or [])]
 
 
-def _cron_remedy(aff, key_fix=False):
+def _cron_remedy(aff, key_fix=False, rec=None):
     """The closing advice: the model@profile binding for a job whose own model is on a stored login (the last resort
-    after key fix lines), dropping the fallback or a configured key for a job that only stops at one (no binding: it
-    would make that fallback the job's model), a configured-key model for AWS SDK credentials (which no binding can
-    record)."""
+    after key fix lines; from 2026.11.10, rec's runtime, it keeps the fallbacks on other providers, which then run
+    on live credentials: no last resort), dropping the fallback or a configured key for a job that only stops at one
+    (no binding: it would make that fallback the job's model), a configured-key model for AWS SDK credentials (which
+    no binding can record)."""
     aws = _cron_kinds(aff)[1]
     prim = any(a.get("primary_affected") and (a.get("refs") or [""])[0] not in (a.get("aws_sdk") or [])
                for a in aff)
     fb = bool(_cron_fallback_only(aff))
-    manual = CRON_MANUAL_LAST if key_fix else CRON_MANUAL
+    if _cron_live(rec):
+        manual = CRON_MANUAL_LAST_LIVE if key_fix else CRON_MANUAL_LIVE
+    else:
+        manual = CRON_MANUAL_LAST if key_fix else CRON_MANUAL
     if prim and fb:  # say which jobs the binding is for
         manual = manual.replace("after the start: ", "after the start, for a job whose own model is refused: ", 1)
     return ". ".join(x for x, on in ((manual, prim), (CRON_FALLBACK, fb), (CRON_AWS_SDK, aws)) if on)
@@ -4620,7 +5503,7 @@ def _cron_promise(aff, rec):
     def provider(a):
         r = (a.get("refs") or [""])[0]
         return r.split("/", 1)[0] if "/" in r else None
-    prim = [a for a in _cron_doctor_binds(aff) if provider(a) not in keyed]
+    prim = [a for a in _cron_doctor_binds(aff, rec) if provider(a) not in keyed]
     if not prim:
         return ""
     if len(prim) == len(aff):
@@ -4630,35 +5513,55 @@ def _cron_promise(aff, rec):
     return "the jobs whose own model is on a stored login"
 
 
-def _cron_doctor_binds(aff):
+def _cron_doctor_binds(aff, rec=None):
     """The affected entries OpenClaw's own migration (#172792, 2026.11.2+) records an account for: the jobs whose own
     model is on a stored login (not on AWS SDK credentials), also one on doctor's copy of a literal key; it binds a job
-    only when exactly one account fits, and the gate reports the jobs doctor leaves after the migration. Doctor skips a
-    job whose own model is set to another runtime than openclaw ("own_runtime": 'runtime <id> inference ownership was
-    left unchanged') or is on a CLI runtime provider (inference-binding-migration.ts)."""
+    only when it can tell which account fits, and the gate reports the jobs doctor leaves after the migration. Doctor
+    skips a job whose own model is set to another runtime than openclaw ("own_runtime": 'runtime <id> inference
+    ownership was left unchanged') or is on a CLI runtime provider (inference-binding-migration.ts). From 2026.11.10
+    (rec's runtime, runtime_caps cron_doctor_binds_codex, 74d1342d3ac) it binds a job on the Codex runtime too, when
+    that model's first credential is a stored profile (binding.runtime "codex"), so own_runtime "codex" stays in."""
+    codex = _cron_caps(rec)["cron_doctor_binds_codex"]
     return [a for a in aff if a.get("primary_affected") and a.get("refs")
-            and a["refs"][0] not in (a.get("aws_sdk") or []) and not a.get("own_runtime")
+            and a["refs"][0] not in (a.get("aws_sdk") or [])
+            and (not a.get("own_runtime") or (codex and a.get("own_runtime") == "codex"))
             and str(a["refs"][0]).split("/", 1)[0] not in CRON_CLI_PROVIDERS]
 
 
 CRON_BOUND_FALLBACKS = ("but then refuses their fallbacks to other providers (as with openclaw/openclaw#192463)")
 CRON_FB_ONLY = ("records only the account of a job's own model: a job whose own model needs no account stays "
                 "unbound, and its fallback on a stored login stays refused")
+# Which account doctor takes, with every 2026.11.2+ runtime (inference-binding-migration.ts, the same selection in
+# 2026.11.2 to 2026.11.10: with several eligible ones the one a run would take now, "Also eligible: ...", none only
+# for an explicit selection with several), and, from 2026.11.10 (cron_bound_live_fallbacks), what a bound job's
+# fallbacks do
+CRON_BINDS_WHEN = "when an eligible account fits (with several, the one a run would take now)"
+CRON_BINDS_WHEN_LIVE = CRON_BINDS_WHEN
+CRON_BOUND_FALLBACKS_LIVE = ("and their fallbacks on other providers then run on live credentials, as in an "
+                             f"interactive run ({CRON_LIVE_ISSUE})")
+
+
+def _cron_binds_clause(rec):
+    """'when ... fits, <what the bound jobs' fallbacks do>' for the texts on the jobs doctor binds (rec's runtime)."""
+    if _cron_live(rec):
+        return f"{CRON_BINDS_WHEN_LIVE}, {CRON_BOUND_FALLBACKS_LIVE}"
+    return f"{CRON_BINDS_WHEN}, {CRON_BOUND_FALLBACKS}"
 
 
 def _cron_outlook(aff, rec, after=False):
     """What OpenClaw's own migration (#172792) does for the affected jobs, as clauses for the closing note and
     `oc-upgrade status`: the account of a job's own model is recorded, but a bound job's fallbacks to other providers
-    are refused (cron/run-inference.ts assertCandidate, as with model@profile: #192463); a job whose own model needs
-    no account stays unbound, and its fallback on a stored login stays refused (embedded runner auth-plan.ts: an
-    unbound cron attempt on a stored profile). On a runtime without that migration (2026.10.10, 2026.11.1) as an
-    outlook "from 2026.11.2"; on one with it (rec "doctor_migration") for this runtime's doctor, and `after` (the
-    report after the migration): the jobs on a stored login that are still listed are the ones doctor left."""
+    are refused (cron/run-inference.ts assertCandidate, as with model@profile: #192463; from 2026.11.10 they run on
+    live credentials instead, #196539: _cron_binds_clause); a job whose own model needs no account stays unbound, and
+    its fallback on a stored login stays refused (embedded runner auth-plan.ts: an unbound cron attempt on a stored
+    profile). On a runtime without that migration (2026.10.10, 2026.11.1) as an outlook "from 2026.11.2"; on one with
+    it (rec "doctor_migration") for this runtime's doctor, and `after` (the report after the migration): the jobs on a
+    stored login that are still listed are the ones doctor left."""
     rt = printable((rec or {}).get("runtime") or "2026.11.2+")
     fb = bool(_cron_fallback_only(aff))
     if (rec or {}).get("doctor_migration"):
         out = []
-        prim = [a for a in aff if a.get("primary_affected")] if after else _cron_doctor_binds(aff)
+        prim = [a for a in aff if a.get("primary_affected")] if after else _cron_doctor_binds(aff, rec)
         if after and not fb:  # also a job on AWS SDK credentials: doctor warns that it records no ambient credential
             return [f"OpenClaw {rt} doctor left them (its warnings are in oc-upgrade log)"]
         if prim and after:
@@ -4667,7 +5570,7 @@ def _cron_outlook(aff, rec, after=False):
         elif prim:
             who = "such jobs" if len(prim) == len(aff) else "the jobs whose own model is on a stored login"
             out.append(f"OpenClaw {rt} doctor records the inference account of {who} during the migration "
-                       f"(openclaw/openclaw#172792) when exactly one account fits, {CRON_BOUND_FALLBACKS}")
+                       f"(openclaw/openclaw#172792) {_cron_binds_clause(rec)}")
         if fb:
             out.append(f"OpenClaw {rt} doctor {CRON_FB_ONLY}")
         return out
@@ -4745,7 +5648,8 @@ def cron_key_fix_lines(rec, indent="", held=False):
                         "To keep the login" + (", after the HOLD is cleared" if by_hand else "")
                         + f": drop {p} from the job's fallbacks (openclaw automations edit <id> "
                         "--fallbacks <list> without it)"
-                        + (f", and for a job whose own model is on {p} the last resort below" if prim else ""))
+                        + (f", and for a job whose own model is on {p} the "
+                           f"{'alternative' if _cron_live(rec) else 'last resort'} below" if prim else ""))
         lines.append(f"{indent}{head}. {fix}")
     return lines
 
@@ -4905,6 +5809,145 @@ def doctor_catalogs(state_dir, targets, orphans):
     return out
 
 
+# --- default cron partition (runtime_caps cron_partition_binding, OpenClaw 2026.11.5+, state schema 34) ----------
+# OpenClaw keys cron rows by their store ("partition", the resolved jobs.json path of the time). From state schema 34 the
+# default store is a recorded identity (config_machine_state "cron.defaultStoreKey"); without one, and unless the
+# inventory is empty or holds the legacy default key, cron is paused ("Default cron partition selection is
+# unresolved; cron is paused") until an interactive doctor selects it. Mirrors
+# openclaw-state-db-cron-identity-migration.ts and cron/store/paths.ts of 2026.11.8 (the same in 2026.11.10).
+CRON_PARTITION_SCHEMA = 34
+CRON_DEFAULT_STORE_STATE_KEY = "cron.defaultStoreKey"
+
+
+def cron_legacy_default_key(env=None):
+    """path.resolve(resolveConfigDir(env), "cron", "jobs.json"): OPENCLAW_STATE_DIR, else the config file's dir."""
+    env = C.openclaw_env() if env is None else env
+    home = env.get("HOME") or os.path.expanduser("~")
+
+    def user_path(v):
+        v = v.strip()
+        if v == "~" or v.startswith("~/"):
+            v = home + v[1:]
+        return os.path.abspath(v)
+    d = (env.get("OPENCLAW_STATE_DIR") or "").strip()
+    if d:
+        base = user_path(d)
+    else:
+        cp = (env.get("OPENCLAW_CONFIG_PATH") or "").strip()
+        base = os.path.dirname(user_path(cp)) if cp else os.path.join(home, ".openclaw")
+    return os.path.join(base, "cron", "jobs.json")
+
+
+def _json_str(v):
+    try:
+        x = json.loads(v) if isinstance(v, str) else None
+    except ValueError:
+        return None
+    return x if isinstance(x, str) and x else None
+
+
+def cron_partitions(state_db):
+    """The persisted cron partition inventory: {store_key: rows}, from the tables 2026.11.8/11.10 count (jobs, scratch,
+    run receipts, run logs, cron task runs, quarantine diagnostics, provisioning receipts). Read-only."""
+    names = table_names(state_db)
+    inv = {}
+
+    def add(key, n=1):
+        if isinstance(key, str) and key:
+            inv[key] = inv.get(key, 0) + int(n or 0)
+    for t in ("cron_jobs", "cron_job_scratch", "cron_run_receipts", "cron_run_logs"):
+        if t in names:
+            for k, n in q(state_db, f"SELECT store_key, COUNT(*) FROM {t} GROUP BY store_key"):
+                add(k, n)
+    if "task_runs" in names:
+        for (detail,) in q(state_db, "SELECT detail_json FROM task_runs WHERE runtime='cron'"):
+            try:
+                d = json.loads(detail) if isinstance(detail, str) else None
+            except ValueError:
+                continue
+            if isinstance(d, dict):
+                add(d.get("storeKey"))
+    if "diagnostic_events" in names:
+        for scope, n in q(state_db, "SELECT scope, COUNT(*) FROM diagnostic_events WHERE scope LIKE 'cron.quarantine:%' "
+                                    "GROUP BY scope"):
+            if isinstance(scope, str):
+                add(scope[len("cron.quarantine:"):], n)
+    if "config_machine_state" in names:
+        for (sk,) in q(state_db, "SELECT state_key FROM config_machine_state WHERE state_key LIKE 'automation-default:%'"):
+            if isinstance(sk, str):
+                add(sk[len("automation-default:"):sk.rfind(":")])
+    return inv
+
+
+def cron_partition_state(state_db, cfg, migrated, env=None):
+    """How the default cron partition resolves on a 2026.11.5+ runtime. `migrated`: the state database is at schema
+    34 or later (else: what its schema-34 migration will do). Returns {"status", "key", "legacy", "partitions"}:
+    status "explicit" (cron.store, or the stored one, names another file: ready), "bound" (recorded identity),
+    "binds" (the migration records one), "default" (no record needed: empty inventory or the legacy key in it),
+    "unresolved" (cron paused) or "invalid" (an unreadable record: paused too)."""
+    legacy = cron_legacy_default_key(env)
+    out = {"legacy": legacy, "key": None, "partitions": {}}
+    if not state_db.is_file():
+        return dict(out, status="default", key=legacy)
+    names = table_names(state_db)
+    machine = {}
+    if "config_machine_state" in names:
+        machine = {k: v for k, v in q(state_db, "SELECT state_key, value_json FROM config_machine_state WHERE "
+                                                 "state_key IN ('cron.store', ?)", (CRON_DEFAULT_STORE_STATE_KEY,))}
+    store = _cfg_get(cfg, "cron", "store")
+    selected = (store.strip() if isinstance(store, str) else "") or _json_str(machine.get("cron.store")) or ""
+    if selected:
+        env_ = C.openclaw_env() if env is None else env
+        home = env_.get("HOME") or os.path.expanduser("~")
+        sel = selected.strip()
+        sel = home + sel[1:] if sel == "~" or sel.startswith("~/") else sel
+        if os.path.abspath(sel) != legacy:
+            return dict(out, status="explicit", key=os.path.abspath(sel))
+    if CRON_DEFAULT_STORE_STATE_KEY in machine:
+        key = _json_str(machine[CRON_DEFAULT_STORE_STATE_KEY])
+        return dict(out, status="bound", key=key) if key else dict(out, status="invalid")
+    inv = cron_partitions(state_db)
+    out["partitions"] = inv
+    if not inv or legacy in inv:
+        return dict(out, status="default" if migrated else "binds", key=legacy)
+    if not migrated and len(inv) == 1:
+        return dict(out, status="binds", key=next(iter(inv)))
+    return dict(out, status="unresolved")
+
+
+def heartbeat_config_paths(cfg):
+    """The heartbeat blocks of openclaw.json (agents.defaults.heartbeat, agents.list[i] / agents.entries.<id>)."""
+    out = []
+    if isinstance(_cfg_get(cfg, "agents", "defaults", "heartbeat"), dict):
+        out.append("agents.defaults.heartbeat")
+    lst = _cfg_get(cfg, "agents", "list")
+    for i, e in enumerate(lst if isinstance(lst, list) else []):
+        if isinstance(e, dict) and isinstance(e.get("heartbeat"), dict):
+            out.append(f"agents.list[{i}].heartbeat")
+    ents = _cfg_get(cfg, "agents", "entries")
+    for k, e in sorted((ents if isinstance(ents, dict) else {}).items()):
+        if isinstance(e, dict) and isinstance(e.get("heartbeat"), dict):
+            out.append(f"agents.entries.{printable(str(k))}.heartbeat")
+    return out
+
+
+def cron_partition_text(st, before):
+    """The WARN/HOLD text for an unresolved or invalid default cron partition (`before`: precheck wording)."""
+    inv = st.get("partitions") or {}
+    parts = "; ".join(f"{printable(k)} ({n} row(s))" for k, n in sorted(inv.items())[:6]) or "none"
+    what = ("OpenClaw's default cron partition record (config_machine_state cron.defaultStoreKey) is unreadable"
+            if st["status"] == "invalid" else
+            f"the cron rows belong to {len(inv)} store(s) and none is the default {printable(st['legacy'])}")
+    if before:
+        return (what + f" (partitions: {parts}): OpenClaw cannot tell which store to run, and its doctor stops "
+                "(\"Default cron partition selection is unresolved\"; HOLD doctor-cron-partition; with heartbeat "
+                "settings its heartbeat migration waits too) until the store is selected in OC_ADDON_UNSAFE=1 openclaw "
+                "doctor --fix in a terminal (the gate's doctor never selects one). Only the jobs of the selected store "
+                "run afterwards")
+    return (what + f" (partitions: {parts}): cron stays paused (\"Default cron partition selection is unresolved\") "
+            "until a default partition is selected in OC_ADDON_UNSAFE=1 openclaw doctor --fix in a terminal")
+
+
 def cron_account_report(state_dir, cfg, runtime=None, doctor_migration=False, pending_copies=False):
     """Forecast for openclaw/openclaw#192195 on the current state (read-only): oc_migrate.cron_account_forecast
     with the auth profiles of the stores and of auth.profiles in openclaw.json, and the profiles OpenClaw's doctor
@@ -4948,7 +5991,8 @@ def cron_account_report(state_dir, cfg, runtime=None, doctor_migration=False, pe
         merged = {p["id"]: p for p in index["shared"]}
         merged.update((p["id"], p) for p in ([] if aid is None else index["agents"].get(aid, [])))
         return {p["provider"].strip().lower() for p in merged.values() if p.get("ref")}
-    copies = mig().doctor_key_copies(cfg, doctor_catalogs(state_dir, targets, orphans), store_ids, store_refs, caps)
+    copies = mig().doctor_key_copies(cfg, doctor_catalogs(state_dir, targets, orphans), store_ids, store_refs, caps,
+                                     shared_providers={str(p.get("provider") or "") for p in index["shared"]})
 
     def copies_for(aid):
         return copies["shared"] + copies["agents"].get(aid, [])
@@ -4988,12 +6032,15 @@ def cron_account_report(state_dir, cfg, runtime=None, doctor_migration=False, pe
         if k["provider"] in own:
             k["own_login"] = True
     if doctor_migration and not pending_copies:  # R6: after a 2026.11.2+ doctor, the gateway's startup warning
-        lw = cron_load_warn_jobs(jobs, cfg, profiles_for, default_agent_id(cfg), configured)
+        # 2026.11.10+: not for a configured key any more (cron_load_warn_stored_only)
+        lw = cron_load_warn_jobs(jobs, cfg, profiles_for, default_agent_id(cfg), configured,
+                                 stored_only=caps["cron_load_warn_stored_only"])
         if lw:
             rec["load_warn"] = [dict(a, id=str(a["id"])[:120], name=C.redact_text(str(a["name"]))[:120])
                                 for a in lw[:CRON_REPORT_MAX]]
             rec["load_warn_count"] = len(lw)
-        bj = cron_bound_jobs(jobs, cfg, default_agent_id(cfg), configured)  # N2: the jobs doctor bound
+        # N2: the jobs doctor bound (2026.11.10+: their candidates on other providers run live)
+        bj = cron_bound_jobs(jobs, cfg, default_agent_id(cfg), configured, live=caps["cron_bound_live_fallbacks"])
         if bj:
             rec["bound_jobs"] = [dict(a, id=str(a["id"])[:120], name=C.redact_text(str(a["name"]))[:120])
                                  for a in bj[:CRON_REPORT_MAX]]
@@ -5041,7 +6088,7 @@ def _synthetic_local_provider(entry):
     return isinstance(api, str) and bool(api.strip()) and mig()._local_base_url(entry.get("baseUrl"))
 
 
-def cron_load_warn_jobs(jobs, cfg, profiles_for, default_agent="main", configured=None):
+def cron_load_warn_jobs(jobs, cfg, profiles_for, default_agent="main", configured=None, stored_only=False):
     """R6: the cron jobs OpenClaw 2026.11.2+ warns about at every gateway start and cron reload ("cron: automation has
     no recorded inference account; run openclaw doctor --fix ...", gateway/server-cron-inference.ts) although its
     doctor leaves them unbound on purpose: agentTurn jobs, enabled or not, with no session target "main", no recorded
@@ -5051,6 +6098,9 @@ def cron_load_warn_jobs(jobs, cfg, profiles_for, default_agent="main", configure
     warning skips those). "key": "config" when the provider has an explicit models.providers.<p>.apiKey (any
     non-blank value or a SecretRef), else "env": the key can only come from the gateway's environment (a
     gateway_env_vars entry such as OPENAI_API_KEY), which a gate run cannot see; without it the job has no credential.
+    stored_only (2026.11.10+, runtime_caps cron_load_warn_stored_only, b9d66a0da1b): the warning skips a first
+    credential that is a configured key (isConfiguredKeyAuthSource, server-cron-inference.ts:143), so only the "env"
+    jobs are left, and the gateway warns about them only while the variable is missing (credentialSource "none").
     Read from openclaw.json only; not modelled: native runtimes. [{"id", "name", "enabled", "provider", "key"}]."""
     M = mig()
     provs = _cfg_get(cfg, "models", "providers")
@@ -5076,6 +6126,8 @@ def cron_load_warn_jobs(jobs, cfg, profiles_for, default_agent="main", configure
             continue  # a stored login (or AWS SDK) comes first: doctor records it (or says why not), the forecast reports it
         key = entry.get("apiKey") if entry else None
         if (isinstance(key, str) and key.strip()) or M.is_secret_ref(key):
+            if stored_only:
+                continue
             kind = "config"
         elif r[0] in CRON_CLI_PROVIDERS or _synthetic_local_provider(entry):
             continue
@@ -5086,7 +6138,7 @@ def cron_load_warn_jobs(jobs, cfg, profiles_for, default_agent="main", configure
     return out
 
 
-def cron_bound_jobs(jobs, cfg, default_agent="main", configured=None):
+def cron_bound_jobs(jobs, cfg, default_agent="main", configured=None, live=False):
     """N2: the agentTurn cron jobs, enabled or not, with a recorded inference account (inferenceBinding; OpenClaw
     2026.11.2+ doctor records it for a job whose own model is on a stored login, openclaw/openclaw#172792) and the
     refs of their model chain (cron_model_chain) that OpenClaw refuses for them from then on: every candidate on a
@@ -5097,7 +6149,13 @@ def cron_bound_jobs(jobs, cfg, default_agent="main", configured=None):
     than the record's (the record is kept when its model is edited without @profile, or when the default model it
     inherits changes: cron-input-validation.ts captureCronUpdatedInferenceBinding) also has "own_refused": that ref,
     and "on_account": its fallbacks on the record's provider, the only candidates OpenClaw can still run (the refusal
-    is no chain stop: model-fallback-runner.ts goes on to the next candidate)."""
+    is no chain stop: model-fallback-runner.ts goes on to the next candidate).
+
+    live (2026.11.10+, runtime_caps cron_bound_live_fallbacks, #196539): OpenClaw refuses none of these candidates.
+    Only those on the recorded provider use the recorded account; every other one, the job's own model included,
+    runs on live credentials (run-inference.ts runParams, isolated-agent/run-prepare.ts uses the record only for its
+    own provider). The entries then have "live" instead of "refused" (the same refs), and "own_live" instead of
+    "own_refused" (no "on_account")."""
     M = mig()
     out = []
     for row in jobs or []:
@@ -5129,9 +6187,11 @@ def cron_bound_jobs(jobs, cfg, default_agent="main", configured=None):
                         refused.append(ref)
                 elif ref not in on_account:
                     on_account.append(ref)
-        out.append(dict({"id": row.get("id"), "name": row.get("name"), "enabled": bool(row.get("enabled")),
-                         "provider": prov, "refused": refused},
-                        **({"own_refused": own, "on_account": on_account} if own else {})))
+        base = {"id": row.get("id"), "name": row.get("name"), "enabled": bool(row.get("enabled")), "provider": prov}
+        if live:
+            out.append(dict(base, live=refused, **({"own_live": own} if own else {})))
+        else:
+            out.append(dict(base, refused=refused, **({"own_refused": own, "on_account": on_account} if own else {})))
     return out
 
 
@@ -5140,33 +6200,50 @@ def _cron_bound_label(a):
     return lab if a.get("enabled") else lab[:-1] + ", disabled)"
 
 
-def _cron_bound_odd(a):
+def _cron_bound_odd(a, live=False):
     """A bound_jobs entry whose own model does not run on its recorded account: the record names no provider, or the
-    job's own model is on another provider (cron_bound_warn_lines)."""
-    return not a.get("provider") or bool(a.get("own_refused"))
+    job's own model is on another provider (cron_bound_warn_lines). live (2026.11.10+): only the record without a
+    provider; a job whose own model is on another provider runs it on live credentials (cron_bound_line)."""
+    return not a.get("provider") or (not live and bool(a.get("own_refused")))
 
 
 def cron_bound_line(rec):
     """N2: the info text for the jobs of a cron_account_report record after a 2026.11.2+ migration that have a
     recorded inference account (bound_jobs) and whose own model runs on it, with the fallbacks OpenClaw refuses for
     them, or None (the other bound jobs: cron_bound_warn_lines). Job ids, names, provider and model ids only (never
-    the recorded profile id)."""
+    the recorded profile id). From 2026.11.10 (rec's runtime, cron_bound_live_fallbacks, #196539) OpenClaw refuses
+    none of their candidates: only those on the recorded provider use the recorded account, every other one runs on
+    live credentials. The line then names every job whose record names a provider, also one whose own model is on
+    another provider (an info, no WARN), and no 'refused:' list."""
+    live = _cron_live(rec)
     bj = [a for a in (rec or {}).get("bound_jobs") or [] if isinstance(a, dict)]
-    ok = [a for a in bj if not _cron_bound_odd(a)]
+    ok = [a for a in bj if not _cron_bound_odd(a, live)]
     n = ((rec or {}).get("bound_jobs_count") or len(bj)) - (len(bj) - len(ok))
     if not bj or n <= 0:
         return None
     off = sum(1 for a in ok if not a.get("enabled"))
     more = f"{' and ' if ok else ''}{n - len(ok)} more" if n > len(ok) else ""
+    head = f"{n} cron job(s){f' ({off} of them disabled)' if off else ''} have a recorded inference account (OpenClaw "
+    if live:
+        rt = printable(rec.get("runtime"))
+
+        def one_live(a):
+            own = a.get("own_live") or a.get("own_refused")
+            return (f"{_cron_bound_label(a)} on {printable(a.get('provider'))}"
+                    + (f" (its own model {printable(own)} is on another provider, so it runs on live credentials too)"
+                       if own else ""))
+        return (head + "2026.11.2+ doctor records one for a job whose own model is on a stored login, "
+                f"openclaw/openclaw#172792): OpenClaw {rt} uses that one account only for their candidates on its "
+                "provider; their fallbacks on other providers run on live credentials, as in an interactive run "
+                f"({CRON_LIVE_ISSUE}; there is no account per fallback): " + "; ".join(one_live(a) for a in ok) + more)
 
     def one(a):
         ref = [printable(r) for r in a.get("refused") or []]
         return (f"{_cron_bound_label(a)} on {printable(a.get('provider'))}"
                 + (f", refused: {', '.join(ref)}" if ref else ", no fallback on another provider"))
-    return (f"{n} cron job(s){f' ({off} of them disabled)' if off else ''} have a recorded inference account (OpenClaw "
-            "2026.11.2+ doctor records one for a job whose own model is on a stored login, openclaw/openclaw#172792): "
-            "their own model runs on that account, and OpenClaw refuses their fallbacks to other providers (as with "
-            "openclaw/openclaw#192463): " + "; ".join(one(a) for a in ok) + more
+    return (head + "2026.11.2+ doctor records one for a job whose own model is on a stored login, "
+            "openclaw/openclaw#172792): their own model runs on that account, and OpenClaw refuses their fallbacks to "
+            "other providers (as with openclaw/openclaw#192463): " + "; ".join(one(a) for a in ok) + more
             + ". To keep such a fallback from being tried, drop it (openclaw automations edit <id> --fallbacks <list> "
             "without it; the job's own list replaces the agent's and the default fallbacks)")
 
@@ -5175,11 +6252,15 @@ def cron_bound_warn_lines(rec):
     """N2-R1: WARN texts for the bound jobs of a cron_account_report record whose own model does not run on the
     recorded account: its provider differs from the record's (OpenClaw refuses it, cron/run-inference.ts
     assertCandidate, and goes on only to fallbacks on the record's provider), or the record names no provider
-    (OpenClaw's normalizeCronInferenceBinding rejects it). Job ids, names, provider and model ids only."""
+    (OpenClaw's normalizeCronInferenceBinding rejects it). Job ids, names, provider and model ids only. From
+    2026.11.10 (cron_bound_live_fallbacks) only the record without a provider: OpenClaw runs an own model on another
+    provider on live credentials ('The selected model uses a different provider ...' is gone), and cron_bound_line
+    names that job."""
     rt = printable((rec or {}).get("runtime") or "2026.11.2+")
+    live = _cron_live(rec)
     out = []
     for a in (rec or {}).get("bound_jobs") or []:
-        if not isinstance(a, dict) or not _cron_bound_odd(a):
+        if not isinstance(a, dict) or not _cron_bound_odd(a, live):
             continue
         head = f"cron job {_cron_bound_label(a)}: "
         fix = "; to fix: openclaw automations edit <id> --model <provider/model>@<profileId>"
@@ -5199,12 +6280,36 @@ def cron_bound_warn_lines(rec):
 def cron_load_warn_line(rec):
     """R6: the info text for a cron_account_report record of a 2026.11.2+ runtime after the migration whose jobs
     run their own model on a configured key or a key from the environment (load_warn), or None. Job ids, names and
-    provider ids only (never a variable's value; the gate cannot see whether it is set)."""
+    provider ids only (never a variable's value; the gate cannot see whether it is set). From 2026.11.10 (rec's
+    runtime, cron_load_warn_stored_only) only the jobs on a key from the environment ("env"): the gateway warns
+    about them only while the variable is missing, and its check has a 5 s budget (cron/service/store.ts:94)."""
     lw = [a for a in (rec or {}).get("load_warn") or [] if isinstance(a, dict)]
     if not lw:
         return None
     n = (rec or {}).get("load_warn_count") or len(lw)
     rt = printable((rec or {}).get("runtime") or "2026.11.2+")
+    if _cron_caps(rec)["cron_load_warn_stored_only"]:
+        env = [a for a in lw if a.get("key") == "env"]  # cron_account_report keeps only these
+        if not env:
+            return None
+        n = n if len(env) == len(lw) else len(env)
+        off = sum(1 for a in env if not a.get("enabled"))
+        more = f" and {n - len(env)} more" if n > len(env) else ""
+        provs = ", ".join(dict.fromkeys(printable(a.get("provider")) for a in env))
+        return (f"{n} cron job(s){f' ({off} of them disabled)' if off else ''} run their own model on a key from the "
+                f"environment ({provs}: a gateway_env_vars entry such as OPENAI_API_KEY or GEMINI_API_KEY) and have "
+                f"no recorded inference account: OpenClaw {rt} doctor leaves such jobs unbound on purpose, and they "
+                "run on that key while the variable is set for the gateway (a gate run cannot check it). While it is "
+                "missing they have no credential and fail when they run, and the gateway writes 'cron: automation has "
+                "no recorded inference account; run openclaw doctor --fix before its next scheduled run ...' (or "
+                "'cron: legacy inference account readiness could not be determined; inspect it with openclaw doctor "
+                "--lint ...') for each of them to OpenClaw's own log (openclaw logs, the Control UI's Logs page; not "
+                "the add-on log), at every start and after each cron.* config change; with the variable set it writes "
+                "nothing for them. That check stops after 5 s in all ('cron: startup inference diagnostics reached "
+                "their time budget; N jobs were not checked. Run openclaw doctor --lint for a complete check.'); "
+                "openclaw doctor --lint is allowed in the add-on and checks every job. The add-on refuses openclaw "
+                "doctor --fix, and its equivalent oc-upgrade retry --doctor would not record an account for these "
+                "jobs either: " + ", ".join(cron_job_label(a) for a in env) + more)
     off = sum(1 for a in lw if not a.get("enabled"))
     more = f" and {n - len(lw)} more" if n > len(lw) else ""
 
@@ -5286,15 +6391,18 @@ def cron_include_line(rec):
 
 def cron_doctor_binds_text(binds, rec, runtime):
     """Precheck info text on a 2026.11.2+ runtime (cron_doctor_migration) for the affected jobs whose own model is on a
-    stored login (_cron_doctor_binds): doctor records that account during the migration when exactly one fits, and a
-    bound job's fallbacks to other providers are refused from then on (job ids, names and model refs only)."""
+    stored login (_cron_doctor_binds): doctor records that account during the migration (CRON_BINDS_WHEN), and a
+    bound job's fallbacks to other providers are refused from then on (job ids, names and model refs only). From
+    2026.11.10 (cron_bound_live_fallbacks) those fallbacks run on live credentials instead (_cron_binds_clause)."""
     rt = printable(runtime or "2026.11.2+")
     jobs = ", ".join(cron_job_label(a) for a in binds[:CRON_REPORT_MAX])
     more = f" and {len(binds) - CRON_REPORT_MAX} more" if len(binds) > CRON_REPORT_MAX else ""
     copied = sorted(printable(x) for x in cron_doctor_binds_keyed(binds, rec))
+    live = C.runtime_caps(runtime)["cron_bound_live_fallbacks"]
+    when = (f"(openclaw/openclaw#172792) {CRON_BINDS_WHEN_LIVE}, {CRON_BOUND_FALLBACKS_LIVE}" if live else
+            f"(openclaw/openclaw#172792) {CRON_BINDS_WHEN}, {CRON_BOUND_FALLBACKS}")
     return (f"{len(binds)} enabled cron job(s) without a recorded inference account run their own model on a stored "
-            f"login: {jobs}{more}; OpenClaw {rt} doctor records that account during the migration when exactly one "
-            f"fits (openclaw/openclaw#172792), {CRON_BOUND_FALLBACKS}"
+            f"login: {jobs}{more}; OpenClaw {rt} doctor records that account during the migration {when}"
             + (f"; for {', '.join(copied)} that account would be doctor's copy of the literal key (the provider line "
                "below says how to keep that key configured instead)" if copied else "")
             + "; the gate reports the jobs doctor leaves after the migration")
@@ -5304,7 +6412,7 @@ def cron_doctor_rest(rec):
     """The part of a precheck cron_account_report record a 2026.11.2+ doctor leaves (None when nothing is left): the
     jobs whose own model needs no stored login and that stop at a fallback on one, and the jobs on AWS SDK
     credentials; with the key fix entries of the providers those jobs reach."""
-    binds = _cron_doctor_binds((rec or {}).get("affected") or [])
+    binds = _cron_doctor_binds((rec or {}).get("affected") or [], rec)
     rest = [a for a in (rec or {}).get("affected") or [] if all(a is not b for b in binds)]
     if not rest:
         return None
@@ -5350,13 +6458,22 @@ def cron_codex_clause(a, ref, primary=False):
 
 def cron_own_runtime_clause(a, rec):
     """wf4: the clause of a per-job cron WARN whose own model is set to another runtime than openclaw (entry
-    "own_runtime"): OpenClaw 2026.11.2+ doctor records no inference account for such a job, or ""."""
+    "own_runtime"): OpenClaw 2026.11.2+ doctor records no inference account for such a job, or "". From 2026.11.10
+    (rec's runtime, cron_doctor_binds_codex, 74d1342d3ac) doctor binds a job on the Codex runtime when that model's
+    first credential is a stored profile (inference-binding-migration.ts: binding.runtime "codex"; native or
+    credentialless Codex auth is skipped): such a job is in _cron_doctor_binds, so after the migration a listed one is
+    a job doctor left."""
     rid = a.get("own_runtime")
     if not rid:
         return ""
     rid, at = printable(rid), printable(a.get("own_runtime_at") or "agentRuntime")
     if (rec or {}).get("doctor_migration"):
         rt = printable(rec.get("runtime") or "2026.11.2+")
+        if a.get("own_runtime") == "codex" and _cron_caps(rec)["cron_doctor_binds_codex"]:
+            return (f"; its model is set to the codex runtime ({at}): OpenClaw {rt} doctor records the account of such "
+                    "a job for the Codex runtime when that model's first credential is a stored login "
+                    "(openclaw/openclaw#189979), but it left this job unbound (doctor's warnings are in oc-upgrade "
+                    "log)")
         return (f"; its model is set to the {rid} runtime ({at}), so OpenClaw {rt} doctor records no inference account "
                 f"for it (doctor: 'runtime {rid} inference ownership was left unchanged') and every run stays refused")
     return (f"; its model is set to the {rid} runtime ({at}), so OpenClaw's own migration (2026.11.2, "
@@ -5419,7 +6536,7 @@ def cron_job_lines(rec, fixup=False, forecast=False):
     if len(aff) > CRON_REPORT_MAX:
         lines.append(f"and {len(aff) - CRON_REPORT_MAX} more cron job(s) (oc-upgrade status)")
     lines += cron_key_fix_lines(rec)
-    remedy = _cron_remedy(aff, bool(keyed))
+    remedy = _cron_remedy(aff, bool(keyed), rec)
     if rec.get("doctor_migration") and not forecast:
         left = _cron_outlook(aff, rec, after=True)
         lines.append(f"{len(aff)} cron job(s) above still have no recorded inference account after the migration: "
@@ -5503,10 +6620,19 @@ def cron_fixup_none_text(a, runtime):
     """N2-R2: why a config fixup (a cron_account_report "autofix" entry) keeps no enabled cron job working: the jobs
     that reach its provider ("bound": their ids) do so only as a fallback of their own model on another provider's
     stored login, which OpenClaw 2026.11.2+ doctor records as their account (their fallbacks to other providers are
-    refused from then on; unbound, the stored login stops the chain first)."""
+    refused from then on; unbound, the stored login stops the chain first). From 2026.11.10 (cron_bound_live_fallbacks,
+    #196539) a bound job runs that fallback on live credentials: on the configured key with the fixup, on doctor's
+    copy without it, so the fixup changes nothing for these jobs either."""
     p, nb = printable(a.get("provider")), len(a.get("bound") or [])
     if not nb:
         return "for no enabled cron job"
+    rt = printable(runtime or "2026.11.2+")
+    if C.runtime_caps(runtime)["cron_bound_live_fallbacks"]:
+        return (f"for no enabled cron job: the {nb} enabled cron job(s) that reach {p} only as a fallback run their "
+                f"own model on another provider's stored login; once OpenClaw {rt} doctor records that account for "
+                f"them, their fallbacks on other providers run on live credentials ({CRON_LIVE_ISSUE}), {p} on the "
+                "configured key with this fixup and on doctor's copy of the key without it; without that account "
+                f"their own model is refused and the chain stops before {p}")
     return (f"for no enabled cron job: the {nb} enabled cron job(s) that reach {p} only as a fallback run their own "
             f"model on another provider's stored login, so OpenClaw {printable(runtime or '2026.11.2+')} refuses {p} "
             "for them either way (with the account doctor records for them, or without it)")
@@ -5554,22 +6680,62 @@ def cron_fixup_kept_jobs(before, after, providers, behind=None):
     return out
 
 
-def cron_fixup_kept_text(kept, fix, runtime):
-    """Info text: the cron jobs the automatic fix keeps working (job id, name and model refs only)."""
-    provs = {r.split("/", 1)[0] for _a, refs in kept for r in refs}
-    paths = ", ".join(printable(f["path"]) for f in fix if f["provider"] in provs)
-    models = ", ".join(dict.fromkeys(printable(r) for _a, refs in kept for r in refs))
-    jobs = ", ".join(cron_job_label(a) for a, _r in kept[:CRON_REPORT_MAX])
-    more = f" and {len(kept) - CRON_REPORT_MAX} more" if len(kept) > CRON_REPORT_MAX else ""
-    return (f"{len(kept)} enabled cron job(s) kept working by the automatic fix ({paths} = \"api-key\" before doctor "
-            f"pass 1; otherwise OpenClaw {runtime} refuses {models} on doctor's copy of the literal key): {jobs}{more}")
+def _cron_kept_own(entry):
+    """A cron_fixup_kept_jobs entry (affected entry, refs) whose own model is among the refs the fix keeps."""
+    a, refs = entry
+    return bool(a.get("primary_affected")) and (a.get("refs") or [None])[0] in refs
+
+
+def cron_fixup_kept_text(kept, fix, runtime, still=None):
+    """Info text: the cron jobs the automatic fix keeps working (job id, name and model refs only). still: the ids of
+    the jobs the forecast with the fix still lists (a fallback of theirs stays refused).
+
+    From 2026.11.10 (cron_bound_live_fallbacks) two groups. A job that reaches a fixed provider as a fallback is kept
+    working as before (without the fix, that fallback is refused on doctor's copy and stops the chain). A job whose
+    own model is on a fixed provider would work without the fix too: doctor binds it to its copy of the literal key
+    (inference-binding-migration.ts), and its fallbacks on other providers then run on live credentials (#196539).
+    With the fix it stays unbound on the configured key, so a fallback of its on a stored login stays refused
+    (#192195; such a job is in `still` and has a WARN line of its own)."""
+    def paths_of(group):
+        provs = {r.split("/", 1)[0] for _a, refs in group for r in refs}
+        return ", ".join(printable(f["path"]) for f in fix if f["provider"] in provs)
+
+    def models_of(group):
+        return ", ".join(dict.fromkeys(printable(r) for _a, refs in group for r in refs))
+
+    def jobs_of(group):
+        more = f" and {len(group) - CRON_REPORT_MAX} more" if len(group) > CRON_REPORT_MAX else ""
+        return ", ".join(cron_job_label(a) for a, _r in group[:CRON_REPORT_MAX]) + more
+    if not C.runtime_caps(runtime)["cron_bound_live_fallbacks"]:
+        return (f"{len(kept)} enabled cron job(s) kept working by the automatic fix ({paths_of(kept)} = \"api-key\" "
+                f"before doctor pass 1; otherwise OpenClaw {runtime} refuses {models_of(kept)} on doctor's copy of the "
+                f"literal key): {jobs_of(kept)}")
+    own = [x for x in kept if _cron_kept_own(x)]
+    fb = [x for x in kept if not _cron_kept_own(x)]
+    out = []
+    if fb:
+        out.append(f"{len(fb)} enabled cron job(s) kept working by the automatic fix ({paths_of(fb)} = \"api-key\" "
+                   f"before doctor pass 1; otherwise OpenClaw {runtime} refuses {models_of(fb)} on doctor's copy of "
+                   f"the literal key, and that stops the chain): {jobs_of(fb)}")
+    if own:
+        late = [a for a, _r in own if still is not None and a.get("id") in still]
+        out.append(f"{len(own)} enabled cron job(s) whose own model the automatic fix keeps on the configured key "
+                   f"({paths_of(own)} = \"api-key\" before doctor pass 1): {jobs_of(own)}. Without the fix OpenClaw "
+                   f"{runtime} doctor would record its copy of the literal key as their account: their own model "
+                   "would run on that copy, and their fallbacks on other providers on live credentials "
+                   f"({CRON_LIVE_ISSUE}). With the fix they stay unbound"
+                   + (f", so a fallback that needs a recorded account stays refused ({CRON_FIXUP_ISSUE}) for "
+                      f"{', '.join(cron_job_label(a) for a in late[:CRON_REPORT_MAX])} (the WARN lines below)"
+                      if late else ""))
+    return ". ".join(out)
 
 
 def cron_fixup_behind_text(behind):
     """Info text: the cron jobs that reach a model the automatic fix covers only after a fallback that stays refused,
     so the fix does not keep them working (job id, name and model refs only). N2: on a 2026.11.2+ runtime the caller
     leaves out the jobs whose own model doctor binds (their own model runs, their fallbacks to other providers are
-    refused: the precheck's info line on those jobs and cron_bound_line after the migration)."""
+    refused, from 2026.11.10 run on live credentials: the precheck's info line on those jobs and cron_bound_line after
+    the migration)."""
     models = ", ".join(dict.fromkeys(printable(r) for _a, refs in behind for r in refs))
     jobs = ", ".join(cron_job_label(a) for a, _r in behind[:CRON_REPORT_MAX])
     more = f" and {len(behind) - CRON_REPORT_MAX} more" if len(behind) > CRON_REPORT_MAX else ""
@@ -6456,17 +7622,26 @@ def sw_export_record(gp, run_id):
 # backups of the state database (state/openclaw.sqlite.doctor-cron-*.bak, R5) ---------
 
 def doctor_copy_kind(name):
-    """"full" | "scoped" for doctor's pre-migration SQLite copies, "cron" for its pre-repair cron backups of the
+    """"full" | "scoped" for doctor's pre-migration SQLite copies, "snapshot" for its pre-repair snapshots, "catalog"
+    for its copies of an agent's models.json (DOCTOR_CATALOG_COPY_RE), "cron" for its pre-repair cron backups of the
     state database (DOCTOR_CRON_COPY_RE), else None."""
     if DOCTOR_COPY_RE.fullmatch(name):
         return "scoped" if name.endswith(".scoped.bak") else "full"
+    if DOCTOR_SNAPSHOT_RE.fullmatch(name):
+        return "snapshot"
+    if DOCTOR_CATALOG_COPY_RE.fullmatch(name):
+        return "catalog"
     return "cron" if DOCTOR_CRON_COPY_RE.fullmatch(name) else None
 
 
 def doctor_cron_copy_ms(name):
-    """The creation time (ms since the epoch) in the name of a pre-repair cron backup, else None."""
+    """The creation time (ms since the epoch) in the name of a pre-repair cron backup or of a models.json copy, else
+    None."""
     m = DOCTOR_CRON_COPY_RE.fullmatch(name)
-    return int(m.group(1).split("-", 1)[0]) if m else None
+    if m:
+        return int(m.group(1).split("-", 1)[0])
+    m = DOCTOR_CATALOG_COPY_RE.fullmatch(name)
+    return int(m.group(1)) if m else None
 
 
 def _made_since(path, since):
@@ -6507,6 +7682,8 @@ def doctor_copies(state_dir):
     if not state_dir.is_dir():
         return found
     for root, dirs, files in os.walk(state_dir, followlinks=False):
+        if root == str(state_dir):  # OpenClaw 2026.11.10's private copy of the state (startup upgrade): never its copies
+            dirs[:] = [d for d in dirs if not d.startswith((UPGRADE_WORK_PREFIX, TOMB_PREFIX + UPGRADE_WORK_PREFIX))]
         rec = [d for d in dirs if DOCTOR_RECOVERY_DIR_RE.fullmatch(d)]
         if rec:
             dirs[:] = [d for d in dirs if d not in rec]
@@ -6619,8 +7796,10 @@ def orphan_outcomes(state_dir, orphans, a_target, since=None):
     return out
 
 
-def orphan_outcome_text(o, a_target=None):
-    """The finalize/status text of an orphan_outcomes entry."""
+def orphan_outcome_text(o, a_target=None, startup_upgrade=False):
+    """The finalize/status text of an orphan_outcomes entry. startup_upgrade: the gateway start upgrades outdated
+    stores by copy and swap (runtime_caps startup_state_upgrade, OpenClaw 2026.11.10+): it opens an orphan read-only at
+    each start, and one below the target makes it copy the state."""
     head = f"orphan agent database {printable(o.get('path'))} (agent {printable(o.get('id'))}, schema " \
            f"{o.get('uv') if o.get('uv') is not None else 'unreadable'} before): "
     aside = ", ".join(printable(x) for x in o.get("set_aside") or [])
@@ -6630,11 +7809,13 @@ def orphan_outcome_text(o, a_target=None):
     if out == "set-aside":
         return head + "doctor found it to be a byte-identical copy of another agent's database and " + kept
     if out == "migrated":
-        text = f"doctor migrated it to schema {o.get('uv_after')}; the gateway does not open it"
+        text = f"doctor migrated it to schema {o.get('uv_after')}; " + (
+            "the gateway opens it read-only at each start" if startup_upgrade else "the gateway does not open it")
     elif out == "not-migrated":
         text = (f"still at schema {o.get('uv_after')}" + (f" (target {a_target})" if a_target else "")
-                + ": doctor did not migrate it (refused or held back; oc-upgrade log says why); the gateway does "
-                "not open it")
+                + ": doctor did not migrate it (refused or held back; oc-upgrade log says why); "
+                + ("the gateway start would copy the state to upgrade it (pc-startup-upgrade)" if startup_upgrade else
+                   "the gateway does not open it"))
     elif out == "gone":
         text = "gone after doctor"
     else:
@@ -6659,7 +7840,7 @@ def outside_agent_dirs(state_dir, cfg):
 
 
 def outside_doctor_copies(dirs):
-    """{absolute path: (size, "full" | "scoped" | "recovery")} of doctor's SQLite copies directly in `dirs` (no
+    """{absolute path: (size, "full" | "scoped" | "snapshot" | "catalog" | "recovery")} of doctor's copies directly in `dirs` (no
     recursion; regular files only, links are not followed), and its pre-repair recovery directories there (real
     directories only)."""
     found = {}
@@ -6675,14 +7856,15 @@ def outside_doctor_copies(dirs):
                 if size is not None:
                     found[pth] = (size, "recovery")
                 continue
-            if not DOCTOR_COPY_RE.fullmatch(name):
+            kind = doctor_copy_kind(name)
+            if kind is None or kind == "cron":  # cron backups exist only beside the state database
                 continue
             try:
                 st = os.lstat(pth)
             except OSError:
                 continue
             if stat.S_ISREG(st.st_mode):
-                found[pth] = (st.st_size, "scoped" if name.endswith(".scoped.bak") else "full")
+                found[pth] = (st.st_size, kind)
     return found
 
 
@@ -6717,9 +7899,11 @@ def copies_text(entries):
     recovery directory with a full database copy by doctor, …'."""
     if not entries:
         return "no new pre-migration SQLite copy by doctor"
-    mig_ = [e for e in entries if e.get("scope") not in ("cron", "recovery")]
+    mig_ = [e for e in entries if e.get("scope") not in ("cron", "recovery", "snapshot", "catalog")]
+    ncat = sum(1 for e in entries if e.get("scope") == "catalog")
     nc = sum(1 for e in entries if e.get("scope") == "cron")
     nr = sum(1 for e in entries if e.get("scope") == "recovery")
+    nsn = sum(1 for e in entries if e.get("scope") == "snapshot")
     nf = sum(1 for e in mig_ if e.get("scope") != "scoped")
     ns = len(mig_) - nf
     parts = []
@@ -6731,6 +7915,12 @@ def copies_text(entries):
     if nr:
         parts.append("1 pre-repair recovery directory with a full database copy" if nr == 1 else
                      f"{nr} pre-repair recovery directories with full database copies")
+    if nsn:
+        parts.append(f"{nsn} pre-repair SQLite snapshot{'' if nsn == 1 else 's'} (auth profile, ACP, exec "
+                     "approvals or gateway token migration)")
+    if ncat:
+        parts.append(f"{ncat} cop{'y' if ncat == 1 else 'ies'} of an agent's models.json (models.json.bak-*, with "
+                     "its literal provider keys)")
     what = parts[0] if len(parts) == 1 else ", ".join(parts[:-1]) + " and " + parts[-1]
     return f"{what} by doctor, {C.human(sum(int(e.get('size') or 0) for e in entries))}"
 
@@ -6763,6 +7953,11 @@ def doctor_cron_copy_ids(text):
     return set(SAVED_CRON_COPY_ID_RE.findall(_flat_doctor_text(text)))
 
 
+def doctor_catalog_copy_ids(text):
+    """The <ms> of the models.json copies one doctor log says it saved (OpenClaw 2026.11.10)."""
+    return set(SAVED_CATALOG_COPY_RE.findall(_flat_doctor_text(text)))
+
+
 def doctor_recovery_dirs(text):
     """The names of the pre-repair recovery directories one doctor log says it saved (or kept after a failed
     repair)."""
@@ -6787,7 +7982,7 @@ def run_doctor_copies(gp, j, present=None):
         for e in (d.get("pre_migration_backups") or []) if isinstance(d, dict) else []:
             if isinstance(e, dict) and e.get("scope") and isinstance(e.get("path"), str):
                 want.add(e["path"])
-    groups, cron_ids, rec_dirs = set(), set(), set()
+    groups, cron_ids, rec_dirs, cat_ids = set(), set(), set(), set()
     for log in sorted((gp["RUNS"] / str(j.get("run_id"))).glob("doctor-pass*.log")):
         try:
             text = log.read_bytes().decode("utf-8", "replace")
@@ -6796,6 +7991,7 @@ def run_doctor_copies(gp, j, present=None):
         groups |= doctor_copy_groups(text)
         cron_ids |= doctor_cron_copy_ids(text)  # R5: also a pass the gate was stopped in (no journal record)
         rec_dirs |= doctor_recovery_dirs(text)
+        cat_ids |= doctor_catalog_copy_ids(text)
     for r, (_size, kind) in present.items():
         if kind == "recovery" and Path(r).name in rec_dirs:
             want.add(r)
@@ -6804,6 +8000,9 @@ def run_doctor_copies(gp, j, present=None):
             want.add(r)
         c = DOCTOR_CRON_COPY_RE.fullmatch(Path(r).name)
         if c and c.group(1) in cron_ids:
+            want.add(r)
+        k = DOCTOR_CATALOG_COPY_RE.fullmatch(Path(r).name)
+        if k and k.group(1) in cat_ids:
             want.add(r)
     state_real = Path(os.path.realpath(str(gp["STATE"])))
     kept = [(x, f"beside an agent database outside {gp['STATE']}: not deleted by the add-on, delete it yourself")
@@ -7161,6 +8360,21 @@ def primary_model_refs(cfg):
     return out
 
 
+def is_cli_error(data):
+    """OpenClaw's JSON error envelope of a failed --json command ({ok: false, error: {type: "cli_error", message}},
+    2026.11.x failure-output.ts formatCliJsonFailure, written to stdout with exit 1)."""
+    return isinstance(data, dict) and (data.get("ok") is False or isinstance(data.get("error"), dict))
+
+
+def cli_error_text(data):
+    """': <redacted message>' of an OpenClaw JSON error envelope, else ''."""
+    if not is_cli_error(data):
+        return ""
+    err = data.get("error") if isinstance(data.get("error"), dict) else {}
+    msg = err.get("message") if isinstance(err.get("message"), str) else ""
+    return f": {C.redact_text(msg)[:200]}" if msg else ""
+
+
 def models_status_problems(rc, data, auth_profiles, codex_allowed=False, primaries=None):
     """Returns [(code, message)]; code "warn" means log only (never HOLD).
 
@@ -7180,7 +8394,12 @@ def models_status_problems(rc, data, auth_profiles, codex_allowed=False, primari
         else:
             probs.append(("pc-models-status", "models status returned no JSON"))
         return probs
-    auth = data.get("auth") if isinstance(data.get("auth"), dict) else {}
+    if is_cli_error(data) or not isinstance(data.get("auth"), dict):
+        # the command failed (an unresolvable config secret, a refused state read, ...): no route was checked, and an
+        # empty profile list must not read as a lost login
+        return [("pc-models-status", f"models status --check failed (rc {rc})"
+                 + (cli_error_text(data) if is_cli_error(data) else ": no auth status in its JSON"))]
+    auth = data["auth"]
     routes = auth.get("runtimeAuthRoutes") if isinstance(auth.get("runtimeAuthRoutes"), list) else []
     codex = [r for r in routes if isinstance(r, dict) and r.get("runtime") == "codex"]
     if codex and not codex_allowed:
@@ -7414,6 +8633,12 @@ def dry_run(network=False, emit=out):
         if cls["verdict"] == "newer":
             emit(f"[gate] dry-run: would HOLD newer-state: {'; '.join(cls['newer'])}")
             return 20
+        startup = plan_startup_upgrade(g.gp, pkg, cfg, planning_held(g.gp["STATE"], marker, pkg)) \
+            if not gate_needed and (marker_rt or not marker) else None
+        if startup:  # OpenClaw 2026.11.10+: the plan holds instead of starting OpenClaw
+            code = "startup-upgrade-unfinished" if startup["plan"] else "startup-upgrade-pending"
+            emit(f"[gate] dry-run: would HOLD {code}: {startup['message']}")
+            return 20
         if not gate_needed:
             emit(f"[gate] dry-run: nothing to migrate (marker: {(marker or {}).get('mode') or 'none'})")
             if isinstance(cfg, dict):  # G1 also runs in a maintenance gate (oc-upgrade retry --doctor + restart)
@@ -7507,6 +8732,12 @@ def _readiness_cron(g):
             return f"for {late} enabled cron job(s) that reach {p} only after a fallback that stays refused"
         if not n:  # N2-R2: only jobs doctor binds to another provider's stored login reach it
             return cron_fixup_none_text(a, g.pkg["version"])
+        own = len([x for x in a.get("own") or [] if x in (a.get("jobs") or [])])
+        if own and g.caps()["cron_bound_live_fallbacks"]:  # 2026.11.10+: doctor would bind those to its key copy
+            own_txt = (f"makes {own} enabled cron job(s) whose own model is on {p} use its configured key, not "
+                       "doctor's copy")
+            return (f"keeps {n - own} enabled cron job(s) that reach {p} as a fallback working, and {own_txt}"
+                    if n > own else own_txt)
         return f"keeps {n} enabled cron job(s) on {p} working"
     lines = [f"[gate]   cron config fixup: would set {printable(a['path'])} = \"api-key\" before doctor pass 1 "
              f"({why(a)}; {CRON_FIXUP_ISSUE})" for a in fix]
@@ -7515,13 +8746,19 @@ def _readiness_cron(g):
     aff = rec["affected"]
     n, rt, on = len(aff), g.pkg["version"], _cron_on(aff)
     if rec.get("doctor_migration"):  # 2026.11.2+: doctor records only the account of a job's own stored login
-        binds = _cron_doctor_binds(aff)
+        binds = _cron_doctor_binds(aff, rec)
         rest = (cron_doctor_rest(rec) or {}).get("affected") or []
         out = []
-        if binds:
+        if binds and g.caps()["cron_bound_live_fallbacks"]:  # 2026.11.10+
             out.append(f"[gate]   cron inference accounts: {len(binds)} enabled cron job(s) run their own model on "
-                       f"a stored login without a recorded account; OpenClaw {rt} doctor records it when exactly one "
-                       "account fits (openclaw/openclaw#172792), then refuses their fallbacks to other providers")
+                       f"a stored login without a recorded account; OpenClaw {rt} doctor records it "
+                       f"(openclaw/openclaw#172792) {CRON_BINDS_WHEN_LIVE}, and their fallbacks on other providers "
+                       f"then run on live credentials ({CRON_LIVE_ISSUE})")
+        elif binds:
+            out.append(f"[gate]   cron inference accounts: {len(binds)} enabled cron job(s) run their own model on "
+                       f"a stored login without a recorded account; OpenClaw {rt} doctor records it "
+                       f"(openclaw/openclaw#172792) {CRON_BINDS_WHEN}, then refuses their fallbacks to other "
+                       "providers")
         if rest:
             out.append(f"[gate]   cron inference accounts: {len(rest)} enabled cron job(s) stop at {_cron_on(rest)} on "
                        f"OpenClaw {rt} and doctor records no account for them (the WARN lines above, "
@@ -7542,6 +8779,7 @@ def hold_after_start(code, last_rc=None, emit=out):
     """`gate --hold-exit78` / `gate --hold-crash-loop <rc>`: always rc 0 (spec §10)."""
     gp = gpaths()
     g = Gate(emit=emit)
+    cfg = {}
     try:
         try:
             g.pkg = C.runtime_package()
@@ -7565,6 +8803,20 @@ def hold_after_start(code, last_rc=None, emit=out):
             nxt = ("run `openclaw config validate` (allowed in HOLD), check the gateway log "
                    "/tmp/openclaw/openclaw-<YYYY-MM-DD>.log, fix, then `oc-upgrade retry`; for plugin problems "
                    "`oc-upgrade retry --doctor` (re-runs doctor, updates plugins)")
+        if g.pkg and C.runtime_caps(g.pkg)["startup_state_upgrade"]:
+            # OpenClaw 2026.11.10+: the start may have failed in its own copy-and-swap upgrade (state-upgrade.ts)
+            pend = startup_upgrade_pending(gp["STATE"], g.pkg["schema_state"], g.pkg["schema_agent"], cfg)
+            if pend["work_dirs"] or pend["outdated"]:
+                msg += ("; " + startup_upgrade_text(pend, g.pkg["version"], g.pkg["schema_state"], g.pkg["schema_agent"])
+                        + ". In the add-on log, the gateway's lines \"State upgrade to <version> stopped: ...\" (disk "
+                          "full or an I/O error; nothing was changed), \"State upgrade to <version> not applied: ...\" "
+                          "(the upgraded config is invalid; nothing was changed) and \"State upgrade chain failed at "
+                          "...\" say what happened")
+                nxt = ADVICE["startup-upgrade-unfinished"] if any(w["plan"] for w in pend["work_dirs"]) else \
+                    ("if the gateway said the disk is full, free space first. Then, for an agent folder you no longer "
+                     "use (neither configured nor registered): move it out of /config/.openclaw/agents (it is in your "
+                     "encrypted backup); otherwise oc-upgrade retry --doctor, so that the gate's doctor migrates in "
+                     "place; then restart the add-on")
         try:
             g.j = load_journal()
         except (OSError, ValueError):
@@ -7763,11 +9015,24 @@ def cleanup_blocked(gp, cur):
     return None
 
 
+def capture_dirs(gp):
+    """Names of the doctor-<uuid> directories (real directories, no symlinks) in <state>.update-captures."""
+    root = captures_root(gp)
+    if os.path.islink(str(root)) or not root.is_dir():
+        return []
+    try:
+        names = os.listdir(root)
+    except OSError:
+        return []
+    return sorted(n for n in names if CAPTURE_NAME_RE.match(n) and not os.path.islink(str(root / n))
+                  and (root / n).is_dir())
+
+
 def run_captures(gp, j):
     """The doctor capture directories a gate run created: parsed from its doctor logs (sealed captures and the
-    evidence of a failed capture, N1) and validated (inside <state>.update-captures, OpenClaw's doctor-<uuid> name,
-    a real directory). The rule (no plaintext copies of secrets) wins over OpenClaw's own retention, so
-    captures with outcome.json go too."""
+    evidence of a failed capture, N1) and the directories it recorded (Gate.note_doctor_captures), all validated (inside <state>.update-captures,
+    OpenClaw's doctor-<uuid> name, a real directory). The rule (no plaintext copies of secrets) wins over
+    OpenClaw's own retention, so captures with outcome.json go too."""
     root = captures_root(gp)
     found = set()
     for log in sorted((gp["RUNS"] / str(j.get("run_id"))).glob("doctor-pass*.log")):
@@ -7778,6 +9043,7 @@ def run_captures(gp, j):
         for line in text.splitlines():
             for m in CAPTURE_RE.finditer(ANSI_RE.sub("", line)):
                 found.add(next(g for g in m.groups() if g).rstrip(".,;:"))
+    found |= {str(root / x) for x in j.get("doctor_captures") or [] if isinstance(x, str) and CAPTURE_NAME_RE.match(x)}
     keep, refused = [], []
     for c in sorted(found):
         pth = Path(c)
@@ -7940,6 +9206,63 @@ def _delete_doctor_copy(gp, parts, facts=None):
         os.close(dfd)
 
 
+def _delete_startup_work(state, name):
+    """A `.upgrade-*` entry of the state dir (OpenClaw 2026.11.10+ startup upgrade), or the add-on's tombstone of one,
+    through _delete_entry (tombstone first; a link is never followed). A directory that holds plan.json (an interrupted
+    swap the next gateway start finishes) is refused, checked through its fd right before the delete."""
+    if not name.startswith((UPGRADE_WORK_PREFIX, TOMB_PREFIX + UPGRADE_WORK_PREFIX)):
+        raise OSError(errno.EPERM, "not a state-upgrade work directory", name)
+    if name.startswith(UPGRADE_WORK_PREFIX):
+        bfd = _open_parent(state)
+        try:
+            if stat.S_ISDIR(os.stat(name, dir_fd=bfd, follow_symlinks=False).st_mode):
+                dfd = os.open(name, _DIR_NOFOLLOW, dir_fd=bfd)
+                try:
+                    os.stat(UPGRADE_PLAN_FILE, dir_fd=dfd, follow_symlinks=False)
+                except FileNotFoundError:
+                    pass
+                else:
+                    raise OSError(errno.EPERM, "it holds plan.json (an interrupted swap): never deleted", name)
+                finally:
+                    os.close(dfd)
+        finally:
+            os.close(bfd)
+    return _delete_entry(state, name)
+
+
+def _startup_leftover_parts(state_real, path):
+    """The components of `path` below the (real) state dir when it names a <file>.pre-<version> generation, a
+    logs/state-upgrade-<version>.log or a staged copy directly in the state dir (STARTUP_STAGED_RE) of OpenClaw's
+    startup upgrade, else None."""
+    p = os.path.normpath(str(path))
+    root = str(state_real).rstrip("/") + "/"
+    if not os.path.isabs(p) or not p.startswith(root):
+        return None
+    parts = p[len(root):].split("/")
+    if any(x in ("", ".", "..") for x in parts):
+        return None
+    if STARTUP_GENERATION_RE.fullmatch(parts[-1]) or (len(parts) == 2 and parts[0] == "logs"
+                                                     and STARTUP_UPGRADE_LOG_RE.fullmatch(parts[1])):
+        return parts
+    if len(parts) == 1 and parts[0].startswith(".") and STARTUP_STAGED_RE.fullmatch(parts[0]):
+        return parts
+    return None
+
+
+def _delete_state_leftover(gp, parts):
+    """One regular file <state>/<parts...> (_startup_leftover_parts): every directory is opened without following a
+    link, and only a regular file is unlinked."""
+    dfd = open_dir_nofollow(gp["STATE"], *parts[:-1])
+    try:
+        st = os.stat(parts[-1], dir_fd=dfd, follow_symlinks=False)
+        if not stat.S_ISREG(st.st_mode):
+            raise OSError(errno.EPERM, "not a regular file", "/".join(parts))
+        os.unlink(parts[-1], dir_fd=dfd)
+        return st.st_size
+    finally:
+        os.close(dfd)
+
+
 def _safe_delete(gp, p, facts=None):
     """Dispatch by the cleanup root a target belongs to; anything else is refused. facts: _delete_doctor_copy."""
     base, name = p.parent, p.name
@@ -7951,6 +9274,12 @@ def _safe_delete(gp, p, facts=None):
         return _delete_file(base, name)
     if base in (gp["ARCHIVES"], captures_root(gp)):
         return _delete_entry(base, name)
+    state_real = os.path.realpath(str(gp["STATE"]))
+    if str(base) == state_real and name.startswith((UPGRADE_WORK_PREFIX, TOMB_PREFIX + UPGRADE_WORK_PREFIX)):
+        return _delete_startup_work(base, name)  # D2: OpenClaw's startup upgrade (_scan_startup_upgrade)
+    sparts = _startup_leftover_parts(state_real, str(p))
+    if sparts is not None:
+        return _delete_state_leftover(gp, sparts)
     parts = _doctor_copy_parts(os.path.realpath(str(gp["STATE"])), str(p))
     if parts is not None:
         return _delete_doctor_copy(gp, parts, facts)
@@ -8037,7 +9366,8 @@ def cleanup_targets(gp, now, hours):
         out_.append((rid, f"run {rid}", due, paths, kept))
     unfinished = {rid for rid, j in runs.items() if not j.get("finished_at")}
     for what, scan in (("archives", _scan_archives), ("captures", _scan_captures),
-                       ("rehearsal", _scan_rehearsal), ("Stage A", _scan_stage_a)):
+                       ("rehearsal", _scan_rehearsal), ("Stage A", _scan_stage_a),
+                       ("state upgrade", _scan_startup_upgrade)):
         try:
             out_ += scan(gp, now, hours, runs, cur, referenced, unfinished)
         except (OSError, ValueError, TypeError, OverflowError) as exc:
@@ -8119,6 +9449,56 @@ def _scan_stage_a(gp, now, hours, runs, cur, referenced, unfinished):
             base = max(mt, done_at) if done_at else mt
             out_.append((None, f"Stage A plaintext archive {f.name}", base + timedelta(hours=hours), [f], []))
     return out_
+
+
+STARTUP_LEFTOVERS_LABEL = "OpenClaw state-upgrade leftovers"
+STARTUP_WAIT_DUE = datetime(9999, 1, 1, tzinfo=timezone.utc)  # kept until a healthy gateway start (cleanup_cmd)
+
+
+def _leftover_stamp(p):
+    """When a startup-upgrade leftover was made: a regular file's newer of mtime and ctime (a <file>.pre-<version> is a
+    hard link of the replaced live file, state-upgrade-tree.ts preserve(): its mtime is the old content's, but link()
+    and the rename over the live name set the inode's ctime to the swap), else the mtime."""
+    try:
+        st = os.lstat(p)
+        t = max(st.st_mtime, st.st_ctime) if stat.S_ISREG(st.st_mode) else st.st_mtime
+        return datetime.fromtimestamp(t, timezone.utc)
+    except (OSError, OverflowError, ValueError):
+        return None
+
+
+def _scan_startup_upgrade(gp, now, hours, runs, cur, referenced, unfinished):
+    """D2 (design decision; runtime_caps startup_state_upgrade): what OpenClaw's own state upgrade at a gateway start
+    left (startup_upgrade_leftovers, plaintext copies). It goes gate_cleanup_hours after the newest of it was written,
+    and only after a healthy gateway start: nothing is pending for a start (no database below its target, no swap
+    plan; startup_upgrade_pending) and a gateway process has been up GATEWAY_HEALTHY_S. Until then the due time is
+    STARTUP_WAIT_DUE. A `.upgrade-*` with plan.json (a swap the next start finishes) or of a process that still runs is
+    never deleted (kept); a tombstone of an interrupted delete goes at once."""
+    try:
+        pkg = C.runtime_package()
+    except C.RuntimePackageError:
+        return []
+    if not C.runtime_caps(pkg)["startup_state_upgrade"]:
+        return []
+    cfg = _read_cfg_lenient()
+    left = startup_upgrade_leftovers(gp["STATE"], cfg)
+    real = Path(os.path.realpath(str(gp["STATE"])))
+    kept = [(str(real / w["path"]), "an interrupted state upgrade with its swap plan (plan.json): the next gateway "
+                                    "start finishes it; never deleted" if w["plan"] else
+             "in use by a running OpenClaw process") for w in left["work_dirs"] if w["plan"] or w["live"]]
+    out_ = [(None, f"leftover {t}", now, [real / t], []) for t in left["tombs"]]
+    paths = [real / r for r in leftover_paths(left) if r not in left["tombs"]]
+    if not paths:
+        return out_ + ([(None, STARTUP_LEFTOVERS_LABEL, now, [], kept)] if kept else [])
+    stamps = [t for t in (_leftover_stamp(x) for x in paths) if t is not None]
+    due = (max(stamps) if stamps else now) + timedelta(hours=hours)
+    pend = startup_upgrade_pending(gp["STATE"], pkg["schema_state"], pkg["schema_agent"], cfg)
+    started = gateway_started_at()
+    if started is None or pend["outdated"] or any(w["plan"] for w in pend["work_dirs"]):
+        due = STARTUP_WAIT_DUE
+    else:
+        due = max(due, started + timedelta(seconds=GATEWAY_HEALTHY_S))
+    return out_ + [(None, STARTUP_LEFTOVERS_LABEL, due, paths, kept)]
 
 
 def cleanup_pass(now=None, hours=None, emit=out, state=None):
@@ -8242,6 +9622,14 @@ def cleanup_loop(emit=out):
         emit(f"[cleanup] doctor captures, doctor's SQLite copies and the gate's config copies are deleted {hours} h "
              "after their gate run; gate archives and rehearsal exports of earlier add-on versions and the 2026.7 "
              "plaintext archives the same time after their run, export or migration (checked hourly)")
+        try:
+            startup = C.runtime_caps(C.runtime_package())["startup_state_upgrade"]
+        except C.RuntimePackageError:
+            startup = False
+        if startup:  # D2 (_scan_startup_upgrade)
+            emit(f"[cleanup] what OpenClaw's own state upgrade at a gateway start left (.upgrade-* without a swap plan, "
+                 f"*.pre-<version>, logs/state-upgrade-*.log) is deleted {hours} h after it was written, once the "
+                 "gateway has run on the upgraded state")
     else:
         emit("[cleanup] gate_cleanup_hours=0: automatic deletion is off (oc-upgrade cleanup lists what to delete)")
     state = {}
@@ -8281,6 +9669,9 @@ def cleanup_cmd(args, emit=out):
             verdict = "nothing left"
         elif not hours:
             verdict = "kept (gate_cleanup_hours=0)"
+        elif due >= STARTUP_WAIT_DUE:
+            verdict = (f"kept until the gateway has run {GATEWAY_HEALTHY_S // 60} min on the upgraded state, then due "
+                       f"{hours} h after the newest of them")
         else:
             verdict = "due now" if now >= due else f"due {C.utc_iso(due)}"
         emit(f"  {printable(label)}: {verdict}")
@@ -8362,7 +9753,7 @@ def _status_cron(j):
         L.append(f"    and {len(aff) - CRON_REPORT_MAX} more")
     L += cron_key_fix_lines(rec, "    ", held=gpaths()["HOLD"].exists())  # the wrapper refuses config set while held
     L.append("    " + "".join(x + ". " for x in _cron_outlook(aff, rec, after=when == "after the migration"))
-             + _cron_remedy(aff, bool(_cron_key_fix(rec))))
+             + _cron_remedy(aff, bool(_cron_key_fix(rec)), rec))
     if lw:
         L.append(f"  {lw}")
     if bl:
@@ -8428,9 +9819,45 @@ def plugin_captures_usage(state_dir):
     return res
 
 
+def startup_leftover_lines(left, state_dir):
+    """`oc-upgrade status` lines for a startup_upgrade_leftovers result (D2): a WARN per `.upgrade-*` with plan.json,
+    then one line for the rest, with what the cleanup does with it (staged copies of a swap plan or of a running start
+    belong to that WARN or that start and are not repeated)."""
+    state_dir = Path(state_dir)
+    L = [f"WARN: unfinished OpenClaw state upgrade {printable(state_dir / w['path'])} with its swap plan (plan.json): "
+         f"never deleted by the add-on; {ADVICE['startup-upgrade-unfinished']}" for w in left["work_dirs"] if w["plan"]]
+    rels = leftover_paths(left, deletable=False)
+    held = {w["path"] for w in left["work_dirs"] if w["plan"]} | set(left.get("staged_held", ()))
+    rels = [r for r in rels if r not in held]
+    if not rels and not left["partial"]:
+        return L
+    sizes = dict(left["generations"], **left["logs"], **left.get("staged", {}))
+    sizes.update({w["path"]: w.get("size") or 0 for w in left["work_dirs"]})
+    try:
+        on = C.runtime_caps(C.runtime_package())["startup_state_upgrade"]
+    except C.RuntimePackageError:
+        on = False
+    hours = C.gate_options()["cleanup_hours"]
+    if on and hours:
+        what = (f"deleted {hours} h after the newest of them, once the gateway has run on the upgraded state (oc-upgrade "
+                "cleanup lists when; a .upgrade-* folder of a running start is kept)")
+    elif on:
+        what = "kept: gate_cleanup_hours=0, delete them yourself"
+    else:
+        what = "the add-on deletes them only with OpenClaw 2026.11.10 or later: delete them yourself"
+    L.append(f"OpenClaw state-upgrade leftovers (a gateway start upgraded the state by copy and swap): {len(rels)} "
+             + ("or more " if left["partial"] else "") + f"item(s), {C.human(sum(sizes.get(r) or 0 for r in rels))}: "
+             + ", ".join(printable(r) for r in rels[:6]) + (" …" if len(rels) > 6 else "")
+             + " — plaintext copies (*.pre-<version> of the state database holds the auth profiles, of openclaw.json the "
+               "gateway token; .upgrade-* is a full copy of the state, .<file>.upgrade-* a staged copy of that file), "
+               f"not the rollback point: {what}")
+    return L
+
+
 def _status_openclaw_leftovers(gp):
     """`oc-upgrade status` lines (D8, D11, plugin captures): OpenClaw's plugin install leftovers, the databases it set
-    aside as <file>.corrupt-<time>, and its native plugin captures. Never deleted by the add-on."""
+    aside as <file>.corrupt-<time>, and its native plugin captures, never deleted by the add-on; and what its startup
+    upgrade left (OpenClaw 2026.11.10+, deleted by the cleanup: startup_leftover_lines)."""
     L = []
     try:
         cfg = _read_cfg_lenient()
@@ -8448,6 +9875,16 @@ def _status_openclaw_leftovers(gp):
                      + (" …" if len(names) > 8 else "")
                      + " — complete plaintext databases (e.g. doctor's renamed copy of another agent's database); "
                        "OpenClaw and the add-on keep them: delete them by hand once you are satisfied")
+        arch = credential_archives(gp["STATE"])
+        if arch:
+            L.append(f"Credential archives OpenClaw kept after importing them (*.migrated*, *.sqlite-import.*.bak): "
+                     f"{len(arch)} file(s), "
+                     f"{C.human(sum(arch.values()))}: " + ", ".join(printable(x) for x in sorted(arch)[:6])
+                     + (" …" if len(arch) > 6 else "")
+                     + " — the original OAuth/credential files (credentials/oauth.json and auth-profiles.json hold "
+                       "keys and tokens in plaintext); "
+                       "OpenClaw and the add-on keep them: delete them by hand once the logins work")
+        L += startup_leftover_lines(startup_upgrade_leftovers(gp["STATE"], cfg), gp["STATE"])
         cap = plugin_captures_usage(gp["STATE"])
         if cap:
             L.append(f"OpenClaw plugin captures: {cap['path']} ({cap['captures']} capture(s), {cap['files']} files"
@@ -8458,6 +9895,44 @@ def _status_openclaw_leftovers(gp):
     except Exception as exc:  # noqa: BLE001 - status must never fail on these lines
         L.append(f"OpenClaw leftovers not checked ({type(exc).__name__})")
     return L
+
+
+# OpenClaw's archives of credential files it imported: the auth migration owner's <file>.migrated-<ISO time with ":" as
+# "-">-<uuid> (2026.11.5+ doctor-auth-migration-receipts.ts: referenced OAuth sidecars, credentials/oauth.json and the
+# flat auth profiles), its <file>.sqlite-import.<...>.bak, and <file>.migrated, .migrated.<n> or .migrated.<sha>.<id>
+# (the allowFrom files of removed channel accounts and other state migrations)
+CREDENTIAL_ARCHIVE_RE = re.compile(r"[^/]{1,200}(?:\.migrated-\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}(?:\.\d{1,3})?Z-"
+                                   + _UUID + r"|\.migrated(?:\.[A-Za-z0-9-]{1,80}){0,2}|\.sqlite-import\.[A-Za-z0-9._-]{1,120}\.bak)")
+
+
+# in an agent directory only the archives of its auth files (legacy-source-files.ts listLegacyAuthProfileArchives)
+_AGENT_AUTH_ARCHIVE_PREFIXES = ("auth-profiles.json.", "auth-state.json.", "auth.json.")
+
+
+def credential_archives(state_dir):
+    """{state-relative path: size} of OpenClaw's credential archives (CREDENTIAL_ARCHIVE_RE) in <state>/credentials,
+    credentials/auth-profiles and, for the auth files, in each agents/<id>/agent (regular files only, links are not
+    followed; read-only). They hold the original keys and OAuth tokens, many in plaintext."""
+    found = {}
+    state_dir = Path(state_dir)
+    dirs = [(state_dir / "credentials", None), (state_dir / "credentials" / "auth-profiles", None)]
+    dirs += [(d, _AGENT_AUTH_ARCHIVE_PREFIXES) for d in sorted(state_dir.glob("agents/*/agent")) if not d.is_symlink()]
+    for d, prefixes in dirs:
+        try:
+            with os.scandir(d) as it:
+                entries = [(e.name, e.path) for e in it]
+        except OSError:
+            continue
+        for name, path in entries:
+            if not CREDENTIAL_ARCHIVE_RE.fullmatch(name) or (prefixes and not name.startswith(prefixes)):
+                continue
+            try:
+                st = os.lstat(path)
+            except OSError:
+                continue
+            if stat.S_ISREG(st.st_mode):
+                found[C.rel(path, state_dir)] = st.st_size
+    return found
 
 
 def plugin_cohort_marker(state_dir, version):
@@ -8513,9 +9988,10 @@ def _status_held_and_plugins(gp, marker):
 
 
 def _status_captures(gp, caps):
-    """N1: only the captures a gate run's doctor log names (and leftover tombstones of an interrupted delete) are
-    deleted with their run; any other doctor-<uuid> directory (doctor run by hand, a capture no log line names) is
-    named as kept. A run's captures count as deleted with it only when cleanup_targets deletes them: the run finished
+    """N1: only the captures of a gate run (named in its doctor log or appeared during its doctor passes,
+    run_captures) and leftover tombstones of an interrupted delete are deleted with their run; any other
+    doctor-<uuid> directory (doctor run by hand before the gate, a capture of a run before 0.5.94-full7 that no log
+    line names) is named as kept. A run's captures count as deleted with it only when cleanup_targets deletes them: the run finished
     (run_due_base), or it is the current run and still running, interrupted or held. Those of a run closed without
     finished_at (abandoned, e.g. after the state dir was wiped during a HOLD) are never deleted (cleanup_targets
     skips that run): named on a line of their own as kept."""
@@ -8584,7 +10060,10 @@ def status_lines():
         L.append(f"  phases done: {', '.join(j.get('phases_done') or []) or '-'}; first write: "
                  f"{j.get('first_write_at') or 'none'}; auto-resumes {j.get('auto_resumes', 0)}/1")
         for d in j.get("doctor") or []:
-            L.append(f"  doctor pass {d.get('pass')}: rc {d.get('rc')} in {C.fmt_duration(d.get('duration_s') or 0)}"
+            settled = f" (stopped by its settled-exit watchdog; outro: exit {d['settled_rc']})" \
+                if d.get("settled_rc") is not None else ""
+            L.append(f"  doctor pass {d.get('pass')}: rc {d.get('rc')}{settled} in "
+                     f"{C.fmt_duration(d.get('duration_s') or 0)}"
                      f"{' (' + d['code'] + ')' if d.get('code') else ''}")
         h = j.get("hold")
         if h:
@@ -8618,9 +10097,13 @@ def status_lines():
             else:
                 L.append(f"  GLM thinking levels (G1): not applied to {refs} ({g1.get('reason')})")
         L += _status_cron(j)  # full5
+        try:
+            startup = C.runtime_caps(C.runtime_package())["startup_state_upgrade"]
+        except C.RuntimePackageError:
+            startup = False
         for o in j.get("orphan_outcomes") or []:  # D11
             if isinstance(o, dict):
-                L.append("  " + orphan_outcome_text(o))
+                L.append("  " + orphan_outcome_text(o, startup_upgrade=startup))
     else:
         L.append("Gate: no run recorded.")
     m = load_marker()
@@ -8652,7 +10135,9 @@ def status_lines():
     L += _status_skills(gp)  # full5
     L += _status_openclaw_leftovers(gp)  # D8, D11, plugin captures
     allbaks = doctor_copies(gp["STATE"])
-    baks = {r: v for r, v in allbaks.items() if v[1] not in ("cron", "recovery")}
+    baks = {r: v for r, v in allbaks.items() if v[1] not in ("cron", "recovery", "snapshot", "catalog")}
+    snaps = {r: v for r, v in allbaks.items() if v[1] == "snapshot"}
+    cats = {r: v for r, v in allbaks.items() if v[1] == "catalog"}
     crons = {r: v for r, v in allbaks.items() if v[1] == "cron"}
     recs = {r: v for r, v in allbaks.items() if v[1] == "recovery"}
     if baks:
@@ -8671,6 +10156,32 @@ def status_lines():
                              for d in dirs[:4])
                  + ": plaintext copies (device keys and tokens), not the rollback point; OpenClaw never deletes "
                  "them; those a gate run made: " + leftover_note(o["cleanup_hours"]))
+    if snaps:  # full7: doctor's pre-repair snapshots (.auth-profile-migration-*.bak, ...)
+        mine = set()
+        for _rid, rj in sorted(_run_journals(gp)[0].items()):
+            try:
+                mine |= {str(x) for x in run_doctor_copies(gp, rj, present=allbaks)[0]}
+            except OSError:
+                continue
+        real = Path(os.path.realpath(str(gp["STATE"])))
+        other = sorted(r for r in snaps if str(real / r) not in mine)
+        L.append(f"Doctor pre-repair SQLite snapshots (*.auth-profile-migration-*.bak, *.pre-acp-*-migration-*.bak, "
+                 f"*.pre-exec-approvals-migration-*.bak, *.doctor-gateway-token.*.bak): {len(snaps)} "
+                 f"({C.human(sum(size for size, _scope in snaps.values()))}): plaintext copies of the databases "
+                 "(auth profiles: keys and tokens), not the rollback point; OpenClaw never deletes them; those a gate "
+                 "run made: " + leftover_note(o["cleanup_hours"]))
+        if other:
+            L.append(f"Doctor pre-repair SQLite snapshots no gate run names: {len(other)}: "
+                     + ", ".join(printable(str(gp["STATE"] / r)) for r in other[:4]) + (" …" if len(other) > 4 else "")
+                     + ": kept, the add-on does not delete them: delete them yourself once you are satisfied")
+    if cats:  # OpenClaw 2026.11.10 doctor's copies of an agent's models.json (models.json.bak-<ms>)
+        L.append(f"Doctor copies of an agent's models.json (models.json.bak-*): {len(cats)} "
+                 f"({C.human(sum(size for size, _scope in cats.values()))}): "
+                 + ", ".join(printable(str(gp["STATE"] / r)) for r in sorted(cats)[:4])
+                 + (" …" if len(cats) > 4 else "")
+                 + ": plaintext copies with the literal provider keys of that file, not the rollback point; OpenClaw "
+                 "never deletes them; those a gate run made: " + leftover_note(o["cleanup_hours"])
+                 + "; delete the others yourself once the models work")
     if recs:  # doctor's pre-repair recovery directories (openclaw-<repair>-recovery-*/database.sqlite)
         L.append(f"Doctor pre-repair recovery directories (openclaw-*-recovery-*/database.sqlite): {len(recs)} "
                  f"({C.human(sum(size for size, _scope in recs.values()))}): "

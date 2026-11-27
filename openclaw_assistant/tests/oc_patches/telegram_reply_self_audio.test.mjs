@@ -7,7 +7,7 @@
 // reply chains (no bot token, no network, no gateway). No runtime dependencies; Node 22 or 24.
 // In a container of the image (the version is read from the package):
 //   node --test tests/oc_patches/telegram_reply_self_audio.test.mjs
-// or against an unpacked package (2026.10.4 or 2026.11.4) patched by oc_dist_patch.py:
+// or against an unpacked package (2026.10.4, 2026.11.4 or 2026.11.10) patched by oc_dist_patch.py:
 //   OC_DIST=<copy>/dist node --test tests/oc_patches/telegram_reply_self_audio.test.mjs
 // Negative control: OC_DIST=<stock package>/dist makes the bot-audio cases fail (stock merges the bot's audio).
 import fs from 'node:fs';
@@ -21,26 +21,52 @@ import { execFileSync } from 'node:child_process';
 const CHUNKS = {
   '2026.10.4': 'bot-message-CpKgMHf_.mjs',
   '2026.11.4': 'bot-message-CA5l5gzv.mjs',
+  '2026.11.10': 'bot-message-kCERMYkG.mjs',
+};
+// Where the sliced code is and what its names are. 2026.11.10 ships a minified dist: the locals of
+// buildTelegramInboundContextPayload are single letters, and the media-kind set lives in another chunk (the
+// message-cache-persistence.ts module of send-outbound-*.mjs).
+const PLAIN = {
+  helpers: [[null, 'const TELEGRAM_MEDIA_KINDS = ', 'async function buildTelegramInboundContextPayload(']],
+  statements: ['\tconst replyHead = visibleReplyChain[0];\n', '\tconst telegramFrom = '],
+  names: { primaryCtx: 'primaryCtx', visibleReplyChain: 'visibleReplyChain', visibleReplyTarget: 'visibleReplyTarget',
+    replyMedia: 'replyMedia', allMedia: 'allMedia', audioTranscribedMediaIndex: 'audioTranscribedMediaIndex',
+    replyMediaFacts: 'replyMediaFacts', replyBody: 'replyBody' },
+};
+const LAYOUT = {
+  '2026.10.4': PLAIN,
+  '2026.11.4': PLAIN,
+  // 2026.11.10: one line per module after a '//!<source path>' marker (no indentation; the session module runs over
+  // lines 19-23 because template literals hold literal newlines). The anchors are minified code, each once per chunk.
+  '2026.11.10': {
+    helpers: [['send-outbound-Cha9OCAg.mjs', 'const TELEGRAM_MEDIA_KINDS=', 'function parseStickerMetadata('],
+      [null, 'function resolveReplyChainMediaType(', 'async function buildTelegramInboundContextPayload(']],
+    statements: ['const $=J[0];', 'const ke='],
+    names: { primaryCtx: 'n', visibleReplyChain: 'J', visibleReplyTarget: 'G', replyMedia: 'a', allMedia: 'i',
+      audioTranscribedMediaIndex: 'ee', replyMediaFacts: 'Ee', replyBody: 'Oe' },
+  },
 };
 
 // OC_DIST: the dist to test (default: the image's $(npm root -g)/openclaw/dist).
 const distDir = process.env.OC_DIST || path.join(execFileSync('npm', ['root', '-g'], { encoding: 'utf8' }).trim(), 'openclaw', 'dist');
 const version = JSON.parse(fs.readFileSync(path.join(distDir, '..', 'package.json'), 'utf8')).version;
-assert.ok(CHUNKS[version], `no telegram-reply-self-audio chunk known for OpenClaw ${version}`);
-const chunk = fs.readFileSync(path.join(distDir, CHUNKS[version]), 'utf8');
+assert.ok(CHUNKS[version] && LAYOUT[version], `no telegram-reply-self-audio chunk known for OpenClaw ${version}`);
+const { helpers: helperSpec, statements: statementSpec, names: N } = LAYOUT[version];
 
-const once = (from, to) => {
+const once = (file, from, to) => {
+  const name = file ?? CHUNKS[version];
+  const chunk = fs.readFileSync(path.join(distDir, name), 'utf8');
   const start = chunk.indexOf(from);
-  assert.ok(start >= 0 && chunk.indexOf(from, start + 1) < 0, `${from.trim()} is not in ${CHUNKS[version]} exactly once`);
+  assert.ok(start >= 0 && chunk.indexOf(from, start + 1) < 0, `${from.trim()} is not in ${name} exactly once`);
   const end = chunk.indexOf(to, start + from.length);
   assert.ok(end > start, `${to.trim()} does not follow ${from.trim()}`);
   return chunk.slice(start, end);
 };
-// TELEGRAM_MEDIA_KINDS with isTelegramMediaKind (2026.10.4) or resolveReplyChainMediaType (2026.10.10 and later)
-const helpers = once('const TELEGRAM_MEDIA_KINDS = ', 'async function buildTelegramInboundContextPayload(');
+// TELEGRAM_MEDIA_KINDS with isTelegramMediaKind (2026.10.4) and resolveReplyChainMediaType (2026.10.10 and later)
+const helpers = helperSpec.map(([file, from, to]) => once(file, from, to)).join('\n');
 // replyHead, toInboundMedia, currentMediaFacts, toReplyChainMediaFact, (patch,) replyMediaFacts, replyTargetMedia, replyBody
-const statements = once('\tconst replyHead = visibleReplyChain[0];\n', '\tconst telegramFrom = ');
-const script = new vm.Script(`${helpers}\n${statements}\nglobalThis.result = { media: replyMediaFacts, replyBody };`);
+const statements = once(null, ...statementSpec);
+const script = new vm.Script(`${helpers}\n${statements}\nglobalThis.result = { media: ${N.replyMediaFacts}, replyBody: ${N.replyBody} };`);
 
 const BOT_ID = 7000001; // ctx.me.id is a number; reply-chain sender ids are strings
 function build(opts) {
@@ -48,8 +74,8 @@ function build(opts) {
   // primaryCtx / me may be passed as undefined on purpose (no default then)
   const primaryCtx = 'primaryCtx' in opts ? opts.primaryCtx : { me: 'me' in opts ? opts.me : { id: BOT_ID } };
   const context = vm.createContext({
-    primaryCtx, visibleReplyChain: chain, visibleReplyTarget: target, replyMedia, allMedia: [],
-    audioTranscribedMediaIndex: undefined,
+    [N.primaryCtx]: primaryCtx, [N.visibleReplyChain]: chain, [N.visibleReplyTarget]: target, [N.replyMedia]: replyMedia,
+    [N.allMedia]: [], [N.audioTranscribedMediaIndex]: undefined,
     formatMediaPlaceholderText: (media) => media.map((m) => `<media:${m.kind ?? m.contentType}>`).join(' '),
   });
   script.runInContext(context);

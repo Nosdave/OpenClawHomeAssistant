@@ -1,5 +1,5 @@
 name: OpenClaw Assistant
-version: "0.5.94-full6"
+version: "0.5.94-full7"
 slug: openclaw_assistant
 description: Run OpenClaw Assistant (OpenClaw-compatible) as a Home Assistant add-on.
 url: https://github.com/Nosdave/OpenClawHomeAssistant
@@ -233,8 +233,17 @@ options:
   # the saved models status output). Copies earlier add-on versions left (gate archives in
   # /share/openclaw-upgrade/, rehearsal exports in /share/openclaw-rehearsal/,
   # the plaintext 2026.7 archives in /config/.openclaw/upgrade-backups/) go after
-  # the same hours, counted from their own time. 0 = never delete. A change
-  # applies from the next add-on start.
+  # the same hours, counted from their own time. It also covers doctor's
+  # pre-repair snapshots of whole databases (*.auth-profile-migration-*.bak,
+  # *.pre-acp-*-migration-*.bak, *.pre-exec-approvals-migration-*.bak,
+  # *.doctor-gateway-token.*.bak; with OpenClaw 2026.11.10 also its copies of an
+  # agent's models.json, models.json.bak-*, with the literal provider keys).
+  # With OpenClaw 2026.11.10 also what a gateway
+  # start's own state upgrade left (.upgrade-* without plan.json,
+  # *.pre-<version>, logs/state-upgrade-*.log, .<file>.upgrade-*): the same hours
+  # after the newest of it, and only after a healthy gateway start; a .upgrade-*
+  # with plan.json is never deleted, one without is deleted by the next gate run
+  # at once. 0 = never delete. A change applies from the next add-on start.
   gate_cleanup_hours: 48
   # Before it changes the state, the gate requires an encrypted Home Assistant
   # backup that contains this add-on (taken before the update) and is at most

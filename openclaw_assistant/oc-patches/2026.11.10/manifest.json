@@ -1,0 +1,50 @@
+{
+  "openclaw_version": "2026.11.10",
+  "patches": [
+    {
+      "name": "memory-search-half-life",
+      "file": "dist/memory-search-DjeqUJt_.mjs",
+      "region": "//!src/agents/memory-search.ts",
+      "stock_sha256": "fe104e1ba7a01c183dbff6115582afa8dc974af7c32a0aa2bee13ddf9ec7c3ab",
+      "patched_sha256": "e0f470a4de57d72db838a66482092a2bf1c7b53886711dda55615b14d7f89d07",
+      "diff": "memory-search-half-life.patch",
+      "note": "Memory search temporal-decay half-life 365 days instead of the hard-coded 30 (see DOCS.md, \"Memory search recency\"; 2026.11.10 still hard-codes 30 days at src/agents/memory-search.ts:169 and the doctor still strips memory.search.query.hybrid.temporalDecay.halfLifeDays as a retired tuning key, legacy-config-migrations.runtime.retired-media.ts:124). minScore is checked before the decay (manager-search-retrieval.ts finalizeKeywordOnlyResults, unchanged apart from types since 2026.11.8), so the half-life only sets the ranking (and with it which eligible hits fit into the returned maxResults, default 6). Same edit as oc-patches/2026.11.4 and the 2026.11.8 set (never shipped); the 2026.11.10 dist puts each module on one line after a '//!<source path>' marker, so the hunk replaces the whole module line (line 3, the file's last line, which has no final newline)."
+    },
+    {
+      "name": "telegram-voice-text-first",
+      "file": "dist/send-BcsDv8XI.mjs",
+      "region": "//!extensions/telegram/src/send-message.ts",
+      "stock_sha256": "5a00317ea38cc6b868029f5b3bc6c86e4f2cbb32791772faeeaca4946939efae",
+      "patched_sha256": "eccb30a47badf03e761a6a1bd9d7e760fd0803f61d752e1e7d0489d73393741f",
+      "diff": "telegram-voice-text-first.patch",
+      "note": "Telegram hotfix TG-20261023 (1/2): a single voice reply whose text exceeds the caption limit sends and confirms the text first, then the audio without caption; a network failure or voice-privacy rejection of the audio keeps the text and is not retried. Same logic as oc-patches/2026.11.4 and the 2026.11.8 set (never shipped), re-derived for the one-line send-message module (line 38; sendMessageTelegram locals: text t, opts n, mediaUrls h, finalMediaBatch m, sendChunkedText E; in sendMediaBatch mediaSender d, followUpText b, mediaDeliveryResult O, mediaMessageId A, resolvedChatId j). Hunk 1 adds findTelegramRequestAuthorityError (export o of the fetch chunk) to the fetch import on line 1. Comments are block comments (a line comment would swallow the rest of the module). 2026.11.10 adds Telegram message effects (c1be284382d, #191646): pendingMessageEffectParams applies only while no part is accepted, so with text-first the effect lands on the text and the audio goes without it."
+    },
+    {
+      "name": "telegram-fetch-fresh-audio",
+      "file": "dist/fetch-CpqTTyCO.mjs",
+      "region": "//!extensions/telegram/src/fetch.ts",
+      "stock_sha256": "4874057425a7709876a6e705b3f7d326377ecffcd78c80efc2647e6445e8c439",
+      "patched_sha256": "1cdae68bf2659046727a0a74576b274c0db87aa966efcc84fdf3138a4ed85d41",
+      "diff": "telegram-fetch-fresh-audio.patch",
+      "note": "Telegram hotfix TG-20261023 (2/2): sendVoice/sendAudio use a fresh connection like sendMessage, with the same rule that a request Telegram may have received is not replayed (isSafeToRetrySendError). extensions/telegram/src/fetch.ts is byte-identical to 2026.11.8 (freshConnection at fetch.ts:555); the hunk replaces the one-line fetch module (line 15, the file's last line, no final newline; resolvedFetch locals: method n, freshConnection r, closed x, sourceFetch u). The marker comment is a block comment. The \"couldn't confirm\" notice needs no add-on patch: openclaw/openclaw#154417 (f6f7252001c1) is in 2026.11.10 (custody tracked from the first platform dispatch until release after the canonical settlement, lifecycle.ts:331/572; pending-delivery-notice.ts checks hasActiveDirectPendingFinalDelivery), and e2a180733f7d (#195400) only moves that set to direct-delivery-active.ts and hands the owed notice to lifecycle delivery when queue recovery gives up (expectedIntentId), as 2026.11.4 did."
+    },
+    {
+      "name": "telegram-reply-self-audio",
+      "file": "dist/bot-message-kCERMYkG.mjs",
+      "region": "//!extensions/telegram/src/bot-message-context.session.ts",
+      "stock_sha256": "943e17ed551030b9021cbdd2f472fb83bc14a376f3c5db8157a2685f18c96bcc",
+      "patched_sha256": "26d18c6caf592bd043165979e765f4c4a55041bfdbb837909863dbaa28bcca6e",
+      "diff": "telegram-reply-self-audio.patch",
+      "note": "Telegram hotfix TG-20261112: voice and audio of a replied-to message the bot itself sent (a reply-chain entry, or the reply target, whose sender id is the bot's own, ctx.me.id) are no longer merged into the user's turn media; they stay in the reply chain under the bot's name. Same logic as oc-patches/2026.11.4 and the 2026.11.8 set (never shipped), re-derived for the minified module (primaryCtx n, visibleReplyTarget G, visibleReplyChain J, replyMedia a, replyMediaFacts Ee, replyBody Oe). The session module follows its marker on lines 19-23 (template literals hold literal newlines); the hunk replaces line 23. The 2026.11.10 changes to the file (#183190, #202542: delivery-only transcript windows) and #155273 (reply media that duplicates the current attachment) leave the reply media facts as in 2026.11.8, so the bot's own voice is still merged in stock 2026.11.10."
+    },
+    {
+      "name": "doctor-restore-env-refs-deferral",
+      "file": "dist/automatic-config-repair-jSKnxU-v.mjs",
+      "region": "//!src/commands/doctor/shared/automatic-config-repair.ts",
+      "stock_sha256": "144b9735e1968002333060e62a8e2417669885f1225078ae86166df84e455b44",
+      "patched_sha256": "8ff094e4455d21ad71b4491c0369c7ecc46d856fec880839882a573b357a8750",
+      "diff": "doctor-restore-env-refs-deferral.patch",
+      "note": "Doctor config repair after a plugin refresh (openclaw/openclaw#205695, P1, open; #203442 the same error for the deepseek provider): planConfigRepair prepares the plugins' configRepair contracts, migrates and validates inside withPluginContracts (the deferral set of the config snapshot), but restores the ${VAR} templates (restoreDoctorConfigEnvRefs, automatic-config-repair.ts:148-150) outside it, under the doctor-wide deferral set. On an update from before 2026.11.10 both sets name codex at the first config read (its npm record is older than the runtime, codex is version-bound); doctor then refreshes codex to 2026.11.10, converged() empties the doctor-wide set but keeps codex in the snapshot's set (previousById, persisted as a pending ledger row), and the config repair that follows (any config 2026.11.10 rejects, e.g. the retired agents.defaults.heartbeat) loads codex's unprepared contract in the restore: PluginSetupPreparationRequiredError 'Plugin codex Doctor source must be prepared before loading', doctor rc 1, and every retry fails the same way (rehearsal 1110: HOLD doctor-maintenance-refused, now doctor-plugin-source-unprepared). The preparation requirement came with c7693dd033d (#188890), so 2026.11.8 is not affected. The patch runs the restore inside withPluginContracts too (one statement on line 3, the planConfigRepair module; withPluginContracts is its local const), so the restore uses exactly the deferral set preparation, migration and validation use; in doctor's preflight that set always contains the doctor-wide one, so the patch only adds deferrals. The other restore callers (doctor-health-contribution-runners.config.ts) prepare the contracts in the same scope first and are unchanged. Rehearsal 1110 (sandbox): from the 2026.11.4 state the gate migrates (pass 2 clean, the codex ledger row completed), and a state already held by the bug completes with oc-upgrade retry. Not fixed upstream through main 367422ead35 and release/2026.11.11 to release/2026.12.1 (2026-11-25): re-derive or drop it on each bump."
+    }
+  ]
+}

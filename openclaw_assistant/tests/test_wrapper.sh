@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Shell tests for the add-on (not copied into the image):
 #   1. openclaw-wrapper.sh: the allow/deny matrix (update refusal, writing
-#      doctor refusal, HOLD allow-list, OC_ADDON_UNSAFE escape), run against a
-#      fake `node` that echoes the argv it was exec'd with.
+#      doctor refusal, the 2026.11.10 database capture/restore refusal, HOLD
+#      allow-list, OC_ADDON_UNSAFE escape), run against a fake `node` that
+#      echoes the argv it was exec'd with.
 #   2. run.sh's migration-gate wait/trap pattern (early_stop, run_migration_gate
 #      and enter_hold, extracted verbatim from run.sh) against a fake
 #      `oc-upgrade` that sleeps, records a forwarded SIGTERM and exits with a
@@ -120,6 +121,7 @@ deny() {
 DOCTOR_MSG="oc-upgrade retry --doctor"
 HOLD_MSG="the add-on is holding OpenClaw"
 UPDATE_MSG="openclaw update is disabled"
+DB_MSG="database restore-session-dependencies are not run by hand in this add-on"
 
 # --- normal operation (no hold.txt), pinned 2026.9.9 --------------------------
 rm -f "$HOLD_FILE"
@@ -170,6 +172,72 @@ deny "$UPDATE_MSG" --dev --update
 # OpenClaw rewrites `--update` only in the root-option position; after a command
 # word it is that command's (unknown) option, not the update command.
 allow gateway --update
+
+# --- OpenClaw 2026.11.10 database commands (design decision D3) ----------------
+# migration-capture create|restore and restore-session-dependencies copy or
+# replace the state outside the add-on's steps; everything else of `database`
+# passes outside a HOLD, as before. The subcommand path is found the way
+# OpenClaw finds it: options and root options (also after the command word)
+# are skipped, and a bare `--` does not hide the words after it.
+allow database migration-capture capabilities
+allow database migration-capture capabilities --json
+allow --profile p database migration-capture capabilities
+allow database migration-capture
+allow database migration-capture --help
+allow database --help
+allow database preflight /tmp/x.sqlite --json
+allow database preflight-agent /tmp/a.sqlite --agent-id main
+allow database ownership status
+allow database port --to sqlite --dry-run
+allow database restore-migration-backup /tmp/b.sqlite /tmp/s.sqlite
+allow database verify-preservation a.json b.json --original-sha256 x --candidate-sha256 y
+allow config get database
+allow agents add restore-session-dependencies --non-interactive
+deny "$DB_MSG" database migration-capture create --output /tmp/cap
+deny "$DB_MSG" database migration-capture create --base-archive /tmp/a.tar.gz --output /tmp/cap --json
+deny "$DB_MSG" database migration-capture create --externally-quiesced --request-id r --suspension-id s --output o
+deny "$DB_MSG" database migration-capture create --output=/tmp/cap
+deny "$DB_MSG" database migration-capture restore /tmp/cap --target /tmp/t --manifest-sha256 abc
+deny "$DB_MSG" database migration-capture restore --target /tmp/t --manifest-sha256 abc -- /tmp/cap
+deny "$DB_MSG" database migration-capture restore --json --manifest-sha256=abc --target=/tmp/t /tmp/cap
+deny "$DB_MSG" database restore-session-dependencies --input /tmp/in --sha256 abc
+deny "$DB_MSG" database restore-session-dependencies --sha256=abc --input=/tmp/in --json
+deny "$DB_MSG" database restore-session-dependencies
+# --output takes the next word as its value, even `--help`: no help exception
+deny "$DB_MSG" database migration-capture create --output --help
+deny "$DB_MSG" database migration-capture create --help
+deny "$DB_MSG" --dev database migration-capture create --output o
+deny "$DB_MSG" --profile p database restore-session-dependencies --input i --sha256 s
+deny "$DB_MSG" --no-color --log-level debug database migration-capture restore c --target t --manifest-sha256 d
+deny "$DB_MSG" database --profile p migration-capture create --output o
+deny "$DB_MSG" database --profile=p migration-capture create --output o
+deny "$DB_MSG" database migration-capture --dev restore c --target t --manifest-sha256 d
+deny "$DB_MSG" database --log-level debug restore-session-dependencies --input i --sha256 s
+deny "$DB_MSG" database --container c migration-capture create --output o
+deny "$DB_MSG" database -- migration-capture create
+deny "$DB_MSG" database migration-capture -- create
+deny "$DB_MSG" -- database restore-session-dependencies --input i --sha256 s
+invoke database migration-capture create --output /tmp/cap
+check "database refusal: no backup advice: err='$ERR'" \
+  grep -qxF "Back up with an encrypted Home Assistant backup of the add-on instead. Read-only: openclaw database migration-capture capabilities" "$T/stderr"
+# OpenClaw 2026.11.10's other new commands stay allowed: `pair <code>` and `id`
+# (named in SECURITY.md), `node join`, `templates draft`, `tools usage`,
+# `agents render-blobster`, `database prepare-state` (PostgreSQL only)
+allow pair ABCD-EFGH --yes
+allow id status
+allow id rebind --cancel
+allow node join openclaw-node://synthetic
+allow templates draft /config/clawd
+allow tools usage status
+allow agents render-blobster design.json --out /tmp/b.svg
+allow database prepare-state --expected-store-id 00000000-0000-4000-8000-000000000000 --expected-namespace x
+EXTRA_ENV=(OC_ADDON_UNSAFE=1)
+allow_unsafe database migration-capture create --output /tmp/cap
+allow_unsafe database migration-capture restore /tmp/cap --target /tmp/t --manifest-sha256 abc
+allow_unsafe database restore-session-dependencies --input /tmp/in --sha256 abc
+EXTRA_ENV=(OC_ADDON_UNSAFE=0)
+deny "$DB_MSG" database migration-capture create --output /tmp/cap
+EXTRA_ENV=()
 # The writing-doctor refusal names what `oc-upgrade retry --doctor` does first: the
 # Home Assistant backup check (the gate writes no archive of its own any more).
 invoke doctor --fix
@@ -226,6 +294,11 @@ deny "$HOLD_MSG" config set gateway.port 1
 deny "$HOLD_MSG" config unset gateway.port
 deny "$HOLD_MSG" database
 deny "$HOLD_MSG" database migrate
+deny "$HOLD_MSG" database migration-capture capabilities
+deny "$HOLD_MSG" database migration-capture create --output /tmp/cap
+deny "$HOLD_MSG" database restore-session-dependencies --input i --sha256 s
+deny "$HOLD_MSG" pair ABCD-EFGH --yes
+deny "$HOLD_MSG" id status
 deny "$HOLD_MSG" doctor
 deny "$HOLD_MSG" doctor --fix
 deny "$HOLD_MSG" doctor --lint --fix
@@ -234,6 +307,7 @@ deny "$UPDATE_MSG" update
 EXTRA_ENV=(OC_ADDON_UNSAFE=1)
 allow_unsafe status
 allow_unsafe doctor --fix
+allow_unsafe database migration-capture create --output /tmp/cap
 allow_unsafe agents add work --non-interactive
 deny "$UPDATE_MSG" update
 EXTRA_ENV=()
@@ -247,6 +321,7 @@ printf '2026.7.1-2\n' > "$T/oc-addon/openclaw-pinned-version"
 rm -f "$HOLD_FILE"
 allow doctor --fix --non-interactive
 allow doctor
+deny "$DB_MSG" database migration-capture create --output /tmp/cap
 printf 'held\n' > "$HOLD_FILE"
 deny "$HOLD_MSG" doctor --fix
 deny "$HOLD_MSG" status

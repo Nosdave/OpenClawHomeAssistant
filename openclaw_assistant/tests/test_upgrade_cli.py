@@ -807,8 +807,9 @@ class PluginsSyncTests(CliEnv):
         calls = self.sync(FAKE_UPDATE_RC="1")
         self.assertIn(["plugins", "update", "@openclaw/codex@2026.10.10"], calls)
         self.assertIn("WARN: @openclaw/codex stays at 2026.10.4 (openclaw plugins update failed, rc 1: ", self.stdout)
-        self.assertIn("OpenClaw 2026.10.10 still loads it (minimum 2026.9.7). The add-on tries again at the next start; "
-                      "by hand: openclaw plugins update @openclaw/codex@2026.10.10", self.stdout)
+        self.assertIn("OpenClaw 2026.10.10 still loads it (minimum 2026.9.7). The add-on tries again at the next start: "
+                      "restart the add-on (openclaw plugins update @openclaw/codex@2026.10.10 is refused while the "
+                      "gateway runs)", self.stdout)
         self.assertNotIn("SECRET", self.stdout + self.stderr)
         self.assertFalse(self.marker().exists())
         self.assertIn(["plugins", "update", "@openclaw/codex@2026.10.10"], self.sync())  # retried at the next start
@@ -956,8 +957,8 @@ class PluginsSyncTests(CliEnv):
         self.assertEqual(self.stdout.splitlines(), [
             "WARN: Official plugins not updated: the npm registry did not confirm @openclaw/acpx@2026.10.10 (npm view: "
             "rc 1: npm error code ENOTFOUND); @openclaw/acpx stays at 2026.10.4, "
-            "@openclaw/codex stays at 2026.10.4. The add-on tries again at the next start; by hand, once online: "
-            "openclaw plugins update @openclaw/acpx@2026.10.10; openclaw plugins update @openclaw/codex@2026.10.10"])
+            "@openclaw/codex stays at 2026.10.4. The add-on tries again at the next start: once the registry is "
+            "reachable, restart the add-on (openclaw plugins update is refused while the gateway runs)"])
         self.assertFalse(self.marker().exists())
         self.assertIn("PLUGIN_PROBE_TIMEOUT = 30\n", SCRIPT.read_text(encoding="utf-8"))
         # the probe's own empty npm cache: no cached registry data answers offline
@@ -976,6 +977,40 @@ class PluginsSyncTests(CliEnv):
         self.assertEqual(self.sync(FAKE_NPM_RC="1"), [["plugins", "list", "--json"]])
         self.assertFalse(self.npm_log.exists())
         self.assertTrue(self.marker().is_file())
+
+    def test_plugins_sync_names_the_codex_floor_of_2026_11_10(self):
+        """OpenClaw 2026.11.10 does not load @openclaw/codex below 2026.11.5-beta.1 (official-runtime-plugins.ts,
+        d5e35ca8321 #192760; loader-runtime-candidate.ts): a failed or skipped update says so. acpx and Brave have
+        no floor."""
+        self.set_runtime("2026.11.10", 40, 42, doctor=False)
+        self.write_plugins([plugin("codex", "@openclaw/codex", "2026.11.4"),
+                            plugin("acpx", "@openclaw/acpx", "2026.11.4"),
+                            plugin("brave", "@openclaw/brave-plugin", "2026.11.4")])
+        self.sync(FAKE_UPDATE_RC="1")
+        self.assertIn("WARN: @openclaw/codex stays at 2026.11.4 (openclaw plugins update failed, rc 1: ", self.stdout)
+        self.assertIn("; OpenClaw 2026.11.10 does not load it below 2026.11.5-beta.1, so it is unavailable until it is "
+                      "updated. The add-on tries again at the next start: restart the add-on (openclaw plugins update "
+                      "@openclaw/codex@2026.11.10 is refused while the gateway runs)", self.stdout)
+        acpx = [ln for ln in self.stdout.splitlines() if ln.startswith("WARN: @openclaw/acpx stays at 2026.11.4")]
+        self.assertEqual(len(acpx), 1, self.stdout)
+        self.assertNotIn("minimum", acpx[0])
+        self.assertNotIn("SECRET", self.stdout + self.stderr)
+        self.assertFalse(self.marker("2026.11.10").exists())
+        # offline: the probe WARN, then one line for the plugin OpenClaw does not load
+        self.sync(FAKE_NPM_RC="1")
+        lines = self.stdout.splitlines()
+        self.assertEqual(len(lines), 2, self.stdout)
+        self.assertTrue(lines[0].startswith("WARN: Official plugins not updated: the npm registry did not confirm "))
+        self.assertEqual(lines[1], "WARN: OpenClaw 2026.11.10 does not load @openclaw/codex 2026.11.4 (minimum "
+                                   "2026.11.5-beta.1): it is unavailable until it is updated.")
+        # a codex at the floor or above still loads; OpenClaw 2026.11.4 keeps the 2026.9.7 floor
+        self.write_plugins([plugin("codex", "@openclaw/codex", "2026.11.5-beta.1")])
+        self.sync(FAKE_UPDATE_RC="1")
+        self.assertIn("; OpenClaw 2026.11.10 still loads it (minimum 2026.11.5-beta.1). ", self.stdout)
+        self.set_runtime("2026.11.4", 22, 27, doctor=False)
+        self.write_plugins([plugin("codex", "@openclaw/codex", "2026.10.4")])
+        self.sync(FAKE_UPDATE_RC="1")
+        self.assertIn("; OpenClaw 2026.11.4 still loads it (minimum 2026.9.7). ", self.stdout)
 
     def test_plugins_sync_probe_timeout(self):
         """A registry probe that hangs ends after its time limit (PLUGIN_PROBE_TIMEOUT; here 1 s through the test
@@ -1073,6 +1108,43 @@ class HeldStoreCheckTests(CliEnv):
                       "deleted agent", self.stdout)
         # state, main and the orphan doctor would migrate; not the held store
         self.assertIn("quick_check ok (3/3); foreign keys ok (3/3)", self.stdout)
+
+
+class PluginFloorCheckTests(CliEnv):
+    def test_check_warns_about_an_official_plugin_the_bundled_openclaw_does_not_load(self):
+        """oc-upgrade check reads OpenClaw's npm install records (no OpenClaw run): an enabled @openclaw/codex below the
+        bundled OpenClaw's floor is a note (2026.11.10: 2026.11.5-beta.1). acpx has no floor; a disabled plugin and
+        OpenClaw 2026.11.4 (floor 2026.9.7) give no WARN."""
+        self.set_runtime("2026.11.10", 40, 42, doctor=False)
+        T.make_1004_state(self.state)
+        self.write_cfg({"meta": {"lastTouchedVersion": "2026.11.4"}, "agents": {"list": [{"id": "main"}]}})
+        T.write_install_records(self.state, {"codex": ("@openclaw/codex", "2026.11.4", None),
+                                             "acpx": ("@openclaw/acpx", "2026.11.4", None)})
+        rc = self.cli("check", env={"OPENCLAW_RUNTIME_VERSION": "2026.11.10"})
+        warn = ("  WARN: @openclaw/codex 2026.11.4 is below the minimum version OpenClaw 2026.11.10 loads "
+                "(2026.11.5-beta.1), so the plugin is unavailable until it is updated; ")
+        self.assertIn(warn + "the migration gate's doctor and the add-on's plugin update step after it bring it to "
+                      "2026.11.10", self.stdout)
+        self.assertIn("  - @openclaw/codex 2026.11.4 is not loaded by OpenClaw 2026.11.10 until it is updated",
+                      self.stdout)
+        self.assertNotIn("@openclaw/acpx 2026.11.4 is below", self.stdout)
+        self.assertNotEqual(rc, 0, self.stdout)
+        # after the migration (marker for this runtime): a restart (plugins update is refused while the gateway runs)
+        (self.upg / "gate").mkdir(parents=True, exist_ok=True)
+        (self.upg / "gate" / "migrated.json").write_text(json.dumps({"runtime": "2026.11.10", "mode": "bump"}))
+        self.cli("check", env={"OPENCLAW_RUNTIME_VERSION": "2026.11.10"})
+        self.assertIn(warn + "restart the add-on: its plugin update step brings it to 2026.11.10 before the gateway "
+                      "starts (openclaw plugins update is refused while the gateway runs)", self.stdout)
+        (self.upg / "gate" / "migrated.json").unlink()
+        self.write_cfg({"meta": {"lastTouchedVersion": "2026.11.4"}, "agents": {"list": [{"id": "main"}]},
+                        "plugins": {"entries": {"codex": {"enabled": False}}}})
+        self.cli("check", env={"OPENCLAW_RUNTIME_VERSION": "2026.11.10"})
+        self.assertNotIn("is below the minimum version", self.stdout)
+        self.write_cfg({"meta": {"lastTouchedVersion": "2026.11.4"}, "agents": {"list": [{"id": "main"}]}})
+        self.set_runtime("2026.11.4", 22, 27, doctor=False)
+        self.cli("check", env={"OPENCLAW_RUNTIME_VERSION": "2026.11.4"})
+        self.assertNotIn("is below the minimum version", self.stdout)
+        self.assertIn("  migrated:", self.stdout)
 
 
 if __name__ == "__main__":

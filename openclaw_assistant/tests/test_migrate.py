@@ -1284,6 +1284,17 @@ class TestPins(unittest.TestCase):
         ours = {m.fmt_path(p["path"]) for p in m.PINS if p["cond"]}
         self.assertTrue(conditional <= ours, conditional - ours)
 
+    def test_heartbeat_pins_skipped_when_heartbeat_retired(self):
+        """full7: OpenClaw 2026.11.5+ rejects heartbeat blocks once doctor moved them into cron (ec5d369a6f66)."""
+        cfg = {"agents": {"defaults": {"systemAgent": {"agentId": "main"}}, "list": [{"id": "main"}, {"id": "b"}]}}
+        new, written, skipped = m.apply_pins(cfg, set(), heartbeat_retired=True)
+        self.assertNotIn("heartbeat", new["agents"]["defaults"])
+        reason = "condition:heartbeat config is retired in this OpenClaw version (doctor moves it into a cron job)"
+        self.assertEqual(self.skipped(skipped)["agents.defaults.heartbeat.agentId"], reason)
+        self.assertEqual(self.skipped(skipped)["agents.defaults.heartbeat.target"], reason)
+        new, _w, _s = m.apply_pins(cfg, set())
+        self.assertEqual(new["agents"]["defaults"]["heartbeat"], {"agentId": "main", "target": "none"})
+
     def test_approval_policy_pin_skipped_when_proposals_retired(self):
         """full5: OpenClaw 2026.10.10+ has no Skill Workshop proposals (strict skills.workshop schema, doctor removes
         approvalPolicy); the pin is skipped there and written as before on 2026.10.4."""
@@ -1297,6 +1308,86 @@ class TestPins(unittest.TestCase):
         new, written, skipped = self.apply(cfg)
         self.assertEqual(new["skills"]["workshop"]["approvalPolicy"], "pending")
         self.assertNotIn("skills.workshop.approvalPolicy", self.skipped(skipped))
+
+    WORKSHOP_PLUGIN = "plugins.entries.skill-workshop.config.autonomous.mode"
+
+    def apply_1110(self, cfg, ledgered=()):
+        caps = _caps("2026.11.10")
+        snap = copy.deepcopy(cfg)
+        out = m.apply_pins(cfg, set(ledgered), retires_skill_proposals=caps["retires_skill_proposals"],
+                           heartbeat_retired=caps["heartbeat_retired"],
+                           skill_workshop_plugin=caps["skill_workshop_plugin_config"])
+        self.assertEqual(cfg, snap, "input mutated")
+        return out
+
+    def test_workshop_pin_lands_at_the_plugin_config_on_2026_11_10(self):
+        """OpenClaw 2026.11.10 (710b58de2ad #190365): skills has no workshop key any more; autonomous.mode belongs to
+        the bundled skill-workshop plugin, and OpenClaw reads its entry only with the migration marker."""
+        self.assertTrue(_caps("2026.11.10")["skill_workshop_plugin_config"])
+        self.assertFalse(_caps("2026.11.8")["skill_workshop_plugin_config"])
+        self.assertFalse(_caps("2026.11.4")["skill_workshop_plugin_config"])
+        new, written, skipped = self.apply_1110({"gateway": {"mode": "local"}})
+        self.assertNotIn("skills", new)
+        self.assertEqual(new["plugins"]["entries"]["skill-workshop"], {"config": {"autonomous": {"mode": "off"}}})
+        self.assertEqual(new["meta"], {"migrations": {"skillWorkshopPlugin": True}})
+        w = {x["path"]: x["value"] for x in written}
+        self.assertEqual((w[self.WORKSHOP_PLUGIN], w["meta.migrations.skillWorkshopPlugin"]), ("off", True))
+        self.assertFalse([p for p in w if p.startswith("skills.")])
+        self.assertEqual(self.skipped(skipped)["skills.workshop.approvalPolicy"],
+                         "condition:Skill Workshop proposals were removed in this OpenClaw version")
+        self.assertEqual(len(written) + len(skipped), 32, "31 pins plus the marker")
+        # a marked config: the leaf rule as before, no second marker write
+        marked = {"meta": {"lastTouchedVersion": "2026.11.10", "migrations": {"skillWorkshopPlugin": True}}}
+        new, written, _s = self.apply_1110(marked)
+        self.assertEqual(new["plugins"]["entries"]["skill-workshop"]["config"]["autonomous"]["mode"], "off")
+        self.assertEqual(new["meta"], marked["meta"])
+        self.assertNotIn("meta.migrations.skillWorkshopPlugin", [x["path"] for x in written])
+        marked["plugins"] = {"entries": {"skill-workshop": {"config": {"autonomous": {"mode": "propose"}}}}}
+        new, _w, skipped = self.apply_1110(marked)
+        self.assertEqual(new["plugins"]["entries"]["skill-workshop"]["config"]["autonomous"]["mode"], "propose")
+        self.assertEqual(self.skipped(skipped)[self.WORKSHOP_PLUGIN], "already-set")
+        # 2026.11.8 and older: the core key as before
+        for v in ("2026.11.8", "2026.11.4"):
+            caps = _caps(v)
+            new, _w, _s = m.apply_pins({}, set(), caps["retires_skill_proposals"], caps["heartbeat_retired"],
+                                       caps["skill_workshop_plugin_config"])
+            self.assertEqual(new["skills"]["workshop"], {"autonomous": {"mode": "off"}}, v)
+            self.assertNotIn("skill-workshop", new["plugins"]["entries"], v)
+            self.assertNotIn("meta", new, v)
+
+    def test_workshop_plugin_pin_skipped_where_openclaw_would_ignore_it(self):
+        """No pin (and no marker) while older skill-workshop plugin policy waits for doctor, while skills.workshop is
+        still set (doctor moves it; a plugin value would win), or when the marker cannot be written; the earlier
+        core path counts as ledgered."""
+        older = ({"plugins": {"entries": {"Skill-Workshop": {"enabled": True}}}},
+                 {"plugins": {"deny": ["skill-workshop"]}},
+                 {"plugins": {"allow": ["telegram"]}})
+        for cfg in older:
+            with self.subTest(cfg=cfg):
+                new, written, skipped = self.apply_1110(cfg)
+                self.assertTrue(self.skipped(skipped)[self.WORKSHOP_PLUGIN].startswith(
+                    "condition:plugin policy written while Skill Workshop was built in waits for openclaw doctor"))
+                self.assertNotIn("meta", new)
+                self.assertNotIn("skill-workshop", new["plugins"]["entries"])
+        new, _w, _s = self.apply_1110({"plugins": {"allow": ["telegram", "skill-workshop"]}})
+        self.assertEqual(new["plugins"]["entries"]["skill-workshop"]["config"]["autonomous"]["mode"], "off")
+        cfg = {"skills": {"workshop": {"autonomous": {"mode": "propose"}}}}
+        new, _w, skipped = self.apply_1110(cfg)
+        self.assertEqual(new["skills"], cfg["skills"])
+        self.assertEqual(self.skipped(skipped)[self.WORKSHOP_PLUGIN],
+                         "condition:skills.workshop is still set (doctor moves it to "
+                         "plugins.entries.skill-workshop.config)")
+        for meta in ("x", {"migrations": []}, {"migrations": {"skillWorkshopPlugin": False}}):
+            with self.subTest(meta=meta):
+                new, _w, skipped = self.apply_1110({"meta": meta})
+                self.assertEqual(self.skipped(skipped)[self.WORKSHOP_PLUGIN],
+                                 "condition:meta.migrations.skillWorkshopPlugin cannot be set to true")
+                self.assertEqual(new["meta"], meta)
+        for led in ("skills.workshop.autonomous.mode", self.WORKSHOP_PLUGIN):
+            new, _w, skipped = self.apply_1110({}, ledgered=[led, None])
+            self.assertEqual(self.skipped(skipped)[self.WORKSHOP_PLUGIN], "ledgered", led)
+            self.assertNotIn("skill-workshop", new["plugins"]["entries"])
+            self.assertEqual(new["agents"]["defaults"]["maxConcurrent"], 4, "a ledger entry without a path is no pin")
 
     def apply(self, cfg, ledgered=()):
         snap = copy.deepcopy(cfg)
@@ -1847,6 +1938,41 @@ class TestRetiredFormats(unittest.TestCase):
         self.assertEqual(self.plan(out)["cron/jobs.json"], ("cron-json", "quarantine"))
         self.assertEqual(out["findings"], [])
 
+    def test_cron_json_and_referenced_sidecars_left_to_doctor_from_2026_11_5(self):
+        # full7: 2026.11.5+ doctor imports cron JSON jobs with their state and referenced OAuth sidecars itself
+        caps = _caps("2026.11.10")
+        hex1, hex2 = "0123456789abcdef" * 2, "fedcba9876543210" * 2
+        _write(self.root, "cron/jobs.json", json.dumps({"jobs": [{"id": "j1"}]}))
+        _write(self.root, "cron/jobs-state.json", "{}")
+        _write(self.root, "cron/runs/j1.jsonl", "{}\n")
+        _write(self.root, "credentials/auth-profiles/%s.json" % hex1, "{}")
+        _write(self.root, "credentials/auth-profiles/%s.json" % hex2, "{}")
+        _agent_db(self.root, {"openai-codex:default": {"type": "oauth", "provider": "openai-codex",
+                                                       "oauthRef": {"id": hex1}}})
+        out = self.run_cls(caps=caps)
+        plan = self.plan(out)
+        self.assertEqual(out["findings"], [])
+        self.assertEqual(plan["cron/jobs.json"], ("cron-json", "leave"))
+        self.assertEqual(plan["cron/jobs-state.json"], ("cron-json-state", "leave"))
+        self.assertEqual(plan["cron/runs/j1.jsonl"], ("cron-run-log", "quarantine"))  # doctor only archives these
+        self.assertEqual(plan["credentials/auth-profiles/%s.json" % hex1], ("oauth-sidecar", "leave"))
+        self.assertEqual(plan["credentials/auth-profiles/%s.json" % hex2], ("oauth-sidecar", "quarantine"))
+        self.assertTrue(any("holds jobs that are not in SQLite: OpenClaw 2026.11.5 and later doctor imports them"
+                            in i for i in out["info"]), out["info"])
+        self.assertTrue(any(i.startswith("1 pre-June OAuth credential sidecar(s) still referenced") for i in out["info"]),
+                        out["info"])
+        # accepting an old code changes nothing (no finding to accept)
+        self.assertEqual(self.plan(self.run_cls(caps=caps, accepted={"cron-json-unimported"}))["cron/jobs.json"],
+                         ("cron-json", "leave"))
+        # an imported store still goes to quarantine with its state
+        _sqlite(os.path.join(self.root, "state/openclaw.sqlite"),
+                ["INSERT INTO cron_jobs VALUES ('%s', 'j1')" % os.path.join(self.root, "cron/jobs.json")])
+        plan = self.plan(self.run_cls(caps=caps))
+        self.assertEqual(plan["cron/jobs.json"], ("cron-json", "quarantine"))
+        self.assertEqual(plan["cron/jobs-state.json"], ("cron-json-state", "quarantine"))
+        # 2026.11.4 keeps the HOLD
+        self.assertIn("oauth-sidecar-referenced", self.codes(self.run_cls(caps=_caps("2026.11.4"))))
+
     def test_cron_receipt_and_custom_store(self):
         import hashlib
         _write(self.root, "x/my-jobs.json", "garbage")
@@ -2116,6 +2242,22 @@ class TestRetiredRuntimeFiles(unittest.TestCase):
 
     def ledger(self, sessions):
         return json.dumps({"version": 1, "sessions": sessions})
+
+    def test_runtime_files_from_2026_11_5_imported_or_quarantined_without_a_hold(self):
+        # full7: 2026.11.5+ doctor imports Voice Wake, conversation bindings and plugin approvals; the ACP ledger,
+        # the restart sentinel and the sandbox registries it only archives (the gate's quarantine instead)
+        for rel in RUNTIME_FILES + SANDBOX_REGISTRIES:
+            _write(self.root, rel, "{}")
+        _write(self.root, "settings/voicewake.json", json.dumps({"triggers": ["synthetic"]}))
+        out = self.run_cls(caps=_caps("2026.11.10"))
+        self.assertEqual(out["findings"], [])
+        plan = self.plan(out)
+        self.assertEqual(plan["settings/voicewake.json"], ("voicewake-json", "leave"))
+        for rel in ("acp/event-ledger.json", "restart-sentinel.json") + SANDBOX_REGISTRIES:
+            self.assertEqual(plan[rel][1], "quarantine", rel)
+            self.assertTrue(self.proof(out, rel).startswith("archived, not imported, from OpenClaw 2026.11.5: "), rel)
+        self.assertTrue(any(i.startswith("retired pre-July-2026 Voice Wake trigger words settings/voicewake.json (")
+                            for i in out["info"]), out["info"])
 
     # ----- version gating -----
     def test_runtime_files_left_to_doctor_for_10_4(self):
@@ -3108,7 +3250,10 @@ class TestDoctorKeyCopies(unittest.TestCase):
         self.assertTrue(m.is_key_marker(" oauth:x "))
         self.assertFalse(m.is_key_marker("OAuth:x"))
         self.assertFalse(m.is_key_marker("EMPTY"))
-        self.assertEqual(len(m._KNOWN_ENV_KEY_MARKERS), 54)  # the 2026.11.1 set (core, legacy, bundled manifests)
+        # the 2026.11.1 set (core, legacy, bundled manifests), the three manifests of 2026.11.8 (bifrost, omlx,
+        # requesty) and the rerank manifest of 2026.11.10
+        self.assertEqual(len(m._KNOWN_ENV_KEY_MARKERS), 58)
+        self.assertTrue(m.is_key_marker("RERANK_API_KEY"))
 
     def test_model_catalog_json_is_parsed_like_openclaw(self):
         text = '{\n // comment\n "providers": {"glm": {"apiKey": "a//b", "models": [1, 2,],},}, // end\n}\n'
@@ -3141,6 +3286,20 @@ class TestDoctorKeyCopies(unittest.TestCase):
                        "ops": [{"id": "dup:default", "provider": "dup", "copy": "catalog"}]}})
         self.assertNotIn("sk-synth", json.dumps(res))
         self.assertEqual(m.doctor_key_copies({}, [], None), {"shared": [], "agents": {}})
+
+    def test_doctor_key_copies_skip_catalog_keys_beside_a_shared_profile_from_2026_11_5(self):
+        """OpenClaw 2026.11.5+ (#187698 skipCatalogCredential): no catalog copy for a provider the shared store already
+        has a profile for, for the main agent dir and for other agents alike; a key of openclaw.json is still copied."""
+        cfg = {"models": {"providers": {"glm": {"apiKey": "sk-synth-1"}}}}
+        catalogs = [("main", True, {"glm": "sk-synth-2", "free": "sk-synth-3"}),
+                    ("haus", False, {"GLM": "sk-synth-4", "own": "sk-synth-5"})]
+        on = m.doctor_key_copies(cfg, catalogs, lambda aid: set(), None, _caps("2026.11.10"),
+                                 shared_providers={"glm"})
+        self.assertEqual(on, {"shared": [{"id": "glm:default", "provider": "glm", "copy": "config"},
+                                         {"id": "free:default", "provider": "free", "copy": "catalog"}],
+                              "agents": {"haus": [{"id": "own:default", "provider": "own", "copy": "catalog"}]}})
+        old = m.doctor_key_copies(cfg, catalogs, lambda aid: set(), None, _caps("2026.11.4"), shared_providers={"glm"})
+        self.assertEqual([x["provider"] for x in old["agents"]["haus"]], ["glm", "own"])
 
     def test_doctor_key_copies_skip_catalog_keys_beside_a_stored_secret_ref(self):
         """OpenClaw 2026.11.4 (#179802, hasProviderSecretRef): no catalog copy for a provider whose effective store

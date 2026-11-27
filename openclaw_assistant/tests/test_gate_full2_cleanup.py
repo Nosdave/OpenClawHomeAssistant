@@ -236,8 +236,61 @@ class CleanupEnv(T.GateEnv):
         return self.journal(), caps
 
 
+# Like OpenClaw 2026.11.5+: the capture is logged only at debug level, so the doctor output names no capture.
+SILENT_CAPTURE_DOCTOR = CAPTURE_DOCTOR.replace(
+    'print("\\x1b[90m│\\x1b[39m  Pre-repair state retained for manual recovery at " + d + "/manifest.json.", flush=True)\n',
+    "")
+
+
 class CleanupTests(CleanupEnv):
     # ----- a real gate run ------------------------------------------------------------------------
+    def test_captures_no_log_line_names_go_with_their_run_and_older_ones_stay(self):
+        # full7 (2026.11.5+, also 2026.11.10): the doctor log names no capture; the run records the doctor-<uuid> dirs
+        # that appeared during its doctor passes, never one that predates its first pass
+        self.assertNotIn("Pre-repair state retained", SILENT_CAPTURE_DOCTOR)
+        before = self.capture()
+        self.build_735()
+        doc = self.bin / "silent-capture-doctor"
+        doc.write_text(SILENT_CAPTURE_DOCTOR)
+        doc.chmod(0o755)
+        self.hooks(doctor_cmd=[str(doc), str(self.bin / "fake-doctor")])
+        self.assertEqual(self.run_gate(), 0, self.out + self.err)
+        j = self.journal()
+        caps = sorted(p for p in self.caps.iterdir() if G.CAPTURE_NAME_RE.match(p.name) and p.name != before.name)
+        self.assertEqual(len(caps), 2, caps)
+        self.assertEqual(j["capture_baseline"], [before.name])
+        self.assertEqual(sorted(j["doctor_captures"]), [c.name for c in caps])
+        self.assertEqual([d["pass"] for d in j["doctor"]], [1, 2])
+        keep, refused = G.run_captures(self.gp, j)
+        self.assertEqual((sorted(keep), refused), (caps, []))
+        after = self.capture()  # after the run finished (doctor by hand): not this run's
+        self.assertEqual(sorted(G.run_captures(self.gp, j)[0]), caps)
+        due = G.run_due_base(j) + H48
+        self.cleanup(due)
+        for c in caps:
+            self.assertFalse(os.path.lexists(c), c)
+        self.assertTrue(before.is_dir())
+        self.assertTrue(after.is_dir())
+
+    def test_capture_of_a_pass_the_gate_did_not_see_end_is_recorded_before_the_next(self):
+        rid = self.new_rid()
+        j = {"run_id": rid, "capture_baseline": [], "doctor_captures": []}
+        gate = SimpleNamespace(j=j, gp=self.gp)
+        c = self.capture()
+        G.Gate.note_doctor_captures(gate)
+        self.assertEqual(j["doctor_captures"], [c.name])
+        G.Gate.note_doctor_captures(gate)
+        self.assertEqual(j["doctor_captures"], [c.name])  # once
+        j2 = {"run_id": rid}
+        G.Gate.note_doctor_captures(SimpleNamespace(j=j2, gp=self.gp))  # no baseline yet: nothing is claimed
+        self.assertNotIn("doctor_captures", j2)
+
+    def test_debug_capture_line_is_parsed_too(self):
+        d = self.capture()
+        r = self.make_run(captures=0, archive=None, extra_lines=[
+            f"\x1b[2mRecovery copy saved before repair. No action needed. For manual recovery: {d}/manifest.json.\x1b[0m"])
+        self.assertEqual(G.run_captures(self.gp, r.j)[0], [d])
+
     def test_real_gate_run_writes_no_archive_and_its_captures_are_deleted_once_when_due(self):
         j, caps = self.real_gate_with_captures()
         rid = j["run_id"]

@@ -15,9 +15,13 @@
 #   - a writing `openclaw doctor` (anything but --lint/--json/--post-upgrade/
 #     --help) on OpenClaw 2026.8+: doctor migrates config and state without an
 #     archive. The add-on's migration gate runs it (`oc-upgrade retry --doctor`).
+#   - `openclaw database migration-capture create|restore` and `openclaw
+#     database restore-session-dependencies` (OpenClaw 2026.11.10+): they copy
+#     the state into plaintext files the add-on does not track, or replace it.
+#     `database migration-capture capabilities` only prints JSON and passes.
 #   - while the add-on holds OpenClaw (hold.txt present), every command except
 #     a small read-only allow-list.
-# OC_ADDON_UNSAFE=1 bypasses the doctor and HOLD checks (support-guided
+# OC_ADDON_UNSAFE=1 bypasses the doctor, database and HOLD checks (support-guided
 # recovery only); an OC_UPGRADE_DIR other than the add-on's hides its HOLD
 # marker, so it gets the same warning. Everything that is allowed is exec'd
 # unchanged, with the image's Node — no extra process is left behind for
@@ -164,6 +168,60 @@ subcommand() {
   return 0
 }
 
+# The first two words of the subcommand path (sub1, sub2), the way OpenClaw
+# finds them (cli-root-options.mjs getRootOptionAwareCommandPath): options are
+# skipped, also after the command word, and so is the value of --profile,
+# --log-level or --container (root options OpenClaw takes anywhere before `--`).
+# Words after a bare `--` count too, so an odd spelling is refused rather than
+# let through.
+subcommand_path() {
+  local r skip_value=false
+  sub1=""
+  sub2=""
+  for r in ${rest[@]+"${rest[@]}"}; do
+    if [ "$skip_value" = "true" ]; then
+      skip_value=false
+      if [ "${r#-}" = "$r" ]; then
+        continue
+      fi
+    fi
+    case "$r" in
+      --profile|--log-level|--container) skip_value=true ;;
+      -*) ;;
+      *)
+        if [ -z "$sub1" ]; then
+          sub1="$r"
+        else
+          sub2="$r"
+          return 0
+        fi
+        ;;
+    esac
+  done
+  return 0
+}
+
+# OpenClaw 2026.11.10 database commands that copy or replace the state outside
+# the add-on's backup and migration steps (register.database.ts):
+# `migration-capture create` writes a plaintext archive of the state, the
+# database images and openclaw.json; `migration-capture restore` unpacks one
+# into a staging tree; `restore-session-dependencies` rewrites the live state
+# database. None of them has an alias. `migration-capture capabilities` only
+# prints JSON.
+database_refused() {
+  [ "$cmd" = "database" ] || return 1
+  subcommand_path
+  case "$sub1" in
+    restore-session-dependencies) return 0 ;;
+    migration-capture)
+      case "$sub2" in
+        create|restore) return 0 ;;
+      esac
+      ;;
+  esac
+  return 1
+}
+
 hold_allows() {
   local sub
   case "$cmd" in
@@ -227,6 +285,15 @@ if [ "$cmd" = "doctor" ] && [ "$doctor_guarded" = "true" ] && ! doctor_is_read_o
 openclaw doctor (without --lint/--json/--post-upgrade) migrates config and state and is not run by hand in this add-on.
 Run: oc-upgrade retry --doctor   and restart the add-on — it first checks for an encrypted Home Assistant backup of the add-on, then runs doctor --fix twice with checks.
 Read-only check: openclaw doctor --lint
+EOF
+  exit 2
+fi
+
+if database_refused; then
+  cat >&2 <<'EOF'
+openclaw database migration-capture create|restore and database restore-session-dependencies are not run by hand in this add-on.
+They copy OpenClaw's state, with its secrets, into plaintext files the add-on does not track, or replace it outside the add-on's backup and migration steps.
+Back up with an encrypted Home Assistant backup of the add-on instead. Read-only: openclaw database migration-capture capabilities
 EOF
   exit 2
 fi

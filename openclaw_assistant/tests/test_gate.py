@@ -133,8 +133,10 @@ print("└  Doctor complete.")
 #   baks                  state-relative DBs doctor copies to <db>.pre-startup-migration-<stamp>.bak first
 #   box                   print the clack box ending in "Doctor complete." (default true)
 #   print                 extra lines (inside the box when box is true)        rc   exit code (default 0)
+#   signal                after the output, the doctor kills itself with this signal (2026.11.10's settled-exit
+#                         watchdog: SIGTERM 10 s after the command settled, whatever exit code it meant)
 SCRIPT_DOCTOR = r'''#!/usr/bin/env python3
-import glob, json, os, shutil, sqlite3, sys
+import glob, json, os, shutil, signal, sqlite3, sys
 script = sys.argv[1]
 with open(script, encoding="utf-8") as f:
     spec = json.load(f)
@@ -220,6 +222,10 @@ if step.get("box", True):
 else:
     for ln in lines:
         print(ln)
+if step.get("signal"):
+    sys.stdout.flush()
+    signal.signal(int(step["signal"]), signal.SIG_DFL)
+    os.kill(os.getpid(), int(step["signal"]))
 sys.exit(int(step.get("rc", 0)))
 '''
 
@@ -1045,6 +1051,14 @@ class DoctorNotesTests(unittest.TestCase):
         self.assertNotIn("sk-abc", text)
         self.assertEqual(G.doctor_notes("Doctor complete."), [])
 
+    def test_heartbeat_conversion_note_of_the_2026_11_lines(self):
+        # 2026.11.5+ (doctor-heartbeat-retirement.ts): the 2026.9.9 "Create heartbeat monitor" line is gone
+        log = ("│  Converted legacy heartbeat cadence to ordinary editable automations; recorded one-way    │\n"
+               "│  provisioning receipts.  │\n└  Doctor complete.\n")
+        self.assertEqual(G.doctor_notes(log), [["info", "doctor turned the heartbeat settings into ordinary cron jobs "
+                                                        "(openclaw automations list shows them; they run on the agent's "
+                                                        "model chain as cron runs)"]])
+
     def test_info_findings_never_hold(self):
         g = G.Gate(dry_run=True, emit=lambda _l: None)
         lines = []
@@ -1792,6 +1806,56 @@ class GateRunMoreTests(GateEnv):
         G.retry_cmd(["--accept", "doctor-not-idempotent"], emit=lambda s: None)
         self.assertEqual(self.run_gate(), 0, self.out)
         self.assertEqual([d["pass"] for d in self.journal()["doctor"]], [1, 2, 3])  # not re-run
+
+    def test_wizard_stamp_alone_is_no_config_change(self):
+        # doctor stamps wizard.lastRunAt on every write (2026.11.4 to 2026.11.10 applyWizardMetadata): no pass 3, no HOLD
+        self.build_735()
+        stamping = self.bin / "stamping-doctor"
+        stamping.write_text(FAKE_DOCTOR + "\nimport time\ncfg = json.load(open(cfgp))\n"
+                            "cfg.setdefault('wizard', {})['lastRunAt'] = str(time.time_ns())\n"
+                            "open(cfgp, 'w').write(json.dumps(cfg))\n")
+        stamping.chmod(0o755)
+        self.hooks(doctor_cmd=[str(stamping)])
+        self.assertEqual(self.run_gate(), 0, self.out)
+        j = self.journal()
+        self.assertEqual([d["pass"] for d in j["doctor"]], [1, 2])
+        self.assertIn("config unchanged", self.out)
+        rd = self.upg / "gate" / "runs" / j["run_id"]
+        self.assertTrue((rd / "config.post-pass2.json").exists())
+        self.assertFalse((rd / "config.post-pass3.json").exists())
+
+    def test_not_idempotent_names_pass3_paths_and_keeps_both_copies(self):
+        self.build_735()
+        flappy = self.bin / "flappy-doctor"
+        flappy.write_text(FAKE_DOCTOR + "\nimport time\ncfg = json.load(open(cfgp))\ncfg['x'] = time.time_ns()\n"
+                          "cfg.setdefault('wizard', {})['lastRunAt'] = str(time.time_ns())\n"
+                          "open(cfgp, 'w').write(json.dumps(cfg))\n")
+        flappy.chmod(0o755)
+        self.hooks(doctor_cmd=[str(flappy)])
+        self.assertEqual(self.run_gate(), 20, self.out)
+        j = self.journal()
+        self.assertEqual(j["hold"]["code"], "doctor-not-idempotent")
+        self.assertIn("again in pass 3: x", j["hold"]["message"])
+        self.assertNotIn("lastRunAt", j["hold"]["message"])
+        rd = self.upg / "gate" / "runs" / j["run_id"]
+        self.assertTrue((rd / "config.post-pass2.json").exists())
+        self.assertTrue((rd / "config.post-pass3.json").exists())
+
+    def test_not_idempotent_names_a_change_f1b_reverts(self):
+        # a doctor that re-adds the codex plugin entry in every pass: F1b removes it again after pass 3, so the paths
+        # must come from doctor's own pass-3 config (review full7)
+        self.build_735()
+        readd = self.bin / "readd-doctor"
+        readd.write_text(FAKE_DOCTOR + "\ncfg = json.load(open(cfgp))\n"
+                         "cfg.setdefault('plugins', {}).setdefault('entries', {})['codex'] = {'enabled': True}\n"
+                         "open(cfgp, 'w').write(json.dumps(cfg))\n")
+        readd.chmod(0o755)
+        self.hooks(doctor_cmd=[str(readd)])
+        self.assertEqual(self.run_gate(), 20, self.out)
+        j = self.journal()
+        self.assertEqual(j["hold"]["code"], "doctor-not-idempotent")
+        self.assertIn("again in pass 3: plugins.entries, plugins.entries.codex.enabled", j["hold"]["message"])
+        self.assertIn("F1b re-applied its fixups after pass 3", j["hold"]["message"])
 
     def test_rc0_held_back_holds_in_doctor1_until_accepted(self):
         self.build_735()

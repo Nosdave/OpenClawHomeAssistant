@@ -5,6 +5,7 @@ import hashlib
 import io
 import json
 import os
+import re
 import shutil
 import sys
 import subprocess
@@ -21,6 +22,7 @@ if str(ADDON) not in sys.path:
 import oc_dist_patch as P  # noqa: E402
 
 REGION = "//#region src/agents/thing.ts"
+NONL_REGION = "//!src/agents/thing.ts"  # the 2026.11.10 dist marks each module with //!<source path>
 STOCK = "\n".join(["import { x } from \"./x-AAAAAAAA.mjs\";", REGION, "const a = {",
                    "\tenabled: true,", "\thalfLifeDays: 30", "};", "function f() {", "\treturn 1;", "}",
                    "//#endregion", "export { a, f };"]) + "\n"
@@ -246,8 +248,20 @@ class RefusalTests(DistPatchCase):
         self.write_inventory()
         self.add_patch(STOCK.replace("30", "365"))
         self.assert_refused("expected dist/thing-BBBBBBBB.mjs")
-        self.add_patch(STOCK.replace("30", "365"), region="//#region src/nowhere.ts")
-        self.assert_refused("no file")
+
+    def test_region_inlined_in_a_js_bundle_or_a_subdirectory(self):
+        self.add_patch(STOCK.replace("30", "365"))
+        for rel in ("dist/config-doctor/bundle.js", "dist/extensions/x/.setup/chunk-DDDDDDDD.mjs", "dist/w.cjs"):
+            with self.subTest(rel=rel):
+                (self.pkg / rel).parent.mkdir(parents=True, exist_ok=True)
+                self.write(rel, "x\n" + REGION + "\n")
+                self.assert_refused(rel)
+                os.unlink(self.pkg / rel)
+        (self.pkg / "dist/notes").mkdir()
+        self.write("dist/notes/readme.txt", REGION + "\n")  # not a script
+        os.symlink(self.pkg / "dist/thing-BBBBBBBB.mjs", self.pkg / "dist/notes/link.js")  # links are not followed
+        self.run_patch()
+        self.assertEqual((self.pkg / "dist/thing-BBBBBBBB.mjs").read_text(), STOCK.replace("30", "365"))
 
     def test_diff_names_must_match_file(self):
         new = STOCK.replace("30", "365")
@@ -261,9 +275,21 @@ class RefusalTests(DistPatchCase):
         self.assert_refused("a second file")
 
     def test_missing_final_newline_marker(self):
+        # a no-newline marker for a file that ends with a newline
         new = STOCK.replace("30", "365")
         self.add_patch(new, diff=udiff("dist/thing-BBBBBBBB.mjs", STOCK, new) + "\\ No newline at end of file\n")
-        self.assert_refused("missing final newlines")
+        self.assert_refused("does not match the file's final newline")
+
+    def test_empty_stock_file(self):
+        self.write("dist/thing-BBBBBBBB.mjs", "")
+        self.write_ownership(stock=sha(b""))
+        self.write_inventory()
+        self.add_patch("x\n", diff="--- a/dist/thing-BBBBBBBB.mjs\n+++ b/dist/thing-BBBBBBBB.mjs\n@@ -0,0 +1 @@\n+x\n",
+                       region=None)
+        with self.assertRaises(P.PatchError) as cm:
+            self.run_patch()
+        self.assertIn("dist/thing-BBBBBBBB.mjs is empty", str(cm.exception))
+        self.assertEqual((self.pkg / "dist/thing-BBBBBBBB.mjs").read_bytes(), b"")
 
     def test_unsafe_paths(self):
         for rel in ("../x.mjs", "/etc/passwd", "dist/../package.json", "dist//x.mjs", "lib/x.mjs"):
@@ -362,6 +388,157 @@ class RefusalTests(DistPatchCase):
         self.assertIn("dist/tool.js", str(cm.exception))
 
 
+# Real GNU `diff -U<n>` output (diffutils 3.10, run with --label a/<file> --label b/<file>) for files with and
+# without a final newline. Python's difflib writes no "\ No newline at end of file" marker, so the cases are fixed
+# here; test_fixtures_are_gnu_diff_output re-creates them where GNU diff is installed.
+NL = "\\ No newline at end of file"
+_I, _M = 'import{x}from"./x-AAAAAAAA.mjs";', NONL_REGION
+_J = 'import{x,y}from"./x-AAAAAAAA.mjs";'
+GNU_DIFF_CASES = [  # (case, -U context lines, old file, new file, hunk lines)
+    ("last line changed, no final newline on either side", 3,
+     f"{_I}\n{_M}\nconst a={{h:30}};export{{a}};", f"{_I}\n{_M}\nconst a={{h:365}};export{{a}};",
+     ["@@ -1,3 +1,3 @@", " " + _I, " " + _M, "-const a={h:30};export{a};", NL, "+const a={h:365};export{a};", NL]),
+    ("the same with -U0", 0,
+     f"{_I}\n{_M}\nconst a={{h:30}};export{{a}};", f"{_I}\n{_M}\nconst a={{h:365}};export{{a}};",
+     ["@@ -3 +3 @@", "-const a={h:30};export{a};", NL, "+const a={h:365};export{a};", NL]),
+    ("the new side drops the final newline", 3, f"{_I}\n{_M}\nconst a=1;\n", f"{_I}\n{_M}\nconst a=1;",
+     ["@@ -1,3 +1,3 @@", " " + _I, " " + _M, "-const a=1;", "+const a=1;", NL]),
+    ("the new side adds a final newline", 3, f"{_I}\n{_M}\nconst a=1;", f"{_I}\n{_M}\nconst a=1;\n",
+     ["@@ -1,3 +1,3 @@", " " + _I, " " + _M, "-const a=1;", NL, "+const a=1;"]),
+    ("an unchanged last line as context, no final newline", 1,
+     f"{_I}\n{_M}\nconst a=1;\nexport{{a}};", f"{_I}\n{_M}\nconst a=2;\nexport{{a}};",
+     ["@@ -2,3 +2,3 @@", " " + _M, "-const a=1;", "+const a=2;", " export{a};", NL]),
+    ("a hunk above a last line without newline (no marker)", 1,
+     f"{_I}\n{_M}\nconst a=1;\nconst b=2;\nexport{{a,b}};", f"{_J}\n{_M}\nconst a=1;\nconst b=2;\nexport{{a,b}};",
+     ["@@ -1,2 +1,2 @@", "-" + _I, "+" + _J, " " + _M]),
+    ("two hunks, the second at the end", 1,
+     f"{_I}\n{_M}\nconst a=1;\nconst b=2;\nconst c=3;\nconst d=4;\nexport{{a}};",
+     f"{_J}\n{_M}\nconst a=1;\nconst b=2;\nconst c=3;\nconst d=4;\nexport{{a,d}};",
+     ["@@ -1,2 +1,2 @@", "-" + _I, "+" + _J, " " + _M, "@@ -6,2 +6,2 @@", " const d=4;", "-export{a};", NL,
+      "+export{a,d};", NL]),
+    ("the last line deleted, -U0", 0, f"{_I}\n{_M}\nconst a=1;\nexport{{a}};", f"{_I}\n{_M}\nconst a=1;\n",
+     ["@@ -4 +3,0 @@", "-export{a};", NL]),
+    ("lines appended after a last line without newline", 3, f"{_I}\n{_M}\nconst a=1;",
+     f"{_I}\n{_M}\nconst a=1;\nexport{{a}};",
+     ["@@ -1,3 +1,4 @@", " " + _I, " " + _M, "-const a=1;", NL, "+const a=1;", "+export{a};", NL]),
+    ("a one-line file", 3, "export const o=1;", "export const o=2;",
+     ["@@ -1 +1 @@", "-export const o=1;", NL, "+export const o=2;", NL]),
+]
+
+
+def gnu_case_diff(hunk_lines):
+    return "\n".join(["--- a/dist/thing-BBBBBBBB.mjs", "+++ b/dist/thing-BBBBBBBB.mjs", *hunk_lines]) + "\n"
+
+
+def gnu_diff_version():
+    try:
+        r = subprocess.run(["diff", "--version"], capture_output=True, text=True)
+    except OSError:
+        return None
+    return r.stdout if r.returncode == 0 and "GNU diffutils" in r.stdout else None
+
+
+class NoFinalNewlineTests(DistPatchCase):
+    """Dist files without a final newline (most chunks of 2026.11.10) and diff's no-newline marker."""
+
+    def nonl_stock(self, old=None):
+        """thing-BBBBBBBB.mjs as the 2026.11.10 dist ships its chunks: one line per module, no final newline."""
+        if old is None:
+            old = f"{_I}\n{NONL_REGION}\nconst a={{enabled:true,halfLifeDays:30}};export{{a}};"
+        self.write("dist/thing-BBBBBBBB.mjs", old)
+        self.write_ownership(stock=sha(old.encode()))
+        self.write_inventory()
+        return old
+
+    def apply_case(self, old, new, diff):
+        self.nonl_stock(old)
+        self.add_patch(new, diff=diff, region=NONL_REGION if NONL_REGION in old.split("\n") else None)
+        self.run_patch()
+        body = (self.pkg / "dist/thing-BBBBBBBB.mjs").read_bytes()
+        self.assertEqual(body, new.encode())
+        self.assertEqual(self.inventory()["dist/thing-BBBBBBBB.mjs"]["sha256"], sha(body))
+        self.assertEqual(self.ownership()["thing-BBBBBBBB.mjs"]["sha256"], sha(body))
+
+    def assert_refused_nonl(self, fragment, old):
+        with self.assertRaises(P.PatchError) as cm:
+            self.run_patch()
+        self.assertIn(fragment, str(cm.exception))
+        self.assertEqual((self.pkg / "dist/thing-BBBBBBBB.mjs").read_bytes(), old.encode())
+        self.assertEqual(self.inventory()["dist/thing-BBBBBBBB.mjs"]["sha256"], sha(old.encode()))
+
+    def test_gnu_diff_cases(self):
+        for case, _n, old, new, hunk in GNU_DIFF_CASES:
+            with self.subTest(case=case):
+                self.apply_case(old, new, gnu_case_diff(hunk))
+
+    @unittest.skipUnless(gnu_diff_version(), "GNU diff is not installed")
+    def test_fixtures_are_gnu_diff_output(self):
+        # the fixtures above are what `diff -U<n>` prints, and every context width applies to the same result
+        for case, n, old, new, hunk in GNU_DIFF_CASES:
+            with self.subTest(case=case):
+                a, b = self.tmp / "gnu-a", self.tmp / "gnu-b"
+                a.write_bytes(old.encode())
+                b.write_bytes(new.encode())
+                for u in (n, 0, 1, 2, 3):
+                    r = subprocess.run(["diff", f"-U{u}", "--label", "a/dist/thing-BBBBBBBB.mjs", "--label",
+                                        "b/dist/thing-BBBBBBBB.mjs", str(a), str(b)], capture_output=True, text=True)
+                    self.assertEqual(r.returncode, 1, r.stderr)
+                    if u == n:
+                        self.assertEqual(r.stdout, gnu_case_diff(hunk))
+                    self.apply_case(old, new, r.stdout)
+
+    def test_no_newline_marker_must_match_the_file(self):
+        old = self.nonl_stock()
+        new = old.replace("halfLifeDays:30", "halfLifeDays:365")
+        hunk = ("--- a/dist/thing-BBBBBBBB.mjs\n+++ b/dist/thing-BBBBBBBB.mjs\n@@ -3 +3 @@\n"
+                "-const a={enabled:true,halfLifeDays:30};export{a};\n<OLD>"
+                "+const a={enabled:true,halfLifeDays:365};export{a};\n<NEW>")
+        marker = NL + "\n"
+        # the last line without its marker claims a final newline the file does not have
+        self.add_patch(new, diff=hunk.replace("<OLD>", "").replace("<NEW>", marker), region=NONL_REGION)
+        self.assert_refused_nonl("does not match the file's final newline", old)
+        self.add_patch(new, diff=hunk.replace("<OLD>", "").replace("<NEW>", ""), region=NONL_REGION)
+        self.assert_refused_nonl("does not match the file's final newline", old)
+        # a marker on the old side only: the new side adds the final newline (another result than patched_sha256)
+        self.add_patch(new, diff=hunk.replace("<OLD>", marker).replace("<NEW>", ""), region=NONL_REGION)
+        self.assert_refused_nonl("expected " + sha(new.encode()), old)
+        self.add_patch(new + "\n", diff=hunk.replace("<OLD>", marker).replace("<NEW>", ""), region=NONL_REGION)
+        self.run_patch()
+        self.assertEqual((self.pkg / "dist/thing-BBBBBBBB.mjs").read_bytes(), (new + "\n").encode())
+
+    def test_marker_on_a_hunk_that_does_not_reach_the_end(self):
+        old = self.nonl_stock()
+        new = old.replace(_I, _J)
+        d = f"--- a/dist/thing-BBBBBBBB.mjs\n+++ b/dist/thing-BBBBBBBB.mjs\n@@ -1 +1 @@\n-{_I}\n{NL}\n+{_J}\n{NL}\n"
+        self.add_patch(new, diff=d, region=NONL_REGION)
+        self.assert_refused_nonl("does not match the file's final newline", old)
+
+    def test_insertion_after_a_last_line_without_newline(self):
+        # diff never writes this (the last line itself changes); the patcher does not guess where the newline goes
+        old = self.nonl_stock()
+        d = "--- a/dist/thing-BBBBBBBB.mjs\n+++ b/dist/thing-BBBBBBBB.mjs\n@@ -3,0 +4 @@\n+export{b};\n"
+        self.add_patch(old + "\nexport{b};\n", diff=d, region=NONL_REGION)
+        self.assert_refused_nonl("does not match the file's final newline", old)
+
+    def test_misplaced_no_newline_marker(self):
+        old = self.nonl_stock()
+        head = "--- a/dist/thing-BBBBBBBB.mjs\n+++ b/dist/thing-BBBBBBBB.mjs\n"
+        for case, body in (("after a removed line that is not the old side's last",
+                            f"@@ -1,2 +1,2 @@\n-{_I}\n{NL}\n+{_J}\n {NONL_REGION}\n"),
+                           ("first in the hunk", f"@@ -1,2 +1,2 @@\n{NL}\n-{_I}\n+{_J}\n {NONL_REGION}\n"),
+                           ("twice after one line", f"@@ -3 +3 @@\n-x\n{NL}\n{NL}\n+y\n{NL}\n")):
+            with self.subTest(case=case):
+                self.add_patch(old, diff=head + body, region=NONL_REGION)
+                self.assert_refused_nonl("misplaced no-newline marker", old)
+
+    def test_hunk_after_the_end_of_the_file(self):
+        old = self.nonl_stock()
+        d = (f"--- a/dist/thing-BBBBBBBB.mjs\n+++ b/dist/thing-BBBBBBBB.mjs\n@@ -3 +3 @@\n-x\n{NL}\n+y\n{NL}\n"
+             "@@ -4 +4 @@\n-z\n+w\n")
+        self.add_patch(old, diff=d, region=NONL_REGION)
+        self.assert_refused_nonl("a hunk follows the end of the file", old)
+
+
 class MainTests(DistPatchCase):
     def test_exit_codes(self):
         self.add_patch(STOCK.replace("30", "365"), version="2026.10.7")
@@ -379,17 +556,32 @@ class MainTests(DistPatchCase):
 # OpenClaw fixed it, is a deliberate edit here (with the reason in CHANGELOG.md).
 _HOTFIX_2026_10 = {"memory-search-half-life", "telegram-voice-text-first", "telegram-delivery-live-custody",
                    "telegram-notice-live-guard", "telegram-fetch-fresh-audio",
-                   "telegram-reply-self-audio"}  # TG-20261112, not fixed upstream through 2026.11.5-beta.2
+                   "telegram-reply-self-audio"}  # TG-20261112, not fixed upstream through 2026.11.10
 # 2026.11.4 keeps all six: its own live-send guard (hasActiveDirectPendingFinalDelivery, cf9a023c222a) ends at the
 # custody release, before the canonical settlement, so telegram-delivery-live-custody and telegram-notice-live-guard
 # stay (openclaw/openclaw#154417 is not in 2026.11.4); the other four regions are unchanged from 2026.11.3.
+# 2026.11.10 drops telegram-delivery-live-custody and telegram-notice-live-guard: openclaw/openclaw#154417
+# (f6f7252001c1) releases the custody only after the canonical settlement and the notice checks the active delivery
+# itself. It needs no gateway-capability-path-guard either: it carries openclaw/openclaw#190863 itself (d4c687ac8c97),
+# which GATEWAY_PATH_TESTS checks. Its dist is one line per module ('//!<source path>' markers, mostly no final
+# newline), see oc_dist_patch.py. The 2026.11.8 set (with the #190863 backport) was never shipped and is removed.
+# It adds doctor-restore-env-refs-deferral (openclaw/openclaw#205695, not fixed upstream through 2026.12.1): doctor's
+# config repair after the codex refresh fails without it on an update from 2026.11.4 (rehearsal 1110).
+_HOTFIX_2026_11_10 = (_HOTFIX_2026_10 - {"telegram-delivery-live-custody", "telegram-notice-live-guard"}) | {
+    "doctor-restore-env-refs-deferral"}
 EXPECTED_PATCHES = {
-    "2026.10.4": _HOTFIX_2026_10,  # 0.5.94-full4 (the version users update from): rollback and emergency builds
-    "2026.11.4": _HOTFIX_2026_10,  # the image default (Dockerfile ARG OPENCLAW_VERSION), from 0.5.94-full6
+    "2026.10.4": _HOTFIX_2026_10,  # 0.5.94-full4: rollback and emergency builds
+    "2026.11.4": _HOTFIX_2026_10,  # 0.5.94-full6 (the version full7 updates from): rollback and emergency builds
+    "2026.11.10": _HOTFIX_2026_11_10,  # the image default (Dockerfile ARG OPENCLAW_VERSION), from 0.5.94-full7
 }
 # Telegram patches whose regression tests are one file for all versions (it maps each version to the patched chunk)
 # instead of a part of tests/oc_patches/telegram_hotfix_<version>.test.mjs.
 CROSS_VERSION_TESTS = {"telegram-reply-self-audio": "telegram_reply_self_audio.test.mjs"}
+# Versions whose own OpenClaw code holds the capability-scoped path check (openclaw/openclaw#190863), with the chunk
+# tests/oc_patches/gateway_capability_path_<version>.test.mjs runs: it checks the stock function still marks the
+# ambiguous scoped paths as malformed (the gateway answers 400, server-http-request.ts:283-286).
+GATEWAY_PATH_TESTS = {"2026.11.10": "plugin-node-capability-C3FKPhfC.mjs"}
+GATEWAY_PATH_GUARD = b"/^\\/(?:\\/|%2f|%5c)/i.test("  # the minified guard of 2026.11.10 (plugin-node-capability.ts:344)
 
 
 def dockerfile_arg(name):
@@ -429,6 +621,43 @@ class RepoPatchSetTests(unittest.TestCase):
                     self.assertTrue(js.is_file(), f"{js.name} missing for {e['name']} in oc-patches/{d.name}")
                     named = f"'{d.name}': '{chunk}'" if cross else f"'{chunk}'"
                     self.assertIn(named, js.read_text(), f"{js.name} does not name {e['file']} for {d.name}")
+
+    def test_doctor_patch_has_its_test_file(self):
+        # doctor-restore-env-refs-deferral runs the real planConfigRepair in a vm (with a stock negative control)
+        for d, man in self.patch_sets():
+            for e in man["patches"]:
+                if e["name"] != "doctor-restore-env-refs-deferral":
+                    continue
+                with self.subTest(version=d.name):
+                    js = ADDON / "tests" / "oc_patches" / f"doctor_restore_env_refs_{d.name}.test.mjs"
+                    self.assertTrue(js.is_file(), f"{js.name} missing for oc-patches/{d.name}")
+                    self.assertIn(f"'{os.path.basename(e['file'])}'", js.read_text())
+
+    def test_gateway_path_check_has_its_test_file(self):
+        # a set that backports #190863 (gateway-capability-path-guard) or a version that carries it upstream has
+        # gateway_capability_path_<version>.test.mjs naming the chunk; the image default is one of them
+        tested = set()
+        for d, man in self.patch_sets():
+            guard = [e for e in man["patches"] if e["name"] == "gateway-capability-path-guard"]
+            chunk = os.path.basename(guard[0]["file"]) if guard else GATEWAY_PATH_TESTS.get(d.name)
+            if not chunk:
+                continue
+            with self.subTest(version=d.name):
+                self.assertFalse(guard and d.name in GATEWAY_PATH_TESTS, "a version needs the backport or has the fix")
+                js = ADDON / "tests" / "oc_patches" / f"gateway_capability_path_{d.name}.test.mjs"
+                self.assertTrue(js.is_file(), f"{js.name} missing for oc-patches/{d.name}")
+                self.assertIn(f"'{chunk}'", js.read_text())
+                tested.add(d.name)
+        self.assertIn(dockerfile_arg("OPENCLAW_VERSION"), tested)
+
+    def test_no_tests_for_a_removed_set(self):
+        for js in sorted((ADDON / "tests" / "oc_patches").glob("*.test.mjs")):
+            m = re.search(r"_(\d{4}\.\d+\.\d+)\.test\.mjs$", js.name)
+            if m:
+                self.assertIn(m.group(1), EXPECTED_PATCHES, f"{js.name} tests a version without a patch set")
+        cross = (ADDON / "tests" / "oc_patches" / CROSS_VERSION_TESTS["telegram-reply-self-audio"]).read_text()
+        named = set(re.findall(r"^  '(\d{4}\.\d+\.\d+)': 'bot-message-", cross, re.M))
+        self.assertEqual(named, {v for v, names in EXPECTED_PATCHES.items() if "telegram-reply-self-audio" in names})
 
     def test_dockerfile_default_pin_has_patch_set_and_lockstep_plugins(self):
         version = dockerfile_arg("OPENCLAW_VERSION")
@@ -480,6 +709,11 @@ class RepoPatchSetTests(unittest.TestCase):
                 self.assertEqual(sha((tmp / "pkg" / e["file"]).read_bytes()), e["patched_sha256"], e["name"])
             with self.assertRaisesRegex(P.PatchError, "is not the stock file"):
                 P.apply_all(str(tmp / "pkg"), str(patch_dir), node_check=False, log=lambda _m: None)
+            if version in GATEWAY_PATH_TESTS:
+                # the upstream #190863 guard is in the stock chunk the gateway path test slices
+                chunk = (src / "dist" / GATEWAY_PATH_TESTS[version]).read_bytes()
+                self.assertEqual(chunk.count(GATEWAY_PATH_GUARD), 1)
+                self.assertIn(b"\n//!src/gateway/plugin-node-capability.ts\n", chunk)
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 

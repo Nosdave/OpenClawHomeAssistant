@@ -53,6 +53,7 @@ EXTRA_JOBS = [
 
 # what OpenClaw's own migration (2026.11.2, openclaw/openclaw#172792) does for the jobs: it records the account of a
 # job's own model only (inference-binding-migration.ts), and a bound job's fallbacks to other providers are refused
+# (2026.11.2 to 2026.11.9; 2026.11.10 runs them on live credentials, #196539: tests/test_gate_1110_cron.py)
 OUTLOOK_PRIM = ("OpenClaw records the inference account of {who} itself from 2026.11.2 (doctor migration, "
                 "openclaw/openclaw#172792), but then refuses their fallbacks to other providers (as with "
                 "openclaw/openclaw#192463)")
@@ -350,8 +351,8 @@ class CronForecastGateTests(T.GateEnv):
         pre = out[:out.index("[gate] 1/8 precheck:")]
         self.assertIn("[gate] 1/8 info: 1 enabled cron job(s) without a recorded inference account run their own "
                       "model on a stored login: 'Morning summary' (job-morning); OpenClaw 2026.11.5-beta.1 doctor "
-                      "records that account during the migration when exactly one fits (openclaw/openclaw#172792), but "
-                      "then refuses their fallbacks to other providers (as with openclaw/openclaw#192463); the gate "
+                      "records that account during the migration (openclaw/openclaw#172792) when an eligible account "
+                      "fits (with several, the one a run would take now), but then refuses their fallbacks to other providers (as with openclaw/openclaw#192463); the gate "
                       "reports the jobs doctor leaves after the migration", pre)
         self.assertNotIn("WARN [gate] cron job 'Morning summary'", pre)
         self.assertIn("WARN [gate] cron job 'Local digest' (job-local)", pre)

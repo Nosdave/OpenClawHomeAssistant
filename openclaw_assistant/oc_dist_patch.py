@@ -7,16 +7,22 @@ usage: oc_dist_patch.py [--no-node-check] PKG_DIR PATCH_DIR
 PATCH_DIR/manifest.json names the OpenClaw version the patches are for and, per patch, the dist
 file, its sha256 before and after, and a unified diff (one file per diff, paths a/<file> b/<file>):
 
-  {"openclaw_version": "2026.10.4",
-   "patches": [{"name": "...", "file": "dist/x-HASH.mjs", "region": "//#region src/....ts",
+  {"openclaw_version": "2026.11.10",
+   "patches": [{"name": "...", "file": "dist/x-HASH.mjs", "region": "//!src/....ts",
                 "stock_sha256": "...", "patched_sha256": "...", "diff": "x.patch"}]}
 
-An empty "patches" list states that this OpenClaw version needs none. Lines are separated by "\\n"
-only, in the dist files and in the diffs (derive diffs with `diff -u` or `git diff --no-index`).
-Every check fails the build instead of skipping a patch: another OpenClaw version, a missing or
-re-packed file, a region that is not in exactly that one file, a hunk whose context is not at the
-stated line (no offset, no fuzz), or a result that is not byte-identical to patched_sha256. All
-checks, including `node --check` of the patched files, run before the first file is replaced.
+The optional "region" is a module marker line that must be in exactly that one dist file
+("//!<source path>" from 2026.11.10, "//#region <source path>" before), of all .mjs, .js and .cjs
+files below dist/. An empty "patches" list
+states that this OpenClaw version needs none. Lines are separated by "\\n" only, in the dist files
+and in the diffs (derive diffs with `diff -u` or `git diff --no-index`). A dist file may lack the
+final newline (most chunks of the 2026.11.10 dist do): a hunk that ends at such a last line must
+carry diff's "\\ No newline at end of file" after it, and the patched file keeps or drops the final
+newline as the new side says. Every check fails the build instead of skipping a patch: another
+OpenClaw version, a missing, empty or re-packed file, a region that is not in exactly that one
+file, a hunk whose context is not at the stated line (no offset, no fuzz), a no-newline marker that
+does not match the file, or a result that is not byte-identical to patched_sha256. All checks,
+including `node --check` of the patched files, run before the first file is replaced.
 OpenClaw's content inventory (dist/postinstall-content-inventory.json) and the chunk hashes in
 dist/runtime-dependency-ownership.json are updated for the patched files; then every inventory
 entry is re-checked (path, sha256, size, exact exec bits).
@@ -91,12 +97,13 @@ def parse_diff(text, rel):
             raise PatchError(f"diff for {rel}: hunk at -{old_start} has new start +{new_start}, "
                              f"expected +{first_old + delta - (0 if new_len else 1)}")
         old, new, i = [], [], i + 1
+        old_eof = new_eof = False  # "\ No newline at end of file" after the old / new side's last line
         while len(old) < old_len or len(new) < new_len:
             if i >= len(lines):
                 raise PatchError(f"diff for {rel}: hunk at -{old_start} has wrong line counts")
             ln = lines[i]
             if ln.startswith("\\"):
-                raise PatchError(f"diff for {rel}: missing final newlines are not supported")
+                raise PatchError(f"diff for {rel}: hunk at -{old_start}: misplaced no-newline marker")
             tag, body = ln[:1], ln[1:]
             if tag == " " and len(old) < old_len and len(new) < new_len:
                 old.append(body)
@@ -109,10 +116,20 @@ def parse_diff(text, rel):
                 raise PatchError(f"diff for {rel}: hunk at -{old_start} has wrong line counts "
                                  f"(line {i + 1}: {ln[:60]!r})")
             i += 1
+            if i < len(lines) and lines[i].startswith("\\"):
+                # the line just read is the last line of its side(s), without a newline
+                ends_old = tag in " -" and len(old) == old_len and not old_eof
+                ends_new = tag in " +" and len(new) == new_len and not new_eof
+                if not (ends_old if tag == "-" else ends_new if tag == "+" else ends_old and ends_new):
+                    raise PatchError(f"diff for {rel}: hunk at -{old_start}: misplaced no-newline marker")
+                old_eof, new_eof = old_eof or tag in " -", new_eof or tag in " +"
+                i += 1
         if i < len(lines) and lines[i].startswith("\\"):
-            raise PatchError(f"diff for {rel}: missing final newlines are not supported")
+            raise PatchError(f"diff for {rel}: hunk at -{old_start}: misplaced no-newline marker")
+        if (old_eof or new_eof) and i < len(lines):
+            raise PatchError(f"diff for {rel}: a hunk follows the end of the file")
         delta += new_len - old_len
-        hunks.append((old_start, old, new))
+        hunks.append((old_start, old, new, old_eof, new_eof))
     if not hunks:
         raise PatchError(f"diff for {rel} has no hunks")
     return hunks
@@ -124,21 +141,28 @@ def apply_hunks(data, hunks, rel):
         text = data.decode("utf-8")
     except UnicodeDecodeError as exc:
         raise PatchError(f"{rel} is not UTF-8") from exc
-    if not text.endswith("\n"):
-        raise PatchError(f"{rel} does not end with a newline")
-    src = text[:-1].split("\n")
-    out, pos = [], 0
-    for old_start, old, new in hunks:
+    if not text:
+        raise PatchError(f"{rel} is empty")
+    final_nl = text.endswith("\n")
+    src = (text[:-1] if final_nl else text).split("\n")
+    out, pos, out_nl = [], 0, final_nl
+    for old_start, old, new, old_eof, new_eof in hunks:
         at = old_start - 1 if old else old_start
         if at < pos:
             raise PatchError(f"{rel}: hunks overlap or are out of order at line {old_start}")
         if at + len(old) > len(src) or src[at:at + len(old)] != old:
             raise PatchError(f"{rel}: hunk context does not match at line {old_start}")
+        ends_file = at + len(old) == len(src)
+        if (old_eof != (ends_file and bool(old) and not final_nl)) or (new_eof and not ends_file) \
+                or (ends_file and not old and not final_nl):
+            raise PatchError(f"{rel}: hunk at line {old_start} does not match the file's final newline")
+        if ends_file:
+            out_nl = not new_eof if new else True
         out.extend(src[pos:at])
         out.extend(new)
         pos = at + len(old)
     out.extend(src[pos:])
-    return ("\n".join(out) + "\n").encode("utf-8") if out else b""
+    return ("\n".join(out) + ("\n" if out_nl else "")).encode("utf-8") if out else b""
 
 
 def write_like(path, data, mode):
@@ -177,23 +201,31 @@ def load_manifest(patch_dir):
     return man
 
 
+REGION_SCAN_SUFFIXES = (".mjs", ".js", ".cjs")
+
+
 def region_files(pkg, regions):
-    """{region marker line: [dist/*.mjs files containing it]} in one pass over dist/."""
+    """{region marker line: [dist files containing it]} in one pass over dist/ and its subdirectories: every regular
+    .mjs, .js and .cjs file (the dist also inlines modules, with the same markers, into .js bundles and into chunks in
+    subdirectories; a second, unpatched copy of a patched module must fail the build). Links are not followed."""
     wanted = {r.encode(): r for r in regions}
     hits = {r: [] for r in regions}
     if not wanted:
         return hits
     dist = os.path.join(pkg, "dist")
-    for name in sorted(os.listdir(dist)):
-        if not name.endswith(".mjs"):
-            continue
-        p = os.path.join(dist, name)
-        if not stat.S_ISREG(os.lstat(p).st_mode):
-            continue
-        with open(p, "rb") as f:
-            found = {wanted[ln.rstrip(b"\n")] for ln in f if ln.rstrip(b"\n") in wanted}
-        for r in found:
-            hits[r].append("dist/" + name)
+    for root, dirs, files in os.walk(dist, followlinks=False):
+        dirs.sort()
+        for name in sorted(files):
+            if not name.endswith(REGION_SCAN_SUFFIXES):
+                continue
+            p = os.path.join(root, name)
+            if not stat.S_ISREG(os.lstat(p).st_mode):
+                continue
+            with open(p, "rb") as f:
+                found = {wanted[ln.rstrip(b"\n")] for ln in f if ln.rstrip(b"\n") in wanted}
+            rel = "dist/" + os.path.relpath(p, dist).replace(os.sep, "/")
+            for r in found:
+                hits[r].append(rel)
     return hits
 
 

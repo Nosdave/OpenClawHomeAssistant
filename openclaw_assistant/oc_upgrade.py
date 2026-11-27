@@ -5,7 +5,8 @@ oc-upgrade — upgrade checks, the migration gate and its helpers for the add-on
 Commands:
   check          Read-only inventory of the persistent OpenClaw state: versions,
                  database schemas, legacy (pre-June 2026) leftovers, model
-                 wildcards, free space and (when a migration is pending) the
+                 wildcards, official plugins the bundled OpenClaw does not
+                 load, free space and (when a migration is pending) the
                  migration-gate readiness. Prints file names, sizes and versions
                  only — never tokens or other secret values.
                  Exit codes: 0 nothing to note, 4 notes (cleanup items the
@@ -348,6 +349,22 @@ def cmd_check(_args):
             print(f"  gate: run {j.get('run_id')} status {j.get('status')} phase {j.get('phase')}")
         m = G.load_marker()
         print(f"  migrated: {m.get('runtime')} ({m.get('mode')})" if m else "  migrated: no marker")
+        # official npm plugins the bundled OpenClaw does not load (PLUGIN_MIN_COMPATIBLE; read-only install records)
+        for x in G.official_plugin_installs(state, cfg if isinstance(cfg, dict) else {}):
+            floor = below_plugin_floor(x["package"], x["version"], pkg["version"]) if x["enabled"] is not False \
+                else None
+            if not floor:
+                continue
+            # `openclaw plugins update` is offline-only (plugins-local-state.ts onForeignOwner "refuse"): it is
+            # refused while the add-on's gateway runs, and plugins-sync runs before the gateway at every start
+            fix = ("restart the add-on: its plugin update step brings it to {1} before the gateway starts (openclaw "
+                   "plugins update is refused while the gateway runs)" if migrated else
+                   "the migration gate's doctor and the add-on's plugin update step after it bring it to {1}")
+            print(f"  WARN: {x['package']} {x['version']} is below the minimum version OpenClaw {pkg['version']} "
+                  f"loads ({floor}), so the plugin is unavailable until it is updated; "
+                  + fix.format(x["package"], pkg["version"]))
+            notes.append(f"{x['package']} {x['version']} is not loaded by OpenClaw {pkg['version']} until it is updated")
+            bump(RC_NOTES)
     try:
         reasons = newer_state_reasons(runtime)
     except Exception as exc:  # noqa: BLE001
@@ -414,7 +431,7 @@ def cmd_check(_args):
     if not shown:
         print("  none")
 
-    print("\n== C2 Pre-July-2026 files and settings (OpenClaw 2026.10 refuses them)"
+    print("\n== C2 Pre-July-2026 files and settings (OpenClaw 2026.10 and later refuse or retire them)"
           + ("  [informational: migrated]" if info_only else ""))
     shown = 0
     if M is not None:
@@ -700,8 +717,59 @@ PLUGIN_STOP_GRACE = 10  # a stop request (SIGTERM from run.sh's shutdown trap vi
 # room for npm's start on slow hardware.
 PLUGIN_PROBE_TIMEOUT = 30
 _RUNTIME_VERSION_RE = re.compile(r"^\d{4}\.\d+\.\d+(?:-\d+)?$")
-# OpenClaw keeps loading a version-bound plugin from this release on (official-runtime-plugins.ts)
-PLUGIN_MIN_COMPATIBLE = {"@openclaw/codex": "2026.9.7"}
+# OpenClaw's loader refuses an enabled npm @openclaw/codex below this floor ("Official runtime plugin codex ... is
+# incompatible with OpenClaw ...; it is unavailable until repaired"), unless the plugin has exactly OpenClaw's version
+# (official-runtime-plugins.ts minimumCompatibleVersion; 2026.11.10 loader-runtime-candidate.ts:244-264 and
+# semver.ts:61-71). (floor, first bundled OpenClaw with it), oldest first: 2026.9.7 in 2026.10.4 to 2026.11.8,
+# 2026.11.5-beta.1 from 2026.11.10 (d5e35ca8321 #192760, not in 2026.11.8/11.9). @openclaw/acpx and Brave have none.
+PLUGIN_MIN_COMPATIBLE = {"@openclaw/codex": (("2026.9.7", (0, 0, 0, 0)), ("2026.11.5-beta.1", (2026, 11, 10, 0)))}
+_RELEASE_RE = re.compile(r"\A(\d{4})\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-(?:(0|[1-9]\d*)|(alpha|beta)\.(0|[1-9]\d*)))?\Z")
+
+
+def plugin_floor(pkg, runtime):
+    """The loader floor (PLUGIN_MIN_COMPATIBLE) of the official plugin `pkg` on OpenClaw `runtime`, or None."""
+    rt = version_tuple(runtime)
+    floor = None
+    for value, since in PLUGIN_MIN_COMPATIBLE.get(pkg, ()):
+        if rt and rt >= since:
+            floor = value
+    return floor
+
+
+def _release_key(text):
+    """OpenClaw's release version order (2026.11.10 semver.ts parseOpenClawReleaseVersion, compareOpenClawSemver) as a
+    tuple: -alpha.N < -beta.N < the release < its corrections -N. None for any other shape: OpenClaw then does not
+    refuse the plugin."""
+    m = _RELEASE_RE.match(text.strip()) if isinstance(text, str) else None
+    if not m or not 1 <= int(m.group(2)) <= 12 or int(m.group(3)) < 1:
+        return None
+    base = (int(m.group(1)), int(m.group(2)), int(m.group(3)))
+    if m.group(5):
+        seq = int(m.group(6))
+        return base + (0, 0 if m.group(5) == "alpha" else 1, seq) if seq > 0 else None
+    if m.group(4) is not None and int(m.group(4)) < 1:
+        return None
+    return base + (1, int(m.group(4) or 0), 0)
+
+
+def below_plugin_floor(pkg, version, runtime):
+    """The floor when OpenClaw `runtime` does not load the enabled official plugin `pkg` at `version`, else None (no
+    floor, an exact pair with OpenClaw's version, or a version OpenClaw cannot parse)."""
+    floor = plugin_floor(pkg, runtime)
+    have, need = _release_key(version), _release_key(floor)
+    if have and need and version != runtime and have < need:
+        return floor
+    return None
+
+
+def _floor_note(pkg, version, runtime):
+    """What OpenClaw `runtime` does with `pkg` left at `version`, for the plugins-sync WARN ("" without a floor)."""
+    floor = plugin_floor(pkg, runtime)
+    if not floor or not _release_key(version):
+        return ""
+    if below_plugin_floor(pkg, version, runtime):
+        return f"; OpenClaw {runtime} does not load it below {floor}, so it is unavailable until it is updated"
+    return f"; OpenClaw {runtime} still loads it (minimum {floor})"
 
 
 def _sync_runtime_version():
@@ -868,8 +936,13 @@ def _plugins_sync(stop=None):
                 print(f"WARN: Official plugins not updated: the npm registry did not confirm {todo[0][0]}@{rt} "
                       f"({why}); "
                       + ", ".join(f"{pkg} stays at {ver or 'an unknown version'}" for pkg, ver in todo)
-                      + ". The add-on tries again at the next start; by hand, once online: "
-                      + "; ".join(f"openclaw plugins update {pkg}@{rt}" for pkg, _v in todo))
+                      + ". The add-on tries again at the next start: once the registry is reachable, restart the "
+                        "add-on (openclaw plugins update is refused while the gateway runs)")
+                for pkg, ver in todo:
+                    floor = below_plugin_floor(pkg, ver, rt)
+                    if floor:
+                        print(f"WARN: OpenClaw {rt} does not load {pkg} {ver} (minimum {floor}): it is unavailable "
+                              "until it is updated.")
                 return RC_OK
         for i, (pkg, ver) in enumerate(todo):
             if stop.is_set():
@@ -901,11 +974,9 @@ def _plugins_sync(stop=None):
                 elif got != rt:
                     failed.append((pkg, got or ver, f"openclaw plugins update left version {got or 'unknown'}"))
         for pkg, ver, why in failed:
-            floor = PLUGIN_MIN_COMPATIBLE.get(pkg)
-            loads = (f"; OpenClaw {rt} still loads it (minimum {floor})" if floor and version_tuple(ver)
-                     and version_tuple(ver) >= version_tuple(floor) else "")
-            print(f"WARN: {pkg} stays at {ver or 'an unknown version'} ({why}){loads}. The add-on tries again at the "
-                  f"next start; by hand: openclaw plugins update {pkg}@{rt}")
+            print(f"WARN: {pkg} stays at {ver or 'an unknown version'} ({why}){_floor_note(pkg, ver, rt)}. The add-on "
+                  f"tries again at the next start: restart the add-on (openclaw plugins update {pkg}@{rt} is refused "
+                  "while the gateway runs)")
         for x in unlisted:
             print(f"WARN: OpenClaw recorded the npm install of {x['package']} {x['version'] or '?'} (plugin "
                   f"{x['id']}), but openclaw plugins list does not show it, so its version is not confirmed (check: "

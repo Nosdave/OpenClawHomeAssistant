@@ -772,6 +772,23 @@ class GateExportTests(Base):
                 self.assertEqual(cfg["skills"]["workshop"].get("approvalPolicy"), want)
                 self.assertEqual(cfg["skills"]["workshop"]["autonomous"]["mode"], "off")
 
+    def test_pins_phase_writes_the_workshop_mode_to_the_plugin_config_on_2026_11_10(self):
+        """2026.11.10 refuses a skills.workshop key (validation.workshop-contract.test.ts): the gate passes
+        runtime_caps skill_workshop_plugin_config, so the pin and its migration marker land in the plugin config."""
+        self.set_runtime("2026.11.10", 40, 42, doctor=False)
+        self.write_cfg({"gateway": {"mode": "local"}})
+        g = G.Gate(emit=lambda s: None)
+        g.pkg = C.runtime_package()
+        g.j = {"run_id": "20261126T120000Z-abcdef", "mode": "from-7x"}
+        G.ensure_dirs(g.gp)
+        g.phase_pins()
+        cfg = json.loads((self.state / "openclaw.json").read_text())
+        self.assertNotIn("skills", cfg)
+        self.assertEqual(cfg["plugins"]["entries"]["skill-workshop"], {"config": {"autonomous": {"mode": "off"}}})
+        self.assertIs(cfg["meta"]["migrations"]["skillWorkshopPlugin"], True)
+        led = json.loads(g.gp["LEDGER"].read_text())
+        self.assertIn("plugins.entries.skill-workshop.config.autonomous.mode", [e["path"] for e in led["entries"]])
+
 # --- doctor notes, advice --------------------------------------------------------------------------
 
 class DoctorTextTests(unittest.TestCase):
@@ -795,7 +812,8 @@ class DoctorTextTests(unittest.TestCase):
         notes = G.doctor_notes(text)
         self.assertEqual(notes, [
             ["info", "doctor archived 2 pending/quarantined Skill Workshop draft(s) in the owner agent's "
-                     "workshop-skills/.archive/.retired-proposals/"],
+                     "workshop-skills/ (.drafts/ from OpenClaw 2026.11.5, .archive/.retired-proposals/ before; "
+                     "/learn drafts lists them)"],
             ["info", "doctor retired the Skill Workshop proposal tables (OpenClaw no longer has the applied, rejected "
                      "and stale proposals, their history and undo records)"],
             ["warn", "doctor put back the pre-apply skill files of Skill Workshop proposal wx-pend-1 (its apply never "
