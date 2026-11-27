@@ -291,7 +291,15 @@ warn_legacy_persistent_dir() {
   local label="$2"
   if [ -e "$path" ]; then
     echo "WARN: Found legacy persistent ${label} at ${path}, but persistence is disabled."
-    echo "WARN: It is excluded from Home Assistant backups, but still uses disk space."
+    case "$path" in
+      */.linuxbrew)
+        # Fork: .linuxbrew is not in backup_exclude (persist_brew_tools defaults to true).
+        echo "WARN: It is still included in Home Assistant backups and uses disk space."
+        ;;
+      *)
+        echo "WARN: It is excluded from Home Assistant backups, but still uses disk space."
+        ;;
+    esac
     echo "WARN: Remove it with: rm -rf ${path}"
   fi
 }
@@ -355,6 +363,15 @@ else
   echo "INFO: persist_node_global=false; npm/pnpm global installs are ephemeral and excluded from HA backups."
 fi
 
+# The add-on's `openclaw` wrapper goes first on PATH (for run.sh and the web
+# terminal it spawns): it refuses `openclaw update` — the image pins the
+# OpenClaw version and line upgrades need the add-on's backup/migration steps —
+# and execs the real CLI for everything else.
+OC_ADDON_BIN="/usr/local/libexec/oc-addon"
+if [ -x "${OC_ADDON_BIN}/openclaw" ]; then
+  export PATH="${OC_ADDON_BIN}:${PATH}"
+fi
+
 # Protect critical runtime variables from accidental override via gateway_env_vars.
 is_reserved_gateway_env_var() {
   case "$1" in
@@ -370,8 +387,14 @@ is_reserved_gateway_env_var() {
     HTTP_PROXY|HTTPS_PROXY|NO_PROXY|http_proxy|https_proxy|no_proxy)
       return 0
       ;;
-    # Add-on internal control vars.
-    OPENCLAW_*)
+    # Add-on internal control vars (OC_GATE_* holds the migration gate's test
+    # hooks, OC_ADDON_UNSAFE the wrapper escape, OC_UPGRADE_DIR the HOLD
+    # marker location the wrapper checks).
+    OPENCLAW_*|OC_GATE_*|OC_ADDON_*|OC_UPGRADE_*|OC_CONFIG_ROOT)
+      return 0
+      ;;
+    # Supervisor credentials: never injectable (the migration gate reads the real token from s6).
+    SUPERVISOR_TOKEN|SUPERVISOR_API|HASSIO_TOKEN)
       return 0
       ;;
     *)
@@ -555,19 +578,41 @@ if ! flock -n 9; then
 fi
 
 # ------------------------------------------------------------------------------
-# Upgrade-state backup
+# Early stop handling. `init: false` makes this script PID 1, and PID 1 ignores
+# a SIGTERM it has no handler for. Until the full `shutdown` trap is installed
+# further down, a stop request is remembered (and forwarded to the migration
+# gate, which runs in the background so this trap can fire while it works).
+# ------------------------------------------------------------------------------
+GATE_PID=""
+GATE_WAIT_INTERRUPTED=false
+SHUTTING_DOWN="false"
+early_stop() {
+  SHUTTING_DOWN="true"
+  GATE_WAIT_INTERRUPTED=true
+  if [ -n "${GATE_PID}" ] && kill -0 "${GATE_PID}" 2>/dev/null; then
+    echo "INFO: Stop requested; forwarding SIGTERM to the migration gate (PID ${GATE_PID})."
+    kill -TERM "${GATE_PID}" 2>/dev/null || true
+  fi
+}
+trap early_stop INT TERM
+
+# ------------------------------------------------------------------------------
+# Upgrade-state backup (OpenClaw 2026.7.x runtimes only)
 #
-# OpenClaw 2026.9.5 upgrades the persistent agent databases to schema 21. Older
-# OpenClaw builds cannot open that schema, so a config-only snapshot is not
-# enough to make an add-on rollback safe. Before the gateway starts a version we
-# have not started before, archive the migration-sensitive state while the old
-# gateway is down. The archive deliberately excludes regenerable/bulky content
-# (skills, media, npm, logs and previous archives), but retains the config,
-# SQLite databases (including WAL/SHM files), agents, pairing and channel state.
+# OpenClaw 2026.8+ migrates the persistent databases one-way (2026.10.4: state
+# schema 20, agent schema 24; 2026.10.10 to 2026.11.4: 22/27); older OpenClaw
+# builds cannot open them. For those
+# runtimes the migration gate (`oc-upgrade gate`, below) requires a recent
+# encrypted Home Assistant backup with this add-on (the only rollback point; the
+# gate writes no archive) before it runs `openclaw doctor --fix`. The local archive below is kept for
+# 2026.7.x runtimes, which perform no schema migration: before the gateway
+# starts a version we have not started before, archive the state while the old
+# gateway is down. It excludes regenerable/bulky content (skills, media, npm,
+# logs and previous archives), but retains the config, SQLite databases
+# (including WAL/SHM files), agents, pairing and channel state.
 #
-# The version marker is written only after a complete archive. If this backup
-# fails we refuse to start the new gateway: letting it migrate first would make
-# the promised rollback path dishonest.
+# The version marker is written only after a complete archive. A failed backup
+# puts the add-on in HOLD (page and terminal stay up) instead of exiting.
 # ------------------------------------------------------------------------------
 OPENCLAW_UPGRADE_BACKUP_DIR="${OPENCLAW_CONFIG_DIR}/upgrade-backups"
 OPENCLAW_UPGRADE_BACKUP_KEEP=3
@@ -611,8 +656,17 @@ backup_state_before_upgrade() {
   fi
   marker="${OPENCLAW_UPGRADE_BACKUP_DIR}/started-${version}"
   if [ -f "$marker" ]; then
-    echo "INFO: Upgrade-state backup already recorded for OpenClaw ${version}."
-    return 0
+    # The marker holds the archive path. Pruning keeps only the newest archives,
+    # so after a rollback to an older version its archive may be gone: take a
+    # fresh one instead of trusting a marker that points at nothing.
+    local recorded
+    recorded="$(head -n 1 "$marker" 2>/dev/null || true)"
+    if [ -n "$recorded" ] && [ -f "$recorded" ]; then
+      echo "INFO: Upgrade-state backup already recorded for OpenClaw ${version}."
+      return 0
+    fi
+    echo "INFO: Upgrade-state backup for OpenClaw ${version} was pruned; taking a new one."
+    rm -f "$marker"
   fi
 
   stamp="$(date -u +%Y%m%d-%H%M%S)"
@@ -628,6 +682,7 @@ backup_state_before_upgrade() {
       --exclude='./skills' \
       --exclude='./logs' \
       --exclude='./.cache' \
+      --exclude='./tmp' \
       -czf "$temporary" .; then
     rm -f "$temporary"
     echo "ERROR: Could not create pre-upgrade state backup."
@@ -650,11 +705,316 @@ backup_state_before_upgrade() {
   return 0
 }
 
-if ! backup_state_before_upgrade; then
-  echo "ERROR: OpenClaw was not started, so its persistent state remains unchanged."
-  echo "ERROR: Free disk space or repair permissions, then restart the add-on."
-  exit 1
+# Fork: only refuse to start when the runtime that is about to run can actually
+# migrate state (the 2026.8+ lines). The 2026.7.x runtime performs no schema
+# migration, so a failed archive there must not take the add-on page and
+# terminal down with it. run.sh calls this only for runtimes below 2026.8 (from
+# 2026.8 on the migration gate requires an encrypted Home Assistant backup instead
+# and writes no archive); the HOLD branch is a
+# fail-closed fallback for an undeterminable runtime version.
+require_upgrade_backup() {
+  local bundled_version
+  if backup_state_before_upgrade; then
+    return 0
+  fi
+  bundled_version="$(openclaw_runtime_version)"
+  if [ -n "$bundled_version" ] && \
+     [ "$(printf '%s\n%s\n' "2026.8.0" "$bundled_version" | sort -V | head -n 1)" != "2026.8.0" ]; then
+    echo "WARN: Pre-upgrade state backup failed; continuing because OpenClaw ${bundled_version} performs no state migration."
+    echo "WARN: Free disk space before the next OpenClaw upgrade — that upgrade will refuse to start without this backup."
+    return 0
+  fi
+  enter_hold "Pre-upgrade state backup failed; OpenClaw was not started, so its persistent state remains unchanged.
+Free disk space or repair permissions, then restart the add-on."
+  return 0
+}
+
+# ------------------------------------------------------------------------------
+# Runtime environment hardening. Variables that would make OpenClaw believe it
+# runs under systemd/launchd, inside an update, or as another host's container
+# are dropped for this script and every child (gateway, terminal CLI, migration
+# gate). With OPENCLAW_UPDATE_IN_PROGRESS set, for example, doctor exits 0
+# having done nothing ("Doctor maintenance deferred").
+# ------------------------------------------------------------------------------
+unset INVOCATION_ID JOURNAL_STREAM SYSTEMD_EXEC_PID OPENCLAW_SYSTEMD_UNIT OPENCLAW_SERVICE_MARKER \
+      OPENCLAW_SERVICE_KIND OPENCLAW_LAUNCHD_LABEL OPENCLAW_CONTAINER NODE_COMPILE_CACHE \
+      OPENCLAW_COMPATIBILITY_HOST_VERSION OPENCLAW_GATEWAY_HOST_LIFELINE OPENCLAW_DOCTOR_SQLITE_NOCOW_REPAIR
+while IFS= read -r _v; do
+  [ -n "$_v" ] && unset "$_v"
+done < <(compgen -e | grep '^OPENCLAW_UPDATE_' || true)
+unset _v
+
+# Bundled OpenClaw version (keeps a -N patch suffix such as 2026.7.1-2), for
+# the state guard and version-dependent config handling in the helpers.
+get_openclaw_version() {
+  local raw
+  raw="$(openclaw --version 2>/dev/null | head -n 1 || true)"
+  printf '%s\n' "$raw" | grep -oE '[0-9]{4}\.[0-9]+\.[0-9]+(-[0-9]+)?' | head -n 1 || true
+}
+OPENCLAW_RUNTIME_VERSION="$(get_openclaw_version)"
+# A failed probe must not look like a pre-2026.8 runtime (that would skip the migration
+# gate and write the plaintext 2026.7 archive): fall back to the version the image pinned.
+if [ -z "$OPENCLAW_RUNTIME_VERSION" ]; then
+  OPENCLAW_RUNTIME_VERSION="$(head -n 1 /usr/local/libexec/oc-addon/openclaw-pinned-version 2>/dev/null | grep -oE '^[0-9]{4}\.[0-9]+\.[0-9]+(-[0-9]+)?$' || true)"
 fi
+export OPENCLAW_RUNTIME_VERSION
+
+# True when the bundled runtime is at least $1 (x.y.z; a -N patch suffix of the
+# runtime is ignored). False when the runtime version is unknown.
+runtime_at_least() {
+  [ -n "${OPENCLAW_RUNTIME_VERSION:-}" ] &&
+  [ "$(printf '%s\n%s\n' "$1" "${OPENCLAW_RUNTIME_VERSION%%-*}" | sort -V | head -n1)" = "$1" ]
+}
+
+# The image pins the OpenClaw version; never let the gateway apply an update on
+# its own (would bypass the image pin and any pre-upgrade backup).
+export OPENCLAW_NO_AUTO_UPDATE=1
+if runtime_at_least 2026.8.0; then
+  # run.sh supervises the gateway: restarts stay in-process (the gateway PID
+  # stays our child, and doctor never detaches), and OpenClaw performs no
+  # service lifecycle, self-update or AI triage of its own. SUPERVISOR_MODE
+  # must never be set without NO_RESPAWN (every restart would then hand off
+  # and exit 0).
+  export OPENCLAW_NO_RESPAWN=1
+  export OPENCLAW_SUPERVISOR_MODE=external
+  export OPENCLAW_SERVICE_REPAIR_POLICY=external
+  # A stray SIGUSR1 must not open the Node inspector on the host's loopback
+  # port 9229 (host_network); OpenClaw 2026.9.6+ restarts on SIGUSR2.
+  export NODE_OPTIONS="${NODE_OPTIONS:+${NODE_OPTIONS} }--disable-sigusr1 --disable-warning=ExperimentalWarning"
+fi
+echo "INFO: OpenClaw runtime version: ${OPENCLAW_RUNTIME_VERSION:-unknown}"
+
+# ------------------------------------------------------------------------------
+# Proxy shim for undici/OpenClaw startup
+# Keep official OpenClaw npm release while enabling HTTP(S)_PROXY support.
+# Set up before anything runs OpenClaw, so the migration gate's doctor (npm and
+# OAuth traffic) goes through the configured proxy as well.
+# ------------------------------------------------------------------------------
+OPENCLAW_GLOBAL_NODE_MODULES="$(HOME=/root npm root -g 2>/dev/null || true)"
+if [ -f /usr/local/lib/openclaw-proxy-shim.cjs ]; then
+  if [ -n "${NODE_OPTIONS:-}" ]; then
+    export NODE_OPTIONS="--require /usr/local/lib/openclaw-proxy-shim.cjs ${NODE_OPTIONS}"
+  else
+    export NODE_OPTIONS="--require /usr/local/lib/openclaw-proxy-shim.cjs"
+  fi
+  export OPENCLAW_GLOBAL_NODE_MODULES
+fi
+
+# The image routes every `openclaw` executable through the add-on wrapper and
+# records the pinned package version. If something inside the container swapped
+# the runtime (e.g. an `npm install -g openclaw@...` run by an agent), the
+# swapped runtime could migrate the state without the add-on's backup steps.
+runtime_integrity_problem() {
+  local wrapper="/usr/local/libexec/oc-addon/openclaw" wrapper_real pinned entry pkg_dir actual d candidate
+  [ -f /usr/local/libexec/oc-addon/openclaw-pinned-version ] || return 0
+  wrapper_real="$(readlink -f "$wrapper" 2>/dev/null || true)"
+  pinned="$(head -n 1 /usr/local/libexec/oc-addon/openclaw-pinned-version 2>/dev/null || true)"
+  entry="$(head -n 1 /usr/local/libexec/oc-addon/openclaw-entry 2>/dev/null || true)"
+  if [ -z "$entry" ]; then
+    echo "the add-on's record of the pinned OpenClaw package is missing (broken image?)"
+    return 0
+  fi
+  pkg_dir="$(dirname "$entry")"
+  actual="$(jq -r '.version // empty' "${pkg_dir}/package.json" 2>/dev/null || true)"
+  if [ -n "$pinned" ] && [ "$actual" != "$pinned" ]; then
+    echo "the OpenClaw package in the container is ${actual:-missing}, but this image pins ${pinned} (changed by npm inside the container?)"
+    return 0
+  fi
+  # Every place an agent's shell or npm could put another `openclaw`: the
+  # standard bin directories (login PATH), the runtime npm/pnpm prefixes, and the
+  # persistent node-global prefix when it is enabled. Checked explicitly instead
+  # of via run.sh's PATH, where the wrapper always comes first.
+  for d in /usr/local/sbin /usr/local/bin /usr/sbin /usr/bin /sbin /bin \
+           "${npm_config_prefix:+${npm_config_prefix}/bin}" "${PNPM_HOME:-}" \
+           "$( [ "$PERSIST_NODE_GLOBAL" = "true" ] || [ "$PERSIST_NODE_GLOBAL" = "1" ] && echo "${PERSISTENT_NODE_GLOBAL}/bin" )"; do
+    [ -n "$d" ] && [ -e "${d}/openclaw" ] || continue
+    if [ "$(readlink -f "${d}/openclaw" 2>/dev/null || true)" != "$wrapper_real" ]; then
+      echo "${d}/openclaw is not the add-on wrapper (another OpenClaw installed inside the container?)"
+      return 0
+    fi
+  done
+  for candidate in /usr/local/lib/node_modules/openclaw \
+                   "${npm_config_prefix:+${npm_config_prefix}/lib/node_modules/openclaw}" \
+                   "$( [ "$PERSIST_NODE_GLOBAL" = "true" ] || [ "$PERSIST_NODE_GLOBAL" = "1" ] && echo "${PERSISTENT_NODE_GLOBAL}/lib/node_modules/openclaw" )"; do
+    [ -n "$candidate" ] && [ -f "${candidate}/package.json" ] || continue
+    if [ "$(readlink -f "$candidate")" != "$(readlink -f "$pkg_dir")" ]; then
+      echo "a second OpenClaw package exists at ${candidate} (installed inside the container?)"
+      return 0
+    fi
+  done
+  return 0
+}
+
+# ------------------------------------------------------------------------------
+# State guard (HOLD)
+#
+# If the persistent state was written by a newer OpenClaw than this image ships
+# (e.g. a Home Assistant restore brought back the old image but not the old
+# data, or the reverse), starting the bundled runtime on it can corrupt it: a
+# 2026.7.x runtime cannot open databases migrated by 2026.8+. Earlier add-on
+# versions "repaired" this by silently npm-installing the newer runtime. Now the
+# add-on holds instead: nothing touches the state, OpenClaw is not started, and
+# the add-on page and terminal stay up so a backup can be restored. From
+# OpenClaw 2026.8 on, the migration gate also decides whether the state has to
+# be migrated first (see below); every failure there is a HOLD as well.
+# ------------------------------------------------------------------------------
+UPG_DIR="${OC_UPGRADE_DIR:-/config/.openclaw-upgrade}"
+mkdir -p "$UPG_DIR"
+chmod 700 "$UPG_DIR" 2>/dev/null || true
+STATE_HOLD=false
+STATE_HOLD_REASON=""
+
+# Put the add-on in HOLD: OpenClaw is not started, nginx and the terminal still
+# come up, and the supervisor loop only waits for the stop request.
+#   $1 = reason (may span several lines)
+#   $2 = "keep": hold.txt was already written by oc-upgrade; leave it as is.
+# The `openclaw` wrapper allows only read-only commands while hold.txt exists.
+enter_hold() {
+  STATE_HOLD=true
+  STATE_HOLD_REASON="$1"
+  if [ "${2:-}" != "keep" ]; then
+    { echo "OpenClaw is held (bundled runtime ${OPENCLAW_RUNTIME_VERSION:-unknown}):"
+      printf '%s\n' "$1"
+      echo "The add-on page and terminal stay available. Details: oc-upgrade status"
+    } > "${UPG_DIR}/hold.txt" 2>/dev/null || true
+  fi
+  echo "ERROR: ================================================================"
+  echo "ERROR: HOLD — OpenClaw will NOT be started."
+  printf '%s\n' "$1" | sed 's/^/ERROR: /'
+  echo "ERROR: The add-on page and terminal stay available. Details: oc-upgrade status"
+  echo "ERROR: ================================================================"
+}
+
+# Idle until the Supervisor stops the add-on (the shutdown trap sets
+# SHUTTING_DOWN); `wait` on a background sleep keeps the trap responsive.
+hold_wait_loop() {
+  while [ "$SHUTTING_DOWN" != "true" ]; do
+    sleep 30 &
+    wait "$!" || true
+  done
+}
+
+STATE_NEWER=false
+OC_UPGRADE_MISSING=false
+if command -v oc-upgrade >/dev/null 2>&1; then
+  if guard_out="$(oc-upgrade state-guard 2>&1)"; then
+    if [ -n "$guard_out" ]; then echo "$guard_out"; fi
+  else
+    guard_rc=$?
+    if [ "$guard_rc" -eq 3 ]; then
+      STATE_NEWER=true
+      STATE_HOLD_REASON="$guard_out"
+    else
+      echo "WARN: oc-upgrade state-guard failed (exit ${guard_rc}); continuing without the state guard."
+      if [ -n "$guard_out" ]; then echo "$guard_out"; fi
+    fi
+  fi
+elif runtime_at_least 2026.8.0; then
+  # OpenClaw 2026.8+ migrates state one-way; without the gate it must not start.
+  OC_UPGRADE_MISSING=true
+  STATE_HOLD_REASON="oc-upgrade missing: cannot run the migration gate (broken image?)."
+else
+  echo "WARN: oc-upgrade is missing from the add-on image; state guard skipped."
+fi
+RUNTIME_PROBLEM="$(runtime_integrity_problem)"
+if [ -n "$RUNTIME_PROBLEM" ]; then
+  STATE_HOLD_REASON="${STATE_HOLD_REASON:+${STATE_HOLD_REASON}
+}${RUNTIME_PROBLEM}."
+fi
+
+if [ "$STATE_NEWER" = "true" ] || [ "$OC_UPGRADE_MISSING" = "true" ] || [ -n "$RUNTIME_PROBLEM" ]; then
+  hold_text="$(
+    printf '%s\n' "$STATE_HOLD_REASON"
+    if [ "$STATE_NEWER" = "true" ]; then
+      echo "Restore the Home Assistant backup that matches this add-on version (or update to the add-on"
+      echo "version that wrote the state)."
+    fi
+    if [ -n "$RUNTIME_PROBLEM" ] || [ "$OC_UPGRADE_MISSING" = "true" ]; then
+      echo "Reinstall or rebuild the add-on in Home Assistant to restore the pinned OpenClaw runtime."
+    fi
+    echo "OpenClaw is not started, and its config, databases, sessions and plugins are not modified"
+    echo "(built-in skill files are still refreshed from the image)."
+  )"
+  enter_hold "$hold_text"
+fi
+
+# ------------------------------------------------------------------------------
+# Migration gate planning (OpenClaw 2026.8+). `oc-upgrade gate --plan` is
+# read-only (it may only write its marker for an adopted state or a sticky
+# hold.txt). Exit codes: 0 no gate, 10 gate needed, 11 sticky HOLD (hold.txt
+# written), 3 state newer than this runtime, anything else an error (fail
+# closed). It reads every SQLite database, so it is bounded by `timeout 600`
+# (124/137 = timed out -> HOLD). The gate itself runs further down, right
+# before the session-lock cleanup, in the background so a stop request can be
+# forwarded to it; it does not repeat the plan lines printed here.
+# ------------------------------------------------------------------------------
+GATE_NEEDED=false
+GATE_PLAN_OUT=""
+if [ "$STATE_HOLD" != "true" ] && runtime_at_least 2026.8.0; then
+  # In the background with the same wait loop as the gate: run.sh is PID 1 and bash defers
+  # the TERM trap while a foreground command runs, so a stop during a slow plan would
+  # otherwise wait for the 600 s timeout and get SIGKILLed by the Supervisor (300 s).
+  plan_file="$(mktemp)"
+  timeout --kill-after=30 600 oc-upgrade gate --plan >"$plan_file" 2>&1 &
+  GATE_PID=$!
+  plan_rc=0
+  plan_rc_known=false
+  GATE_WAIT_INTERRUPTED=true
+  while [ "$GATE_WAIT_INTERRUPTED" = "true" ]; do
+    GATE_WAIT_INTERRUPTED=false
+    if wait "$GATE_PID" 2>/dev/null; then r=0; else r=$?; fi
+    if [ "$r" -eq 127 ] && [ "$plan_rc_known" = "true" ]; then
+      break
+    fi
+    plan_rc=$r
+    plan_rc_known=true
+  done
+  GATE_PID=""
+  plan_out="$(cat "$plan_file" 2>/dev/null || true)"
+  rm -f "$plan_file"
+  if [ -n "$plan_out" ]; then printf '%s\n' "$plan_out"; fi
+  if [ "$SHUTTING_DOWN" = "true" ]; then
+    echo "INFO: Stop requested during migration planning; exiting."
+    exit 0
+  fi
+  case "$plan_rc" in
+    0)  ;;
+    10) GATE_NEEDED=true; GATE_PLAN_OUT="$plan_out" ;;
+    124|137)
+      enter_hold "The migration gate planning timed out (oc-upgrade gate --plan did not finish within 600 s); OpenClaw was not started.
+Check the disk (slow or failing storage?), then restart the add-on. Details: oc-upgrade status."
+      ;;
+    11)
+      if [ -s "${UPG_DIR}/hold.txt" ]; then
+        enter_hold "$(cat "${UPG_DIR}/hold.txt")" keep
+      else
+        enter_hold "${plan_out:-The migration gate is on hold.}
+Details: oc-upgrade status. After fixing the cause: oc-upgrade retry (then restart the add-on)."
+      fi
+      ;;
+    3)
+      STATE_NEWER=true
+      enter_hold "${plan_out}
+Restore the Home Assistant backup that matches this add-on version."
+      ;;
+    *)
+      enter_hold "oc-upgrade gate --plan failed (exit ${plan_rc}): ${plan_out}"
+      ;;
+  esac
+fi
+if [ "$STATE_HOLD" != "true" ]; then
+  # A HOLD from an earlier boot no longer applies. Before a gate run the gate
+  # (and run_migration_gate) delete it themselves.
+  if [ "$GATE_NEEDED" != "true" ]; then rm -f "${UPG_DIR}/hold.txt"; fi
+  # From 2026.8 on there is no local archive (the gate requires an encrypted HA backup). Not
+  # started when a stop request arrived meanwhile (the Supervisor would kill it).
+  if ! runtime_at_least 2026.8.0 && [ "$SHUTTING_DOWN" != "true" ]; then require_upgrade_backup; fi
+fi
+
+# A rehearsal export request of an earlier add-on version is void (no copies of the
+# state outside the encrypted Home Assistant backup); leftover exports in /share are
+# deleted by the cleanup loop below.
+rm -f "${UPG_DIR}/export-request" 2>/dev/null || true
 
 # ------------------------------------------------------------------------------
 # Session lock cleanup helpers
@@ -700,7 +1060,214 @@ cleanup_session_locks() {
   done
 }
 
-if [ "$CLEAN_LOCKS_ON_START" = "true" ]; then
+# ------------------------------------------------------------------------------
+# Self-heal: reclaim orphaned Telegram ingress-spool claims.
+# OpenClaw's isolated-polling spool leaves an inbound update as
+# <id>.json.processing if the gateway is interrupted mid-claim (e.g. a restart
+# while a message is being handled). Because the container gateway runs as PID 1,
+# OC's own recovery (processExists(1)) false-positives and skips the orphan for
+# ~6h, blocking that Telegram lane -> bot appears unreachable.
+# We run this BEFORE each gateway (re)start (gateway not yet running => race-free),
+# mirroring OC's recoverStaleTelegramSpooledUpdateClaims:
+#   - sibling <id>.json.failed (dead-letter) -> delete .processing (never resurrect)
+#   - sibling <id>.json already exists        -> delete .processing (don't clobber)
+#   - otherwise                               -> rename .processing -> .json (requeue)
+# MUST be fail-safe: never abort run.sh under `set -euo pipefail`.
+# Upstream bug, open as of OC 2026.6.6: openclaw/openclaw#84674 / #85168.
+# ------------------------------------------------------------------------------
+heal_telegram_ingress_spool() {
+  # OpenClaw 2026.8+ keeps Telegram ingress in its state database and never
+  # reads these spool files; the migration gate only reports leftovers.
+  if runtime_at_least 2026.8.0; then return 0; fi
+  local base="/config/.openclaw/telegram"
+  local healed=0 dropped=0 spool_dir f pending failed
+  shopt -s nullglob
+  for spool_dir in "${base}"/ingress-spool-*/; do
+    [ -d "$spool_dir" ] || continue
+    for f in "${spool_dir}"*.json.processing; do
+      [ -f "$f" ] || continue
+      pending="${f%.processing}"
+      failed="${pending}.failed"
+      if [ -e "$failed" ]; then
+        rm -f -- "$f" && dropped=$((dropped + 1)) || true
+      elif [ -e "$pending" ]; then
+        rm -f -- "$f" && dropped=$((dropped + 1)) || true
+      elif mv -f -- "$f" "$pending" 2>/dev/null; then
+        healed=$((healed + 1))
+      else
+        echo "WARN: could not reclaim orphaned spool file: $f"
+      fi
+    done
+  done
+  shopt -u nullglob
+  if [ "$healed" -gt 0 ] || [ "$dropped" -gt 0 ]; then
+    echo "INFO: Telegram ingress-spool self-heal: requeued $healed, dropped $dropped orphan(s)."
+  fi
+}
+
+# ------------------------------------------------------------------------------
+# Ensure the Brave web-search provider plugin is installed (idempotent).
+# Brave is an EXTERNAL official plugin (@openclaw/brave-plugin), NOT bundled in
+# core openclaw. It installs into the persistent config dir
+# (/config/.openclaw/extensions), so once present it survives image rebuilds --
+# but a fresh state or a migration has no Brave, and our oc_config_helper would
+# then strip a persisted tools.web.search.provider=brave as "unavailable".
+# We (re)ensure it here, BEFORE the config-helper repair runs, so a user's Brave
+# selection stays intact across rebuilds/fresh states.
+# The plugin version MUST match the baked openclaw (CalVer lockstep; plugin
+# peerDependencies.openclaw>=X). The image records the version it was built
+# with (Dockerfile ARG BRAVE_PLUGIN_VERSION, checked against npm at build time).
+# Best-effort: never blocks startup (guarded, non-fatal). Runs after the
+# migration gate, so never against unmigrated state.
+# ------------------------------------------------------------------------------
+BRAVE_PLUGIN_VERSION="$(head -n 1 /usr/local/libexec/oc-addon/brave-plugin-version 2>/dev/null | grep -oE '^[0-9]{4}\.[0-9]+\.[0-9]+(-[0-9]+)?$' || true)"
+if [ -z "$BRAVE_PLUGIN_VERSION" ]; then
+  # Image without a valid record: CalVer lockstep with the bundled runtime
+  # (OPENCLAW_RUNTIME_VERSION already falls back to the image's pinned version).
+  # No hard-coded version: it would pin a plugin built for another OpenClaw.
+  BRAVE_PLUGIN_VERSION="${OPENCLAW_RUNTIME_VERSION:-}"
+fi
+ensure_brave_plugin() {
+  if [ -z "$BRAVE_PLUGIN_VERSION" ]; then
+    echo "WARN: Brave web-search plugin not ensured: the OpenClaw version is unknown (non-fatal)."
+    return 0
+  fi
+  local marker="/config/.openclaw/.brave_plugin_${BRAVE_PLUGIN_VERSION}"
+  if [ -f "$marker" ]; then
+    return 0
+  fi
+  # Install or CONVERGE to the pinned version. --force upgrades any older Brave
+  # install (e.g. left over from a previous OpenClaw version) to match the host
+  # CalVer, instead of adopting a stale version. Guarded by the per-version
+  # marker so it runs at most once per version. Runs before gateway start
+  # (gateway down => safe). (Replaces the old adopt-without-version path that
+  # wrote a new-version marker for a stale install -> version drift on bumps.)
+  echo "INFO: Ensuring Brave web-search plugin @openclaw/brave-plugin@${BRAVE_PLUGIN_VERSION}..."
+  # OpenClaw 2026.8+ asks to accept a plugin's declared capabilities (the
+  # Brave manifest declares none); 2026.7.x does not know the flag.
+  local accept_flag=()
+  if runtime_at_least 2026.8.0; then accept_flag=(--accept-capabilities); fi
+  if timeout 180 openclaw plugins install "npm:@openclaw/brave-plugin@${BRAVE_PLUGIN_VERSION}" --pin --force "${accept_flag[@]}" >/dev/null 2>&1; then
+    touch "$marker" 2>/dev/null || true
+    echo "INFO: Brave web-search plugin ensured (@${BRAVE_PLUGIN_VERSION})."
+  else
+    echo "WARN: Brave plugin install failed or timed out (non-fatal); web search may use a bundled provider (e.g. duckduckgo)."
+  fi
+  return 0
+}
+
+# ------------------------------------------------------------------------------
+# Bring the ENABLED official npm plugins (@openclaw/codex, @openclaw/acpx, ...)
+# to the bundled OpenClaw version (CalVer cohort; peer openclaw >=<version>).
+# OpenClaw's doctor (`doctor --fix`, in the gate's doctor passes) updates the
+# enabled official catalog plugins itself, but a failed fetch there is only a
+# doctor warning; this step catches what it left behind (failed or deferred
+# fetches, records doctor does not treat as official npm installs, package-id
+# migrations). `oc-upgrade plugins-sync` runs `openclaw plugins update
+# <pkg>@<version>` for each enabled one that is older (never a downgrade,
+# disabled plugins and Brave untouched; Brave is ensure_brave_plugin's job),
+# prints one report line and writes the per-version marker only when the
+# plugin list confirms every enabled one at that version (and shows every npm
+# install OpenClaw recorded), so a failed update is retried at the next start;
+# the gate deletes a marker its postconditions contradict. Shares
+# the validated OPENCLAW_RUNTIME_VERSION with the Brave step. Runs after the
+# migration gate with the gateway down; best-effort, never blocks startup:
+# it asks the npm registry first (`npm view`, 30 s at most) and updates
+# nothing offline, so an offline start does not wait for the update timeouts.
+# It runs in the background (PLUGINS_PID) so the shutdown trap can forward a
+# stop request: bash defers the trap while a foreground command runs, and npm
+# updates can take longer than the Supervisor's 300 s stop timeout. `timeout`
+# passes SIGTERM on; oc-upgrade then stops the update's process group.
+# ------------------------------------------------------------------------------
+PLUGINS_PID=""
+ensure_official_plugin_cohort() {
+  local rc=0
+  if [ -z "${OPENCLAW_RUNTIME_VERSION:-}" ]; then
+    echo "WARN: Official plugins not updated: the OpenClaw version is unknown (non-fatal)."
+    return 0
+  fi
+  runtime_at_least 2026.8.0 || return 0
+  if [ -f "/config/.openclaw/.plugin_cohort_${OPENCLAW_RUNTIME_VERSION}" ]; then
+    return 0
+  fi
+  [ "${SHUTTING_DOWN:-false}" != "true" ] || return 0
+  timeout --kill-after=30 1200 oc-upgrade plugins-sync &
+  PLUGINS_PID=$!
+  while :; do
+    if wait "$PLUGINS_PID" 2>/dev/null; then rc=0; else rc=$?; fi
+    # The shutdown trap interrupts `wait` (>128) while the step still runs: wait for its real end.
+    if [ "$rc" -gt 128 ] && [ "${SHUTTING_DOWN:-false}" = "true" ] && kill -0 "$PLUGINS_PID" 2>/dev/null; then
+      continue
+    fi
+    break
+  done
+  PLUGINS_PID=""
+  if [ "${SHUTTING_DOWN:-false}" = "true" ]; then
+    echo "INFO: Stop requested during the official plugin update step."
+  elif [ "$rc" -ne 0 ]; then
+    echo "WARN: Official plugin update step failed or timed out (non-fatal); it runs again at the next start."
+  fi
+  return 0
+}
+
+# ------------------------------------------------------------------------------
+# Migration gate (OpenClaw 2026.8+, when `gate --plan` asked for it above).
+# `oc-upgrade gate` checks for an encrypted Home Assistant backup (the rollback
+# point), cleans up, pre-migrates the config, runs `openclaw doctor --fix --non-interactive` twice and checks the
+# result; any failure leaves a HOLD with hold.txt (exit 20, or 1 for an internal
+# error). It runs in the background so the early stop trap can forward SIGTERM
+# (exit 130/143, the next start resumes once).
+# ------------------------------------------------------------------------------
+run_migration_gate() {
+  local rc=0 r rc_known=false
+  # A hold.txt from an earlier run must never be mistaken for this run's reason.
+  rm -f "${UPG_DIR}/hold.txt"
+  echo "INFO: Starting the OpenClaw migration gate (OpenClaw ${OPENCLAW_RUNTIME_VERSION}); nginx and the terminal start after it."
+  # Unbuffered, so the gate's progress lines reach the add-on log as they happen.
+  # OC_GATE_PLAN_SHOWN: plan lines already printed above (the gate re-plans silently).
+  OC_GATE_PLAN_SHOWN="${GATE_PLAN_OUT:-}" OC_GATE_FROM_RUNSH=1 PYTHONUNBUFFERED=1 oc-upgrade gate &
+  GATE_PID=$!
+  # One wait loop. A trapped signal makes `wait` return early (>128) after
+  # early_stop ran (which sets GATE_WAIT_INTERRUPTED), so wait again for the
+  # real exit status. A repeated wait for an already collected status answers
+  # 127 ("not a child"); keep the status collected before in that case.
+  GATE_WAIT_INTERRUPTED=true
+  while [ "$GATE_WAIT_INTERRUPTED" = "true" ]; do
+    GATE_WAIT_INTERRUPTED=false
+    if wait "$GATE_PID" 2>/dev/null; then r=0; else r=$?; fi
+    if [ "$r" -eq 127 ] && [ "$rc_known" = "true" ]; then
+      break
+    fi
+    rc=$r
+    rc_known=true
+  done
+  GATE_PID=""
+  if [ "$rc" -eq 0 ]; then
+    return 0
+  fi
+  if [ "$SHUTTING_DOWN" = "true" ]; then
+    echo "INFO: The migration gate stopped (exit ${rc}) on the stop request; the next start resumes it."
+    return 0
+  fi
+  if [ -s "${UPG_DIR}/hold.txt" ]; then
+    enter_hold "$(cat "${UPG_DIR}/hold.txt")" keep
+  else
+    enter_hold "The migration gate failed unexpectedly (exit ${rc}); see the log above. Retry: oc-upgrade retry (then restart the add-on)."
+  fi
+  return 0
+}
+
+if [ "$STATE_HOLD" != "true" ] && [ "$GATE_NEEDED" = "true" ] && [ "$SHUTTING_DOWN" != "true" ]; then
+  run_migration_gate
+fi
+if [ "$SHUTTING_DOWN" = "true" ]; then
+  echo "INFO: Stop requested during startup; exiting."
+  exit 0
+fi
+
+if [ "$STATE_HOLD" = "true" ]; then
+  echo "INFO: HOLD: skipping session lock cleanup."
+elif [ "$CLEAN_LOCKS_ON_START" = "true" ]; then
   cleanup_session_locks
 else
   echo "INFO: clean_session_locks_on_start=false; skipping session lock cleanup."
@@ -739,11 +1306,23 @@ GW_RELAY_PID=""
 NGINX_PID=""
 TTYD_PID=""
 HEALTH_PID=""
-SHUTTING_DOWN="false"
+CLEANUP_PID=""
+# Keep a stop request that arrived before this point (early_stop trap).
+SHUTTING_DOWN="${SHUTTING_DOWN:-false}"
 
 shutdown() {
   SHUTTING_DOWN="true"
   echo "Shutdown requested; stopping services..."
+
+  # The official plugin update step (before the gateway starts; ensure_official_plugin_cohort waits for it).
+  if [ -n "${PLUGINS_PID:-}" ] && kill -0 "${PLUGINS_PID}" 2>/dev/null; then
+    kill -TERM "${PLUGINS_PID}" 2>/dev/null || true
+  fi
+
+  # The cleanup loop stops at its next check; it is reaped after the gateway (no wait here).
+  if [ -n "${CLEANUP_PID:-}" ] && kill -0 "${CLEANUP_PID}" >/dev/null 2>&1; then
+    kill -TERM "${CLEANUP_PID}" >/dev/null 2>&1 || true
+  fi
 
   if [ -n "${HEALTH_PID}" ] && kill -0 "${HEALTH_PID}" >/dev/null 2>&1; then
     kill -TERM "${HEALTH_PID}" >/dev/null 2>&1 || true
@@ -760,99 +1339,83 @@ shutdown() {
     wait "${TTYD_PID}" || true
   fi
 
+  # Stop the gateway and give it time to drain and flush its SQLite state.
+  # After an in-process self-restart the tracked PID can be a wrapper that has
+  # already exited while the daemon lives on, so also signal whatever holds the
+  # gateway port. The poll stays below config.yaml `timeout: 300`, after which
+  # the Supervisor sends SIGKILL.
+  local _gw_pids="" _p _i _alive
   if [ -n "${GW_PID}" ] && kill -0 "${GW_PID}" >/dev/null 2>&1; then
-    kill -TERM "${GW_PID}" >/dev/null 2>&1 || true
-    # wait reaps child PIDs; for non-child (re-tracked) PIDs it fails instantly,
-    # so fall back to a timed kill -0 poll to let the gateway finish cleanly.
-    if ! wait "${GW_PID}" 2>/dev/null; then
-      for _i in 1 2 3 4 5; do
-        kill -0 "${GW_PID}" 2>/dev/null || break
-        sleep 1
+    _gw_pids="${GW_PID}"
+  fi
+  _p="$(find_gateway_daemon_pid 2>/dev/null || true)"
+  if [ -n "$_p" ] && [ "$_p" != "${GW_PID}" ] && kill -0 "$_p" >/dev/null 2>&1; then
+    _gw_pids="${_gw_pids} ${_p}"
+  fi
+  if [ -n "$_gw_pids" ]; then
+    for _p in $_gw_pids; do
+      kill -TERM "$_p" >/dev/null 2>&1 || true
+    done
+    for _i in $(seq 1 270); do
+      _alive=false
+      for _p in $_gw_pids; do
+        if kill -0 "$_p" 2>/dev/null; then _alive=true; fi
       done
-    fi
+      [ "$_alive" = "true" ] || break
+      if [ "$_i" -eq 60 ]; then
+        echo "WARN: gateway still stopping after 60 s (OpenClaw 2026.9+ waits for plugin cleanup; up to 270 s)"
+      fi
+      if [ $((_i % 15)) -eq 0 ]; then
+        echo "Waiting for the gateway to stop (${_i}s)..."
+      fi
+      sleep 1
+    done
+    # The Supervisor kills the whole add-on 300 s after the stop request, while
+    # OpenClaw 2026.9+'s own stop budget is 325 s (unchanged in 2026.10): end it here, logged.
+    for _p in $_gw_pids; do
+      if kill -0 "$_p" 2>/dev/null; then
+        echo "WARN: gateway PID ${_p} did not stop within 270 s; sending SIGKILL."
+        kill -KILL "$_p" >/dev/null 2>&1 || true
+      fi
+    done
+    # Reap our own child so it does not linger as a zombie.
+    wait "${GW_PID}" 2>/dev/null || true
   fi
 
   stop_gw_relay
 
-  if [ "$CLEAN_LOCKS_ON_EXIT" = "true" ]; then
+  if [ -n "${CLEANUP_PID:-}" ]; then
+    for _i in 1 2 3 4 5 6 7 8 9 10; do
+      kill -0 "${CLEANUP_PID}" 2>/dev/null || break
+      sleep 1
+    done
+    if kill -0 "${CLEANUP_PID}" 2>/dev/null; then
+      kill -KILL "${CLEANUP_PID}" >/dev/null 2>&1 || true
+    fi
+    wait "${CLEANUP_PID}" 2>/dev/null || true
+    CLEANUP_PID=""
+  fi
+
+  if [ "$CLEAN_LOCKS_ON_EXIT" = "true" ] && [ "${STATE_HOLD:-false}" != "true" ]; then
     cleanup_session_locks || true
   fi
 }
 
 trap shutdown INT TERM
-
-if ! command -v openclaw >/dev/null 2>&1; then
-  echo "ERROR: openclaw is not installed."
-  exit 1
+# A stop request that arrived between the migration gate and this trap.
+if [ "$SHUTTING_DOWN" = "true" ]; then
+  echo "INFO: Stop requested during startup; exiting."
+  exit 0
 fi
 
-get_openclaw_version() {
-  local raw
-  raw="$(openclaw --version 2>/dev/null | head -n 1 || true)"
-  printf '%s\n' "$raw" | grep -oE '[0-9]{4}\.[0-9]+\.[0-9]+' | head -n 1 || true
-}
-
-version_is_less_than() {
-  local left="$1"
-  local right="$2"
-  [ -n "$left" ] && [ -n "$right" ] && [ "$left" != "$right" ] && \
-    [ "$(printf '%s\n%s\n' "$left" "$right" | sort -V | head -n 1)" = "$left" ]
-}
-
-repair_runtime_version_mismatch() {
-  local config_path="/config/.openclaw/openclaw.json"
-  local runtime_version persisted_version refreshed_version
-
-  if [ ! -f "$config_path" ]; then
-    return 0
-  fi
-
-  runtime_version="$(get_openclaw_version)"
-  persisted_version="$(python3 - "$config_path" <<'PY'
-import json
-import sys
-from pathlib import Path
-
-path = Path(sys.argv[1])
-try:
-    data = json.loads(path.read_text(encoding="utf-8"))
-except Exception:
-    print("", end="")
-    raise SystemExit(0)
-
-value = data.get("meta", {}).get("lastTouchedVersion", "")
-print(value if isinstance(value, str) else "", end="")
-PY
-)"
-
-  if [ -z "$runtime_version" ] || [ -z "$persisted_version" ]; then
-    return 0
-  fi
-
-  if ! version_is_less_than "$runtime_version" "$persisted_version"; then
-    return 0
-  fi
-
-  echo "WARN: Persisted OpenClaw config was last written by newer version $persisted_version, but bundled runtime is $runtime_version."
-  echo "WARN: Attempting one-time runtime repair so the gateway can start after add-on rebuilds or Home Assistant OS updates."
-
-  if npm install -g "openclaw@${persisted_version}" >/tmp/openclaw-runtime-repair.log 2>&1; then
-    refreshed_version="$(get_openclaw_version)"
-    echo "INFO: OpenClaw runtime repair succeeded (${runtime_version} -> ${refreshed_version:-$persisted_version})."
-    return 0
-  fi
-
-  echo "ERROR: Automatic runtime repair failed; startup will continue with bundled OpenClaw $runtime_version."
-  echo "ERROR: Review /tmp/openclaw-runtime-repair.log and rerun 'openclaw update' or 'npm install -g openclaw@${persisted_version}' once connectivity is available."
-  return 0
-}
-
-repair_runtime_version_mismatch
+if ! command -v openclaw >/dev/null 2>&1; then
+  enter_hold "openclaw is not installed in the add-on image (broken image?). Reinstall or rebuild the add-on."
+fi
 
 # Bootstrap minimal OpenClaw config ONLY if missing.
 # We do not overwrite or patch existing configs; onboarding owns everything else.
 OPENCLAW_CONFIG_PATH="/config/.openclaw/openclaw.json"
-if [ ! -f "$OPENCLAW_CONFIG_PATH" ]; then
+if [ ! -f "$OPENCLAW_CONFIG_PATH" ] && [ "$STATE_HOLD" != "true" ]; then
   echo "INFO: OpenClaw config missing; bootstrapping minimal config at $OPENCLAW_CONFIG_PATH"
   python3 - <<'PY'
 import json
@@ -896,7 +1459,17 @@ if [ ! -f "$HELPER_PATH" ] && [ -f "$(dirname "$0")/oc_config_helper.py" ]; then
   HELPER_PATH="$(dirname "$0")/oc_config_helper.py"
 fi
 
-if [ -f "$OPENCLAW_CONFIG_PATH" ]; then
+CONFIG_UNREADABLE=false
+if [ "$STATE_HOLD" = "true" ]; then
+  # Nothing may write to state that is newer than this runtime.
+  CONFIG_UNREADABLE=true
+  echo "INFO: HOLD: skipping plugin and config repair steps."
+elif [ -f "$OPENCLAW_CONFIG_PATH" ]; then
+  # Ensure Brave is present BEFORE repair-known-invalid-settings, so a persisted
+  # tools.web.search.provider=brave is not stripped as "unavailable".
+  ensure_brave_plugin || true
+  # Then the other enabled official plugins, to the same OpenClaw version (gateway still down).
+  ensure_official_plugin_cohort || true
   if [ -f "$HELPER_PATH" ]; then
     # Snapshot BEFORE the first mutation of this boot so `oc-config restore`
     # can always undo whatever the repair/apply steps below decide to change.
@@ -908,25 +1481,41 @@ if [ -f "$OPENCLAW_CONFIG_PATH" ]; then
       :
     else
       rc=$?
-      echo "ERROR: Failed to repair known invalid OpenClaw config settings via oc_config_helper.py (exit code ${rc})."
-      echo "ERROR: Gateway configuration may be invalid; aborting startup."
-      exit "${rc}"
+      if [ "$rc" -eq 2 ]; then
+        # openclaw.json exists but is not valid JSON. The helper refuses to touch
+        # it (it would otherwise rebuild it from scratch and drop every agent,
+        # channel and credential). Keep booting so the add-on page and terminal
+        # stay reachable for a repair / `oc-config restore`.
+        CONFIG_UNREADABLE=true
+        echo "ERROR: $OPENCLAW_CONFIG_PATH is not valid JSON; the add-on will not modify it."
+        echo "ERROR: Fix it in the add-on terminal ('oc-config list' / 'oc-config restore <n>') and restart."
+      else
+        # Never exit PID 1 here: that would take the add-on page and terminal
+        # down with it. Hold instead, so the config can be inspected and fixed.
+        echo "ERROR: Failed to repair known invalid OpenClaw config settings via oc_config_helper.py (exit code ${rc})."
+        CONFIG_UNREADABLE=true
+        enter_hold "The add-on could not check/repair openclaw.json (oc_config_helper.py repair-known-invalid-settings, exit ${rc}); the gateway configuration may be invalid.
+Inspect it in the terminal (openclaw config validate, oc-config list / oc-config restore <n>), fix it, then restart the add-on."
+      fi
     fi
 
     # In lan_https mode the gateway uses an internal port; nginx owns the external one.
     EFFECTIVE_GW_PORT="$GATEWAY_INTERNAL_PORT"
-    if python3 "$HELPER_PATH" apply-gateway-settings "$GATEWAY_MODE" "$GATEWAY_REMOTE_URL" "$GATEWAY_BIND_MODE" "$EFFECTIVE_GW_PORT" "$ENABLE_OPENAI_API" "$GATEWAY_AUTH_MODE" "$GATEWAY_TRUSTED_PROXIES"; then
+    if [ "$CONFIG_UNREADABLE" = "true" ]; then
+      echo "WARN: Skipping gateway settings: openclaw.json is unreadable or the add-on is in HOLD."
+    elif python3 "$HELPER_PATH" apply-gateway-settings "$GATEWAY_MODE" "$GATEWAY_REMOTE_URL" "$GATEWAY_BIND_MODE" "$EFFECTIVE_GW_PORT" "$ENABLE_OPENAI_API" "$GATEWAY_AUTH_MODE" "$GATEWAY_TRUSTED_PROXIES"; then
       :
     else
       rc=$?
       echo "ERROR: Failed to apply gateway settings via oc_config_helper.py (exit code ${rc})."
-      echo "ERROR: Gateway configuration may be incorrect; aborting startup."
-      exit "${rc}"
+      CONFIG_UNREADABLE=true
+      enter_hold "The add-on could not apply its gateway settings to openclaw.json (oc_config_helper.py apply-gateway-settings, exit ${rc}); the gateway configuration may be incorrect.
+Inspect it in the terminal (openclaw config validate, oc-config list / oc-config restore <n>), fix it, then restart the add-on."
     fi
 
     # Conservative OpenClaw defaults for explicitly selected low-resource setups.
     # Only writes keys the user has not set, and never runs for auto-detection.
-    if [ "$RESOURCE_PROFILE" = "low" ]; then
+    if [ "$RESOURCE_PROFILE" = "low" ] && [ "$CONFIG_UNREADABLE" != "true" ]; then
       python3 "$HELPER_PATH" apply-resource-profile low || \
         echo "WARN: Could not apply low-profile OpenClaw defaults; continuing."
     fi
@@ -1094,7 +1683,7 @@ fi
 # - In all modes: also include origin from gateway_public_url when present
 # - Helper merges with existing origins + user extras and deduplicates
 # ------------------------------------------------------------------
-if [ -f "$HELPER_PATH" ] && [ -f "$OPENCLAW_CONFIG_PATH" ]; then
+if [ -f "$HELPER_PATH" ] && [ -f "$OPENCLAW_CONFIG_PATH" ] && [ "$CONFIG_UNREADABLE" != "true" ]; then
   ALLOWED_ORIGINS=""
 
   if [ "$ENABLE_HTTPS_PROXY" = "true" ] && [ -n "$LAN_IP" ]; then
@@ -1126,28 +1715,19 @@ PY
     echo "WARN: Could not set controlUi settings — gateway may reject the Control UI"
 fi
 
-# ------------------------------------------------------------------------------
-# Proxy shim for undici/OpenClaw startup
-# Keep official OpenClaw npm release while enabling HTTP(S)_PROXY support.
-# ------------------------------------------------------------------------------
-OPENCLAW_GLOBAL_NODE_MODULES="$(HOME=/root npm root -g 2>/dev/null || true)"
-if [ -f /usr/local/lib/openclaw-proxy-shim.cjs ]; then
-  if [ -n "${NODE_OPTIONS:-}" ]; then
-    export NODE_OPTIONS="--require /usr/local/lib/openclaw-proxy-shim.cjs ${NODE_OPTIONS}"
-  else
-    export NODE_OPTIONS="--require /usr/local/lib/openclaw-proxy-shim.cjs"
-  fi
-  export OPENCLAW_GLOBAL_NODE_MODULES
-fi
+# (The proxy shim for undici/OpenClaw is set up next to the runtime environment
+# hardening near the top, before the migration gate.)
 
 # ------------------------------------------------------------------------------
 # Auto-configure MCP (Model Context Protocol) for Home Assistant
 # Registers HA as an MCP server so OpenClaw can control HA entities/services.
 # Requires: homeassistant_token set in add-on options + mcporter CLI available.
-# Runs once; re-runs when the token changes.
+# Runs once; re-runs when the token or the Home Assistant URL changes.
 # Auto-detects HA API URL: supervisor proxy if available, else localhost:8123.
 # ------------------------------------------------------------------------------
-if [ "$AUTO_CONFIGURE_MCP" = "true" ] && [ -n "$HA_TOKEN" ]; then
+if [ "$STATE_HOLD" = "true" ]; then
+  echo "INFO: HOLD: skipping MCP auto-configuration."
+elif [ "$AUTO_CONFIGURE_MCP" = "true" ] && [ -n "$HA_TOKEN" ]; then
   if command -v mcporter >/dev/null 2>&1; then
     # Detect HA API URL. This add-on runs with host_network: true, so the
     # container is not on the Supervisor bridge network and the `supervisor`
@@ -1162,10 +1742,14 @@ if [ "$AUTO_CONFIGURE_MCP" = "true" ] && [ -n "$HA_TOKEN" ]; then
       MCP_HA_URL="http://localhost:8123/api/mcp"
     fi
     MCP_FLAG="/config/.openclaw/.mcp_ha_configured"
-    MCP_TOKEN_HASH=$(printf '%s' "$HA_TOKEN" | sha256sum | cut -d' ' -f1)
+    # Fingerprint covers token AND URL, so changing ha_base_url (or the URL
+    # detection above) re-registers the server. Older markers held a token-only
+    # hash and trigger one re-registration; add-on versions before 0.5.90
+    # registered the unreachable http://supervisor/... URL.
+    MCP_TOKEN_HASH=$(printf '%s\n%s' "$HA_TOKEN" "$MCP_HA_URL" | sha256sum | cut -d' ' -f1)
 
     if [ -f "$MCP_FLAG" ] && [ "$(cat "$MCP_FLAG" 2>/dev/null)" = "$MCP_TOKEN_HASH" ]; then
-      echo "INFO: MCP Home Assistant server already configured (token unchanged)"
+      echo "INFO: MCP Home Assistant server already configured (token and URL unchanged)"
     else
       echo "INFO: Configuring MCP for Home Assistant at $MCP_HA_URL ..."
       # Remove stale entry if present (token may have changed)
@@ -1191,6 +1775,8 @@ fi
 
 start_openclaw_runtime() {
   echo "Starting OpenClaw Assistant runtime (openclaw)..."
+  # Reclaim orphaned Telegram ingress-spool claims before (re)starting the gateway.
+  heal_telegram_ingress_spool || true
   if [ "$GATEWAY_MODE" = "remote" ]; then
     # Remote mode: do NOT start a local gateway service.
     # Start a node/client host that connects to the configured remote gateway URL.
@@ -1213,7 +1799,7 @@ url = (sys.argv[1] or '').strip()
 p = urlparse(url)
 if p.scheme not in ('ws', 'wss') or not p.hostname:
     print('echo "ERROR: Invalid gateway.remote.url (expected ws:// or wss://): %s"' % url.replace('"', '\\"'))
-    print('exit 1')
+    print('return 1')
     raise SystemExit(0)
 port = p.port or (443 if p.scheme == 'wss' else 80)
 print(f'NODE_HOST={p.hostname}')
@@ -1311,27 +1897,38 @@ find_gateway_daemon_pid() {
   # Tier 3: scan /proc for any openclaw process we don't already know about.
   # The daemon's cmdline (e.g. node /usr/.../openclaw/...) contains "openclaw"
   # from the moment it is forked, even before process.title is set.
-  local known=" ${NGINX_PID:-0} ${TTYD_PID:-0} ${GW_RELAY_PID:-0} ${GW_PID:-0} $$ "
-  local f cand
-  for f in /proc/[0-9]*/cmdline; do
-    [ -r "$f" ] || continue
-    if tr '\0' ' ' < "$f" 2>/dev/null | grep -q "openclaw"; then
-      cand="${f#/proc/}"
-      cand="${cand%%/*}"
-      case "$known" in *" $cand "*) continue ;; esac
-      echo "$cand"
-      return 0
-    fi
-  done
+  # Not with OPENCLAW_NO_RESPAWN=1 (2026.8+): restarts stay in-process, so the
+  # gateway PID stays our child, and the scan could adopt an unrelated
+  # `openclaw` CLI process (hiding exit codes, or signalling it on shutdown).
+  if [ "${OPENCLAW_NO_RESPAWN:-}" != "1" ]; then
+    local known=" ${NGINX_PID:-0} ${TTYD_PID:-0} ${GW_RELAY_PID:-0} ${GW_PID:-0} ${CLEANUP_PID:-0} $$ "
+    local f cand
+    for f in /proc/[0-9]*/cmdline; do
+      [ -r "$f" ] || continue
+      if tr '\0' ' ' < "$f" 2>/dev/null | grep -q "openclaw"; then
+        cand="${f#/proc/}"
+        cand="${cand%%/*}"
+        case "$known" in *" $cand "*) continue ;; esac
+        echo "$cand"
+        return 0
+      fi
+    done
+  fi
 
   return 1
 }
 
-if ! start_openclaw_runtime; then
-  exit 1
+if [ "$STATE_HOLD" = "true" ]; then
+  echo "ERROR: HOLD: OpenClaw runtime not started (see above / oc-upgrade status)."
+elif [ "$SHUTTING_DOWN" = "true" ]; then
+  echo "INFO: Stop requested during startup; exiting."
+  exit 0
+elif start_openclaw_runtime; then
+  start_gw_relay
+else
+  # Keep the add-on page and terminal up instead of exiting PID 1.
+  enter_hold "OpenClaw could not be started (see the error above). Fix the add-on configuration, then restart the add-on."
 fi
-
-start_gw_relay
 
 # Start web terminal (optional)
 TTYD_PID_FILE="/var/run/openclaw-ttyd.pid"
@@ -1524,7 +2121,15 @@ fi
 # Keep add-on alive even if gateway/node runtime restarts itself (e.g. during onboarding).
 # If runtime exits unexpectedly, restart it while nginx/ttyd stay up.
 #
-# Design notes (issue #95):
+# OpenClaw 2026.8+ (OPENCLAW_NO_RESPAWN=1): restarts stay in-process, so the
+# gateway PID stays our child and `wait` returns its real exit code. Exit 78
+# means the gateway refused to start (invalid config, unmigrated or newer state,
+# lock, gateway.mode): that is a HOLD at once, never a restart loop and never an
+# automatic doctor run. Ten failed starts in a row are a HOLD as well. Both stay
+# until `oc-upgrade retry` (sticky across restarts). 2026.7.x keeps the
+# behaviour described below.
+#
+# Design notes (issue #95, OpenClaw 2026.7.x):
 #   `openclaw gateway run` is a thin wrapper that spawns `openclaw-gateway` as a
 #   long-running daemon and then exits. When the gateway self-restarts (SIGUSR1 /
 #   `openclaw gateway restart`), the old daemon exits and a NEW daemon is forked —
@@ -1546,41 +2151,30 @@ GW_IS_CHILD=true   # true only when GW_PID was started by us (can use `wait`)
 
 # Consecutive failed starts, used for restart backoff (reset once a boot sticks).
 GW_FAIL_STREAK=0
-# `openclaw doctor --fix` is attempted at most once per add-on start.
-GW_DOCTOR_FIX_DONE=false
+# Fork policy: the add-on never runs `openclaw doctor --fix` on its own after
+# startup. Upstream retries a crash-looping gateway with an automatic
+# `openclaw doctor --fix --non-interactive --yes`. On this deployment that would
+# run OpenClaw's config/state migrations (e.g. the openai-codex -> openai route
+# migration) unattended and without a pre-migration backup. Doctor runs only in
+# the migration gate at startup (backup check first, checks after), also when
+# requested with `oc-upgrade retry --doctor`. A crash loop backs off and
+# reports; on OpenClaw 2026.8+ it ends in a HOLD.
+GW_CRASH_LOOP_HOLD_AFTER=10
 
-# Some OpenClaw upgrades gate startup behind a data migration and refuse to boot
-# until `openclaw doctor --fix` has run (e.g. the legacy workspace state check
-# introduced in 2026.8.2). Without this the supervisor restarts forever, writing
-# a stability bundle on every attempt. Try the documented repair exactly once,
-# snapshotting openclaw.json first so the change is reversible.
-attempt_doctor_fix() {
-  if [ "$GW_DOCTOR_FIX_DONE" = "true" ]; then
-    return 1
-  fi
-  GW_DOCTOR_FIX_DONE=true
+if [ "$STATE_HOLD" = "true" ]; then
+  # Keep nginx/ttyd (and the health sensors) running so the user can inspect
+  # and restore; wait until the Supervisor stops the add-on.
+  hold_wait_loop
+  exit 0
+fi
 
-  echo "NOTICE: Gateway failed to start repeatedly; running 'openclaw doctor --fix' once."
-  echo "NOTICE: This is the repair OpenClaw itself recommends for upgrade migrations."
-
-  if [ -f "$HELPER_PATH" ] && [ -f "$OPENCLAW_CONFIG_PATH" ]; then
-    python3 "$HELPER_PATH" snapshot "$CONFIG_BACKUP_KEEP" pre-doctor-fix --force ||       echo "WARN: Could not snapshot openclaw.json before doctor --fix; continuing."
-  fi
-
-  # --non-interactive is required: there is no TTY here, and without it doctor
-  # only prints advisory notices and skips the repairs that need confirmation.
-  # --yes accepts repair defaults so migrations are not deferred.
-  if openclaw doctor --fix --non-interactive --yes; then
-    echo "INFO: 'openclaw doctor --fix' completed; retrying gateway startup."
-  else
-    echo "WARN: 'openclaw doctor --fix' exited non-zero — the repair did not fully complete."
-    echo "WARN: Doctor exits non-zero while a legacy source or an interrupted"
-    echo "WARN: '.doctor-importing' claim remains. Open the add-on terminal and run:"
-    echo "WARN:   openclaw doctor --fix"
-    echo "WARN: Do not delete the reported files to silence it; they hold unmigrated state."
-  fi
-  return 0
-}
+# Deletes OpenClaw's doctor captures of finished migration-gate runs (and the archives and
+# exports earlier add-on versions left) gate_cleanup_hours after the run (rule: no
+# long-lived plaintext copies). Never during a gate run or HOLD.
+if command -v oc-upgrade >/dev/null 2>&1; then
+  OC_GATE_FROM_RUNSH=1 PYTHONUNBUFFERED=1 oc-upgrade cleanup --loop &
+  CLEANUP_PID=$!
+fi
 
 while true; do
   GW_START_SECONDS=$SECONDS
@@ -1593,7 +2187,8 @@ while true; do
     # Poll with kill -0 until it exits.
     while kill -0 "$GW_PID" 2>/dev/null; do
       if [ "$SHUTTING_DOWN" = "true" ]; then break 2; fi
-      sleep 5
+      sleep 5 &
+      wait "$!" || true
     done
     GW_EXIT_CODE=0
   fi
@@ -1606,21 +2201,78 @@ while true; do
     break
   fi
 
+  # OpenClaw 2026.8+ exit 78: the gateway refused to start. Record a sticky
+  # HOLD (oc-upgrade classifies the state and writes hold.txt) and wait.
+  if [ "$GW_IS_CHILD" = "true" ] && [ "${GW_EXIT_CODE:-0}" -eq 78 ] && runtime_at_least 2026.8.0; then
+    stop_gw_relay
+    hold_out="$(oc-upgrade gate --hold-exit78 2>&1 || true)"
+    if [ -s "${UPG_DIR}/hold.txt" ]; then hold_keep=keep; else hold_keep=""; fi
+    enter_hold "OpenClaw exited with code 78 (it refused to start: configuration or state needs attention).
+${hold_out}" "$hold_keep"
+    hold_wait_loop
+    exit 0
+  fi
+
+  # A runtime swapped inside the container (e.g. `npm install -g openclaw@...`)
+  # must not be (re)started or adopted after a self-restart: check before the
+  # daemon detection below, stop a daemon that may already run the swapped
+  # code, and hold here without counting it as a crash.
+  RUNTIME_PROBLEM="$(runtime_integrity_problem)"
+  if [ -n "$RUNTIME_PROBLEM" ]; then
+    if [ "$RUNTIME_PROBLEM" != "${LAST_RUNTIME_PROBLEM:-}" ]; then
+      {
+        echo "OpenClaw is held (bundled runtime ${OPENCLAW_RUNTIME_VERSION:-unknown}):"
+        echo "${RUNTIME_PROBLEM}."
+        echo "Reinstall or rebuild the add-on in Home Assistant to restore the pinned OpenClaw runtime."
+      } > "${UPG_DIR}/hold.txt" 2>/dev/null || true
+      echo "ERROR: HOLD — not restarting OpenClaw: ${RUNTIME_PROBLEM}."
+      echo "ERROR: Reinstall or rebuild the add-on in Home Assistant. Details: oc-upgrade status"
+      LAST_RUNTIME_PROBLEM="$RUNTIME_PROBLEM"
+    fi
+    _swapped_pid="$(ss -tlnp 2>/dev/null | grep ":${GATEWAY_INTERNAL_PORT} " \
+      | sed -n 's/.*pid=\([0-9]*\).*/\1/p' | head -1 || true)"
+    [ -n "$_swapped_pid" ] || _swapped_pid="$(pgrep -f "openclaw-gateway" 2>/dev/null | head -1 || true)"
+    if [ -n "$_swapped_pid" ] && kill -0 "$_swapped_pid" 2>/dev/null; then
+      echo "ERROR: Stopping gateway PID ${_swapped_pid} (it may run the swapped OpenClaw)."
+      kill -TERM "$_swapped_pid" 2>/dev/null || true
+    fi
+    stop_gw_relay
+    sleep 60 &
+    wait "$!" || true
+    if [ "$SHUTTING_DOWN" = "true" ]; then
+      break
+    fi
+    GW_IS_CHILD=true
+    GW_PID=""
+    continue
+  fi
+  LAST_RUNTIME_PROBLEM=""
+
   # --- Detect self-restart ---------------------------------------------------
   # Try up to 10 times (≈ 20 s) using all 3 tiers of find_gateway_daemon_pid.
   # Tier 3 (/proc scan) usually finds the daemon on the very first attempt
   # because the process exists immediately after fork, even before port bind
   # or process.title. The retries cover edge cases on extremely slow I/O.
+  # Every sleep in this crash-restart window is `sleep & wait`, so a stop
+  # request runs the shutdown trap at once, and SHUTTING_DOWN is checked again
+  # after the detection, after the backoff and right before a restart: a
+  # gateway started after shutdown() would never be stopped.
   RESTARTED_PID=""
   if [ "$GATEWAY_MODE" != "remote" ]; then
     for _attempt in 1 2 3 4 5 6 7 8 9 10; do
       RESTARTED_PID=$(find_gateway_daemon_pid 2>/dev/null || true)
       [ -n "$RESTARTED_PID" ] && break
-      sleep 2
+      [ "$SHUTTING_DOWN" = "true" ] && break
+      sleep 2 &
+      wait "$!" || true
     done
   else
-    sleep 2
+    sleep 2 &
+    wait "$!" || true
     RESTARTED_PID=$(pgrep -f "openclaw.*node.*run" 2>/dev/null | head -1 || true)
+  fi
+  if [ "$SHUTTING_DOWN" = "true" ]; then
+    break
   fi
 
   if [ -n "$RESTARTED_PID" ]; then
@@ -1656,36 +2308,59 @@ while true; do
   if [ "$GW_UPTIME" -ge 120 ]; then
     GW_FAIL_STREAK=0
   fi
+
   GW_FAIL_STREAK=$((GW_FAIL_STREAK + 1))
   GW_BACKOFF=$((2 ** (GW_FAIL_STREAK < 6 ? GW_FAIL_STREAK : 6)))
   if [ "$GW_BACKOFF" -gt 60 ]; then
     GW_BACKOFF=60
   fi
 
-  # After a few quick failures, try the one-shot upgrade repair before backing off.
-  if [ "$GW_FAIL_STREAK" -ge 2 ] && attempt_doctor_fix; then
-    GW_BACKOFF=2
+  if [ "$GW_FAIL_STREAK" -ge "$GW_CRASH_LOOP_HOLD_AFTER" ] && runtime_at_least 2026.8.0; then
+    # Crash loop: stop restarting and hold (sticky until `oc-upgrade retry`).
+    stop_gw_relay
+    hold_out="$(oc-upgrade gate --hold-crash-loop "${GW_EXIT_CODE}" 2>&1 || true)"
+    if [ -s "${UPG_DIR}/hold.txt" ]; then hold_keep=keep; else hold_keep=""; fi
+    enter_hold "OpenClaw failed to start ${GW_FAIL_STREAK} times in a row (last exit code ${GW_EXIT_CODE}).
+${hold_out}" "$hold_keep"
+    hold_wait_loop
+    exit 0
   fi
 
   if [ "$GW_FAIL_STREAK" -ge 5 ]; then
     echo "ERROR: OpenClaw runtime has failed ${GW_FAIL_STREAK} times in a row."
     echo "ERROR: The terminal and add-on page stay available — open the terminal and run:"
-    echo "ERROR:   openclaw doctor"
     echo "ERROR:   oc-gateway status"
+    echo "ERROR:   openclaw config validate"
+    if runtime_at_least 2026.8.0; then
+      echo "ERROR:   openclaw doctor --lint   (read-only)"
+      echo "ERROR: Do not run 'openclaw doctor --fix' by hand (blocked). Use 'oc-upgrade retry --doctor',"
+      echo "ERROR: which first checks for an encrypted Home Assistant backup of the add-on; then restart the add-on."
+    else
+      echo "ERROR: Take a Home Assistant backup of the add-on before running 'openclaw doctor --fix':"
+      echo "ERROR: it migrates configuration and state and cannot be undone without that backup."
+    fi
     echo "ERROR: Recent failures are detailed in /config/.openclaw/logs/stability/."
   fi
 
   echo "WARN: OpenClaw runtime exited with code ${GW_EXIT_CODE}. Restarting in ${GW_BACKOFF}s..."
-  sleep "$GW_BACKOFF"
+  sleep "$GW_BACKOFF" &
+  wait "$!" || true
+  if [ "$SHUTTING_DOWN" = "true" ]; then
+    break
+  fi
 
   # Stop the loopback relay BEFORE restarting the gateway (tailnet mode only).
   # The relay holds 127.0.0.1:GATEWAY_PORT — leaving it up causes the new gateway
   # to detect the port as occupied and exit with code 1, re-entering the loop.
   stop_gw_relay
 
+  if [ "$SHUTTING_DOWN" = "true" ]; then
+    break
+  fi
   if ! start_openclaw_runtime; then
     echo "ERROR: Failed to restart OpenClaw runtime; retrying in 5s..."
-    sleep 5
+    sleep 5 &
+    wait "$!" || true
   else
     GW_IS_CHILD=true
     start_gw_relay

@@ -1,0 +1,61 @@
+--- a/dist/lifecycle-BZUtlfJ8.mjs
++++ b/dist/lifecycle-BZUtlfJ8.mjs
+@@ -39,6 +39,22 @@
+ 	onPlatformSendDispatch: () => Promise.resolve(),
+ 	release: () => void 0
+ };
++// TG-20261023: process-local live custody; no persisted debt is removed.
++const addonLiveDeliveries = globalThis[Symbol.for("addon.telegram.live-final.v1")] ??= new Map();
++function addonLiveKey(sessionId, intentId) { return JSON.stringify([sessionId, intentId]); }
++function addonAcquireDelivery(completion) {
++    if (!completion) return () => {};
++    const key = addonLiveKey(completion.sessionId, completion.intentId);
++    addonLiveDeliveries.set(key, (addonLiveDeliveries.get(key) ?? 0) + 1);
++    let released = false;
++    return () => {
++        if (released) return;
++        released = true;
++        const count = addonLiveDeliveries.get(key) ?? 0;
++        if (count <= 1) addonLiveDeliveries.delete(key);
++        else addonLiveDeliveries.set(key, count - 1);
++    };
++}
+ function resolvePendingFinalCompletion(payload) {
+ 	const identity = getReplyPayloadMetadata(payload)?.pendingFinalDeliveryCompletion;
+ 	return identity ? {
+@@ -188,6 +204,10 @@
+ 	else await settlePendingFinalDelivery(completion, "unknown", ["queued", "unknown"]);
+ }
+ async function settleChannelDeliveryAttempt(attempt, onDelivered, onFinalizationError) {
++    try { return await addonSettleChannelDeliveryAttempt(attempt, onDelivered, onFinalizationError); }
++    finally { attempt.addonReleaseLive?.(); }
++}
++async function addonSettleChannelDeliveryAttempt(attempt, onDelivered, onFinalizationError) {
+ 	const emitFailure = (error) => {
+ 		const partial = isChannelPartialDeliveryError(error) ? error.deliveryResult : void 0;
+ 		if (!isPlatformMessageNotDispatchedError(error)) attempt.emitMessageSent?.({
+@@ -324,6 +344,11 @@
+ 		})
+ 	};
+ 	async function deliverReply(payload, info, operation) {
++        const addonLive = { release: addonAcquireDelivery(resolvePendingFinalCompletion(payload)), deferred: false };
++        try { return await addonDeliverReply(payload, info, operation, addonLive); }
++        finally { if (!addonLive.deferred) addonLive.release(); }
++    }
++    async function addonDeliverReply(payload, info, operation, addonLive) {
+ 		const preparedPayloadResult = delivery.preparePayload ? await delivery.preparePayload(payload, info) : payload;
+ 		const preparedValue = preparedPayloadResult === null ? null : operation.prepare(copyReplyPayloadMetadata(payload, preparedPayloadResult));
+ 		if (preparedValue === null) return await suppressReply(payload, info, "no_visible_payload");
+@@ -413,9 +438,11 @@
+ 			payload: effectivePayload,
+ 			info: directInfo,
+ 			result,
+-			emitMessageSent: emitMessageSentForDelivery
++			emitMessageSent: emitMessageSentForDelivery,
++			addonReleaseLive: addonLive.release
+ 		};
+ 		if (result?.finalization) {
++			addonLive.deferred = true;
+ 			result.finalization.catch(() => void 0);
+ 			pendingAttempts.push(attempt);
+ 		} else await settleChannelDeliveryAttempt(attempt, delivery.onDelivered);

@@ -67,8 +67,8 @@ configuration:
     description: Kommagetrennte zusätzliche Control-UI-Origins, die bei lan_https in gateway.controlUi.allowedOrigins zusammengeführt werden (Beispiel - https://ha.example.com:8443,capacitor://localhost)
 
   controlui_disable_device_auth:
-    name: Control-UI-Geräte-Pairing deaktivieren (veraltet)
-    description: "Hat keine Wirkung mehr. OpenClaw hat gateway.controlUi.dangerouslyDisableDeviceAuth in der 2026.8.x-Reihe zurückgezogen, daher koppelt sich jeder Browser einmal. Genehmigen Sie einen Browser im Add-on-Terminal mit: openclaw devices list, dann openclaw devices approve <requestId>."
+    name: Control-UI-Geräte-Pairing deaktivieren (nur OpenClaw ≤ 2026.7)
+    description: "Überspringt das einmalige Browser-Pairing der Control UI (Token-Authentifizierung bleibt aktiv). Wirkt nur, solange das gebündelte OpenClaw 2026.7.x ist; OpenClaw hat gateway.controlUi.dangerouslyDisableDeviceAuth in der 2026.8.x-Reihe zurückgezogen, danach entfernt das Add-on den Schlüssel und jeder Browser koppelt sich einmal. Genehmigen Sie einen Browser im Add-on-Terminal mit: openclaw devices list, dann openclaw devices approve <requestId>."
 
   gateway_bind_mode:
     name: Gateway-Bindungsmodus
@@ -146,3 +146,15 @@ configuration:
   config_backup_keep:
     name: Aufzubewahrende Konfigurations-Snapshots
     description: Wie viele openclaw.json-Snapshots in /config/.openclaw/backups aufbewahrt werden. Vor dem ersten Konfigurationsschreibvorgang jedes Starts wird ein Snapshot erstellt, sodass unerwünschte Änderungen mit 'oc-config restore' rückgängig gemacht werden können. 0 deaktiviert Snapshots.
+
+  glm_thinking_levels:
+    name: GLM-Denkstufen
+    description: "Ein GLM-Modell mit dem Denkformat 'qwen-chat-template' bekommt nur Denken an/aus. Wenn AN, stellt das Migrations-Gate es bei seinem nächsten Lauf auf reasoning_effort um (OpenClaw-Update oder 'oc-upgrade retry --doctor' und ein Neustart; ein normaler Neustart reicht nicht), damit /think- und thinkingDefault-Stufen beim Modell ankommen. 'Aus' wird dann als 'none' statt enable_thinking gesendet: Prüfen Sie vorher Ihren GLM-Server (siehe Dokumentation). Wieder AUS schalten macht die Änderung nicht rückgängig. Jede Änderung wird im Transform-Ledger des Gates protokolliert."
+
+  gate_cleanup_hours:
+    name: Doctor-Aufzeichnungen löschen nach (Stunden)
+    description: Stunden nach einem abgeschlossenen Lauf des Migrations-Gates, bis das Add-on die Doctor-Aufzeichnungen von OpenClaw aus diesem Lauf (/config/.openclaw.update-captures/doctor-*) und die SQLite-Kopien löscht, die Doctor in diesem Lauf neben den Datenbanken angelegt hat (*.pre-startup-migration-*.bak, .scoped.bak, die Cron-Sicherungen vor einer Reparatur state/openclaw.sqlite.doctor-cron-*.bak und die Wiederherstellungsverzeichnisse vor einer Reparatur openclaw-*-recovery-*/), sowie die eigenen Klartext-Kopien der openclaw.json im Laufverzeichnis des Gates (/config/.openclaw-upgrade/gate/runs/<Lauf>/config.*.json, mit der gespeicherten Ausgabe von models status). Kopien früherer Add-on-Versionen (Gate-Archive in /share/openclaw-upgrade, Probe-Exporte in /share/openclaw-rehearsal, die Klartext-Archive von 2026.7 in /config/.openclaw/upgrade-backups) werden dieselbe Zeit nach ihrem Lauf, Export bzw. nach der Migration gelöscht. 0 = nie. Eine Änderung gilt ab dem nächsten Start des Add-ons. Bereich 0-720, Standard 48.
+
+  gate_backup_max_age_hours:
+    name: Erforderliches Backup-Alter (Stunden)
+    description: "Bevor es den OpenClaw-Zustand ändert, verlangt das Migrations-Gate ein verschlüsseltes Home-Assistant-Backup, das dieses Add-on enthält, vor dem Update erstellt wurde und höchstens so viele Stunden alt ist; andernfalls hält es an (akzeptierbar mit 'oc-upgrade retry --accept ha-backup-missing'). Dieses Backup ist der einzige Rollback-Punkt: Das Gate schreibt kein eigenes Archiv. Bereich 1-168, Standard 24."

@@ -1,0 +1,59 @@
+{
+  "openclaw_version": "2026.11.4",
+  "patches": [
+    {
+      "name": "memory-search-half-life",
+      "file": "dist/memory-search-DD--gfEX.mjs",
+      "region": "//#region src/agents/memory-search.ts",
+      "stock_sha256": "49274f5d7d417ddc7b425f9194901baed316a5874f4470318e0c8efc141d2e08",
+      "patched_sha256": "754007ef02701c6f827e6ccee33b4d4474cb432b765ef4fbd95a38542c75bd2f",
+      "diff": "memory-search-half-life.patch",
+      "note": "Memory search temporal-decay half-life 365 days instead of the hard-coded 30 (see DOCS.md, \"Memory search recency\"; 2026.11.4 still hard-codes 30 days). Since 2026.10.10 minScore is checked before the decay (openclaw/openclaw#168692), so the half-life only sets the ranking (and with it which eligible hits fit into the returned maxResults, default 6). Same diff as oc-patches/2026.11.3, at the same lines: src/agents/memory-search.ts is unchanged in 2026.11.4 (no commit in v2026.11.3..v2026.11.4; the chunk differs from 2026.11.3 only in its import/export lines)."
+    },
+    {
+      "name": "telegram-voice-text-first",
+      "file": "dist/send-CvWi3zfv.mjs",
+      "region": "//#region extensions/telegram/src/send-message.ts",
+      "stock_sha256": "d839163363b737039861cc90dc2aaca7487c1155538a3949a2f2354c14aebeda",
+      "patched_sha256": "02ac37854c5d3bc5857892e15f39734ded6609753cc204b7aa9c6a8337634e5e",
+      "diff": "telegram-voice-text-first.patch",
+      "note": "Telegram hotfix TG-20261023 (1/3): a single voice reply whose text exceeds the caption limit sends and confirms the text first, then the audio without caption; a network failure or voice-privacy rejection of the audio keeps the text and is not retried. Same diff as oc-patches/2026.11.3, at the same lines; extensions/telegram/src/send-message.ts is unchanged in 2026.11.4 (the chunk differs from 2026.11.3 only in its import/export lines)."
+    },
+    {
+      "name": "telegram-delivery-live-custody",
+      "file": "dist/lifecycle-BZUtlfJ8.mjs",
+      "region": "//#region src/channels/turn/lifecycle.ts",
+      "stock_sha256": "929c987a84a6ef07ea5dd450d7dd52f6baf7e81ea0b09a7e2def62c40f2f1468",
+      "patched_sha256": "deda9339057a15567a690361be59309d1f8d441ac80b7f4bd0e4d3ab33fa76c0",
+      "diff": "telegram-delivery-live-custody.patch",
+      "note": "Telegram hotfix TG-20261023 (2/3): a process-local refcount per sessionId/intentId is held from the start of a direct reply delivery until its canonical settlement (also across deferred finalization). Same hunk bodies as oc-patches/2026.11.3 (local names addonLive and attempt.addonReleaseLive, because deliverReply has its own custody/releaseCustody); the first hunk sits 1 line, the others 6 lines further down: src/channels/turn/lifecycle.ts is unchanged in 2026.11.4, but its chunk also carries src/channels/turn/direct-delivery-custody.ts, which 2026.11.4 changed (cf9a023c222a, cherry-pick of e2a180733f7d: trackActiveDirectPendingFinalDelivery from onPlatformSendDispatch until the custody release). That upstream guard does not make this patch redundant: deliverReply releases the custody in its finally (or when result.finalization settles), before settleChannelDeliveryAttempt writes the canonical \"delivered\" (for deferred finalization only at the end of the dispatch), so a message arriving in between still got the \"couldn't confirm\" notice; this refcount is released only after that settlement. openclaw/openclaw#154417 (f6f7252001c1) is not in 2026.11.4."
+    },
+    {
+      "name": "telegram-notice-live-guard",
+      "file": "dist/pending-delivery-notice-C9L5X9zk.mjs",
+      "region": "//#region src/channels/turn/pending-delivery-notice.ts",
+      "stock_sha256": "bfe5c039d73774d490fe53292e02601999dc09e6c31f88c529d87ff5d1c32def",
+      "patched_sha256": "1b255528a3367436069178038633ff2c5b05845f31ce379d205ae5744b4ddf02",
+      "diff": "telegram-notice-live-guard.patch",
+      "note": "Telegram hotfix TG-20261023 (2/3): the pending-delivery notice (\"I couldn’t confirm whether my previous reply reached this chat ...\") skips an intent that is still being delivered; settled unknown outcomes and restart debts are still reported. Re-derived for 2026.11.4: the region moved from the execution chunk into its own chunk (with src/channels/turn/direct-delivery-active.ts), and cf9a023c222a added the parameter expectedIntentId (recovery hands its own intent's notice over) and the upstream check hasActiveDirectPendingFinalDelivery to the same condition; addonHasLiveDelivery is added right after that check, only for calls without expectedIntentId (the same helper as in 2026.11.3, inserted after the region marker). The hand-over caller, settleFailedQueuedDeliveryCompletion, passes expectedIntentId once a queued pending final settles unknown after exhausted retries; on Telegram that runs inside the live durable delivery (deliverDurable, deliver-queue, recoverLiveFinalDelivery, settleQueuedFailure) while this refcount is still held for the same sessionId/intentId, so the live check must not apply there, or the notice stock 2026.11.4 sends at that point would wait for the next incoming message. Both added checks only return early, so the upstream guard and the recovery hand-over keep working; see telegram-delivery-live-custody for why the upstream guard alone leaves a gap."
+    },
+    {
+      "name": "telegram-fetch-fresh-audio",
+      "file": "dist/fetch-CbMOee_S.mjs",
+      "region": "//#region extensions/telegram/src/fetch.ts",
+      "stock_sha256": "03d8db1f402f7b01a9be57aa0a7294c3980a7aafafd695732c2fcd1683d314ee",
+      "patched_sha256": "f84f27edce7a4e456fadb21c654d079487d69645d361a111755c87587c02578b",
+      "diff": "telegram-fetch-fresh-audio.patch",
+      "note": "Telegram hotfix TG-20261023 (3/3): sendVoice/sendAudio use a fresh connection like sendMessage, with the same rule that a request Telegram may have received is not replayed (isSafeToRetrySendError). Same diff as oc-patches/2026.11.3, at the same lines; extensions/telegram/src/fetch.ts is unchanged in 2026.11.4 (the chunk differs from 2026.11.3 only in its import/export lines)."
+    },
+    {
+      "name": "telegram-reply-self-audio",
+      "file": "dist/bot-message-CA5l5gzv.mjs",
+      "region": "//#region extensions/telegram/src/bot-message-context.session.ts",
+      "stock_sha256": "a5216678e6019ffed42494ac2776bf23e6be0021fe085b954f52536a428ac347",
+      "patched_sha256": "b6546078be63484f491c3720207e643902810a512cec182776df18ea3296cc3d",
+      "diff": "telegram-reply-self-audio.patch",
+      "note": "Telegram hotfix TG-20261112: voice and audio of a replied-to message the bot itself sent (a reply-chain entry, or the reply target, whose sender id is the bot's own, ctx.me.id) are no longer merged into the user's turn media; they stay in the reply chain under the bot's name ([media_path] under '<bot name> (you)'). Audio as OpenClaw counts it for hasInboundAudio: kind audio or an audio content type, i.e. Telegram voice and audio messages, plus a downloaded file with an audio/* type deeper in the reply chain; a document the user replies to directly takes the reply target's kind document (stock head merge of the reply target into the first chain entry) and stays attached as before. The bot's other media (images, documents, stickers, video), all media of other senders and the reply-chain text are unchanged; without the bot's id on the update nothing changes. Before, a reply to one of the bot's own voice messages (also an unintended one, for example a notification quick reply) attached the bot's TTS audio to the user's turn ('[Audio attachment could not be analyzed]', or with audio transcription '[Audio] User text: ... Transcript: <the bot's words>'), as if the user had sent it. Stock behaviour since at least 2026.10.4, still in 2026.11.4 and 2026.11.5-beta.2. Same diff as oc-patches/2026.11.3, at the same line; extensions/telegram/src/bot-message-context.session.ts is unchanged in 2026.11.4 (the chunk differs from 2026.11.3 only in its import/export lines and one bot-deps chunk name outside the hunk)."
+    }
+  ]
+}

@@ -67,8 +67,8 @@ configuration:
     description: Допълнителни origins за Control UI, разделени със запетая; сливат се в gateway.controlUi.allowedOrigins при lan_https (пример - https://ha.example.com:8443,capacitor://localhost)
 
   controlui_disable_device_auth:
-    name: Изключване на device pairing за Control UI (остаряло)
-    description: "Вече няма никакъв ефект. OpenClaw премахна gateway.controlUi.dangerouslyDisableDeviceAuth в серията 2026.8.x, така че всеки браузър се сдвоява веднъж. Одобрете браузър от терминала на добавката с: openclaw devices list, след това openclaw devices approve <requestId>."
+    name: Изключване на device pairing за Control UI (само OpenClaw ≤ 2026.7)
+    description: "Пропуска еднократното сдвояване на браузъра за Control UI (удостоверяването с токен остава активно). Действа само докато вграденият OpenClaw е 2026.7.x; OpenClaw премахна gateway.controlUi.dangerouslyDisableDeviceAuth в серията 2026.8.x и оттогава добавката изтрива ключа и всеки браузър се сдвоява веднъж. Одобрете браузър от терминала на добавката с: openclaw devices list, след това openclaw devices approve <requestId>."
 
   gateway_bind_mode:
     name: Режим на свързване на Gateway
@@ -146,3 +146,15 @@ configuration:
   config_backup_keep:
     name: Брой запазени копия на конфигурацията
     description: Колко копия на openclaw.json да се пазят в /config/.openclaw/backups. Копие се създава преди първия запис на конфигурацията при всяко стартиране, така че нежеланите промени да могат да се отменят с 'oc-config restore'. Задайте 0, за да изключите копията.
+
+  glm_thinking_levels:
+    name: Нива на мислене за GLM
+    description: "GLM модел, настроен с формат на мислене 'qwen-chat-template', може само да включва или изключва мисленето. Когато е ВКЛЮЧЕНО, миграционният gate при следващото си изпълнение (обновяване на OpenClaw или 'oc-upgrade retry --doctor' и рестарт; обикновен рестарт не го прилага) го превключва към reasoning_effort, за да достигат нивата от /think и thinkingDefault до модела. 'Изключено' тогава се изпраща като 'none' вместо enable_thinking: първо проверете своя GLM сървър (вижте документацията). Повторното ИЗКЛЮЧВАНЕ на опцията не отменя промяната. Всяка промяна се записва в дневника на трансформациите на gate."
+
+  gate_cleanup_hours:
+    name: Изтриване на записите от doctor след (часове)
+    description: Брой часове след завършено изпълнение на миграционния gate, след които добавката изтрива записите от doctor на OpenClaw от това изпълнение (/config/.openclaw.update-captures/doctor-*) и SQLite копията, които doctor е създал при него до базите данни (*.pre-startup-migration-*.bak, .scoped.bak, резервните копия на doctor преди поправка на cron state/openclaw.sqlite.doctor-cron-*.bak и директориите за възстановяване преди поправка openclaw-*-recovery-*/), както и собствените некриптирани копия на openclaw.json в директорията на изпълнението (/config/.openclaw-upgrade/gate/runs/<изпълнение>/config.*.json, заедно със запазения изход на models status). Копията, оставени от по-стари версии на добавката (архиви на gate в /share/openclaw-upgrade, експорти за проба в /share/openclaw-rehearsal, некриптираните архиви от 2026.7 в /config/.openclaw/upgrade-backups), се изтриват след същото време от тяхното изпълнение, експорт или миграция. 0 = никога. Промяната важи от следващото стартиране на добавката. Диапазон 0-720, по подразбиране 48.
+
+  gate_backup_max_age_hours:
+    name: Изисквана давност на резервното копие (часове)
+    description: "Преди да промени състоянието на OpenClaw, миграционният gate изисква криптирано резервно копие на Home Assistant, което съдържа тази добавка, е направено преди обновяването и е с давност не повече от толкова часа; в противен случай gate спира (може да се приеме с 'oc-upgrade retry --accept ha-backup-missing'). Това резервно копие е единствената точка за връщане назад: gate не записва собствен архив. Диапазон 1-168, по подразбиране 24."

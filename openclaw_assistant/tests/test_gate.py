@@ -1,0 +1,3158 @@
+"""Unit and integration tests for oc_gate (stdlib unittest, Python 3.11).
+
+Everything runs in a temporary tree (OPENCLAW_STATE_DIR, OC_UPGRADE_DIR, OC_UPGRADE_SHARE_DIR,
+OC_CONFIG_ROOT, OC_ADDON_ENTRY_FILE) with a fake `node` (fake OpenClaw CLI) and a fake doctor
+passed through the OC_GATE_TEST_HOOKS doctor_cmd hook. The real oc_migrate is used.
+"""
+
+import copy
+import hashlib
+import io
+import json
+import os
+import shutil
+import sqlite3
+import stat
+import sys
+import tempfile
+import threading
+import time
+import unittest
+from contextlib import redirect_stderr, redirect_stdout
+from pathlib import Path
+from unittest import mock
+
+ADDON = Path(__file__).resolve().parent.parent
+if str(ADDON) not in sys.path:
+    sys.path.insert(0, str(ADDON))
+
+import oc_common as C  # noqa: E402
+import oc_gate as G  # noqa: E402
+
+_REAL_WHICH = shutil.which
+
+
+def which_without_npm(name, *a, **kw):
+    return None if name == "npm" else _REAL_WHICH(name, *a, **kw)
+
+RUNTIME = "2026.9.9"
+
+FAKE_NODE = r'''#!/usr/bin/env python3
+import json, os, sys
+args = sys.argv[1:]
+if args[:1] == ["--input-type=module"]:
+    if os.environ.get("OCQ_SQL"):
+        sys.stderr.write("fake node: no node:sqlite\n")
+        sys.exit(1)
+    print("24.16.0 3.50.4")
+    sys.exit(0)
+cmd = args[1:]
+mode = os.environ.get("FAKE_OC_MODE", "")
+def out(o, rc=0):
+    sys.stdout.write(json.dumps(o) + "\n")
+    sys.exit(rc)
+if cmd[:2] == ["config", "validate"]:
+    if "invalid-config" in mode:
+        out({"valid": False, "issues": [{"message": "bogus key"}]}, 1)
+    if "invalid-glm" in mode and "supportsReasoningEffort" in open(os.environ["OPENCLAW_CONFIG_PATH"]).read():
+        out({"valid": False, "issues": [{"message": "models.providers.glm.models.0.compat: unknown key"}]}, 1)
+    out({"valid": True, "path": "x", "warnings": []})
+if cmd[:1] == ["doctor"] and "--lint" in cmd:
+    f = []
+    if "lint-legacy" in mode:
+        f.append({"checkId": "core/doctor/legacy-state", "severity": "warning", "message": "legacy sidecar"})
+    out({"schemaVersion": 1, "ok": not f, "checksRun": 10, "checksSkipped": 0, "findings": f}, 1 if f else 0)
+if cmd[:3] == ["models", "auth", "list"]:
+    out({"profiles": []})
+if cmd[:3] == ["models", "auth", "order"]:
+    out({"order": None})
+if cmd[:2] == ["models", "status"]:
+    out({"auth": {"runtimeAuthRoutes": [], "modelRouteIssues": [], "missingProvidersInUse": [],
+                  "oauth": {"profiles": [{"profileId": "openai:default", "provider": "openai", "type": "oauth",
+                                          "status": "ok"}]}}})
+if cmd[:1] == ["sessions"]:
+    out({"sessions": []})
+if cmd[:2] == ["plugins", "list"]:
+    if os.environ.get("FAKE_PLUGINS_LIST"):  # a whole `plugins list --json` output (plugins_list_output)
+        out(json.load(open(os.environ["FAKE_PLUGINS_LIST"], encoding="utf-8")))
+    out({"plugins": []})
+sys.stderr.write("fake node: unhandled %r\n" % (cmd,))
+sys.exit(3)
+'''
+
+# Fake doctor: "migrates" the synthetic DBs to 19/24, canonicalizes openai-codex refs, prints a clack box.
+FAKE_DOCTOR = r'''#!/usr/bin/env python3
+import glob, json, os, sqlite3, sys
+state = os.environ["OPENCLAW_STATE_DIR"]
+cfgp = os.environ["OPENCLAW_CONFIG_PATH"]
+sdb = os.path.join(state, "state", "openclaw.sqlite")
+if os.path.exists(sdb):
+    c = sqlite3.connect(sdb)
+    c.execute("PRAGMA user_version=19")
+    c.execute("UPDATE schema_meta SET schema_version=19, app_version='2026.9.9' WHERE meta_key='primary'")
+    c.execute("DROP TABLE IF EXISTS cron_run_logs")
+    c.execute("UPDATE agent_databases SET schema_version=24")
+    c.commit()
+    c.close()
+for a in glob.glob(os.path.join(state, "agents/*/agent/openclaw-agent.sqlite")):
+    c = sqlite3.connect(a)
+    c.execute("PRAGMA user_version=24")
+    c.execute("UPDATE schema_meta SET schema_version=24 WHERE meta_key='primary'")
+    c.commit()
+    c.close()
+dev = os.path.join(state, "identity", "device.json")
+if os.path.exists(dev):
+    os.remove(dev)
+text = open(cfgp, encoding="utf-8").read()
+cfg = json.loads(text.replace("openai-codex/", "openai/"))
+meta = cfg.setdefault("meta", {})
+meta["lastTouchedVersion"] = "2026.9.9"
+meta.setdefault("migrations", {})["modelPolicyAllowlist"] = True
+new = json.dumps(cfg, indent=2, ensure_ascii=False) + "\n"
+if new != text:
+    with open(cfgp, "w", encoding="utf-8") as f:
+        f.write(new)
+print("┌  OpenClaw doctor")
+print("│")
+print("◇  Doctor changes ───╮")
+print("│  - Migrated shared state tables │")
+print("└  Doctor complete.")
+'''
+
+# Scriptable fake doctor (GateEnv.doctor_script): argv[1] is a JSON script, either one step for every pass or
+# {"passes": [step, ...]} (pass n uses step n, the last one repeats; the counter is <script>.count).
+# A step (every key optional):
+#   state_uv / agent_uv   migrate the state DB / every agent DB below agents/ to this user_version (schema_meta
+#                         primary, agent_databases.schema_version and the agent schema_meta follow)
+#   app_version           schema_meta app_version and openclaw.json meta.lastTouchedVersion
+#   drop_tables           state DB tables to drop          remove   state-relative paths to delete
+#   sql / agent_sql       SQL statements run on the state DB / on every agent DB after the migration
+#   write                 {state-relative path: text} files doctor writes (parents are created)
+#   canonicalize_codex    openai-codex/ -> openai/ in openclaw.json (default true)
+#   skip_agents           agent ids whose DB (and agent_databases row) the migration leaves alone (held stores)
+#   baks                  state-relative DBs doctor copies to <db>.pre-startup-migration-<stamp>.bak first
+#   box                   print the clack box ending in "Doctor complete." (default true)
+#   print                 extra lines (inside the box when box is true)        rc   exit code (default 0)
+SCRIPT_DOCTOR = r'''#!/usr/bin/env python3
+import glob, json, os, shutil, sqlite3, sys
+script = sys.argv[1]
+with open(script, encoding="utf-8") as f:
+    spec = json.load(f)
+counter = script + ".count"
+n = int(open(counter).read()) if os.path.exists(counter) else 0
+with open(counter, "w") as f:
+    f.write(str(n + 1))
+passes = spec.get("passes")
+step = passes[min(n, len(passes) - 1)] if passes else spec
+state = os.environ["OPENCLAW_STATE_DIR"]
+cfgp = os.environ["OPENCLAW_CONFIG_PATH"]
+sdb = os.path.join(state, "state", "openclaw.sqlite")
+for rel in step.get("baks") or []:
+    src = os.path.join(state, rel)
+    if os.path.exists(src):
+        shutil.copyfile(src, src + ".pre-startup-migration-20261101T000000Z.bak")
+s_uv, a_uv, app = step.get("state_uv"), step.get("agent_uv"), step.get("app_version")
+if os.path.exists(sdb):
+    c = sqlite3.connect(sdb)
+    if s_uv is not None:
+        c.execute("PRAGMA user_version=%d" % int(s_uv))
+        c.execute("UPDATE schema_meta SET schema_version=? WHERE meta_key='primary'", (s_uv,))
+    if app is not None:
+        c.execute("UPDATE schema_meta SET app_version=? WHERE meta_key='primary'", (app,))
+    for t in step.get("drop_tables") or []:
+        c.execute('DROP TABLE IF EXISTS "%s"' % t.replace('"', ''))
+    for q in step.get("sql") or []:
+        c.execute(q)
+    if a_uv is not None:
+        skip = [str(x) for x in step.get("skip_agents") or []]
+        try:
+            c.execute("UPDATE agent_databases SET schema_version=? WHERE agent_id NOT IN (%s)"
+                      % ",".join("?" * len(skip)) if skip else "UPDATE agent_databases SET schema_version=?",
+                      (a_uv, *skip))
+        except sqlite3.OperationalError:
+            pass
+    c.commit()
+    c.close()
+if a_uv is not None:
+    for a in glob.glob(os.path.join(state, "agents/*/agent/openclaw-agent.sqlite")):
+        if os.path.basename(os.path.dirname(os.path.dirname(a))) in (step.get("skip_agents") or []):
+            continue
+        c = sqlite3.connect(a)
+        c.execute("PRAGMA user_version=%d" % int(a_uv))
+        c.execute("UPDATE schema_meta SET schema_version=? WHERE meta_key='primary'", (a_uv,))
+        c.commit()
+        c.close()
+for a in glob.glob(os.path.join(state, "agents/*/agent/openclaw-agent.sqlite")) if step.get("agent_sql") else []:
+    c = sqlite3.connect(a)
+    for q in step["agent_sql"]:
+        c.execute(q)
+    c.commit()
+    c.close()
+for rel, body in (step.get("write") or {}).items():
+    p = os.path.join(state, rel)
+    os.makedirs(os.path.dirname(p), exist_ok=True)
+    with open(p, "w", encoding="utf-8") as f:
+        f.write(body)
+for rel in step.get("remove") or []:
+    p = os.path.join(state, rel)
+    if os.path.lexists(p):
+        os.remove(p)
+text = open(cfgp, encoding="utf-8").read()
+if step.get("canonicalize_codex", True):
+    text2 = text.replace("openai-codex/", "openai/")
+else:
+    text2 = text
+cfg = json.loads(text2)
+if app is not None:
+    cfg.setdefault("meta", {})["lastTouchedVersion"] = app
+new = json.dumps(cfg, indent=2, ensure_ascii=False) + "\n"
+if new != text:
+    with open(cfgp, "w", encoding="utf-8") as f:
+        f.write(new)
+lines = [str(x) for x in step.get("print") or []]
+if step.get("box", True):
+    print("┌  OpenClaw doctor")
+    print("│")
+    print("◇  Doctor changes ───╮")
+    for ln in lines:
+        print("│  " + ln + " │")
+    print("└  Doctor complete.")
+else:
+    for ln in lines:
+        print(ln)
+sys.exit(int(step.get("rc", 0)))
+'''
+
+
+def make_735_state(state, with_cron_codex=False):
+    """Minimal clean pre-journal 7.35 state DB + main agent DB (schemas from the 7.35 DDL)."""
+    (state / "state").mkdir(parents=True, exist_ok=True)
+    c = sqlite3.connect(str(state / "state" / "openclaw.sqlite"))
+    c.executescript("""
+        CREATE TABLE schema_meta (meta_key TEXT NOT NULL PRIMARY KEY, role TEXT NOT NULL,
+            schema_version INTEGER NOT NULL, agent_id TEXT, app_version TEXT, created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL);
+        INSERT INTO schema_meta VALUES ('primary','global',1,NULL,NULL,0,0);
+        INSERT INTO schema_meta VALUES ('startup-migrations','global',1,NULL,'2026.7.35',0,0);
+        CREATE TABLE agent_databases (agent_id TEXT NOT NULL, path TEXT NOT NULL, schema_version INTEGER NOT NULL,
+            last_seen_at INTEGER NOT NULL, size_bytes INTEGER, PRIMARY KEY (agent_id, path));
+        INSERT INTO agent_databases VALUES ('main','agents/main/agent/openclaw-agent.sqlite',1,0,NULL);
+        CREATE TABLE migration_sources (source_key TEXT, target_table TEXT);
+        CREATE TABLE cron_run_logs (id INTEGER);
+        CREATE TABLE device_identities (identity_key TEXT);
+        CREATE TABLE cron_jobs (job_id TEXT, payload_model TEXT, payload_fallbacks_json TEXT);
+        PRAGMA user_version=1;
+    """)
+    if with_cron_codex:
+        c.execute("INSERT INTO cron_jobs VALUES ('j1','openai-codex/gpt-5.4-mini',NULL)")
+    c.commit()
+    c.close()
+    make_agent_db(state, "main", 1)
+
+
+def make_agent_db(state, aid, uv, auth=True):
+    d = state / "agents" / aid / "agent"
+    d.mkdir(parents=True, exist_ok=True)
+    c = sqlite3.connect(str(d / "openclaw-agent.sqlite"))
+    c.executescript(f"""
+        CREATE TABLE schema_meta (meta_key TEXT NOT NULL PRIMARY KEY, role TEXT NOT NULL,
+            schema_version INTEGER NOT NULL, agent_id TEXT, app_version TEXT, created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL);
+        INSERT INTO schema_meta VALUES ('primary','agent',{uv},'{aid}',NULL,0,0);
+        PRAGMA user_version={uv};
+    """)
+    if auth:
+        c.execute("CREATE TABLE auth_profile_store (store_key TEXT PRIMARY KEY, store_json TEXT, updated_at INTEGER)")
+        c.execute("INSERT INTO auth_profile_store VALUES ('primary', ?, 0)", (json.dumps({"profiles": {
+            "openai-codex:default": {"type": "oauth", "provider": "openai-codex", "access": "SECRET-ACCESS",
+                                     "refresh": "SECRET-REFRESH", "expires": 4102444800000}}}),))
+    c.commit()
+    c.close()
+
+
+def make_99_state(state, s=19, a=24, app=RUNTIME):
+    (state / "state").mkdir(parents=True, exist_ok=True)
+    c = sqlite3.connect(str(state / "state" / "openclaw.sqlite"))
+    c.executescript(f"""
+        CREATE TABLE schema_meta (meta_key TEXT NOT NULL PRIMARY KEY, role TEXT NOT NULL,
+            schema_version INTEGER NOT NULL, agent_id TEXT, app_version TEXT, created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL);
+        INSERT INTO schema_meta VALUES ('primary','global',{s},NULL,'{app}',0,0);
+        CREATE TABLE agent_databases (agent_id TEXT NOT NULL, path TEXT NOT NULL, schema_version INTEGER NOT NULL,
+            last_seen_at INTEGER NOT NULL, size_bytes INTEGER, PRIMARY KEY (agent_id, path));
+        INSERT INTO agent_databases VALUES ('main','agents/main/agent/openclaw-agent.sqlite',{a},0,NULL);
+        CREATE TABLE config_machine_state (state_key TEXT PRIMARY KEY, value_json TEXT);
+        CREATE TABLE device_identities (identity_key TEXT);
+        INSERT INTO device_identities VALUES ('primary');
+        PRAGMA user_version={s};
+    """)
+    c.commit()
+    c.close()
+    make_agent_db(state, "main", a, auth=False)
+
+
+# --- 2026.10.x shapes (full5 prep) ---------------------------------------------------------------
+FIXTURES = Path(__file__).resolve().parent / "fixtures"
+DDL_1004_STATE = FIXTURES / "openclaw-state-schema-2026.10.4.sql"  # verbatim OpenClaw v2026.10.4 DDL
+DDL_1004_AGENT = FIXTURES / "openclaw-agent-schema-2026.10.4.sql"
+# Synthetic content of make_1004_state(content=True): no real prompts, ids or tokens.
+CRON_1004_JOBS = [
+    {"id": "job-morning", "name": "Morning summary", "enabled": True, "agentId": "main", "sessionTarget": "isolated",
+     "schedule": {"kind": "cron", "expr": "0 7 * * *"},
+     "payload": {"kind": "agentTurn", "message": "synthetic prompt", "model": "openai/gpt-5.5",
+                 "fallbacks": ["anthropic/claude-sonnet-4-6"]}},
+    {"id": "job-local", "name": "Local digest", "enabled": True, "agentId": "main", "sessionTarget": "isolated",
+     "schedule": {"kind": "every", "everyMs": 3600000},
+     "payload": {"kind": "agentTurn", "message": "synthetic prompt"}},
+    {"id": "job-off", "name": "Paused reminder", "enabled": False, "agentId": "main", "sessionTarget": "main",
+     "schedule": {"kind": "cron", "expr": "30 18 * * 5"},
+     "payload": {"kind": "systemEvent", "text": "synthetic event"}},
+]
+AUTH_1004_STORE = {"version": 1, "profiles": {
+    "openai:default": {"type": "oauth", "provider": "openai", "access": "SECRET-ACCESS", "refresh": "SECRET-REFRESH",
+                       "expires": 4102444800000},
+    "anthropic:default": {"type": "token", "provider": "anthropic", "token": "SECRET-ANTHROPIC-TOKEN"}}}
+SW_1004_PROPOSALS = [
+    ("prop-1", "create", "pending", {"name": "weather-brief", "draft": "synthetic draft"}),
+    ("prop-2", "update", "applied", {"name": "shopping-list", "draft": "synthetic draft"}),
+]
+
+
+# `openclaw plugins list --json` in the real shape (full5 rehearsal D2): tests/fixtures/plugins-list-2026.10.10.json
+# is OpenClaw 2026.10.10's output for a state with codex, acpx and Brave installed from npm, cut to three bundled
+# entries, with the paths and generation hashes replaced by synthetic ones. Every entry keeps the field set OpenClaw
+# writes (PluginRecord): no packageName, no packageVersion. Tests build their entries from it, never invent keys.
+PLUGINS_LIST_1010 = FIXTURES / "plugins-list-2026.10.10.json"
+
+
+def plugins_list_output(plugins=None):
+    """The fixture's whole output, with `plugins` instead of its entries when given."""
+    data = json.loads(PLUGINS_LIST_1010.read_text(encoding="utf-8"))
+    if plugins is not None:
+        data["plugins"] = plugins
+    return data
+
+
+def plugin_project_dir(state, pkg, ver):
+    """OpenClaw's generation project of an npm install: <state>/npm/projects/<name>-<hash>__openclaw-generation__g-<16
+    hex> (synthetic hashes; a new version gets a new generation)."""
+    h = hashlib.sha256(pkg.encode()).hexdigest()
+    g = hashlib.sha256(f"{pkg}@{ver}".encode()).hexdigest()
+    return f"{state}/npm/projects/{pkg.lstrip('@').replace('/', '-')}-{h[:10]}__openclaw-generation__g-{g[:16]}"
+
+
+def listed_plugin(pid, pkg, ver, enabled=True, origin="global", spec=None, state="/config/.openclaw"):
+    """One `plugins list --json` entry shaped like the fixture's. origin 'global': an npm install of `pkg` (its
+    rootDir/source in its generation project, trust.installSpec `spec` or the package name; trusted-official for
+    @openclaw/ packages, provenance-invalid for others, as OpenClaw's resolvePluginTrust says); 'bundled': a plugin of
+    the OpenClaw package; 'config'/'workspace': a load path (no install record, trust origin-path)."""
+    entries = {x["id"]: x for x in plugins_list_output()["plugins"]}
+    if origin == "bundled":
+        x = copy.deepcopy(entries["alibaba"])
+        root = f"/usr/local/lib/node_modules/openclaw/dist/extensions/{pid}"
+        x.update(id=pid, name=pkg, rootDir=root, source=f"{root}/index.js")
+    else:
+        x = copy.deepcopy(entries[pid] if pid in entries else entries["acpx"])
+        base = plugin_project_dir(state, pkg, ver) if origin == "global" else f"/config/plugins-dev/{pid}"
+        root = f"{base}/node_modules/{pkg}" if origin == "global" else base
+        old = x["rootDir"]
+        text = json.dumps(x).replace(old, root)  # rootDir, source
+        text = text.replace(old.rsplit("/node_modules/", 1)[0] + "/node_modules/", base + "/node_modules/")  # deps
+        x = json.loads(text)
+        x.update(id=pid, rootDir=root, source=f"{root}/dist/index.js", origin=origin)
+        x["trust"] = {"reason": "trusted-official", "registryPath": f"{state}/state/openclaw.sqlite", "origin": origin,
+                      "installSource": "npm", "installSpec": spec or pkg}
+        if origin != "global":
+            x["trust"] = {"reason": "origin-path", "registryPath": x["trust"]["registryPath"], "origin": origin}
+        elif not pkg.startswith("@openclaw/"):
+            x["trust"]["reason"] = "provenance-invalid"
+        if x["trust"]["reason"] != "trusted-official":
+            x.pop("trustedOfficialInstall", None)
+        else:
+            x["trustedOfficialInstall"] = True
+    x.update(version=ver, enabled=enabled, status="loaded" if enabled else "disabled")
+    return x
+
+
+def write_install_records(state, records):
+    """OpenClaw's npm install records (state DB config_machine_state 'plugins.installedIndex', as 2026.10.x and
+    2026.11.1 write them) for {plugin id: (package, version, spec or None)}; installPath is listed_plugin's rootDir."""
+    recs = {}
+    for pid, (pkg, ver, spec) in records.items():
+        recs[pid] = {"source": "npm", "spec": spec or pkg,
+                     "installPath": f"{plugin_project_dir(state, pkg, ver)}/node_modules/{pkg}", "version": ver,
+                     "resolvedName": pkg, "resolvedVersion": ver, "resolvedSpec": f"{pkg}@{ver}",
+                     "integrity": "sha512-synthetic", "shasum": "0" * 40, "resolvedAt": "2026-11-01T00:00:00.000Z",
+                     "installedAt": "2026-11-01T00:00:00.000Z"}
+    c = sqlite3.connect(str(Path(state) / "state" / "openclaw.sqlite"))
+    c.execute("DELETE FROM config_machine_state WHERE state_key='plugins.installedIndex'")
+    c.execute("INSERT INTO config_machine_state VALUES ('plugins.installedIndex', ?, 0)",
+              (json.dumps({"revision": 1, "index": {"version": 1, "installRecords": recs, "plugins": [],
+                                                    "diagnostics": []}}),))
+    c.commit()
+    c.close()
+
+
+def make_1004_agent_db(state, aid, uv=24, app="2026.10.4", auth_store=None):
+    """Agent DB with the 2026.10.4 agent DDL at user_version `uv` (optional auth_profile_store 'primary')."""
+    d = state / "agents" / aid / "agent"
+    d.mkdir(parents=True, exist_ok=True)
+    c = sqlite3.connect(str(d / "openclaw-agent.sqlite"))
+    c.executescript(DDL_1004_AGENT.read_text(encoding="utf-8"))
+    c.execute("INSERT INTO schema_meta VALUES ('primary','agent',?,?,?,0,0)", (uv, aid, app))
+    if auth_store is not None:
+        c.execute("INSERT INTO auth_profile_store VALUES ('primary', ?, 0)", (json.dumps(auth_store),))
+    c.execute(f"PRAGMA user_version={int(uv)}")
+    c.commit()
+    c.close()
+
+
+def make_1004_state(state, s=20, a=24, app="2026.10.4", agents=("main",), content=False):
+    """State DB + agent DBs with the 2026.10.4 DDL (tests/fixtures/openclaw-*-schema-2026.10.4.sql).
+
+    s/a/app are the recorded versions: the defaults are a state 2026.10.4 left behind (the source of a
+    10.4 -> 10.10/11.1 bump); s=19, app="2026.9.9" gives a state that still needs the 10.4 migration.
+    content=True adds synthetic rows: cron jobs (job_json), Skill Workshop proposals and an auth profile
+    store with an OAuth and a token profile in the first agent DB."""
+    (state / "state").mkdir(parents=True, exist_ok=True)
+    c = sqlite3.connect(str(state / "state" / "openclaw.sqlite"))
+    c.executescript(DDL_1004_STATE.read_text(encoding="utf-8"))
+    c.execute("INSERT INTO schema_meta VALUES ('primary','global',?,NULL,?,0,0)", (s, app))
+    for aid in agents:
+        c.execute("INSERT INTO agent_databases VALUES (?, ?, ?, 0, NULL)",
+                  (aid, f"agents/{aid}/agent/openclaw-agent.sqlite", a))
+    c.execute("INSERT INTO device_identities VALUES ('primary', 'dev-synthetic', 'PUB', 'SECRET-PRIVATE-KEY', 0, 0)")
+    if content:
+        for i, job in enumerate(CRON_1004_JOBS):
+            c.execute("INSERT INTO cron_jobs (store_key, job_id, name, enabled, agent_id, payload_kind, job_json, "
+                      "sort_order, updated_at) VALUES ('default', ?, ?, ?, ?, ?, ?, ?, 0)",
+                      (job["id"], job["name"], int(job["enabled"]), job["agentId"], job["payload"]["kind"],
+                       json.dumps(job), i))
+        for pid, kind, status, rec in SW_1004_PROPOSALS:
+            c.execute("INSERT INTO skill_workshop_proposals (proposal_id, record_json, owner_agent_id, kind, status, "
+                      "created_at, updated_at, draft_hash) VALUES (?, ?, 'main', ?, ?, '2026-10-01T00:00:00Z', "
+                      "'2026-10-01T00:00:00Z', ?)",
+                      (pid, json.dumps(dict(rec, id=pid, status=status)), kind, status, "sha256:" + pid))
+    c.execute(f"PRAGMA user_version={int(s)}")
+    c.commit()
+    c.close()
+    for n, aid in enumerate(agents):
+        make_1004_agent_db(state, aid, a, app, auth_store=AUTH_1004_STORE if content and n == 0 else None)
+
+
+CFG_735 = {
+    "meta": {"lastTouchedVersion": "2026.7.35"},
+    "agents": {"defaults": {"model": {"primary": "openai-codex/gpt-5.5", "fallbacks": ["vllm/qwen3.5-122b"]},
+                            "models": {"openai-codex/*": {}, "openai-codex/gpt-5.5": {"alias": "gpt"},
+                                       "vllm/qwen3.5-122b": {}}},
+               "list": [{"id": "main", "default": True}]},
+    "models": {"providers": {"vllm": {"baseUrl": "http://127.0.0.1:8000/v1", "models": [{"id": "qwen3.5-122b"}]}}},
+    "gateway": {"mode": "local", "auth": {"token": "SECRET-GATEWAY-TOKEN"}},
+    "channels": {"telegram": {"enabled": True, "botToken": "123456:SECRET-BOT-TOKEN"}},
+}
+
+
+class GateEnv(unittest.TestCase):
+    """Temporary add-on tree with fake runtime package, fake node and fake doctor."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="oc-gate-test-"))
+        self.root = self.tmp / "config"
+        self.state = self.root / ".openclaw"
+        self.upg = self.root / ".openclaw-upgrade"
+        self.share = self.tmp / "share"
+        self.ws = self.root / "clawd"
+        for d in (self.state, self.upg, self.share, self.ws):
+            d.mkdir(parents=True)
+        pkg = self.tmp / "pkg" / "openclaw"
+        pkg.mkdir(parents=True)
+        (pkg / "openclaw.mjs").write_text("")
+        self.pkg_dir = pkg
+        self.set_runtime(RUNTIME, 19, 24, doctor=False)
+        (self.tmp / "entry").write_text(str(pkg / "openclaw.mjs") + "\n")
+        self.bin = self.tmp / "bin"
+        self.bin.mkdir()
+        for name, body in (("node", FAKE_NODE), ("fake-doctor", FAKE_DOCTOR), ("script-doctor", SCRIPT_DOCTOR)):
+            (self.bin / name).write_text(body)
+            (self.bin / name).chmod(0o755)
+        self.doctor_cmd = [str(self.bin / "fake-doctor")]
+        self.features_file = self.tmp / "openclaw-features.json"  # absent unless a test writes it (features())
+        self.env = mock.patch.dict(os.environ, {
+            "OPENCLAW_STATE_DIR": str(self.state), "OC_UPGRADE_DIR": str(self.upg),
+            "OC_UPGRADE_SHARE_DIR": str(self.share), "OC_CONFIG_ROOT": str(self.root),
+            "OC_ADDON_ENTRY_FILE": str(self.tmp / "entry"), "PATH": f"{self.bin}:{os.environ.get('PATH', '')}",
+            "OC_GATE_TEST_HOOKS": "1", "TMPDIR": str(self.tmp), "ADDON_VERSION": "0.5.94-test",
+            "OC_ADDON_OPTIONS_FILE": str(self.tmp / "options.json"),
+            "OC_ADDON_FEATURES_FILE": str(self.features_file)})
+        self.env.start()
+        for k in ("OPENCLAW_CONFIG_PATH", "OPENCLAW_WORKSPACE_DIR", "OPENCLAW_RUNTIME_VERSION", "FAKE_OC_MODE",
+                  "SQLITE_TMPDIR", "OC_GATE_FROM_RUNSH"):
+            os.environ.pop(k, None)
+        os.environ["OPENCLAW_CONFIG_PATH"] = str(self.state / "openclaw.json")
+        self.base_options = {}  # options every test starts from (the gate needs none since 0.5.94-full3)
+        self.options()
+        G.STOP.clear()
+        G._STOP_SIG[0] = None
+        del G.NODE_FALLBACKS[:]
+
+    def tearDown(self):
+        self.env.stop()
+        G.STOP.clear()
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    # helpers
+    def write_cfg(self, cfg):
+        (self.state / "openclaw.json").write_text(json.dumps(cfg, indent=2) + "\n")
+
+    def hooks(self, **kw):
+        base = {"skip_network_check": True, "skip_space_check": True, "skip_backup_check": True,
+                "doctor_cmd": list(self.doctor_cmd)}
+        base.update(kw)
+        (self.upg / "gate").mkdir(parents=True, exist_ok=True)
+        (self.upg / "gate" / "test-hooks.json").write_text(json.dumps(base))
+
+    def set_runtime(self, version, state_schema, agent_schema, doctor=True):
+        """Bundled OpenClaw `version` with schema targets state/agent (package.json of the fake package).
+
+        With doctor=True the scriptable fake doctor migrates every DB to these targets from now on (the
+        2026.9.9 FAKE_DOCTOR stays the default of runtime RUNTIME); doctor_script() adjusts its steps."""
+        self.runtime = version
+        (self.pkg_dir / "package.json").write_text(json.dumps({
+            "version": version, "openclaw": {"schemaVersions": {"state": state_schema, "agent": agent_schema}}}))
+        if doctor:
+            self.doctor_script(state_uv=state_schema, agent_uv=agent_schema, app_version=version,
+                               drop_tables=["cron_run_logs"], remove=["identity/device.json"])
+
+    def doctor_script(self, passes=None, **step):
+        """Use the scriptable fake doctor (SCRIPT_DOCTOR) with one step for every pass or `passes`."""
+        script = self.tmp / "doctor-script.json"
+        script.write_text(json.dumps({"passes": passes} if passes else step))
+        try:
+            os.unlink(f"{script}.count")
+        except FileNotFoundError:
+            pass
+        self.doctor_cmd = [str(self.bin / "script-doctor"), str(script)]
+        hk = self.upg / "gate" / "test-hooks.json"
+        if hk.exists():  # hooks() already ran: switch its doctor too
+            cur = json.loads(hk.read_text())
+            cur["doctor_cmd"] = list(self.doctor_cmd)
+            hk.write_text(json.dumps(cur))
+
+    def features(self, version=None, **caps):
+        """The image's build-time capability record (oc_common.runtime_caps reads it for this runtime only)."""
+        self.features_file.write_text(json.dumps({"openclaw_version": version or self.runtime, **caps}))
+
+    def journal(self):
+        return json.loads((self.upg / "gate" / "journal.json").read_text())
+
+    def options(self, **kw):
+        (self.tmp / "options.json").write_text(json.dumps({**self.base_options, **kw}))
+
+    def quiet(self, fn, *a, **kw):
+        buf, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(buf), redirect_stderr(err):
+            rv = fn(*a, **kw)
+        self.out = buf.getvalue()
+        self.err = err.getvalue()
+        return rv
+
+    def run_gate(self):
+        return self.quiet(G.run_gate)
+
+    def plan(self, apply=False):
+        lines = []
+        d = G.plan(apply=apply, emit=lines.append)
+        self.out = "\n".join(lines)
+        return d
+
+    def build_735(self, **kw):
+        make_735_state(self.state, **kw)
+        self.write_cfg(CFG_735)
+        (self.state / "agents" / "main" / "sessions").mkdir(parents=True)
+        (self.state / "agents" / "main" / "sessions" / "sessions.json").write_text(json.dumps({
+            "agent:main:main": {"sessionId": "s1", "updatedAt": 1, "modelProvider": "openai-codex", "model": "gpt-5.5"},
+            "agent:main:x": {"sessionId": "s2", "updatedAt": 1, "model": "vllm/qwen3.5-122b"}}))
+        (self.ws / "AGENTS.md").write_text("# agents\n")
+        (self.ws / "node_modules" / "big").mkdir(parents=True, exist_ok=True)
+        (self.ws / "node_modules" / "big" / "x.js").write_text("x" * 1000)
+
+
+# --- decision table ---------------------------------------------------------------------------
+
+def cls_of(verdict="ok", schema=None, files=False, state_uv=19, agents=None):
+    schema = schema or ("ok" if verdict in ("ok",) else verdict)
+    return {"verdict": verdict, "schema_verdict": schema, "files_verdict": "gate" if files else "ok",
+            "newer": ["state schema 20 > 19"] if verdict == "newer" else [],
+            "gate": ["state schema 1 < 19"] if schema == "gate" else [], "files": ["x/device.json"] if files else [],
+            "state": {"uv": state_uv, "eff": state_uv}, "state_uv": state_uv,
+            "agents": agents if agents is not None else {"main": 24 if state_uv != 1 else 1},
+            "agent_paths": {"main": "agents/main/agent/openclaw-agent.sqlite"}, "orphans": []}
+
+
+BIND = {"state_db": {"dev": 1, "ino": 2}, "agents": [{"path": "agents/main/agent/openclaw-agent.sqlite", "dev": 1,
+                                                       "ino": 3}]}
+
+
+def ctx(**kw):
+    c = {"fresh": False, "runtime": RUNTIME, "cls": cls_of(), "journal": None, "marker": None, "retry": None,
+         "cfg": {"meta": {"lastTouchedVersion": RUNTIME}}, "binding": BIND}
+    c.update(kw)
+    return c
+
+
+class DecideTests(unittest.TestCase):
+    def test_fresh(self):
+        d = G.decide(ctx(fresh=True))
+        self.assertEqual((d["rc"], d["action"]), (0, "none"))
+        self.assertFalse(d["bk"]["consume_retry"])
+
+    def test_fresh_with_stale_hold_journal_needs_housekeeping(self):
+        d = G.decide(ctx(fresh=True, journal={"status": "hold", "hold": {"code": "doctor-failed"}}))
+        self.assertEqual(d["rc"], 0)
+        self.assertEqual(d["bk"]["journal_status"], "abandoned")
+
+    def test_newer(self):
+        self.assertEqual(G.decide(ctx(cls=cls_of("newer")))["rc"], 3)
+
+    def test_from_7x_gate(self):
+        d = G.decide(ctx(cls=cls_of("gate", state_uv=1), cfg={"meta": {"lastTouchedVersion": "2026.7.35"}}))
+        self.assertEqual((d["rc"], d["action"], d["mode"]), (10, "run", "from-7x"))
+
+    def test_hold_without_retry_is_sticky(self):
+        j = {"status": "hold", "run_id": "r1", "phase": "postconditions", "first_write_at": "t",
+             "hold": {"code": "pc-legacy-refs", "phase": "postconditions"}}
+        d = G.decide(ctx(journal=j))
+        self.assertEqual((d["rc"], d["hold"]["code"]), (11, "pc-legacy-refs"))
+
+    def test_B1_retry_after_successful_doctor_resumes_not_adopts(self):
+        # verdict ok (doctor done), no marker, lastTouched == runtime: must resume, never adopt
+        j = {"status": "hold", "run_id": "r1", "mode": "from-7x", "phase": "postconditions", "first_write_at": "t",
+             "doctor_started": True, "hold": {"code": "pc-legacy-refs", "phase": "postconditions"}}
+        d = G.decide(ctx(journal=j, retry={"accept": ["pc-legacy-refs"], "doctor": False}))
+        self.assertEqual((d["rc"], d["action"], d["mode"], d["resume_phase"]),
+                         (10, "resume", "from-7x", "postconditions"))
+        self.assertIsNone(d["marker"])
+        self.assertTrue(d["bk"]["consume_retry"])
+        self.assertEqual(d["bk"]["accept"], ["pc-legacy-refs"])
+        self.assertEqual(d["bk"]["auto_resumes"], 0)
+
+    def test_B1_retry_doctor_redo(self):
+        j = {"status": "hold", "run_id": "r1", "mode": "from-7x", "phase": "postconditions", "first_write_at": "t",
+             "doctor_started": True, "hold": {"code": "pc-schema", "phase": "postconditions"}}
+        d = G.decide(ctx(journal=j, retry={"doctor": True}))
+        self.assertTrue(d["bk"]["redo_doctor"])
+
+    def test_retry_before_first_write_reruns_precheck(self):
+        j = {"status": "hold", "run_id": "r1", "mode": "from-7x", "phase": "precheck", "first_write_at": None,
+             "hold": {"code": "no-network", "phase": "precheck"}}
+        d = G.decide(ctx(journal=j, retry={"accept": ["no-network"]},
+                         cls=cls_of("gate", state_uv=1), cfg={"meta": {"lastTouchedVersion": "2026.7.35"}}))
+        self.assertEqual((d["rc"], d["action"], d["resume_phase"]), (10, "resume", "precheck"))
+
+    def test_retry_before_first_write_when_nothing_left_closes_run(self):
+        j = {"status": "hold", "run_id": "r1", "mode": "bump", "phase": "precheck", "first_write_at": None,
+             "hold": {"code": "low-disk-config", "phase": "precheck"}}
+        d = G.decide(ctx(journal=j, retry={}))
+        self.assertEqual(d["rc"], 0)
+        self.assertEqual(d["bk"]["journal_status"], "done")
+        self.assertEqual(d["marker"], "adopt")
+
+    def test_exit78_retry_ok_and_gate(self):
+        j = {"status": "hold", "run_id": "r1", "mode": "from-7x", "first_write_at": "t",
+             "hold": {"code": "exit78", "phase": "gateway"}}
+        marker = {"runtime": RUNTIME, "mode": "from-7x", "binding": BIND}
+        d = G.decide(ctx(journal=j, retry={}, marker=marker))
+        self.assertEqual(d["rc"], 0)
+        self.assertEqual(d["bk"]["journal_status"], "done")
+        d = G.decide(ctx(journal=j, retry={}, marker=marker, cls=cls_of("gate", state_uv=19)))
+        self.assertEqual((d["rc"], d["mode"], d["new_run"]), (10, "maintenance", True))
+        self.assertEqual(d["reason"], "retry after exit78: maintenance gate (backup check, doctor)")
+        d = G.decide(ctx(journal=j, retry={"doctor": True}, marker=marker))
+        self.assertEqual((d["rc"], d["mode"]), (10, "maintenance"))
+
+    def test_interrupt_counting(self):
+        j = {"status": "interrupted", "run_id": "r1", "mode": "from-7x", "phase": "doctor1", "auto_resumes": 0}
+        d = G.decide(ctx(journal=j))
+        self.assertEqual((d["rc"], d["action"], d["resume_phase"], d["bk"]["auto_resumes"]),
+                         (10, "resume", "doctor1", 1))
+        j["auto_resumes"] = 1
+        d = G.decide(ctx(journal=j))
+        self.assertEqual((d["rc"], d["hold"]["code"]), (11, "interrupted-twice"))
+        d = G.decide(ctx(journal=j, retry={}))
+        self.assertEqual((d["rc"], d["action"], d["bk"]["auto_resumes"]), (10, "resume", 0))
+        j2 = dict(j, status="running", auto_resumes=0)
+        self.assertEqual(G.decide(ctx(journal=j2))["rc"], 10)
+
+    def test_B4_bump_repeat_guard(self):
+        marker = {"runtime": RUNTIME, "mode": "bump", "binding": BIND}
+        done = {"status": "done", "run_id": "r1"}
+        d = G.decide(ctx(journal=done, marker=marker, cls=cls_of("gate", state_uv=19)))
+        self.assertEqual((d["rc"], d["hold"]["code"]), (11, "bump-repeat"))
+        d = G.decide(ctx(journal=done, marker=marker, cls=cls_of("gate", state_uv=19), retry={}))
+        self.assertEqual((d["rc"], d["mode"]), (10, "bump"))
+        other = {"state_db": {"dev": 1, "ino": 99}, "agents": BIND["agents"]}
+        d = G.decide(ctx(journal=done, marker=marker, cls=cls_of("gate", state_uv=19), binding=other))
+        self.assertEqual((d["rc"], d["mode"]), (10, "bump"))
+
+    def test_maintenance_request(self):
+        marker = {"runtime": RUNTIME, "mode": "from-7x", "binding": BIND}
+        d = G.decide(ctx(journal={"status": "done"}, marker=marker, retry={"doctor": True}))
+        self.assertEqual((d["rc"], d["mode"]), (10, "maintenance"))
+
+    def test_ok_paths(self):
+        marker = {"runtime": RUNTIME, "mode": "from-7x", "binding": BIND}
+        d = G.decide(ctx(marker=marker))
+        self.assertEqual((d["rc"], d["marker"]), (0, None))
+        d = G.decide(ctx(marker=marker, binding={"state_db": {"dev": 9, "ino": 9}, "agents": []}))
+        self.assertEqual((d["rc"], d["marker"]), (0, "rebind"))
+        self.assertTrue(any("marker rebound" in w for w in d["warnings"]))
+        d = G.decide(ctx(marker=dict(marker, runtime="2026.9.5")))
+        self.assertEqual((d["rc"], d["mode"]), (10, "bump"))
+        d = G.decide(ctx(cfg={}))
+        self.assertEqual((d["rc"], d["marker"]), (0, "adopt"))
+        d = G.decide(ctx(cfg={"meta": {"lastTouchedVersion": "2026.9.5"}}))
+        self.assertEqual((d["rc"], d["mode"]), (10, "bump"))
+
+    def test_files_only_gate_with_marker_is_logged_only(self):
+        marker = {"runtime": RUNTIME, "mode": "from-7x", "binding": BIND}
+        d = G.decide(ctx(marker=marker, cls=cls_of("gate", schema="ok", files=True)))
+        self.assertEqual(d["rc"], 0)
+        self.assertTrue(any("legacy files" in w for w in d["warnings"]))
+        d = G.decide(ctx(cls=cls_of("gate", schema="ok", files=True)))
+        self.assertEqual((d["rc"], d["mode"]), (10, "bump"))
+
+    def test_newer_state_hold_closes_after_restore(self):
+        j = {"status": "hold", "run_id": "r1", "hold": {"code": "newer-state", "phase": "precheck"}}
+        d = G.decide(ctx(journal=j))
+        self.assertEqual(d["rc"], 0)
+        self.assertEqual(d["bk"]["journal_status"], "done")
+
+    def test_stale_retry_is_discarded(self):
+        marker = {"runtime": RUNTIME, "mode": "from-7x", "binding": BIND}
+        d = G.decide(ctx(marker=marker, journal={"status": "done"}, retry={"accept": ["x"]}))
+        self.assertEqual(d["rc"], 0)
+        self.assertTrue(d["bk"]["consume_retry"])
+
+    def test_infer_mode(self):
+        self.assertEqual(G.infer_mode(cls_of("gate", state_uv=1), {}), "from-7x")
+        self.assertEqual(G.infer_mode(cls_of("gate", state_uv=19), {}), "bump")
+        c = cls_of("gate", state_uv=None, agents={"main": 1})
+        self.assertEqual(G.infer_mode(c, {}), "from-7x")
+        c = cls_of("gate", state_uv=None, agents={})
+        self.assertEqual(G.infer_mode(c, {"meta": {"lastTouchedVersion": "2026.7.35"}}), "from-7x")
+        # F6: a v1 agent DB or a 7.x config means from-7x whatever the state DB says
+        for uv in (0, 19):
+            self.assertEqual(G.infer_mode(cls_of("gate", state_uv=uv, agents={"main": 24, "work": 1}), {}), "from-7x")
+            self.assertEqual(G.infer_mode(cls_of("gate", state_uv=uv),
+                                          {"meta": {"lastTouchedVersion": "2026.7.35"}}), "from-7x")
+        self.assertEqual(G.infer_mode(cls_of("gate", state_uv=19), {"meta": {"lastTouchedVersion": "2026.9.5"}}), "bump")
+
+    def test_F6_from7x_wins_for_post_run_retries_and_bumps(self):
+        """Reviewer repro decide_test.py: a rolled-back 2026.7.x state never gets a maintenance or bump run."""
+        cls735 = cls_of("gate", state_uv=1)
+        cfg7 = {"meta": {"lastTouchedVersion": "2026.7.35"}}
+        marker = {"runtime": RUNTIME, "mode": "from-7x", "run_id": "old", "binding": {}}
+        for code in ("exit78", "crash-loop"):
+            j = {"status": "hold", "run_id": "old", "mode": "from-7x", "first_write_at": None,
+                 "hold": {"code": code, "phase": "gateway"}}
+            for retry in ({"doctor": False, "accept": []}, {"doctor": True}):
+                d = G.decide(ctx(cls=cls735, journal=j, marker=marker, retry=retry, cfg=cfg7, binding={}))
+                self.assertEqual((d["rc"], d["action"], d["mode"], d["new_run"]), (10, "run", "from-7x", True))
+        # version bumps (marker for another runtime / config written by another version)
+        d = G.decide(ctx(marker=dict(marker, runtime="2026.9.5"), cfg=cfg7))
+        self.assertEqual((d["rc"], d["mode"]), (10, "from-7x"))
+        d = G.decide(ctx(cfg=cfg7))
+        self.assertEqual((d["rc"], d["mode"]), (10, "from-7x"))
+        d = G.decide(ctx(cls=cls_of("gate", state_uv=19, agents={"main": 1}), marker=dict(marker, runtime="2026.9.5")))
+        self.assertEqual((d["rc"], d["mode"]), (10, "from-7x"))
+
+
+# --- classification ---------------------------------------------------------------------------
+
+class ClassifyTests(GateEnv):
+    def test_735_state_needs_gate(self):
+        make_735_state(self.state)
+        c = G.classify(self.state, {}, 19, 24, RUNTIME)
+        self.assertEqual((c["verdict"], c["schema_verdict"], c["state_uv"]), ("gate", "gate", 1))
+        self.assertEqual(c["agents"], {"main": 1})
+
+    def test_99_state_ok_and_newer(self):
+        make_99_state(self.state)
+        c = G.classify(self.state, {}, 19, 24, RUNTIME)
+        self.assertEqual(c["verdict"], "ok", c)
+        c = G.classify(self.state, {}, 18, 24, "2026.9.5")
+        self.assertEqual(c["verdict"], "newer")
+        c = G.classify(self.state, {"meta": {"lastTouchedVersion": "2026.10.1"}}, 19, 24, RUNTIME)
+        self.assertEqual(c["verdict"], "newer")
+
+    def test_99_state_against_2026_10_targets(self):
+        # a state migrated by 2026.9.9 (19/24) meets the 2026.10.2 package (20/24): bump gate, agents current
+        make_99_state(self.state, app="2026.9.9")
+        c = G.classify(self.state, {"meta": {"lastTouchedVersion": "2026.9.9"}}, 20, 24, "2026.10.2")
+        self.assertEqual((c["verdict"], c["schema_verdict"]), ("gate", "gate"), c)
+        self.assertIn("state schema 19 < 20", c["gate"])
+        self.assertEqual(c["agents"], {"main": 24})
+        self.assertEqual(G.infer_mode(c, {"meta": {"lastTouchedVersion": "2026.9.9"}}), "bump")
+        # app_version written by 9.9 is not a schema_meta problem for the 10.2 runtime
+        con = sqlite3.connect(str(self.state / "state" / "openclaw.sqlite"))
+        con.execute("UPDATE schema_meta SET schema_version=20 WHERE meta_key='primary'")
+        con.commit()
+        con.close()
+        pkg = {"version": "2026.10.2", "schema_state": 20, "schema_agent": 24}
+        probs = G.schema_meta_problems(self.state, G.classify(self.state, {}, 20, 24, "2026.10.2"), pkg)
+        self.assertFalse([x for x in probs if "app_version" in x or "primary {" in x and "'2026.9.9'" in x], probs)
+
+    def test_content_version_and_cron_run_logs(self):
+        make_99_state(self.state, s=18)
+        con = sqlite3.connect(str(self.state / "state" / "openclaw.sqlite"))
+        con.execute("INSERT INTO config_machine_state VALUES ('state.schema.contentVersion', '19')")
+        con.commit()
+        c = G.classify(self.state, {}, 19, 24, RUNTIME)
+        self.assertEqual((c["state"]["eff"], c["verdict"]), (19, "ok"))
+        con.execute("CREATE TABLE cron_run_logs (id INTEGER)")
+        con.commit()
+        con.close()
+        c = G.classify(self.state, {}, 19, 24, RUNTIME)
+        self.assertEqual(c["verdict"], "gate")
+        self.assertIn("legacy cron_run_logs table present", c["gate"])
+
+    def test_B4_orphan_agent_db_excluded(self):
+        make_99_state(self.state)
+        make_agent_db(self.state, "ghost", 1, auth=False)
+        c = G.classify(self.state, {}, 19, 24, RUNTIME)
+        self.assertEqual(c["verdict"], "ok")
+        self.assertEqual([o["id"] for o in c["orphans"]], ["ghost"])
+        cfg = {"agents": {"list": [{"id": "main"}, {"id": "ghost"}]}}
+        c = G.classify(self.state, cfg, 19, 24, RUNTIME)
+        self.assertEqual(c["verdict"], "gate")
+        self.assertEqual(c["orphans"], [])
+
+    def test_fresh_agent_db_ignored(self):
+        make_99_state(self.state)
+        d = self.state / "agents" / "main" / "agent"
+        os.remove(d / "openclaw-agent.sqlite")
+        sqlite3.connect(str(d / "openclaw-agent.sqlite")).close()
+        c = G.classify(self.state, {}, 19, 24, RUNTIME)
+        self.assertEqual(c["verdict"], "ok")
+        self.assertEqual(c["agents"], {})
+
+    def test_files_verdict(self):
+        make_99_state(self.state)
+        con = sqlite3.connect(str(self.state / "state" / "openclaw.sqlite"))
+        con.execute("DELETE FROM device_identities")
+        con.commit()
+        con.close()
+        (self.state / "identity").mkdir()
+        (self.state / "identity" / "device.json").write_text("{}")
+        c = G.classify(self.state, {}, 19, 24, RUNTIME)
+        self.assertEqual((c["schema_verdict"], c["files_verdict"], c["verdict"]), ("ok", "gate", "gate"))
+        os.remove(self.state / "identity" / "device.json")
+        (self.ws / "openclaw-workspace-state.json").write_text("{}")
+        self.assertEqual(G.classify(self.state, {}, 19, 24, RUNTIME)["files_verdict"], "gate")
+        os.remove(self.ws / "openclaw-workspace-state.json")
+        Path(f"{self.ws}.attested").write_bytes(b"not an attestation")
+        self.assertEqual(G.classify(self.state, {}, 19, 24, RUNTIME)["files_verdict"], "ok")
+        Path(f"{self.ws}.attested").write_bytes(G.ATTESTATION_HEADER + b"x")
+        self.assertEqual(G.classify(self.state, {}, 19, 24, RUNTIME)["files_verdict"], "gate")
+
+    def test_B5_legacy_dir_attestation(self):
+        make_99_state(self.state)
+        key = hashlib.sha256(str(self.ws).encode()).hexdigest()
+        d = self.root / ".clawdbot" / "workspace-attestations"
+        d.mkdir(parents=True)
+        (d / f"{key}.attested").write_text("x")
+        self.assertEqual(G.classify(self.state, {}, 19, 24, RUNTIME)["files_verdict"], "gate")
+
+    def test_prejournal_check(self):
+        make_735_state(self.state)
+        sdb = self.state / "state" / "openclaw.sqlite"
+        self.assertEqual(G.prejournal_problems(sdb), [])
+        con = sqlite3.connect(str(sdb))
+        con.execute("CREATE TABLE config_machine_state (state_key TEXT)")
+        con.execute("INSERT INTO migration_sources VALUES ('agent-deletion-journal-reconstruction', 'x')")
+        con.commit()
+        con.close()
+        probs = G.prejournal_problems(sdb)
+        self.assertIn("table config_machine_state present", probs)
+        self.assertTrue(any("reconstruction receipt" in p for p in probs))
+        self.assertEqual(G.prejournal_problems(self.state / "nope.sqlite"), ["state/openclaw.sqlite missing"])
+
+    def test_schema_meta_check_accepts_real_99_shape(self):
+        # real 2026.9.9 result: state primary app_version NULL, agent primary app_version = runtime
+        make_99_state(self.state, app=None)
+        con = sqlite3.connect(str(self.state / "state" / "openclaw.sqlite"))
+        con.execute("UPDATE schema_meta SET app_version=NULL WHERE meta_key='primary'")
+        con.commit()
+        con.close()
+        con = sqlite3.connect(str(self.state / "agents" / "main" / "agent" / "openclaw-agent.sqlite"))
+        con.execute("UPDATE schema_meta SET app_version=? WHERE meta_key='primary'", (RUNTIME,))
+        con.commit()
+        con.close()
+        pkg = {"version": RUNTIME, "schema_state": 19, "schema_agent": 24}
+        c = G.classify(self.state, {}, 19, 24, RUNTIME)
+        self.assertEqual(G.schema_meta_problems(self.state, c, pkg), [])
+        # an older writer (a 9.x gateway, or an agent DB already at the target) is fine; a newer one or junk is not
+        for app, n in (("2026.9.5", 0), ("2099.1.1", 1), ("junk", 1)):
+            con = sqlite3.connect(str(self.state / "state" / "openclaw.sqlite"))
+            con.execute("UPDATE schema_meta SET app_version=? WHERE meta_key='primary'", (app,))
+            con.commit()
+            con.close()
+            self.assertEqual(len(G.schema_meta_problems(self.state, c, pkg)), n, app)
+
+    def test_workspaces_from_config(self):
+        cfg = {"agents": {"defaults": {"workspace": "~/clawd"}, "list": [{"id": "a", "workspace": "~/ws-a"}],
+                          "entries": {"b": {"workspace": str(self.root / "ws-b")}}}}
+        self.assertEqual(G.workspaces(cfg), [self.ws, self.root / "ws-a", self.root / "ws-b"])
+
+
+# --- plan (integration, read-only) -----------------------------------------------------------------
+
+class PlanTests(GateEnv):
+    def test_fresh_install(self):
+        self.assertEqual(self.plan()["rc"], 0)
+        self.assertIn("[gate] plan: fresh install", self.out)
+
+    def test_735_plan_is_read_only(self):
+        make_735_state(self.state)
+        self.write_cfg(CFG_735)
+        (self.upg / "gate").mkdir(parents=True)
+        (self.upg / "gate" / "retry-request.json").write_text("{}")
+        before = {p: p.stat().st_mtime_ns for p in self.tmp.rglob("*") if p.is_file()}
+        d = self.plan()
+        self.assertEqual((d["rc"], d["mode"]), (10, "from-7x"))
+        self.assertEqual(sum(1 for x in self.out.splitlines() if x.startswith("[gate] plan:")), 1)
+        after = {p: p.stat().st_mtime_ns for p in self.tmp.rglob("*") if p.is_file()}
+        self.assertEqual(before, after)
+        self.assertTrue((self.upg / "gate" / "retry-request.json").exists())
+
+    def test_adopt_writes_marker(self):
+        make_99_state(self.state)
+        self.write_cfg({"meta": {"lastTouchedVersion": RUNTIME}})
+        self.assertEqual(self.plan()["rc"], 0)
+        m = json.loads((self.upg / "gate" / "migrated.json").read_text())
+        self.assertEqual((m["runtime"], m["mode"]), (RUNTIME, "adopted"))
+
+    def test_unversioned_config_with_legacy_refs_is_not_adopted(self):
+        """Codex review: an unversioned config that still uses openai-codex refs must not get a marker."""
+        make_99_state(self.state)
+        self.write_cfg({"agents": {"defaults": {"model": {"primary": "openai-codex/gpt-5.5"}}}})
+        self.assertEqual(self.plan()["rc"], 0)
+        self.assertFalse((self.upg / "gate" / "migrated.json").exists())
+        self.assertIn("not recorded as migrated", self.out.lower())
+
+    def test_B11_plan_error_with_marker_starts(self):
+        make_99_state(self.state)
+        self.write_cfg({})
+        (self.upg / "gate").mkdir(parents=True)
+        (self.upg / "gate" / "migrated.json").write_text(json.dumps({"runtime": RUNTIME, "mode": "from-7x"}))
+        with mock.patch.object(G, "classify", side_effect=RuntimeError("boom")):
+            d = self.plan()
+        self.assertEqual(d["rc"], 0)
+        self.assertIn("WARN [gate] planning failed", self.out)
+        os.remove(self.upg / "gate" / "migrated.json")
+        with mock.patch.object(G, "classify", side_effect=RuntimeError("boom")):
+            self.assertEqual(self.plan()["rc"], 1)
+
+    def test_B11_shortcut_only_without_an_open_gate_run(self):
+        """Reviewer repro b11.py: a planning error must not bypass a held maintenance run."""
+        make_99_state(self.state)
+        self.write_cfg({})
+        (self.upg / "gate").mkdir(parents=True)
+        (self.upg / "gate" / "migrated.json").write_text(json.dumps({"runtime": RUNTIME, "mode": "from-7x"}))
+        jpath = self.upg / "gate" / "journal.json"
+        for status, rc in (("hold", 1), ("running", 1), ("interrupted", 1), ("done", 0), ("abandoned", 0)):
+            jpath.write_text(json.dumps({"status": status, "run_id": "m1", "mode": "maintenance",
+                                         "first_write_at": "t", "hold": {"code": "doctor-failed", "phase": "doctor2"}}))
+            with self.subTest(status=status), mock.patch.object(G, "classify", side_effect=ValueError("boom")):
+                d = self.plan()
+                self.assertEqual(d["rc"], rc, self.out)
+                self.assertEqual("planning error ignored" in self.out, rc == 0)
+        jpath.write_text("{not json")
+        with mock.patch.object(G, "classify", side_effect=ValueError("boom")):
+            self.assertEqual(self.plan()["rc"], 1)
+
+    def test_plan_reraises_a_stop(self):
+        make_99_state(self.state)
+        self.write_cfg({})
+        (self.upg / "gate").mkdir(parents=True)
+        (self.upg / "gate" / "migrated.json").write_text(json.dumps({"runtime": RUNTIME, "mode": "from-7x"}))
+        with mock.patch.object(G, "classify", side_effect=C.Stopped("stop requested")):
+            with self.assertRaises(C.Stopped):
+                self.plan()
+
+    def test_sticky_hold_writes_hold_txt(self):
+        make_735_state(self.state)
+        self.write_cfg(CFG_735)
+        (self.upg / "gate").mkdir(parents=True)
+        j = {"schema": 1, "run_id": "r1", "mode": "from-7x", "status": "hold", "phase": "precheck",
+             "first_write_at": None, "hold": {"code": "no-network", "codes": ["no-network"], "phase": "precheck",
+                                              "message": "npm unreachable", "acceptable": True,
+                                              "findings": [{"code": "no-network", "cls": "acceptable",
+                                                            "message": "npm unreachable"}]}}
+        (self.upg / "gate" / "journal.json").write_text(json.dumps(j))
+        d = self.plan()
+        self.assertEqual(d["rc"], 11)
+        txt = (self.upg / "hold.txt").read_text()
+        self.assertIn("migration gate run r1, phase precheck", txt)
+        self.assertIn("Reason [no-network]: npm unreachable", txt)
+        self.assertIn("oc-upgrade retry --accept no-network", txt)
+        self.assertEqual(self.journal()["status"], "hold")
+
+    def test_newer_rc3(self):
+        make_99_state(self.state, s=25)
+        self.write_cfg({})
+        self.assertEqual(self.plan()["rc"], 3)
+
+
+# --- doctor output ---------------------------------------------------------------------------------
+
+BOX_OK = ("┌  OpenClaw doctor\n│\n◇  Doctor warnings ──╮\n"
+          "│  - Model metadata looked corrupt but Doctor could  │\n"
+          "│    not prove the responsible config write. It was left unchanged. │\n"
+          "│  - provider catalog timed out after 5000ms │\n└  Doctor complete.\n")
+
+
+class DoctorNotesTests(unittest.TestCase):
+    """Contract addendum 1 item 7: behaviour-change notes parsed from the normalized doctor log."""
+
+    LOG = "\n".join([
+        "\u25c7  Doctor warnings \u2500\u2500\u2500\u256e",
+        "\u2502  - agents.entries.other_agent.model is \"vllm/qwen3.5-122b\", a bare      \u2502",
+        "\u2502    string with no fallbacks. At runtime this clobbers                   \u2502",
+        "\u2502    agents.defaults.model.fallbacks (openai/gpt-5.5), leaving   \u2502",
+        "\u2502  Agent \"main\":                                                           \u2502",
+        "\u2502  31 allowed skills are not usable in this environment (missing           \u2502",
+        "\u2502  Create heartbeat monitor for agent \"main\" at 1h.         \u2502",
+        "\u2502  Create heartbeat monitor for agent \"main\" at 1h.         \u2502",
+        "\u2502  Removed untouched ~/clawd/TOOLS.md after archiving it.  \u2502",
+        "\u2502  Migrated ~/clawd/HEARTBEAT.md into cron scratch for Heartbeat (main).  \u2502",
+        "\u2502  Agent \"main\": Memory search provider is set to \"openai\" but no API key  \u2502",
+        "\u2502  was found. sk-abcdefghijklmnopqrstuvwxyz \u2502",
+    ])
+
+    def test_notes(self):
+        notes = G.doctor_notes(self.LOG)
+        levels = [n[0] for n in notes]
+        text = "\n".join(n[1] for n in notes)
+        self.assertEqual(levels, ["info", "warn", "warn", "warn", "warn", "warn"])
+        self.assertIn("agents.entries.other_agent.model has no explicit \"fallbacks\"", text)
+        self.assertIn("memory search of agent main uses provider openai without an API key, so semantic recall does "
+                      "not work until one is configured", text)  # not cut by the "API key: value" redaction
+        self.assertIn("31 skill(s) of agent main", text)
+        self.assertEqual(text.count("heartbeat monitor"), 1, "deduplicated")
+        self.assertIn("~/clawd/TOOLS.md", text)
+        self.assertIn("~/clawd/HEARTBEAT.md", text)
+        self.assertNotIn("sk-abc", text)
+        self.assertEqual(G.doctor_notes("Doctor complete."), [])
+
+    def test_info_findings_never_hold(self):
+        g = G.Gate(dry_run=True, emit=lambda _l: None)
+        lines = []
+        g.emit = lines.append
+        g.resolve([G.finding("canonical-openai-refs", "info", "3 canonical openai/* refs/keys will be pinned"),
+                   G.finding("x", "warn", "w")], "precheck")
+        self.assertEqual(lines, ["[gate] 1/8 info: 3 canonical openai/* refs/keys will be pinned", "WARN [gate] x: w"])
+        g.cleanup_tmp()
+
+
+class DoctorRetirementTests(unittest.TestCase):
+    """Contract addendum 2 item 7: retired-model replacements parsed from the normalized doctor log.
+    The lines are copied from real 9.9 doctor logs (harness T1 pass 1, exp5 pass 1, exp1raw) or built
+    from the dist templates (retired-model-ref-repair-BeQCC1zw.mjs, legacy-config-migrations.runtime.models)."""
+
+    T1_PASS1 = "\n".join([
+        "◇  Doctor changes ───╮",
+        "│  Replaced retired agents.defaults.model.fallbacks.0                      │",
+        "│  \"openai/gpt-5.4-mini\" with \"openai/gpt-5.6-luna\".                       │",
+        "│  Replaced retired agents.defaults.heartbeat.model \"openai/gpt-5.4-mini\"  │",
+        "│  with \"openai/gpt-5.6-luna\".                                             │",
+        "│  Preserved inherited openai/gpt-5.4 settings in                          │",
+        "│  agents.entries.main.models.openai/gpt-5.6-terra.                        │",
+        "│  Replaced retired hooks.mappings.0.model \"openai/gpt-5.4-mini\" with      │",
+        "│  \"openai/gpt-5.6-luna\".                                                  │",
+        "│  Repaired Codex model routes:- agents.defaults.model.primary:          │",
+        "│  openai-codex/gpt-5.5 -> openai/gpt-5.5.-                              │",
+        "│  - Discarded retired shared-state commitments rows, table, and indexes  │",
+    ])
+    EXP5_PASS1 = "\n".join([
+        "│  - Upgraded config.agents.defaults.models key from                       │",
+        "│    \"anthropic/claude-opus-4-5\" to \"anthropic/claude-opus-4-7\".           │",
+        "│  - Merged config.agents.defaults.models key \"anthropic/claude-opus-4-5\"  │",
+        "│    into \"anthropic/claude-opus-4-7\".                                     │",
+        "│  - Merged config.agents.defaults.models key                              │",
+        "│    \"anthropic/claude-sonnet-4-5\" into \"anthropic/claude-sonnet-4-6\".     │",
+        "│  - Upgraded config.agents.defaults.models key from                       │",
+        "│    \"openai/gpt-5.1-codex\" to \"openai/gpt-5.3-codex\".                     │",
+    ])
+    RAW = "\n".join([
+        "│  Replaced stale agents.defaults.model primary \"openai-codex/gpt-5.5\"    │",
+        "│  with default \"openai/gpt-6-astra\" (provider \"openai-codex\" is          │",
+        "│  unavailable).                                                          │",
+        "│  Added agents.defaults.models entry \"openai/gpt-6-astra\" to keep the    │",
+    ])
+
+    def test_real_t1_log(self):
+        pairs, removed = G.doctor_retirements(self.T1_PASS1)
+        self.assertEqual(pairs, {"openai/gpt-5.4-mini": "openai/gpt-5.6-luna", "openai/gpt-5.4": "openai/gpt-5.6-terra"})
+        self.assertEqual(removed, [])
+
+    def test_real_exp5_log(self):
+        pairs, _r = G.doctor_retirements(self.EXP5_PASS1)
+        self.assertEqual(pairs, {"anthropic/claude-opus-4-5": "anthropic/claude-opus-4-7",
+                                 "anthropic/claude-sonnet-4-5": "anthropic/claude-sonnet-4-6",
+                                 "openai/gpt-5.1-codex": "openai/gpt-5.3-codex"})
+
+    def test_raw_path_damage_is_no_retirement(self):
+        self.assertEqual(G.doctor_retirements(self.RAW), ({}, []))
+
+    def test_other_dist_templates(self):
+        text = "\n".join([
+            'Moved retired agents.entries.ops.models.openai/gpt-5.2-pro to openai/gpt-5.5-pro.',
+            'Preserved agents.defaults.models.openai/gpt-5.4-nano for other authentication routes and added '
+            'openai/gpt-5.6-luna.',
+            'Preserved agents.defaults.modelPolicy.allow.3 "openai/o3" for other authentication routes and allowed '
+            '"openai/gpt-5.5".',
+            'Replaced retired agents.defaults.modelPolicy.allow.0 "xai/grok-4.3" with "xai/grok-4.7".',
+            'Preserved agents.defaults.imageModel model "openai/gpt-image-1@openai:old" as '
+            '"openai/gpt-image-2@openai:default" after config repair.',
+            'Upgraded config.agents.defaults.model.primary from "google/gemini-3-pro" to "google/gemini-3.1-pro".',
+            'Upgraded config.x provider/model from "a/b" to "a/c".',
+            'Upgraded config.models.providers.vllm.models.0.id from "qwen" to "qwen3".',
+            'Upgraded config.x key from "openai-codex/gpt-5.2" to "openai/gpt-5.5".',
+            'Removed retired agents.defaults.heartbeat.model "openai/gpt-4o" so it inherits the configured '
+            'default model.',
+        ])
+        pairs, removed = G.doctor_retirements(text)
+        self.assertEqual(pairs, {"openai/gpt-5.2-pro": "openai/gpt-5.5-pro",
+                                 "openai/gpt-5.4-nano": "openai/gpt-5.6-luna", "openai/o3": "openai/gpt-5.5",
+                                 "xai/grok-4.3": "xai/grok-4.7", "openai/gpt-image-1": "openai/gpt-image-2",
+                                 "google/gemini-3-pro": "google/gemini-3.1-pro", "a/b": "a/c"})
+        self.assertEqual(removed, [["agents.defaults.heartbeat.model", "openai/gpt-4o"]])
+
+
+class DoctorEvalTests(unittest.TestCase):
+    def test_success(self):
+        ev = G.evaluate_doctor(0, "\x1b[32m└  Doctor complete.\x1b[0m\n")
+        self.assertIsNone(ev["code"])
+        self.assertTrue(ev["complete"])
+
+    def test_B3_benign_marker_text_with_rc0_passes(self):
+        ev = G.evaluate_doctor(0, BOX_OK)
+        self.assertIsNone(ev["code"], ev)
+
+    def test_rc0_without_complete(self):
+        self.assertEqual(G.evaluate_doctor(0, "Doctor maintenance deferred")["code"], "doctor-incomplete")
+
+    def test_rc0_suspicious(self):
+        ev = G.evaluate_doctor(0, "Preserved retired table x\nDoctor complete.\n")
+        self.assertEqual((ev["code"], ev["cls"]), ("doctor-warnings", "acceptable"))
+
+    def test_markers_with_rc1(self):
+        cases = {
+            "Held agent databases: main": "doctor-held-back",
+            "2 agent database(s) held back": "doctor-held-back",
+            "Doctor stopped because a state migration refused to continue.": "doctor-migration-refused",
+            "Doctor could not enter maintenance mode": "doctor-maintenance-refused",
+            "Doctor found plugin load errors": "doctor-plugin-load",
+            "config fixes were not applied": "doctor-config-write",
+            "Cannot verify pre-migration SQLite backup": "doctor-backup-unverifiable",
+            "state database schema migration required": "doctor-incomplete",
+            "SQLite integrity check of x timed out after 300s": "doctor-incomplete",
+            "Failing check plugin-doctor-state (step-refused)": "doctor-failed",
+            "something else entirely": "doctor-failed",
+            "provider catalog timed out after 5000ms": "doctor-failed",
+        }
+        for text, code in cases.items():
+            self.assertEqual(G.evaluate_doctor(1, text)["code"], code, text)
+
+    def test_2026_10_doctor_texts(self):
+        # held stores: 2026.10 warns and exits 0 (9.9 failed doctor)
+        ev = G.evaluate_doctor(0, "Warning: Agent deletion journal reconstructed; 1 store held back. Updates can "
+                                  "continue; held stores remain untouched.\nDoctor complete.\n")
+        self.assertEqual((ev["code"], ev["cls"]), ("doctor-held-back", "acceptable"))
+        # an agent deleted with its files kept is no problem (10.2 docs); nor are held lines without a cause
+        ok = ("Held agent old database /x/openclaw-agent.sqlite (retained-by-deletion); skipped session retention.\n"
+              "Doctor complete.\n")
+        self.assertIsNone(G.evaluate_doctor(0, ok)["code"])
+        ev = G.evaluate_doctor(0, "Held agent w database /x.sqlite; deletion history needs repair.\nDoctor complete.\n")
+        self.assertEqual(ev["code"], "doctor-held-back")
+        self.assertEqual([e["code"] for e in G.acceptable_doctor(ev)], ["doctor-held-back"])
+        # warnings in the same pass ride along, so accepting the held stores does not accept them too
+        ev = G.evaluate_doctor(0, "Preserved retired model ids.\n1 store held back.\nDoctor complete.\n")
+        self.assertEqual([e["code"] for e in G.acceptable_doctor(ev)], ["doctor-held-back", "doctor-warnings"])
+        self.assertEqual(G.acceptable_doctor(G.evaluate_doctor(0, "Doctor complete.\n")), [])
+        # rc != 0: a specific failure wins over held-back warnings printed earlier in the same run
+        text = "Warning: Agent deletion journal reconstructed; 1 store held back.\nconfig fixes were not applied"
+        self.assertEqual(G.evaluate_doctor(1, text)["code"], "doctor-config-write")
+        self.assertEqual(G.evaluate_doctor(1, "Agent deletion journal changed before quarantine; stores were "
+                                              "left untouched.")["code"], "doctor-incomplete")
+        self.assertEqual(G.evaluate_doctor(1, "Session field room predates July 2026; install OpenClaw 2026.9.5")["code"],
+                         "doctor-retired-format")
+        # 2026.10 wraps specific failures in "Doctor could not complete maintenance ..."
+        wrapped = ("Doctor could not complete maintenance: repairs stopped.\n"
+                   "Doctor finished, but config fixes were not applied.")
+        self.assertEqual(G.evaluate_doctor(1, wrapped)["code"], "doctor-config-write")
+        self.assertEqual(G.evaluate_doctor(1, "Doctor could not complete maintenance.\nCannot verify pre-migration "
+                                              "SQLite backup x")["code"], "doctor-backup-unverifiable")
+        # refusals of pre-July-2026 settings/files win over the generic markers
+        for text in ("Config contains retired pre-July-2026 settings: plugins.installs. Doctor cannot remove",
+                     "Cron state: retired files whose last writer predates July 1, 2026: /config/.openclaw/cron/jobs.json",
+                     "Retired memory index format detected. Preserve a complete copy",
+                     "Doctor stopped because a state migration refused to continue. Plugin install index x predates "
+                     "the July 2026 upgrade support window",
+                     "Unsupported Telegram spool directory: ingress-spool-a b"):
+            self.assertEqual(G.evaluate_doctor(1, text)["code"], "doctor-retired-format", text)
+        # benign 2026.10 note is no maintenance refusal any more
+        self.assertEqual(G.evaluate_doctor(1, "Doctor could not verify the Codex bwrap network sandbox.")["code"],
+                         "doctor-failed")
+        self.assertEqual(G.evaluate_doctor(1, "Doctor could not complete maintenance")["code"],
+                         "doctor-maintenance-refused")
+        # unfinished plugin upgrades only count in the final pass
+        text = 'Plugin "codex" data/settings upgrade is unfinished: x\nDoctor complete.\n'
+        self.assertIsNone(G.evaluate_doctor(0, text)["code"])
+        ev = G.evaluate_doctor(0, text, final=True)
+        self.assertEqual((ev["code"], ev["cls"]), ("doctor-warnings", "acceptable"))
+        kept = "Kept auth profile openai-codex:default unchanged because its provider realm is unresolved.\nDoctor complete.\n"
+        self.assertIsNone(G.evaluate_doctor(0, kept)["code"])
+        self.assertEqual(G.evaluate_doctor(0, kept, final=True)["code"], "doctor-warnings")
+        cron = ('Plugin session repair: Dreaming cron inspection remains pending; existing cron rows were retained. '
+                'Retry with "openclaw doctor --fix". Error: database is locked\nDoctor complete.\n')
+        self.assertIsNone(G.evaluate_doctor(0, cron)["code"])
+        ev = G.evaluate_doctor(0, cron, final=True)
+        self.assertEqual((ev["code"], ev["cls"]), ("doctor-warnings", "acceptable"))
+
+    def test_optional_step_retired_refusal_is_its_own_code(self):
+        """2026.10.5+: doctor:sandbox refuses the retired sandbox registries after the database migration but only
+        prints a "Doctor warnings" line and exits 0. Own acceptable code, only when runtime_caps says the runtime
+        retires these files (2026.10.4: unchanged)."""
+        sandbox = ("◇  Doctor warnings ──╮\n│  doctor:sandbox run failed: Sandbox registries: retired files whose last "
+                   "writer predates July 1, 2026: /config/.openclaw/sandbox/containers.json. The files were left "
+                   "unchanged. │\nDoctor complete.\n")
+        self.assertIsNone(G.evaluate_doctor(0, sandbox)["code"])
+        ev = G.evaluate_doctor(0, sandbox, retired_warning=True)
+        self.assertEqual((ev["code"], ev["cls"]), ("doctor-retired-warning", "acceptable"))
+        self.assertIn("sandbox/containers.json", ev["message"])
+        uninspectable = ("doctor:sandbox run failed: Cannot inspect potentially retired state at /x/sandbox/browsers: "
+                         "EACCES\nDoctor complete.\n")
+        self.assertEqual(G.evaluate_doctor(0, uninspectable, retired_warning=True)["code"], "doctor-retired-warning")
+        # accepting one code never accepts the others in the same pass
+        both = "Preserved retired model ids.\n" + sandbox
+        self.assertEqual([e["code"] for e in G.acceptable_doctor(G.evaluate_doctor(0, both, retired_warning=True))],
+                         ["doctor-warnings", "doctor-retired-warning"])
+        self.assertEqual([e["code"] for e in G.acceptable_doctor(G.evaluate_doctor(0, both))], ["doctor-warnings"])
+        held = "1 store held back.\n" + both
+        self.assertEqual([e["code"] for e in G.acceptable_doctor(G.evaluate_doctor(0, held, retired_warning=True))],
+                         ["doctor-held-back", "doctor-warnings", "doctor-retired-warning"])
+        # rc != 0: the admission refusal stays doctor-retired-format
+        refusal = ("Runtime JSON sidecars: retired files whose last writer predates July 1, 2026: /y/restart-sentinel"
+                   ".json. The files were left unchanged. Upgrade through OpenClaw 2026.9.7")
+        for flag in (False, True):
+            self.assertEqual(G.evaluate_doctor(1, refusal, retired_warning=flag)["code"], "doctor-retired-format")
+        self.assertIn("doctor-retired-warning", G.ACCEPTABLE)
+        self.assertIn("doctor-retired-warning", G.ADVICE)
+
+    def test_wrapped_clack_box(self):
+        text = "│  Doctor stopped     │\n│  because the step refused │\n"
+        self.assertEqual(G.evaluate_doctor(1, text)["code"], "doctor-migration-refused")
+
+    def test_exit_codes(self):
+        self.assertEqual(G.evaluate_doctor(-9, "")["code"], "doctor-crashed")
+        self.assertEqual(G.evaluate_doctor(137, "")["code"], "doctor-crashed")
+        self.assertEqual(G.evaluate_doctor(134, "")["code"], "doctor-crashed")
+        self.assertEqual(G.evaluate_doctor(143, "")["code"], "doctor-interrupted")
+        self.assertEqual(G.evaluate_doctor(2, "Doctor stopped because")["code"], "doctor-invocation")
+        self.assertEqual(G.evaluate_doctor(-15, "", timed_out=True)["code"], "doctor-timeout")
+        self.assertEqual(G.evaluate_doctor(-15, "", stopping=True)["code"], "interrupted")
+
+
+class DoctorRunnerTests(GateEnv):
+    def gate_for_doctor(self, script, **hooks):
+        f = self.bin / "doc.sh"
+        f.write_text("#!/bin/sh\n" + script)
+        f.chmod(0o755)
+        self.hooks(doctor_cmd=[str(f)], **hooks)
+        g = G.Gate(emit=lambda s: None)
+        g.pkg = C.runtime_package()
+        g.j = {"run_id": "r-doc", "mode": "bump", "doctor": [], "history": []}
+        g.sizes = {"s_mib": 1}
+        return g
+
+    def test_success_and_mirror(self):
+        lines = []
+        g = self.gate_for_doctor("echo 'token sk-abcdefghijklmnopqrst'; echo 'Doctor complete.'; exit 0")
+        g.emit = lines.append
+        ev = g.run_doctor_pass(1, "doctor1")
+        self.assertIsNone(ev["code"])
+        self.assertTrue(any(x.startswith("[doctor] ") for x in lines))
+        self.assertFalse(any("sk-abcdefghijklmnopqrst" in x for x in lines))
+        self.assertEqual(g.j["doctor"][0]["rc"], 0)
+        self.assertTrue((self.upg / "gate" / "runs" / "r-doc" / "doctor-pass1.log").exists())
+
+    def test_each_marker_class_rc1(self):
+        for text, code in (("Doctor stopped because x", "doctor-migration-refused"),
+                           ("Held agent main", "doctor-held-back"), ("plugin load errors", "doctor-plugin-load"),
+                           ("Doctor could not enter maintenance", "doctor-maintenance-refused"),
+                           ("config fixes were not applied", "doctor-config-write"),
+                           ("backup group is missing", "doctor-backup-unverifiable"),
+                           ("schema migration required (audit-events-v2)", "doctor-incomplete"),
+                           ("Failing check foo", "doctor-failed")):
+            g = self.gate_for_doctor(f"echo '{text}'; exit 1")
+            self.assertEqual(g.run_doctor_pass(1, "doctor1")["code"], code)
+
+    def test_rc0_benign_marker_text_passes(self):
+        g = self.gate_for_doctor("echo 'Doctor could not prove the responsible config write'; "
+                                 "echo 'catalog timed out after 5000ms'; echo 'Doctor complete.'")
+        self.assertIsNone(g.run_doctor_pass(1, "doctor1")["code"])
+
+    def test_only_this_attempts_output_is_evaluated(self):
+        g = self.gate_for_doctor("echo 'Doctor complete.'")
+        log = self.upg / "gate" / "runs" / "r-doc" / "doctor-pass1.log"
+        log.parent.mkdir(parents=True)
+        log.write_text("Doctor stopped because earlier attempt\n")
+        self.assertIsNone(g.run_doctor_pass(1, "doctor1")["code"])
+
+    def test_timeout(self):
+        g = self.gate_for_doctor("sleep 30", doctor_timeout_s=1)
+        t0 = time.monotonic()
+        ev = g.run_doctor_pass(1, "doctor1")
+        self.assertEqual(ev["code"], "doctor-timeout")
+        self.assertLess(time.monotonic() - t0, 15)
+
+    def test_stop_signal(self):
+        g = self.gate_for_doctor("sleep 30")
+        threading.Timer(0.5, G.STOP.set).start()
+        with self.assertRaises(G.GateStopped):
+            g.run_doctor_pass(1, "doctor1")
+        self.assertEqual(len(g.j["doctor"]), 1)
+
+
+# --- space ---------------------------------------------------------------------------------------
+
+class SpaceTests(unittest.TestCase):
+    @staticmethod
+    def du(free):
+        return lambda p: mock.Mock(free=free[p])
+
+    def needs(self):
+        # the precheck's needs since 0.5.94-full3 (no /share: the gate writes no archive)
+        return [("/config", "/c", 6 * C.GIB, "low-disk-config"), ("sqlite-tmp", "/t", 2 * C.GIB, "low-disk-tmp")]
+
+    def test_shared_disk_sum(self):
+        fs = {"/c": {"dev": 1, "mm": "8:1", "fstype": "ext4"}, "/t": {"dev": 5, "mm": "0:50", "fstype": "overlay"}}
+        free = {"/c": 7 * C.GIB, "/t": 40 * C.GIB}
+        with mock.patch.object(G, "existing_parent", side_effect=lambda p: p):
+            F, summary = G.space_check(self.needs(), disk_usage=self.du(free), fsinfo=lambda p: fs[p])
+        self.assertEqual([f["code"] for f in F], ["low-disk-config"])  # 8 GiB > 7 GiB (overlay not distinct)
+        self.assertIn("/config+sqlite-tmp need 8.0 GiB have 7.0 GiB", summary)
+
+    def test_distinct_filesystems(self):
+        fs = {"/c": {"dev": 1, "mm": "8:1", "fstype": "ext4"}, "/t": {"dev": 3, "mm": "0:60", "fstype": "tmpfs"}}
+        free = {"/c": 7 * C.GIB, "/t": 1 * C.GIB}
+        with mock.patch.object(G, "existing_parent", side_effect=lambda p: p):
+            F, summary = G.space_check(self.needs(), disk_usage=self.du(free), fsinfo=lambda p: fs[p])
+        self.assertEqual([f["code"] for f in F], ["low-disk-tmp"])
+        self.assertEqual(summary, "/config need 6.0 GiB have 7.0 GiB; sqlite-tmp need 2.0 GiB have 1.0 GiB")
+
+    def test_proven_distinct(self):
+        a = {"dev": 1, "mm": "8:1", "fstype": "ext4"}
+        self.assertFalse(G.proven_distinct(a, dict(a)))
+        self.assertTrue(G.proven_distinct(a, {"dev": 2, "mm": "8:2", "fstype": "ext4"}))
+        self.assertFalse(G.proven_distinct(a, {"dev": 2, "mm": "0:40", "fstype": "overlay"}))
+        self.assertFalse(G.proven_distinct(a, {"dev": 2, "mm": "0:41", "fstype": "btrfs"}))
+        self.assertTrue(G.proven_distinct(a, {"dev": 2, "mm": "0:42", "fstype": "tmpfs"}))
+        self.assertFalse(G.proven_distinct(a, None))
+
+    def test_mountinfo_parse(self):
+        with tempfile.NamedTemporaryFile("w", delete=False) as f:
+            f.write("22 1 8:1 / / rw - ext4 /dev/sda1 rw\n"
+                    "30 22 0:50 / /tmp rw - tmpfs tmpfs rw\n")
+        try:
+            m = G.read_mountinfo(f.name)
+            self.assertEqual(m[1], {"mm": "0:50", "mountpoint": "/tmp", "fstype": "tmpfs"})
+            ident = G.fs_identity("/tmp", mounts=m)
+            self.assertEqual(ident["mm"], "0:50")
+        finally:
+            os.unlink(f.name)
+
+
+# --- quarantine ----------------------------------------------------------------------------------
+
+class QuarantineTests(GateEnv):
+    def test_moves_and_manifest(self):
+        make_735_state(self.state)
+        self.write_cfg(CFG_735)
+        tg = self.state / "telegram"
+        tg.mkdir()
+        (tg / "sticker-cache.json").write_text('{"a":1}')
+        os.symlink("/etc/hostname", tg / "bot-info-default.json")
+        sp = tg / "ingress-spool-default"
+        sp.mkdir()
+        (sp / "1.json").write_text("{}")
+        adir = self.state / "agents" / "main" / "agent"
+        (adir / "openclaw-agent.sqlite.memory-reindex-0123abcd-0123-4123-8123-0123456789ab").write_text("x")
+        qdir = self.upg / "gate" / "quarantine" / "r-q"
+        (qdir / "telegram").mkdir(parents=True)
+        (qdir / "telegram" / "sticker-cache.json").write_text("older")
+        g = G.Gate(emit=lambda s: None)
+        g.pkg = C.runtime_package()
+        g.read_config()
+        g.j = {"run_id": "r-q", "mode": "from-7x", "history": [], "source": {"from_checkpoint": "2026.7.35"},
+               "first_write_at": None}
+        g.phase_cleanup()
+        self.assertTrue(g.j["first_write_at"])
+        man = json.loads((qdir / "MANIFEST.json").read_text())
+        kinds = {m["src"]: m["kind"] for m in man}
+        self.assertEqual(kinds.get("telegram/sticker-cache.json"), "telegram-cache")
+        self.assertEqual(kinds.get("telegram/bot-info-default.json"), "telegram-cache")
+        self.assertIn("sqlite-transient", kinds.values())
+        self.assertTrue((qdir / "telegram" / "sticker-cache.json.1").exists())  # collision suffix
+        self.assertTrue(os.path.islink(qdir / "telegram" / "bot-info-default.json"))  # moved, not followed
+        self.assertFalse(os.path.lexists(tg / "bot-info-default.json"))
+        self.assertTrue((sp / "1.json").exists())  # ingress spool is left in place
+        self.assertEqual(stat.S_IMODE(qdir.stat().st_mode), 0o700)
+        sticker = [m for m in man if m["src"] == "telegram/sticker-cache.json"][0]
+        self.assertEqual(len(sticker["sha256"]), 64)
+        # idempotent re-run: nothing left to move
+        g.phase_cleanup()
+        self.assertEqual(len(json.loads((qdir / "MANIFEST.json").read_text())), len(man))
+
+    def test_skip_cleanup_kinds_hook(self):
+        make_735_state(self.state)
+        self.write_cfg(CFG_735)
+        (self.state / "telegram").mkdir()
+        (self.state / "telegram" / "sticker-cache.json").write_text("{}")
+        self.hooks(skip_cleanup_kinds=["telegram-cache"])
+        g = G.Gate(emit=lambda s: None)
+        g.read_config()
+        g.j = {"run_id": "r-q2", "mode": "from-7x", "history": [], "source": {"from_checkpoint": "2026.7.35"}}
+        g.phase_cleanup()
+        self.assertTrue((self.state / "telegram" / "sticker-cache.json").exists())
+
+
+# --- hold.txt / retry / processes ------------------------------------------------------------------
+
+class HoldRetryTests(GateEnv):
+    def test_hold_text_format(self):
+        txt = G.hold_text(RUNTIME, "r1", "precheck",
+                          [{"code": "no-network", "cls": "acceptable", "message": "npm unreachable"},
+                           {"code": "sqlite-corrupt", "cls": "hard", "message": "bad page"}],
+                          "unchanged (nothing written yet)", "fix it")
+        lines = txt.splitlines()
+        self.assertEqual(lines[0], "OpenClaw is held (bundled runtime 2026.9.9) — migration gate run r1, phase precheck")
+        self.assertEqual(lines[1], "Reason [no-network]: npm unreachable")
+        self.assertEqual(lines[2], "Reason [sqlite-corrupt]: bad page")
+        self.assertEqual(lines[3], "State: unchanged (nothing written yet)")
+        self.assertEqual(lines[4], "Next: fix it")
+        self.assertEqual(lines[5], "Accept (only if you understand the consequence): oc-upgrade retry --accept no-network")
+        self.assertEqual(lines[6], "Details: oc-upgrade status | oc-upgrade log")
+
+    def write_journal(self, j):
+        (self.upg / "gate").mkdir(parents=True, exist_ok=True)
+        (self.upg / "gate" / "journal.json").write_text(json.dumps(j))
+
+    def retry(self, *args):
+        lines = []
+        rc = G.retry_cmd(list(args), emit=lines.append)
+        self.out = "\n".join(lines)
+        return rc
+
+    def test_retry_rules(self):
+        self.assertEqual(self.retry(), 1)  # nothing to retry
+        self.write_journal({"run_id": "r1", "status": "hold", "hold": {
+            "code": "no-network", "codes": ["no-network", "sqlite-corrupt"],
+            "findings": [{"code": "no-network", "cls": "acceptable"}, {"code": "sqlite-corrupt", "cls": "hard"}]}})
+        self.assertEqual(self.retry("--accept", "sqlite-corrupt"), 1)
+        self.assertEqual(self.retry("--accept", "bogus"), 1)
+        self.assertEqual(self.retry("--accept", "no-network"), 0)
+        req = json.loads((self.upg / "gate" / "retry-request.json").read_text())
+        self.assertEqual((req["doctor"], req["accept"]), (False, ["no-network"]))
+        self.assertEqual(self.retry("--doctor", "--accept=pc-probe"), 0)
+        req = json.loads((self.upg / "gate" / "retry-request.json").read_text())
+        self.assertEqual((req["doctor"], req["accept"]), (True, ["no-network", "pc-probe"]))
+        self.assertEqual(self.retry("--cancel"), 0)
+        self.assertFalse((self.upg / "gate" / "retry-request.json").exists())
+
+    def test_retry_refuses_newer_and_foreign_holds(self):
+        self.write_journal({"run_id": "r1", "status": "hold", "hold": {"code": "newer-state", "codes": ["newer-state"]}})
+        self.assertEqual(self.retry(), 1)
+        self.write_journal({"run_id": "r1", "status": "done"})
+        (self.upg / "hold.txt").write_text("OpenClaw is held (bundled runtime 2026.9.9):\nstate is newer\n")
+        self.assertEqual(self.retry(), 1)
+        self.assertIn("not a migration-gate hold", self.out)
+        os.remove(self.upg / "hold.txt")
+        self.assertEqual(self.retry(), 1)
+        self.assertEqual(self.retry("--doctor"), 0)  # maintenance request after done
+
+    def test_retry_for_plan_sticky_hold(self):
+        self.write_journal({"run_id": "r1", "status": "interrupted", "auto_resumes": 1})
+        self.assertEqual(self.retry(), 0)
+
+    def test_hold_after_start(self):
+        make_99_state(self.state)
+        self.write_cfg({"meta": {"lastTouchedVersion": RUNTIME}})
+        self.write_journal({"schema": 1, "run_id": "r1", "mode": "from-7x", "status": "done", "phases_done": [],
+                            "history": []})
+        rc = self.quiet(G.hold_after_start, "exit78", None, emit=print)
+        self.assertEqual(rc, 0)
+        j = self.journal()
+        self.assertEqual((j["status"], j["hold"]["code"], j["hold"]["sub"]), ("hold", "exit78", "ok"))
+        txt = (self.upg / "hold.txt").read_text()
+        self.assertIn("migrated (gateway refused to start)", txt)
+        self.assertIn("oc-upgrade retry --doctor", txt)  # B15
+        self.assertIn("[gate] HOLD exit78 in gateway:", self.out)
+        self.assertEqual(self.quiet(G.hold_after_start, "crash-loop", 1, emit=print), 0)
+        self.assertEqual(self.journal()["hold"]["code"], "crash-loop")
+
+    def test_hold_after_start_on_a_state_that_still_needs_migration(self):
+        make_735_state(self.state)
+        self.write_cfg(CFG_735)
+        self.write_journal({"schema": 1, "run_id": "r1", "mode": "from-7x", "status": "done", "phases_done": [],
+                            "history": []})
+        self.assertEqual(self.quiet(G.hold_after_start, "exit78", None, emit=print), 0)
+        j = self.journal()
+        self.assertEqual((j["hold"]["code"], j["hold"]["sub"]), ("exit78", "gate"))
+        self.assertIn("Next: oc-upgrade retry runs the gate again (backup check, doctor), then restart the add-on",
+                      (self.upg / "hold.txt").read_text().splitlines())
+
+    def test_find_openclaw_processes(self):
+        proc = self.tmp / "proc"
+
+        def add(pid, argv, ppid=1):
+            d = proc / str(pid)
+            d.mkdir(parents=True)
+            (d / "cmdline").write_bytes(b"\0".join(a.encode() for a in argv) + b"\0")
+            (d / "stat").write_text(f"{pid} (x y) S {ppid} 0 0")
+        add(10, ["node", "/usr/local/lib/node_modules/openclaw/openclaw.mjs", "gateway", "run"])
+        add(11, ["openclaw-gateway"])
+        add(12, ["/bin/bash", "/run.sh"])
+        add(13, ["python3", "/usr/local/bin/oc-upgrade", "gate"])
+        add(14, ["node", "/usr/local/lib/node_modules/openclaw/openclaw.mjs", "doctor"], ppid=13)
+        add(15, ["node", "/usr/local/lib/node_modules/openclaw/openclaw.mjs", "gateway", "call", "health",
+                 "--token", "SECRET-TOKEN-VALUE"])
+        add(16, ["openclaw", "--token=SECRET-TOKEN-VALUE", "status"])
+        found = G.find_openclaw_processes("/usr/local/lib/node_modules/openclaw/openclaw.mjs", proc_dir=str(proc),
+                                          self_pid=13)
+        self.assertEqual([f["pid"] for f in found], [10, 11, 15, 16])
+        # F13: argv[0..2] only, redacted
+        cmds = {f["pid"]: f["cmd"] for f in found}
+        self.assertEqual(cmds[15], "node /usr/local/lib/node_modules/openclaw/openclaw.mjs gateway")
+        self.assertEqual(cmds[16], "openclaw --token=*** status")
+        self.assertNotIn("SECRET", json.dumps(found))
+
+
+# --- full gate runs (fake node + fake doctor + real oc_migrate) -------------------------------------
+
+class GateRunTests(GateEnv):
+    def test_from_7x_happy_path_then_second_boot(self):
+        self.build_735()
+        self.hooks()
+        rc = self.run_gate()
+        self.assertEqual(rc, 0, self.out)
+        self.assertIn("[gate] done: MIGRATED 2026.9.9", self.out)
+        for n in range(1, 9):
+            self.assertIn(f"[gate] {n}/8 ", self.out)
+        self.assertNotRegex(self.out, r"\[gate\] \d/9 ")
+        self.assertNotIn("SECRET", self.out)
+        j = self.journal()
+        self.assertEqual((j["status"], j["mode"]), ("done", "from-7x"))
+        self.assertEqual(j["phases_done"], list(G.PHASES))
+        m = json.loads((self.upg / "gate" / "migrated.json").read_text())
+        self.assertEqual((m["runtime"], m["mode"]), (RUNTIME, "from-7x"))
+        cfg = json.loads((self.state / "openclaw.json").read_text())
+        self.assertNotIn("openai-codex/", json.dumps(cfg))
+        self.assertEqual(cfg["agents"]["defaults"]["models"]["openai/gpt-5.5"]["agentRuntime"]["id"], "openclaw")
+        self.assertIn("vllm/qwen3.5-122b", cfg["agents"]["defaults"]["models"])  # untouched
+        sess = json.loads((self.state / "agents/main/sessions/sessions.json").read_text())
+        self.assertEqual(sess["agent:main:main"]["agentRuntimeOverride"], "openclaw")
+        self.assertNotIn("agentRuntimeOverride", sess["agent:main:x"])
+        rd = self.upg / "gate" / "runs" / j["run_id"]
+        for f in ("config.pre-gate.json", "config.pre-pass1.json", "config.post-pass1.json", "transform-ledger.json",
+                  "doctor-pass1.log", "doctor-pass2.log", "events.log"):
+            self.assertTrue((rd / f).exists(), f)
+        self.assertEqual(stat.S_IMODE((rd / "config.pre-gate.json").stat().st_mode), 0o600)
+        self.assertNotIn("SECRET", (rd / "transform-ledger.json").read_text())
+        led = json.loads((self.upg / "gate" / "pins-ledger.json").read_text())
+        self.assertGreater(len(led["entries"]), 10)
+        self.assertFalse((self.upg / "hold.txt").exists())
+        # second boot: nothing to do
+        d = self.plan()
+        self.assertEqual(d["rc"], 0, self.out)
+        self.assertIn("migrated (from-7x", self.out)
+
+    def test_precheck_hold_leaves_state_unchanged_then_accept(self):
+        self.build_735()
+        self.hooks(skip_network_check=False)
+        with mock.patch.object(G.shutil, "which", side_effect=which_without_npm):
+            before = (self.state / "openclaw.json").read_bytes()
+            self.assertEqual(self.run_gate(), 20, self.out)
+        self.assertIn("[gate] HOLD no-network in precheck:", self.out)
+        self.assertIn("[gate] next:", self.out)
+        self.assertEqual((self.state / "openclaw.json").read_bytes(), before)
+        self.assertFalse((self.share / "openclaw-upgrade").exists())
+        txt = (self.upg / "hold.txt").read_text()
+        self.assertIn("State: unchanged (nothing written yet)", txt)
+        self.assertEqual(self.plan()["rc"], 11)
+        self.assertEqual(G.retry_cmd(["--accept", "no-network"], emit=lambda s: None), 0)
+        self.assertEqual(self.plan()["rc"], 10)
+        with mock.patch.object(G.shutil, "which", side_effect=which_without_npm):
+            rc = self.run_gate()
+        self.assertEqual(rc, 0, self.out)
+        self.assertIn("WARN [gate] accepted no-network", self.out)
+
+    def test_doctor_failure_hold_and_retry_resumes_doctor(self):
+        self.build_735()
+        bad = self.bin / "bad-doctor"
+        bad.write_text("#!/bin/sh\necho 'Doctor stopped because a state migration refused to continue.'\nexit 1\n")
+        bad.chmod(0o755)
+        self.hooks(doctor_cmd=[str(bad)])
+        self.assertEqual(self.run_gate(), 20)
+        j = self.journal()
+        self.assertEqual((j["hold"]["code"], j["phase"]), ("doctor-migration-refused", "doctor1"))
+        self.assertIn("partially migrated (doctor started)", (self.upg / "hold.txt").read_text())
+        self.hooks()
+        G.retry_cmd([], emit=lambda s: None)
+        rc = self.run_gate()
+        self.assertEqual(rc, 0, self.out)
+        self.assertIn("4/8 doctor pass 1 rc=0", self.out)  # the failed pass is run again
+        self.assertEqual([d["pass"] for d in self.journal()["doctor"]], [1, 1, 2])
+        self.assertFalse((self.share / "openclaw-upgrade").exists())  # no gate archive, not even on a retry
+
+    def test_interrupt_doctor_killed_after_the_grace_period_says_so(self):
+        """Rehearsal A2: a doctor that does not stop within DOCTOR_STOP_GRACE is killed (rc -9); the line says so
+        instead of "doctor was asked to stop"."""
+        self.build_735()
+        stubborn = self.bin / "stubborn-doctor"
+        stubborn.write_text("#!/bin/sh\ntrap '' TERM\nsleep 30\n")
+        stubborn.chmod(0o755)
+        self.hooks(doctor_cmd=[str(stubborn)])
+        threading.Timer(3.0, lambda: os.kill(os.getpid(), 15)).start()
+        with mock.patch.object(G, "DOCTOR_STOP_GRACE", 1):
+            self.assertEqual(self.run_gate(), 143, self.out)
+        self.assertIn("4/8 doctor pass 1: stop requested; doctor did not stop within ", self.out)
+        self.assertIn(" and was killed (rc -9)\n", self.out)
+        self.assertNotIn("doctor was asked to stop", self.out)
+
+    def test_interrupt_resume_once_then_interrupted_twice(self):
+        self.build_735()
+        slow = self.bin / "slow-doctor"
+        slow.write_text("#!/bin/sh\nsleep 30\n")
+        slow.chmod(0o755)
+        self.hooks(doctor_cmd=[str(slow)])
+        threading.Timer(3.0, lambda: os.kill(os.getpid(), 15)).start()
+        rc = self.run_gate()
+        self.assertEqual(rc, 143, self.out)
+        self.assertIn("4/8 doctor pass 1: stop requested; doctor was asked to stop and stopped (rc -15)", self.out)
+        j = self.journal()
+        self.assertEqual((j["status"], j["phase"]), ("interrupted", "doctor1"))
+        d = self.plan()
+        self.assertEqual((d["rc"], d["action"]), (10, "resume"))
+        G.STOP.clear()
+        threading.Timer(3.0, lambda: os.kill(os.getpid(), 15)).start()
+        self.assertEqual(self.run_gate(), 143)
+        self.assertEqual(self.journal()["auto_resumes"], 1)
+        d = self.plan()
+        self.assertEqual((d["rc"], d["hold"]["code"]), (11, "interrupted-twice"))
+        self.assertIn("interrupted-twice", (self.upg / "hold.txt").read_text())
+        G.STOP.clear()
+        self.hooks()
+        self.assertEqual(G.retry_cmd([], emit=lambda s: None), 0)
+        self.assertEqual(self.run_gate(), 0, self.out)
+
+    def test_internal_error_hold_and_resume_at_phase(self):
+        self.build_735()
+        self.hooks(raise_in_phase="fixups")
+        self.assertEqual(self.run_gate(), 1)
+        j = self.journal()
+        self.assertEqual((j["hold"]["code"], j["phase"]), ("internal-error", "fixups"))
+        rd = self.upg / "gate" / "runs" / j["run_id"]
+        self.assertIn("Traceback", (rd / "events.log").read_text())
+        self.hooks()
+        G.retry_cmd([], emit=lambda s: None)
+        self.assertEqual(self.run_gate(), 0, self.out)
+        self.assertIn("resume: generic checks only", self.out)  # B2: no from-7x prechecks after the first write
+        self.assertIn("openai-codex/*", (rd / "config.pre-gate.json").read_text())  # B2: write-once
+        self.assertEqual(self.journal()["doctor"][-1]["pass"], 2)  # pass 1 not repeated
+        self.assertEqual(sum(1 for d in self.journal()["doctor"] if d["pass"] == 1), 1)
+
+    def test_postcondition_policy_hold_and_accept(self):
+        self.build_735()
+        self.hooks()
+        os.environ["FAKE_OC_MODE"] = "lint-legacy"
+        self.assertEqual(self.run_gate(), 20, self.out)
+        j = self.journal()
+        self.assertEqual((j["hold"]["code"], j["hold"]["acceptable"]), ("pc-legacy-state", True))  # B4a: policy
+        G.retry_cmd(["--accept", "pc-legacy-state"], emit=lambda s: None)
+        self.assertEqual(self.run_gate(), 0, self.out)
+
+    def test_bump_mode_skips_from7x_phases(self):
+        make_99_state(self.state)
+        self.write_cfg({"meta": {"lastTouchedVersion": RUNTIME}, "gateway": {"mode": "local"}})
+        (self.upg / "gate").mkdir(parents=True)
+        (self.upg / "gate" / "migrated.json").write_text(json.dumps({"runtime": "2026.9.5", "mode": "from-7x"}))
+        self.hooks()
+        self.assertEqual(self.run_gate(), 0, self.out)
+        j = self.journal()
+        self.assertEqual(j["mode"], "bump")
+        self.assertNotIn("premigrate", j["phases_done"])
+        self.assertNotIn("pins", j["phases_done"])
+        self.assertFalse((self.upg / "gate" / "pins-ledger.json").exists())
+        # B4 guard: the same runtime on the same state never bumps twice
+        con = sqlite3.connect(str(self.state / "state" / "openclaw.sqlite"))
+        con.execute("CREATE TABLE cron_run_logs (id INTEGER)")
+        con.commit()
+        con.close()
+        d = self.plan()
+        self.assertEqual((d["rc"], d["hold"]["code"]), (11, "bump-repeat"))
+
+    def test_bump_mode_runs_retired_format_precheck(self):
+        """Review: the 2026.10 retired-format checks (6b) also run in bump mode, before the first write."""
+        make_99_state(self.state)
+        self.write_cfg({"meta": {"lastTouchedVersion": RUNTIME}, "gateway": {"mode": "local"}})
+        (self.upg / "gate").mkdir(parents=True)
+        (self.upg / "gate" / "migrated.json").write_text(json.dumps({"runtime": "2026.9.5", "mode": "from-7x"}))
+        (self.state / "device-pair-notify.json").write_text('{"subscribers": [{"id": 1}]}')
+        (self.state / "cron" / "runs").mkdir(parents=True)
+        (self.state / "cron" / "runs" / "j.jsonl").write_text("{}\n")
+        self.hooks()
+        self.assertEqual(self.run_gate(), 20, self.out)
+        j = self.journal()
+        self.assertEqual((j["mode"], j["hold"]["code"], j["phase"]), ("bump", "device-pair-subscribers", "precheck"))
+        self.assertIsNone(j.get("first_write_at"))
+        self.assertTrue((self.state / "cron" / "runs" / "j.jsonl").exists(), "nothing moved before the HOLD")
+        G.retry_cmd(["--accept", "device-pair-subscribers"], emit=lambda s: None)
+        self.assertEqual(self.run_gate(), 0, self.out)
+        self.assertFalse((self.state / "device-pair-notify.json").exists())
+        self.assertFalse((self.state / "cron" / "runs" / "j.jsonl").exists())
+        man = next((self.upg / "gate" / "quarantine").glob("*/MANIFEST.json"))
+        kinds = {e["kind"] for e in json.loads(man.read_text())}
+        self.assertEqual(kinds, {"device-pair-notify", "cron-run-log"})
+
+    def test_from7x_retired_files_and_plugins_installs(self):
+        """Gate-level: retired files go to quarantine (state and /config roots), plugins.installs is removed (R0)."""
+        self.build_735()
+        cfg = json.loads((self.state / "openclaw.json").read_text())
+        cfg.setdefault("plugins", {})["installs"] = {"brave": {"source": "npm"}}
+        self.write_cfg(cfg)
+        con = sqlite3.connect(str(self.state / "state" / "openclaw.sqlite"))
+        con.execute("CREATE TABLE IF NOT EXISTS installed_plugin_index (index_key TEXT PRIMARY KEY, "
+                    "install_records_json TEXT)")
+        con.execute("INSERT INTO installed_plugin_index VALUES ('installed-plugin-index', '{\"brave\": {}}')")
+        con.commit()
+        con.close()
+        (self.state / "delivery-queue").mkdir()
+        (self.state / "delivery-queue" / "a.json").write_text("{}")
+        (self.ws / "memory" / ".dreams").mkdir(parents=True)
+        (self.ws / "memory" / ".dreams" / "phase-signals.json").write_text("{}")
+        self.hooks(accept=["dreaming-json-unmigrated"])
+        self.assertEqual(self.run_gate(), 0, self.out)
+        self.assertIn("removed retired key(s) OpenClaw 2026.10 refuses: plugins.installs", self.out)
+        self.assertNotIn("installs", json.loads((self.state / "openclaw.json").read_text()).get("plugins", {}))
+        self.assertFalse((self.state / "delivery-queue" / "a.json").exists())
+        self.assertFalse((self.ws / "memory" / ".dreams" / "phase-signals.json").exists())
+        man = json.loads(next((self.upg / "gate" / "quarantine").glob("*/MANIFEST.json")).read_text())
+        dream = [e for e in man if e["kind"] == "dreaming-json"]
+        self.assertEqual(len(dream), 1)
+        self.assertEqual(dream[0].get("root"), "config")
+        self.assertTrue(Path(dream[0]["dst"]).exists())
+        self.assertIn("/config-root/clawd/memory/.dreams/", dream[0]["dst"])
+        led = json.loads(next((self.upg / "gate" / "runs").glob("*/transform-ledger.json")).read_text())
+        self.assertEqual([e["path"] for e in led if e["step"] == "R0"], ["plugins.installs"])
+
+    def test_gate_refuses_without_runsh_and_deletes_stale_hold(self):
+        make_99_state(self.state)
+        self.write_cfg({"meta": {"lastTouchedVersion": RUNTIME}})
+        (self.upg / "hold.txt").write_text("stale")
+        self.assertEqual(self.run_gate(), 0)
+        self.assertFalse((self.upg / "hold.txt").exists())  # B16
+
+
+class GateRunMoreTests(GateEnv):
+    def test_fixups_invalid_restores_post_pass1(self):
+        self.build_735()
+        self.hooks()
+        os.environ["FAKE_OC_MODE"] = "invalid-config"
+        self.assertEqual(self.run_gate(), 20, self.out)
+        j = self.journal()
+        self.assertEqual((j["hold"]["code"], j["phase"]), ("fixups-invalid", "fixups"))
+        rd = self.upg / "gate" / "runs" / j["run_id"]
+        self.assertEqual((self.state / "openclaw.json").read_bytes(), (rd / "config.post-pass1.json").read_bytes())
+
+    def test_not_idempotent_runs_pass3_then_accept(self):
+        self.build_735()
+        flappy = self.bin / "flappy-doctor"
+        flappy.write_text(FAKE_DOCTOR + "\nimport time\ncfg = json.load(open(cfgp))\ncfg['x'] = time.time_ns()\n"
+                          "open(cfgp, 'w').write(json.dumps(cfg))\n")
+        flappy.chmod(0o755)
+        self.hooks(doctor_cmd=[str(flappy)])
+        self.assertEqual(self.run_gate(), 20, self.out)
+        j = self.journal()
+        self.assertEqual(j["hold"]["code"], "doctor-not-idempotent")
+        self.assertEqual([d["pass"] for d in j["doctor"]], [1, 2, 3])
+        self.assertIn("doctor2", j["phases_done"])
+        G.retry_cmd(["--accept", "doctor-not-idempotent"], emit=lambda s: None)
+        self.assertEqual(self.run_gate(), 0, self.out)
+        self.assertEqual([d["pass"] for d in self.journal()["doctor"]], [1, 2, 3])  # not re-run
+
+    def test_rc0_held_back_holds_in_doctor1_until_accepted(self):
+        self.build_735()
+        doc = self.bin / "held-doctor"
+        doc.write_text(FAKE_DOCTOR + "\nprint('│  Warning: 1 agent database store held back (unverified registration) │')\n")
+        doc.chmod(0o755)
+        self.hooks(doctor_cmd=[str(doc)])
+        self.assertEqual(self.run_gate(), 20, self.out)
+        j = self.journal()
+        self.assertEqual((j["hold"]["code"], j["phase"]), ("doctor-held-back", "doctor1"))
+        self.assertIn("doctor1", j["phases_done"])
+        self.assertIn("--accept doctor-held-back", (self.upg / "hold.txt").read_text())
+        G.retry_cmd(["--accept", "doctor-held-back"], emit=lambda s: None)
+        self.assertEqual(self.run_gate(), 0, self.out)
+        self.assertEqual([d["pass"] for d in self.journal()["doctor"]], [1, 2])  # pass 1 not re-run
+        self.assertIn("WARN [gate] accepted doctor-held-back", self.out)
+
+    def test_rc0_held_back_with_warnings_needs_both_accepted(self):
+        self.build_735()
+        doc = self.bin / "held-warn-doctor"
+        doc.write_text(FAKE_DOCTOR + "\nprint('│  Preserved retired model ids: openai/gpt-4o │')"
+                                     "\nprint('│  1 agent store remain held │')\n")
+        doc.chmod(0o755)
+        self.hooks(doctor_cmd=[str(doc)])
+        self.assertEqual(self.run_gate(), 20, self.out)
+        j = self.journal()
+        self.assertEqual((j["hold"]["codes"], j["phase"]), (["doctor-held-back", "doctor-warnings"], "doctor1"))
+        self.assertIn("--accept doctor-held-back,doctor-warnings", (self.upg / "hold.txt").read_text())
+        G.retry_cmd(["--accept", "doctor-held-back"], emit=lambda s: None)
+        self.assertEqual(self.run_gate(), 20, self.out)  # pass 1 again: the warnings are still unaccepted
+        self.assertEqual(self.journal()["hold"]["codes"], ["doctor-warnings"])
+        G.retry_cmd(["--accept", "doctor-warnings"], emit=lambda s: None)
+        self.assertEqual(self.run_gate(), 0, self.out)
+        self.assertEqual([d["pass"] for d in self.journal()["doctor"]], [1, 1, 2])
+
+    def test_rc0_held_back_first_in_pass2_holds_in_doctor2(self):
+        self.build_735()
+        doc = self.bin / "late-held-doctor"
+        doc.write_text(FAKE_DOCTOR + "\ncnt = os.path.join(os.path.dirname(os.path.abspath(sys.argv[0])), 'passes')\n"
+                       "k = int(open(cnt).read()) + 1 if os.path.exists(cnt) else 1\n"
+                       "open(cnt, 'w').write(str(k))\n"
+                       "if k >= 2:\n    print('Held agent ops: unverified-agent-databases')\n")
+        doc.chmod(0o755)
+        self.hooks(doctor_cmd=[str(doc)])
+        self.assertEqual(self.run_gate(), 20, self.out)
+        j = self.journal()
+        self.assertEqual(j["hold"]["code"], "doctor-held-back")
+        self.assertIn("doctor2", j["phases_done"])
+        self.assertEqual([d["pass"] for d in j["doctor"]], [1, 2])
+        G.retry_cmd(["--accept", "doctor-held-back"], emit=lambda s: None)
+        self.assertEqual(self.run_gate(), 0, self.out)
+        self.assertEqual([d["pass"] for d in self.journal()["doctor"]], [1, 2])
+
+    def test_maintenance_run_after_migration(self):
+        self.build_735()
+        self.hooks()
+        self.assertEqual(self.run_gate(), 0, self.out)
+        first = self.journal()["run_id"]
+        self.assertEqual(G.retry_cmd(["--doctor"], emit=lambda s: None), 0)
+        self.assertEqual(self.run_gate(), 0, self.out)
+        j = self.journal()
+        self.assertNotEqual(j["run_id"], first)
+        self.assertEqual(j["mode"], "maintenance")
+        self.assertNotIn("pins", j["phases_done"])
+        self.assertTrue((self.upg / "gate" / "runs" / first / "journal.json").exists())
+        self.assertEqual(j["phases_done"], ["precheck", "cleanup", "doctor1", "fixups", "doctor2", "postconditions",
+                                            "finalize"])
+        self.assertFalse((self.share / "openclaw-upgrade").exists())
+
+    def test_B19_new_from7x_run_resets_pins_ledger(self):
+        self.build_735()
+        self.hooks()
+        self.assertEqual(self.run_gate(), 0, self.out)
+        n1 = len(json.loads((self.upg / "gate" / "pins-ledger.json").read_text())["entries"])
+        # rollback: restore a 7.35 state and config
+        shutil.rmtree(self.state)
+        self.state.mkdir()
+        self.build_735()
+        self.assertEqual(self.run_gate(), 0, self.out)
+        led = json.loads((self.upg / "gate" / "pins-ledger.json").read_text())
+        self.assertEqual(len(led["entries"]), n1)
+        self.assertEqual(len(list((self.upg / "gate").glob("pins-ledger.*.json"))), 1)
+
+    def test_openclaw_running_is_hard_hold(self):
+        self.build_735()
+        self.hooks()
+        with mock.patch.object(G, "find_openclaw_processes", return_value=[{"pid": 42, "cmd": "openclaw-gateway"}]):
+            self.assertEqual(self.run_gate(), 20)
+        self.assertEqual(self.journal()["hold"]["code"], "openclaw-running")
+
+    def test_not_pre_journal_is_hard_hold(self):
+        self.build_735()
+        self.hooks()
+        con = sqlite3.connect(str(self.state / "state" / "openclaw.sqlite"))
+        con.execute("CREATE TABLE agent_deletion_journal (x)")
+        con.commit()
+        con.close()
+        self.assertEqual(self.run_gate(), 20)
+        j = self.journal()
+        self.assertEqual((j["hold"]["code"], j["hold"]["acceptable"]), ("not-pre-journal", False))
+        self.assertIsNone(j["first_write_at"])
+        self.assertEqual(G.retry_cmd(["--accept", "not-pre-journal"], emit=lambda s: None), 1)
+
+    def test_legacy_state_dir_hold(self):
+        self.build_735()
+        self.hooks()
+        (self.root / ".clawdbot").mkdir()
+        (self.root / ".clawdbot" / "x").write_text("1")
+        self.assertEqual(self.run_gate(), 20)
+        self.assertIn("legacy-state-dir", self.journal()["hold"]["codes"])
+
+
+class GateAddendum2Tests(GateEnv):
+    """Contract addendum 2: retired-model replacements, codex plugin rule 4/6, plan lines not repeated."""
+
+    RETIRING = FAKE_DOCTOR + r"""
+# doctor 9.9 online: retired openai/gpt-5.4-mini -> openai/gpt-5.6-luna in every value slot; with legacy
+# refs in the config (pass 1) the Codex route repair also deletes compaction.model
+cfg = json.load(open(cfgp, encoding="utf-8"))
+lines = []
+if "openai-codex/" in text:
+    comp = cfg.get("agents", {}).get("defaults", {}).get("compaction")
+    if isinstance(comp, dict) and comp.pop("model", None) is not None:
+        lines.append("Removed agents.defaults.compaction.model; Codex runtime uses native server-side compaction.")
+def walk(node, path):
+    if isinstance(node, dict):
+        for k in list(node):
+            if isinstance(node[k], str) and node[k] == "openai/gpt-5.4-mini" and "modelPolicy" not in path:
+                node[k] = "openai/gpt-5.6-luna"
+                lines.append('Replaced retired %s "openai/gpt-5.4-mini" with "openai/gpt-5.6-luna".' % ".".join(path + [k]))
+            else:
+                walk(node[k], path + [k])
+    elif isinstance(node, list):
+        for i, v in enumerate(node):
+            if v == "openai/gpt-5.4-mini" and "modelPolicy" not in path:
+                node[i] = "openai/gpt-5.6-luna"
+                lines.append('Replaced retired %s "openai/gpt-5.4-mini" with "openai/gpt-5.6-luna".' % ".".join(path + [str(i)]))
+            else:
+                walk(v, path + [str(i)])
+walk(cfg, [])
+if lines:
+    open(cfgp, "w", encoding="utf-8").write(json.dumps(cfg, indent=2) + "\n")
+    print("◇  Doctor changes ───╮")
+    for l in lines:
+        # clack wraps long lines inside the box at a word boundary
+        cut = l.rfind(" ", 0, 60) if len(l) > 60 else len(l)
+        print("│  " + l[:cut] + "  │")
+        if l[cut:].strip():
+            print("│  " + l[cut:].strip() + "  │")
+if os.environ.get("FAKE_CODEX_PKG") == "1":
+    os.makedirs(os.path.join(state, "npm", "projects", "openclaw-codex-0123abcd"), exist_ok=True)
+print("Doctor complete.")
+"""
+
+    def build_retiring(self):
+        make_735_state(self.state)
+        cfg = json.loads(json.dumps(CFG_735))
+        d = cfg["agents"]["defaults"]
+        d["model"]["fallbacks"] = ["openai-codex/gpt-5.4-mini", "vllm/qwen3.5-122b"]
+        d["heartbeat"] = {"model": "openai-codex/gpt-5.4-mini"}
+        d["compaction"] = {"model": "openai-codex/gpt-5.4-mini"}
+        self.write_cfg(cfg)
+        (self.ws / "AGENTS.md").write_text("# agents\n")
+        doc = self.bin / "retiring-doctor"
+        doc.write_text(self.RETIRING)
+        doc.chmod(0o755)
+        self.hooks(doctor_cmd=[str(doc)])
+
+    def test_retired_models_followed_no_hold_no_pass3(self):
+        """Harness T1/T3: PC3 accepts doctor's successor, F3 restores compaction.model as the successor,
+        so pass 2 leaves openclaw.json unchanged (no pass 3)."""
+        self.build_retiring()
+        self.assertEqual(self.run_gate(), 0, self.out)
+        self.assertIn("[gate] done: MIGRATED", self.out)
+        self.assertIn("config unchanged", self.out)
+        self.assertNotIn("doctor pass 3", self.out)
+        j = self.journal()
+        self.assertEqual([x["pass"] for x in j["doctor"]], [1, 2])
+        self.assertEqual(j["doctor_retired_map"], {"openai/gpt-5.4-mini": "openai/gpt-5.6-luna"})
+        cfg = json.loads((self.state / "openclaw.json").read_text())
+        d = cfg["agents"]["defaults"]
+        self.assertEqual(d["compaction"]["model"], "openai/gpt-5.6-luna")
+        self.assertEqual(d["heartbeat"]["model"], "openai/gpt-5.6-luna")
+        self.assertEqual(d["model"]["fallbacks"], ["openai/gpt-5.6-luna", "vllm/qwen3.5-122b"])
+        self.assertEqual(d["models"]["openai/gpt-5.6-luna"]["agentRuntime"]["id"], "openclaw")
+        self.assertIn("[gate] info: doctor replaced retired model openai/gpt-5.4-mini with openai/gpt-5.6-luna",
+                      self.out)
+        ledger = json.loads((self.upg / "gate" / "runs" / j["run_id"] / "transform-ledger.json").read_text())
+        f3 = [e for e in ledger if e["step"] == "F3"]
+        self.assertEqual([(e["path"], e["after"]) for e in f3],
+                         [("agents.defaults.compaction.model", "openai/gpt-5.6-luna")])
+
+    def test_codex_package_warning_only_when_kept_disabled(self):
+        self.build_retiring()
+        os.environ["FAKE_CODEX_PKG"] = "1"
+        try:
+            self.assertEqual(self.run_gate(), 0, self.out)
+        finally:
+            os.environ.pop("FAKE_CODEX_PKG", None)
+        self.assertIn("WARN [gate] doctor installed @openclaw/codex but the add-on keeps it disabled", self.out)
+        self.assertFalse(self.journal()["fixups"]["codex_needed"])
+
+    def test_codex_package_before_keeps_doctor_setting(self):
+        self.build_retiring()
+        (self.state / "npm" / "projects" / "openclaw-codex-old").mkdir(parents=True)
+        os.environ["FAKE_CODEX_PKG"] = "1"
+        try:
+            self.assertEqual(self.run_gate(), 0, self.out)
+        finally:
+            os.environ.pop("FAKE_CODEX_PKG", None)
+        self.assertNotIn("keeps it disabled", self.out)
+        self.assertIn("[gate] 6/8 info: doctor installed the @openclaw/codex plugin", self.out)
+        self.assertIn("codex plugin entry restored: no (Codex was in use before the migration", self.out)
+        self.assertTrue(self.journal()["fixups"]["codex_needed"])
+
+    def test_codex_cron_ids(self):
+        """F1/PC2 input: openai-codex ids used by 7.x cron jobs (doctor pins them for cron intent)."""
+        make_735_state(self.state, with_cron_codex=True)
+        db = self.state / "state" / "openclaw.sqlite"
+        c = sqlite3.connect(str(db))
+        c.execute("INSERT INTO cron_jobs VALUES ('j2','vllm/qwen3.5-122b',?)",
+                  (json.dumps(["openai-codex/gpt-5.5", "openai-codex/*", "vllm/x"]),))
+        c.execute("INSERT INTO cron_jobs VALUES ('j3','anthropic/claude-sonnet-4-6',NULL)")
+        c.commit()
+        c.close()
+        self.assertEqual(G.codex_cron_ids(db), (2, ["gpt-5.4-mini", "gpt-5.5"]))
+        self.assertEqual(G.codex_cron_ids(self.state / "missing.sqlite"), (0, []))
+        self.write_cfg(CFG_735)
+        self.hooks()
+        self.assertEqual(self.run_gate(), 0, self.out)
+        self.assertEqual(self.journal()["cron_legacy_ids"], ["gpt-5.4-mini", "gpt-5.5"])
+        self.assertIn("2 cron job(s) use openai-codex models", self.out)
+
+    def test_spool_info_printed_once(self):
+        """Harness finding 4: the Telegram ingress spool line appeared twice in from-7x runs."""
+        self.build_735()
+        self.hooks()
+        sp = self.state / "telegram" / "ingress-spool-default"
+        sp.mkdir(parents=True)
+        (sp / "1.json").write_text("{}")  # not a 2026.10 spool name: neither imported nor counted
+        (sp / "0000000000000007.json").write_text(
+            json.dumps({"version": 1, "updateId": 7, "receivedAt": 1, "update": {"update_id": 7}}))
+        self.assertEqual(self.run_gate(), 0, self.out)
+        lines = [x for x in self.out.splitlines() if "legacy Telegram update file(s)" in x]
+        self.assertEqual(len(lines), 1, self.out)
+        self.assertIn("1 legacy Telegram update file(s); doctor imports them into the SQLite ingress queue", lines[0])
+
+    def test_gate_run_does_not_repeat_plan_lines(self):
+        """Addendum 2 item 11: run.sh prints `gate --plan`; the gate run must not print it again."""
+        self.build_735()
+        self.hooks()
+        d = self.plan()
+        self.assertEqual(d["rc"], 10)
+        plan_lines = self.out
+        self.assertIn("[gate] plan:", plan_lines)
+        os.environ["OC_GATE_PLAN_SHOWN"] = plan_lines
+        try:
+            self.assertEqual(self.run_gate(), 0, self.out)
+        finally:
+            os.environ.pop("OC_GATE_PLAN_SHOWN", None)
+        self.assertNotIn("[gate] plan:", self.out)
+        self.assertIn("[gate] done: MIGRATED", self.out)
+
+    def test_gate_run_prints_a_changed_plan(self):
+        self.build_735()
+        self.hooks()
+        os.environ["OC_GATE_PLAN_SHOWN"] = "[gate] plan: something else -> gate run"
+        try:
+            self.assertEqual(self.run_gate(), 0, self.out)
+        finally:
+            os.environ.pop("OC_GATE_PLAN_SHOWN", None)
+        self.assertEqual(sum(1 for x in self.out.splitlines() if x.startswith("[gate] plan:")), 1, self.out)
+
+
+class ReviewFixTests(GateEnv):
+    """Stage B review fixes: F1 symlinked state/workspace roots, F4 pins retry, F5 lone surrogates, F15 cron."""
+
+    @staticmethod
+    def move_aside(path, dest):
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        os.rename(path, dest)
+        os.symlink(dest, path)
+
+    def test_F1_state_symlinks_at_every_level(self):
+        make_735_state(self.state)
+        cls = G.classify(self.state, {}, 19, 24, RUNTIME)
+        self.assertEqual(G.state_symlinks(self.state, cls), [])
+        for rel in ("state", "state/openclaw.sqlite", "agents", "agents/main", "agents/main/agent",
+                    "agents/main/agent/openclaw-agent.sqlite"):
+            src, dst = self.state / rel, self.tmp / "moved" / rel.replace("/", "_")
+            self.move_aside(src, dst)
+            try:
+                with self.subTest(rel=rel):
+                    self.assertEqual(G.state_symlinks(self.state, cls), [str(src)])
+            finally:
+                os.unlink(src)
+                os.rename(dst, src)
+        cfg = self.state / "openclaw.json"
+        cfg.write_text("{}")
+        self.move_aside(cfg, self.tmp / "elsewhere" / "openclaw.json")
+        self.assertEqual(G.state_symlinks(self.state, cls), [str(cfg)])  # Codex review: config symlink
+        os.unlink(cfg)
+        os.rename(self.tmp / "elsewhere" / "openclaw.json", cfg)
+        self.move_aside(self.state, self.tmp / "big-disk" / ".openclaw")
+        self.assertEqual(G.state_symlinks(self.state, cls), [str(self.state)])
+
+    def test_F1_symlinked_agent_dir_holds_before_anything_is_written(self):
+        """Reviewer repro symstate.py: a backup (tar) of a symlinked directory holds the link, not the DBs."""
+        self.build_735()
+        self.hooks()
+        adir = self.state / "agents" / "main" / "agent"
+        self.move_aside(adir, self.tmp / "media" / "agent")
+        self.assertEqual(self.run_gate(), 20, self.out)
+        j = self.journal()
+        self.assertEqual((j["hold"]["code"], j["hold"]["acceptable"], j["first_write_at"]),
+                         ("state-symlink", False, None))
+        self.assertEqual(j["hold"]["message"], "symlinked director(ies) would be backed up as bare links, without "
+                                               f"the data they point to: {adir}")
+        self.assertIn("replace the symlink by the real directory", (self.upg / "hold.txt").read_text())
+        self.assertFalse((self.share / "openclaw-upgrade").exists())
+        self.assertEqual(G.retry_cmd(["--accept", "state-symlink"], emit=lambda s: None), 1)
+
+    def test_F1_symlinked_workspace_holds(self):
+        """Reviewer repro archive_test.py: only the link of a symlinked workspace would be backed up."""
+        self.build_735()
+        self.hooks()
+        ext = self.tmp / "elsewhere" / "ws2"
+        (ext / "memory").mkdir(parents=True)
+        (ext / "memory" / "notes.md").write_text("important")
+        os.symlink(ext, self.root / "clawd-helper")
+        cfg = json.loads(json.dumps(CFG_735))
+        cfg["agents"]["list"].append({"id": "helper", "workspace": str(self.root / "clawd-helper")})
+        self.write_cfg(cfg)
+        self.assertEqual(self.run_gate(), 20, self.out)
+        h = self.journal()["hold"]
+        self.assertEqual(h["code"], "state-symlink")
+        self.assertIn("would be backed up as bare links", h["message"])
+        self.assertIn("clawd-helper", h["message"])
+        g = G.Gate(emit=lambda s: None)
+        g.cfg = cfg
+        self.assertEqual(g.workspace_symlinks(), [str(self.root / "clawd-helper")])
+        # a link whose target is covered anyway (another workspace root, the state dir) is fine
+        os.unlink(self.root / "clawd-helper")
+        os.symlink(self.ws, self.root / "clawd-helper")
+        (self.state / "workspace-ops").mkdir()
+        os.symlink(self.state / "workspace-ops", self.root / "ws-ops")
+        cfg["agents"]["list"].append({"id": "ops", "workspace": str(self.root / "ws-ops")})
+        g = G.Gate(emit=lambda s: None)
+        g.cfg = cfg
+        self.assertEqual(g.workspace_symlinks(), [])
+
+    def test_F4_pins_retry_applies_pins_to_the_current_config(self):
+        """Reviewer repro pins_stale.py: the retry used the first attempt's snapshot."""
+        cfgp = self.state / "openclaw.json"
+        self.write_cfg({"channels": {"telegram": {"streaming": "on"}}, "gateway": {"mode": "local"}})
+        g = G.Gate(emit=lambda s: None)
+        g.pkg = C.runtime_package()
+        g.j = {"run_id": "r-pins", "mode": "from-7x", "history": []}
+        G.ensure_dirs()
+        answers = iter([(False, "rc 1: channels.telegram.streaming invalid"), (True, "rc 0")])
+        with mock.patch.object(g, "config_validate", side_effect=lambda tag: next(answers)):
+            with self.assertRaises(G.HoldError) as cm:
+                g.phase_pins()
+            self.assertEqual(cm.exception.findings[0]["code"], "pins-invalid")
+            self.assertEqual(json.loads(cfgp.read_text())["channels"]["telegram"]["streaming"], "on")  # restored
+            cur = json.loads(cfgp.read_text())
+            cur["channels"]["telegram"]["streaming"] = {"mode": "partial"}
+            cur["userFix"] = True
+            cfgp.write_text(json.dumps(cur))
+            g.phase_pins()
+        final = json.loads(cfgp.read_text())
+        self.assertTrue(final["userFix"])
+        self.assertEqual(final["channels"]["telegram"]["streaming"]["mode"], "partial")
+        self.assertEqual(final["agents"]["defaults"]["maxConcurrent"], 4)
+        pre = json.loads((self.upg / "gate" / "runs" / "r-pins" / "config.pre-pins.json").read_text())
+        self.assertTrue(pre["userFix"])
+
+    def test_F5_lone_surrogates_in_config_and_sessions(self):
+        """Reviewer repro surrogate.py: Node writes "\\ud83d" for a label cut mid-emoji."""
+        self.build_735()
+        cfg = json.loads(json.dumps(CFG_735))
+        cfg["ui"] = {"assistant": {"name": "Nova \ud83d"}}
+        self.write_cfg(cfg)
+        sp = self.state / "agents" / "main" / "sessions" / "sessions.json"
+        store = json.loads(sp.read_text())
+        store["agent:main:main"]["label"] = "Hallo \ud83d"
+        sp.write_text(json.dumps(store))
+        # 9.9 (Node's JSON.stringify) writes lone surrogates as \\u escapes too
+        doc = self.bin / "ascii-doctor"
+        doc.write_text(FAKE_DOCTOR.replace("ensure_ascii=False", "ensure_ascii=True"))
+        doc.chmod(0o755)
+        self.hooks(doctor_cmd=[str(doc)])
+        self.assertEqual(self.run_gate(), 0, self.out)
+        new = json.loads((self.state / "openclaw.json").read_bytes().decode("utf-8"))
+        self.assertEqual(new["ui"]["assistant"]["name"], "Nova \ud83d")
+        sess = json.loads(sp.read_bytes().decode("utf-8"))
+        self.assertEqual((sess["agent:main:main"]["agentRuntimeOverride"], sess["agent:main:main"]["label"]),
+                         ("openclaw", "Hallo \ud83d"))
+
+    def test_F5_premigrate_value_error_is_premigrate_failed(self):
+        self.build_735()
+        cfg = json.loads(json.dumps(CFG_735))
+        cfg["agents"]["defaults"]["models"] = ["openai-codex/gpt-5.5"]  # not an object: R2 cannot pin
+        self.write_cfg(cfg)
+        self.hooks()
+        self.assertEqual(self.run_gate(), 20, self.out)
+        self.assertEqual(self.journal()["hold"]["code"], "premigrate-failed")
+
+    def test_F15_cron_jobs_on_openai_models_mean_codex_in_use(self):
+        make_735_state(self.state)
+        db = self.state / "state" / "openclaw.sqlite"
+        c = sqlite3.connect(str(db))
+        c.execute("INSERT INTO cron_jobs VALUES ('j1','openai/gpt-5.5',NULL)")
+        c.execute("INSERT INTO cron_jobs VALUES ('j2','vllm/q',?)", (json.dumps(["OpenAI/gpt-5.4-mini"]),))
+        c.execute("INSERT INTO cron_jobs VALUES ('j3','openai-codex/gpt-5.4',NULL)")
+        c.commit()
+        c.close()
+        self.assertEqual(G.codex_cron_ids(db, "openai")[1], ["gpt-5.4-mini", "gpt-5.5"])
+        self.assertEqual(G.codex_cron_ids(db)[1], ["gpt-5.4"])
+        g = G.Gate(emit=lambda s: None)
+        g.j = {"plugins_before": [], "cron_openai_ids": []}
+        self.assertFalse(g.codex_pkg_before())
+        g.j["cron_openai_ids"] = ["gpt-5.5"]
+        self.assertTrue(g.codex_pkg_before())
+        self.write_cfg(CFG_735)
+        self.hooks()
+        self.assertEqual(self.run_gate(), 0, self.out)
+        j = self.journal()
+        self.assertEqual(j["cron_openai_ids"], ["gpt-5.4-mini", "gpt-5.5"])
+        self.assertTrue(j["fixups"]["codex_needed"])
+
+
+GLM_REF = "glm/GLM-5.3-Flash-EXL3"
+
+
+def cfg_735_glm():
+    cfg = copy.deepcopy(CFG_735)
+    cfg["models"]["providers"]["glm"] = {
+        "api": "openai-completions", "baseUrl": "http://192.0.2.10:8888/v1",
+        "models": [{"id": "GLM-5.3-Flash-EXL3", "reasoning": True, "compat": {"thinkingFormat": "qwen-chat-template"}}]}
+    cfg["agents"]["defaults"]["models"][GLM_REF] = {"alias": "GLM"}
+    return cfg
+
+
+class GlmThinkingLevelsGateTests(GateEnv):
+    """G1: add-on option glm_thinking_levels (default off)."""
+
+    CONVERTED = {"supportsReasoningEffort": True, "supportedReasoningEfforts": ["none", "low", "high", "max"],
+                 "reasoningEffortMap": {"minimal": "low", "medium": "high", "xhigh": "max"}}
+
+    def setup_glm(self, **options):
+        self.build_735()
+        self.write_cfg(cfg_735_glm())
+        self.options(**options)
+        self.hooks()
+
+    def glm_compat(self):
+        cfg = json.loads((self.state / "openclaw.json").read_text())
+        return cfg["models"]["providers"]["glm"]["models"][0]["compat"], cfg
+
+    def g1_ledger(self):
+        rd = self.upg / "gate" / "runs" / self.journal()["run_id"]
+        return [e for e in json.loads((rd / "transform-ledger.json").read_text()) if e.get("step") == "G1"]
+
+    def test_off_only_informs(self):
+        self.setup_glm(timezone="Europe/Paris", glm_thinking_levels=False)
+        self.assertEqual(self.run_gate(), 0, self.out)
+        self.assertEqual(self.glm_compat()[0], {"thinkingFormat": "qwen-chat-template"})
+        self.assertIn(f"5/8 info: {GLM_REF} only switch thinking on/off", self.out)
+        self.assertNotIn("glm_thinking", self.journal())
+        self.assertEqual(self.g1_ledger(), [])
+
+    def test_on_by_default(self):
+        # config.yaml default true: the Supervisor writes it; a missing key or file means the same
+        for opts in ({"timezone": "Europe/Paris"}, None):
+            with self.subTest(opts=opts):
+                self.setUp_again()
+                self.build_735()
+                self.write_cfg(cfg_735_glm())
+                if opts is None:  # no options file at all: the config.yaml defaults
+                    (self.tmp / "options.json").unlink()
+                else:
+                    self.options(**opts)
+                self.hooks()
+                self.assertEqual(self.run_gate(), 0, self.out)
+                self.assertEqual(self.glm_compat()[0], self.CONVERTED)
+
+    def setUp_again(self):
+        self.tearDown()
+        self.setUp()
+
+    def test_runtime_guard(self):
+        self.assertFalse(G.glm_runtime_ok("2026.7.35"))
+        self.assertFalse(G.glm_runtime_ok("2026.8.35"))
+        self.assertFalse(G.glm_runtime_ok(None))
+        self.assertTrue(G.glm_runtime_ok("2026.9.9"))
+        self.assertTrue(G.glm_runtime_ok("2026.10.2"))
+        self.assertTrue(G.glm_runtime_ok("2026.10.3"))
+        self.assertTrue(G.glm_runtime_ok("2026.10.4"))
+        self.assertTrue(G.glm_runtime_ok("2026.10.5-beta.2"))
+        self.setup_glm(glm_thinking_levels=True)
+        with mock.patch.object(G, "glm_runtime_ok", lambda v: False):
+            self.assertEqual(self.run_gate(), 0, self.out)
+        self.assertIn("5/8 info: GLM thinking levels need OpenClaw 2026.9+", self.out)
+        self.assertEqual(self.glm_compat()[0], {"thinkingFormat": "qwen-chat-template"})
+
+    def test_option_converts_and_ledgers(self):
+        self.setup_glm(glm_thinking_levels=True)
+        self.assertEqual(self.run_gate(), 0, self.out)
+        self.assertIn(f"GLM thinking levels (G1): applied to {GLM_REF} (transform-ledger.json, step G1)",
+                      "\n".join(G.status_lines()))
+        compat, cfg = self.glm_compat()
+        self.assertEqual(compat, self.CONVERTED)
+        self.assertEqual(cfg["agents"]["defaults"]["models"][GLM_REF], {"alias": "GLM"})  # no params added
+        self.assertIn(f"5/8 GLM thinking levels: {GLM_REF} send the level as reasoning_effort", self.out)
+        self.assertIn("4 change(s) in", self.out)
+        self.assertEqual(len(self.g1_ledger()), 4)
+        j = self.journal()
+        self.assertEqual(j["glm_thinking"], {"applied": True, "refs": [GLM_REF]})
+        rd = self.upg / "gate" / "runs" / j["run_id"]
+        post = json.loads((rd / "config.post-fixups.json").read_text())
+        self.assertEqual(post["models"]["providers"]["glm"]["models"][0]["compat"], self.CONVERTED)
+        self.assertEqual(json.loads((rd / "config.pre-g1.json").read_text())["models"]["providers"]["glm"]
+                         ["models"][0]["compat"], {"thinkingFormat": "qwen-chat-template"})
+
+    def test_skipped_models_are_named_when_the_option_is_on(self):
+        self.build_735()
+        cfg = cfg_735_glm()
+        cfg["models"]["providers"]["glm"]["models"][0]["compat"]["supportedReasoningEfforts"] = ["low", "high"]
+        self.write_cfg(cfg)
+        self.options(glm_thinking_levels=True)
+        self.hooks()
+        self.assertEqual(self.run_gate(), 0, self.out)
+        self.assertIn(f"5/8 info: GLM thinking levels: {GLM_REF} left as is (has its own supportedReasoningEfforts",
+                      self.out)
+        self.assertEqual(self.glm_compat()[0]["thinkingFormat"], "qwen-chat-template")
+
+    def test_validate_failure_restores_and_the_gate_goes_on(self):
+        self.setup_glm(glm_thinking_levels=True)
+        os.environ["FAKE_OC_MODE"] = "invalid-glm"
+        self.assertEqual(self.run_gate(), 0, self.out)
+        self.assertEqual(self.glm_compat()[0], {"thinkingFormat": "qwen-chat-template"})
+        self.assertIn("WARN [gate] GLM thinking levels not applied", self.out)
+        self.assertEqual(self.g1_ledger(), [])
+        self.assertFalse(self.journal()["glm_thinking"]["applied"])
+
+    def test_stop_during_the_g1_check_restores_and_resumes(self):
+        self.setup_glm(glm_thinking_levels=True)
+        real = G.Gate.config_validate
+
+        def stop_in_g1(gate, tag):
+            if tag == "pc-g1-validate":
+                G.STOP.set()
+                raise G.GateStopped()
+            return real(gate, tag)
+        with mock.patch.object(G.Gate, "config_validate", stop_in_g1):
+            self.assertEqual(self.run_gate(), 143, self.out)
+        # the interrupted step left neither the G1 write nor its ledger entries behind
+        self.assertEqual(self.glm_compat()[0], {"thinkingFormat": "qwen-chat-template"})
+        self.assertEqual(self.g1_ledger(), [])
+        G.STOP.clear()
+        os.environ["FAKE_OC_MODE"] = "invalid-glm"  # a rejected G1 result must still only warn on resume
+        self.assertEqual(self.run_gate(), 0, self.out)
+        self.assertIn("WARN [gate] GLM thinking levels not applied", self.out)
+        self.assertNotIn("fixups-invalid", self.out)
+        self.assertEqual(self.glm_compat()[0], {"thinkingFormat": "qwen-chat-template"})
+
+    def test_killed_after_the_write_is_undone_on_resume(self):
+        self.setup_glm(glm_thinking_levels=True)
+        real = G.Gate.config_validate
+
+        def die_in_g1(gate, tag):
+            if tag == "pc-g1-validate":
+                raise SystemExit(137)  # SIGKILL stand-in: nothing after the write runs ...
+            return real(gate, tag)
+        orig_undo = G.Gate.glm_undo
+        with mock.patch.object(G.Gate, "config_validate", die_in_g1), \
+                mock.patch.object(G.Gate, "glm_undo", lambda *a, **k: None):  # ... not even the undo
+            with self.assertRaises(SystemExit):
+                self.run_gate()
+        self.assertEqual(self.glm_compat()[0], self.CONVERTED)  # unvalidated G1 write on disk
+        self.assertTrue(self.journal()["glm_thinking"]["pending"])
+        self.assertIs(G.Gate.glm_undo, orig_undo)
+        os.environ["FAKE_OC_MODE"] = "invalid-glm"
+        self.assertEqual(self.run_gate(), 0, self.out)
+        self.assertIn("5/8 GLM thinking levels: the step was interrupted before its check finished", self.out)
+        self.assertIn("WARN [gate] GLM thinking levels not applied", self.out)
+        self.assertNotIn("fixups-invalid", self.out)
+        self.assertEqual(self.glm_compat()[0], {"thinkingFormat": "qwen-chat-template"})
+        self.assertEqual(self.g1_ledger(), [])
+
+    def test_maintenance_run_applies_it_later(self):
+        self.setup_glm(glm_thinking_levels=False)
+        self.assertEqual(self.run_gate(), 0, self.out)
+        self.assertEqual(self.glm_compat()[0], {"thinkingFormat": "qwen-chat-template"})
+        self.options(glm_thinking_levels=True)
+        lines = []
+        G.dry_run(network=False, emit=lines.append)  # migrated install: the preview still shows it
+        self.assertIn(f"[gate] dry-run: GLM thinking levels (option glm_thinking_levels on): {GLM_REF} would send",
+                      "\n".join(lines))
+        self.assertEqual(G.retry_cmd(["--doctor"], emit=lambda s: None), 0)
+        self.assertEqual(self.run_gate(), 0, self.out)
+        self.assertEqual(self.journal()["mode"], "maintenance")
+        self.assertEqual(self.glm_compat()[0], self.CONVERTED)
+        self.assertEqual(len(self.g1_ledger()), 4)
+
+    def test_dry_run_preview(self):
+        self.setup_glm(glm_thinking_levels=True)
+        lines = []
+        G.dry_run(network=False, emit=lines.append)
+        self.assertIn(f"GLM thinking levels (option glm_thinking_levels on): {GLM_REF} would send the level",
+                      "\n".join(lines))
+        self.options(glm_thinking_levels=False)
+        lines = []
+        G.dry_run(network=False, emit=lines.append)
+        self.assertIn("(option glm_thinking_levels off)", "\n".join(lines))
+
+
+class DryRunTests(GateEnv):
+    def test_dry_run_is_read_only(self):
+        self.build_735()
+        self.hooks()
+        before = {str(p): p.stat().st_mtime_ns for p in self.root.rglob("*") if p.is_file()}
+        lines = []
+        rc = G.dry_run(network=False, emit=lines.append)
+        out = "\n".join(lines)
+        self.assertIn(rc, (0, 20), out)
+        self.assertIn("a gate would run in mode from-7x", out)
+        self.assertIn("pre-migrate:", out)
+        after = {str(p): p.stat().st_mtime_ns for p in self.root.rglob("*") if p.is_file()}
+        self.assertEqual(before, after)
+        self.assertFalse((self.upg / "gate" / "journal.json").exists())
+
+    def test_dry_run_names_the_backup_as_the_rollback_point(self):
+        """0.5.94-full3: the readiness preview has no "archive:" line any more (the gate writes no archive)."""
+        self.build_735()
+        self.hooks()
+        lines = []
+        self.assertEqual(G.dry_run(network=False, emit=lines.append), 0, "\n".join(lines))
+        self.assertIn("[gate]   rollback point: the encrypted Home Assistant backup (no archive of the gate's own)",
+                      lines)
+        self.assertEqual([x for x in lines if "archive:" in x], [])
+        self.assertIn("[gate] dry-run: the precheck would pass", lines)
+        self.assertEqual(list(self.share.iterdir()), [])
+
+
+# Obviously fake age private key (the bech32 alphabet in order): a value a user might still have pasted into the
+# removed option gate_archive_age_recipient.
+FAKE_AGE_SECRET_KEY = "AGE-SECRET-KEY-1" + ("QPZRY9X8GF2TVDW0S3JN54KHCE6MUA7L" * 2)[:58]
+FAKE_AGE_RECIPIENT = "age1" + "q" * 58
+FULL3_PHASES_FROM7X = ["precheck", "cleanup", "premigrate", "doctor1", "fixups", "doctor2", "postconditions", "pins",
+                       "finalize"]
+MARKER_KEYS = {"schema", "runtime", "mode", "run_id", "completed_at", "binding", "accepted", "orphans",
+               "addon_version"}
+
+
+class NoGateArchiveTests(GateEnv):
+    """0.5.94-full3: the gate writes no archive of its own (the encrypted Home Assistant backup is the only
+    rollback point). Journals of 0.5.94-full2 with an archive record and stored values of the removed options
+    gate_archive / gate_archive_age_recipient still work."""
+
+    def marker(self):
+        return json.loads((self.upg / "gate" / "migrated.json").read_text())
+
+    def share_snapshot(self):
+        """Every entry below /share: (kind, bytes, inode, mtime_ns); a directory's mtime shows added/removed names."""
+        snap = {}
+        for p in [self.share, *self.share.rglob("*")]:
+            st = os.lstat(p)
+            data = p.read_bytes() if stat.S_ISREG(st.st_mode) else None
+            snap[str(p)] = (stat.S_IFMT(st.st_mode), data, st.st_ino, st.st_mtime_ns)
+        return snap
+
+    def make_full2_archive(self, run_id):
+        """The /share side of a 0.5.94-full2 run (encrypted archive, manifest.json, SHA256SUMS) and its journal
+        record. The archive bytes are a stand-in: the gate must never read them."""
+        adir = self.share / "openclaw-upgrade" / run_id
+        adir.mkdir(parents=True, mode=0o700)
+        name = f"openclaw-state-20261018-120000-before-{RUNTIME}.tar.gz.age"
+        data = b"age-encryption.org/v1\n-> X25519 not-a-real-stanza\n--- not-a-real-mac\n" + b"\x00" * 64
+        (adir / name).write_bytes(data)
+        sha = hashlib.sha256(data).hexdigest()
+        (adir / "manifest.json").write_text(json.dumps({"schema": 2, "kind": "openclaw-addon-pre-migration-archive",
+                                                         "format": "tar.gz+age", "run_id": run_id}))
+        (adir / "SHA256SUMS").write_text(f"{sha}  {name}\n")
+        rec = {"mode": "encrypted", "format": "tar.gz+age", "dir": str(adir), "file": name, "sha256": sha,
+               "size": len(data), "plaintext_sha256": "0" * 64, "plaintext_size": 1, "members": 1,
+               "recipient": FAKE_AGE_RECIPIENT, "verified": True, "created_at": "2026-10-18T12:00:00Z"}
+        return adir, rec
+
+    def to_full2_journal(self, j):
+        """Rewrite the journal as 0.5.94-full2 left it: phase "archive" done (right after the precheck), its record
+        and the validated option snapshot."""
+        adir, rec = self.make_full2_archive(j["run_id"])
+        done = j["phases_done"]
+        done.insert(done.index("precheck") + 1, "archive")
+        j.update({"archive": rec, "addon_version": "0.5.94-full2",
+                  "archive_opt": {"mode": "encrypted", "recipient": FAKE_AGE_RECIPIENT, "age_version": "v1.2.1"}})
+        (self.upg / "gate" / "journal.json").write_text(json.dumps(j))
+        return adir, rec
+
+    def assert_secret_nowhere(self, texts):
+        """The key body appears in no output and no file of the tree except the options file the user put it in."""
+        needles = [FAKE_AGE_SECRET_KEY[16:], FAKE_AGE_SECRET_KEY[16:].lower()]
+        for label, text in texts:
+            for n in needles:
+                self.assertNotIn(n, text, f"stored option value echoed in {label}")
+        opts = self.tmp / "options.json"
+        for p in self.tmp.rglob("*"):
+            if p == opts or p.is_symlink() or not p.is_file():
+                continue
+            data = p.read_bytes()
+            for n in needles:
+                self.assertNotIn(n.encode(), data, f"stored option value found in {p.relative_to(self.tmp)}")
+
+    # (a) a from-7x run: no archive phase, nothing below /share, no archive fields
+    def test_from_7x_run_writes_no_archive(self):
+        self.build_735()
+        self.hooks()
+        self.assertEqual(self.run_gate(), 0, self.out)
+        self.assertNotIn("archive", G.PHASES)
+        j = self.journal()
+        self.assertEqual((j["status"], j["mode"]), ("done", "from-7x"))
+        self.assertEqual(j["phases_done"], FULL3_PHASES_FROM7X)
+        self.assertFalse({"archive", "archive_opt"} & set(j), sorted(j))
+        self.assertEqual(list(self.share.iterdir()), [])  # not even /share/openclaw-upgrade
+        m = self.marker()
+        self.assertEqual(set(m), MARKER_KEYS)
+        self.assertEqual((m["mode"], m["run_id"]), ("from-7x", j["run_id"]))
+        self.assertNotIn("archive", self.out)
+        self.assertNotIn("sha256", self.out)
+        self.assertRegex(self.out, r"\[gate\] info: the doctor captures of this run and the gate's plaintext copies "
+                                   r"of openclaw.json in its run directory \(config.\*.json, with the saved models "
+                                   r"status output\) are deleted after \S+ \(gate_cleanup_hours=48\)\n")
+        self.assertNotIn("archive", (self.upg / "gate" / "runs" / j["run_id"] / "events.log").read_text())
+        st = G.status_lines()
+        self.assertIn("Gate options: delete doctor captures, SQLite copies "
+                      "and the gate's config copies 48 h after a run "
+                      "(0 = never); backup max age 24 h", st)
+        self.assertEqual([x for x in st if "archive" in x.lower()], [])
+
+    def test_finalize_with_cleanup_off_keeps_the_doctor_captures(self):
+        self.build_735()
+        self.hooks()
+        self.options(gate_cleanup_hours=0)
+        self.assertEqual(self.run_gate(), 0, self.out)
+        self.assertIn("[gate] info: the doctor captures of this run and the gate's plaintext copies of openclaw.json "
+                      "in its run directory (config.*.json, with the saved models status output) are kept "
+                      "(gate_cleanup_hours=0): delete them yourself", self.out)
+        self.assertEqual(list(self.share.iterdir()), [])
+
+    def test_precheck_space_check_needs_no_share(self):
+        self.build_735()
+        self.hooks(skip_space_check=False)
+        seen = []
+
+        def fake_space_check(needs, **_kw):
+            seen.append([(label, str(path), code) for label, path, _need, code in needs])
+            return [], "mocked"
+        with mock.patch.object(G, "space_check", side_effect=fake_space_check):
+            self.assertEqual(self.run_gate(), 0, self.out)
+        self.assertEqual(len(seen), 1)
+        self.assertEqual([(label, code) for label, _p, code in seen[0]],
+                         [("/config", "low-disk-config"), ("sqlite-tmp", "low-disk-tmp")])
+        self.assertFalse(any(str(self.share) in p for _l, p, _c in seen[0]))
+        self.assertIn("space ok (mocked)", self.out)
+
+    # (b) journals of 0.5.94-full2 with an archive phase and record
+    def test_full2_journal_after_first_write_resumes_without_touching_its_archive(self):
+        self.build_735()
+        self.hooks(raise_in_phase="fixups")
+        self.assertEqual(self.run_gate(), 1, self.out)
+        j0 = self.journal()
+        self.assertTrue(j0["first_write_at"])
+        adir, rec = self.to_full2_journal(j0)
+        before = self.share_snapshot()
+        self.hooks()
+        self.assertEqual(G.retry_cmd([], emit=lambda s: None), 0)
+        self.assertEqual(self.run_gate(), 0, self.out)
+        self.assertIn("[gate] done: MIGRATED 2026.9.9", self.out)
+        self.assertNotRegex(self.out, r"\[gate\] \d/9 ")
+        self.assertNotIn("archive:", self.out)
+        self.assertNotIn("archive-missing", self.out)
+        self.assertEqual(self.share_snapshot(), before)
+        j = self.journal()
+        self.assertEqual(j["status"], "done")
+        self.assertEqual(j["phases_done"], ["precheck", "archive"] + FULL3_PHASES_FROM7X[1:])
+        self.assertEqual(j["archive"], rec)  # the earlier version's record stays for status and the cleanup
+        self.assertEqual(set(self.marker()), MARKER_KEYS)
+        st = G.status_lines()
+        self.assertIn(f"  archive (earlier add-on version): {adir}/{rec['file']}", st)
+        self.assertIn("Gate archives in /share from earlier add-on versions (deleted automatically, see oc-upgrade "
+                      "cleanup):", st)
+        self.assertIn(f"  {adir / rec['file']} ({C.human(rec['size'])}, encrypted)", st)
+        self.assertNotIn(FAKE_AGE_RECIPIENT, "\n".join(st))
+
+    def test_full2_archive_missing_hold_continues_after_a_plain_retry(self):
+        """0.5.94-full2 held archive-missing (hard) when the archive of a partially migrated run was gone; without
+        a gate archive that hold is sticky until `oc-upgrade retry`, which then finishes the run."""
+        self.build_735()
+        self.hooks(raise_in_phase="fixups")
+        self.assertEqual(self.run_gate(), 1, self.out)
+        adir, rec = self.to_full2_journal(self.journal())
+        (adir / rec["file"]).unlink()
+        j0 = self.journal()
+        f = {"code": "archive-missing", "cls": "hard", "phase": "archive",
+             "message": f"the verified pre-migration archive {adir}/{rec['file']} is missing or changed, and the "
+                        "state was already partially migrated"}
+        j0.update({"phase": "archive", "hold": dict(f, codes=["archive-missing"], acceptable=False, retry="continue",
+                                                    state_changed=True, resume_after=False, findings=[f])})
+        (self.upg / "gate" / "journal.json").write_text(json.dumps(j0))
+        before = self.share_snapshot()
+        self.hooks()
+        self.assertEqual(self.run_gate(), 20, self.out)  # sticky until retried
+        self.assertEqual(self.journal()["hold"]["code"], "archive-missing")
+        self.assertEqual(G.retry_cmd([], emit=lambda s: None), 0)
+        d = self.plan()
+        self.assertEqual((d["rc"], d["action"], d["resume_phase"]), (10, "resume", "archive"))
+        self.assertEqual(self.run_gate(), 0, self.out)
+        self.assertIn("[gate] done: MIGRATED 2026.9.9", self.out)
+        self.assertEqual(self.share_snapshot(), before)
+        j = self.journal()
+        self.assertEqual((j["status"], j["hold"]), ("done", None))
+        self.assertEqual(j["phases_done"], ["precheck", "archive"] + FULL3_PHASES_FROM7X[1:])
+        self.assertEqual(j["previous_holds"][-1]["code"], "archive-missing")
+
+    def test_full2_journal_before_first_write_resumes_without_touching_its_archive(self):
+        self.build_735()
+        self.hooks(raise_in_phase="cleanup")
+        self.assertEqual(self.run_gate(), 1, self.out)
+        j0 = self.journal()
+        self.assertEqual((j0["hold"]["code"], j0["phase"], j0["first_write_at"]), ("internal-error", "cleanup", None))
+        adir, rec = self.to_full2_journal(j0)
+        before = self.share_snapshot()
+        self.hooks()
+        self.assertEqual(G.retry_cmd([], emit=lambda s: None), 0)
+        self.assertEqual(self.run_gate(), 0, self.out)
+        self.assertIn("journal empty (pre-journal 7.x)", self.out)  # nothing was written: the full precheck again
+        self.assertNotIn("archive:", self.out)
+        self.assertEqual(self.share_snapshot(), before)
+        j = self.journal()
+        self.assertEqual(j["status"], "done")
+        self.assertEqual(j["phases_done"], ["precheck", "archive"] + FULL3_PHASES_FROM7X[1:])
+        self.assertEqual(j["archive"], rec)
+        self.assertEqual(set(self.marker()), MARKER_KEYS)
+
+    def test_full2_journal_interrupted_in_the_archive_phase_resumes(self):
+        """A 0.5.94-full2 run stopped while it archived (phase "archive", no record yet) resumes automatically and
+        leaves the incomplete archive of that attempt to the cleanup."""
+        self.build_735()
+        self.hooks(raise_in_phase="cleanup")
+        self.assertEqual(self.run_gate(), 1, self.out)
+        j0 = self.journal()
+        tmp = self.share / "openclaw-upgrade" / j0["run_id"] / f"openclaw-state-x-before-{RUNTIME}.tar.gz.age.tmp"
+        tmp.parent.mkdir(parents=True)
+        tmp.write_bytes(b"age-encryption.org/v1\n")
+        j0.update({"status": "interrupted", "phase": "archive", "hold": None, "auto_resumes": 0,
+                   "phases_done": ["precheck"], "archive": None,
+                   "archive_opt": {"mode": "encrypted", "recipient": FAKE_AGE_RECIPIENT}})
+        (self.upg / "gate" / "journal.json").write_text(json.dumps(j0))
+        before = self.share_snapshot()
+        self.hooks()
+        d = self.plan()
+        self.assertEqual((d["rc"], d["action"], d["resume_phase"]), (10, "resume", "archive"))
+        self.assertEqual(self.run_gate(), 0, self.out)
+        self.assertEqual(self.share_snapshot(), before)
+        j = self.journal()
+        self.assertEqual((j["status"], j["phases_done"]), ("done", FULL3_PHASES_FROM7X))
+
+    # (c) stored values of the removed options are ignored
+    def test_removed_archive_options_are_ignored_and_never_echoed(self):
+        """An install updated from 0.5.94-full2 keeps the stored values (the Supervisor only warns about them):
+        no HOLD (full2 held archive-key-missing / archive-key-invalid for these) and no echo of the value."""
+        self.build_735()
+        self.hooks()
+        texts = []
+        variants = [("private key", {"gate_archive": "encrypted", "gate_archive_age_recipient": FAKE_AGE_SECRET_KEY}),
+                    ("whole key file", {"gate_archive_age_recipient": f"# created: 2026-10-18T00:00:00Z\n"
+                                                                      f"# public key: {FAKE_AGE_RECIPIENT}\n"
+                                                                      f"{FAKE_AGE_SECRET_KEY.lower()}\n"}),
+                    ("encrypted without recipient", {"gate_archive": "encrypted", "gate_archive_age_recipient": ""}),
+                    ("off", {"gate_archive": "off"}),
+                    ("invalid values", {"gate_archive": ["plain"], "gate_archive_age_recipient": 42})]
+        for label, opts in variants:
+            with self.subTest(label):
+                self.options(**opts)
+                self.assertEqual(C.gate_options(), {"cleanup_hours": 48, "backup_max_age_hours": 24, "problems": []})
+                lines = []
+                self.assertEqual(G.dry_run(network=False, emit=lines.append), 0, "\n".join(lines))
+                text = "\n".join(lines)
+                self.assertIn("[gate] dry-run: the precheck would pass", lines)
+                self.assertNotIn("gate_archive", text)
+                self.assertNotIn("archive-key", text)
+                texts.append((f"dry-run {label}", text))
+        self.options(gate_archive="encrypted", gate_archive_age_recipient=FAKE_AGE_SECRET_KEY)
+        self.assertEqual(self.run_gate(), 0, self.out)
+        self.assertIn("[gate] done: MIGRATED 2026.9.9", self.out)
+        self.assertFalse((self.upg / "hold.txt").exists())
+        j = self.journal()
+        self.assertEqual((j["status"], j["hold"]), ("done", None))
+        self.assertNotIn("gate_archive", self.out + self.err)
+        self.assertNotIn("archive-key", self.out + self.err)
+        self.assertEqual(list(self.share.iterdir()), [])
+        texts += [("stdout", self.out), ("stderr", self.err), ("status", "\n".join(G.status_lines()))]
+        self.assert_secret_nowhere(texts)
+
+    def test_missing_or_unreadable_options_file_means_the_defaults(self):
+        """0.5.94-full2 held archive-key-missing for these (fail-closed archive setting); now nothing depends on it."""
+        self.build_735()
+        self.hooks()
+        opts = self.tmp / "options.json"
+        for label, content in [("missing", None), ("not json", "{gate_archive: off"), ("json list", '["off"]'),
+                               ("empty object", "{}")]:
+            with self.subTest(label):
+                if content is None:
+                    opts.unlink(missing_ok=True)
+                else:
+                    opts.write_text(content)
+                self.assertEqual(C.gate_options(), {"cleanup_hours": 48, "backup_max_age_hours": 24, "problems": []})
+                lines = []
+                self.assertEqual(G.dry_run(network=False, emit=lines.append), 0, "\n".join(lines))
+                self.assertIn("[gate] dry-run: the precheck would pass", lines)
+                self.assertFalse([x for x in lines if x.startswith("WARN [gate] add-on option")], lines)
+
+    def test_invalid_integer_options_warn_without_echoing_the_value(self):
+        self.build_735()
+        self.hooks()
+        self.options(gate_cleanup_hours="SECRET-VALUE-1", gate_backup_max_age_hours=True)
+        lines = []
+        self.assertEqual(G.dry_run(emit=lines.append), 0, "\n".join(lines))
+        text = "\n".join(lines)
+        self.assertIn("WARN [gate] add-on option gate_cleanup_hours is not an integer in 0..720; using 48", text)
+        self.assertIn("WARN [gate] add-on option gate_backup_max_age_hours is not an integer in 1..168; using 24", text)
+        self.assertNotIn("SECRET-VALUE", text)
+
+
+class CodexAllowedPostconditionTests(unittest.TestCase):
+    """Harness TU: on the live-like install Codex runs canonical openai/* routes already on 7.35."""
+
+    ROUTES = {"auth": {"runtimeAuthRoutes": [{"provider": "openai", "runtime": "codex",
+                                                 "authProvider": "openai", "status": "indeterminate"}],
+                       "modelRouteIssues": [], "missingProvidersInUse": []}}
+
+    def test_models_status_codex_route_fails_when_codex_was_not_in_use(self):
+        probs = G.models_status_problems(0, self.ROUTES, [])
+        self.assertIn("pc-codex-runtime", [c for c, _ in probs])
+
+    def test_models_status_codex_route_ok_when_codex_was_in_use(self):
+        self.assertEqual(G.models_status_problems(0, self.ROUTES, [], codex_allowed=True), [])
+
+    def test_sessions_codex_rows(self):
+        data = {"sessions": [
+            {"key": "agent:main:main", "modelProvider": "openai", "agentRuntime": {"id": "codex"}},
+            {"key": "agent:main:legacy", "modelProvider": "openai", "agentRuntime": {"id": "codex"}},
+        ]}
+        self.assertEqual(len(G.sessions_problems(0, data, [], set())), 2)
+        # canonical sessions may stay on Codex, but sessions R5 pinned to openclaw must not
+        probs = G.sessions_problems(0, data, ["agent:main:legacy"], set(), codex_allowed=True)
+        self.assertEqual(probs, ["session agent:main:legacy: runtime codex"])
+
+
+class ModelsStatusRegressionOnlyTests(unittest.TestCase):
+    """`models status --check` exits 1 for merely indeterminate readiness (v99 docs/cli/models.md:91)."""
+
+    def issues(self, *items):
+        return {"auth": {"runtimeAuthRoutes": [], "missingProvidersInUse": [],
+                         "modelRouteIssues": [{"kind": k, "provider": pr, "model": m} for k, pr, m in items]}}
+
+    def test_indeterminate_and_fallback_issues_only_warn(self):
+        data = self.issues(("indeterminate", "openai", "gpt-5.5"), ("missing", "anthropic", "claude-opus-4-8"))
+        probs = G.models_status_problems(1, data, [], primaries={"vllm/qwen3.5-122b"})
+        self.assertTrue(probs)
+        self.assertEqual({c for c, _ in probs}, {"warn"})
+
+    def test_primary_route_issue_holds(self):
+        data = self.issues(("missing", "openai", "gpt-5.5"))
+        probs = G.models_status_problems(1, data, [], primaries={"openai/gpt-5.5"})
+        self.assertIn("pc-models-status", [c for c, _ in probs])
+
+    def test_indeterminate_primary_only_warns(self):
+        data = self.issues(("indeterminate", "openai", "gpt-5.5"))
+        probs = G.models_status_problems(1, data, [], primaries={"openai/gpt-5.5"})
+        self.assertEqual({c for c, _ in probs}, {"warn"})
+
+    def test_lost_oauth_login_holds(self):
+        data = {"auth": {"oauth": {"profiles": []}, "modelRouteIssues": []}}
+        probs = G.models_status_problems(0, data, [{"type": "oauth", "provider": "openai-codex"}])
+        self.assertIn("pc-models-status", [c for c, _ in probs])
+
+    def oauth(self, *profiles):
+        return {"auth": {"oauth": {"profiles": [{"type": "oauth", "provider": pr, "status": st}
+                                                for pr, st in profiles]}, "modelRouteIssues": []}}
+
+    def test_expired_oauth_access_token_only_warns(self):
+        # an idle 7.35 install already reports the Codex login as "expired"
+        before = [{"type": "oauth", "provider": "openai-codex"}]
+        probs = G.models_status_problems(0, self.oauth(("openai", "expired")), before)
+        self.assertEqual({c for c, _ in probs}, {"warn"})
+        self.assertEqual(G.models_status_problems(0, self.oauth(("openai-codex", "ok")), before), [])
+
+    def test_missing_oauth_profile_holds(self):
+        before = [{"type": "oauth", "provider": "openai-codex"}]
+        probs = G.models_status_problems(0, self.oauth(("openai", "missing"), ("xai", "ok")), before)
+        self.assertIn("pc-models-status", [c for c, _ in probs])
+
+    def test_primary_model_refs(self):
+        cfg = {"agents": {"defaults": {"model": {"primary": "vllm/Qwen3.5-122b"}},
+                          "entries": {"other_agent": {"model": "vllm/qwen3.5-122b"},
+                                      "x": {"model": {"primary": "openai/gpt-5.5"}}}}}
+        self.assertEqual(G.primary_model_refs(cfg), {"vllm/qwen3.5-122b", "openai/gpt-5.5"})
+
+
+class Full3ReviewTests(GateEnv):
+    """Review of 0.5.94-full3: HOLDs left by full2, agent DBs outside /config, leftovers with cleanup off."""
+
+    FULL2_NEXT = ("set gate_archive_age_recipient in the add-on Configuration to your age public key (age1...), or "
+                  "set gate_archive: off, then oc-upgrade retry")
+
+    def full2_hold(self, code="archive-key-missing", first_write_at=None, codes=None):
+        return {"schema": 1, "run_id": "20261018T101010Z-abcdef", "mode": "from-7x", "status": "hold",
+                "phase": "precheck", "phases_done": [], "first_write_at": first_write_at, "doctor": [],
+                "hold": {"code": code, "codes": codes or [code], "phase": "precheck", "acceptable": False,
+                         "message": "gate_archive is 'encrypted' but gate_archive_age_recipient is empty",
+                         "next": self.FULL2_NEXT}}
+
+    def test_removed_archive_hold_before_the_first_write_resumes_by_itself(self):
+        cfg7 = {"meta": {"lastTouchedVersion": "2026.7.35"}}
+        d = G.decide(ctx(journal=self.full2_hold(), cls=cls_of("gate", state_uv=1), cfg=cfg7))
+        self.assertEqual((d["rc"], d["action"], d["resume_phase"]), (10, "resume", "precheck"))
+        self.assertTrue(any("archive-key-missing no longer applies" in w for w in d["warnings"]), d["warnings"])
+        # a HOLD with a current code next to the removed one, or after the first write, stays until retry
+        for j in (self.full2_hold(codes=["archive-key-missing", "no-network"]),
+                  self.full2_hold("archive-missing", first_write_at="2026-10-18T10:20:00Z")):
+            self.assertEqual(G.decide(ctx(journal=j, cls=cls_of("gate", state_uv=1), cfg=cfg7))["rc"], 11)
+
+    def test_full2_hold_resumes_and_migrates_on_full3(self):
+        self.build_735()
+        self.hooks()
+        C.atomic_write_json(self.upg / "gate" / "journal.json", self.full2_hold())
+        self.assertEqual(self.run_gate(), 0, self.out)
+        self.assertIn("previous HOLD archive-key-missing no longer applies", self.out)
+        j = self.journal()
+        self.assertEqual(j["status"], "done")
+        self.assertEqual(j["previous_holds"][-1]["code"], "archive-key-missing")
+
+    def test_removed_hold_after_the_first_write_names_no_removed_option(self):
+        self.build_735()
+        self.hooks()
+        C.atomic_write_json(self.upg / "gate" / "journal.json",
+                            self.full2_hold("archive-missing", first_write_at="2026-10-18T10:20:00Z"))
+        self.assertEqual(self.run_gate(), 20, self.out)
+        hold = (self.upg / "hold.txt").read_text()
+        self.assertIn(G.REMOVED_HOLD_ADVICE, hold)
+        self.assertNotIn("gate_archive", hold.split("Reason")[0] + hold.split("Next")[-1])
+        status = "\n".join(G.status_lines())
+        self.assertIn("HOLD archive-missing in precheck", status)
+        self.assertIn(f"next: {G.REMOVED_HOLD_ADVICE}", status)
+        self.assertNotIn(self.FULL2_NEXT, status)
+
+    def test_agent_db_outside_config_holds_acceptably_before_any_write(self):
+        self.build_735()
+        self.hooks()
+        src = self.state / "agents" / "main" / "agent" / "openclaw-agent.sqlite"
+        ext = self.tmp / "media" / "agents" / "main" / "agent"
+        ext.mkdir(parents=True)
+        shutil.copy2(src, ext / src.name)
+        c = sqlite3.connect(self.state / "state" / "openclaw.sqlite")
+        c.execute("UPDATE agent_databases SET path=? WHERE agent_id='main'", (str(ext / src.name),))
+        c.commit()
+        c.close()
+        self.assertEqual(self.run_gate(), 20, self.out)
+        j = self.journal()
+        self.assertEqual((j["hold"]["code"], j["hold"]["acceptable"], j["first_write_at"]),
+                         ("data-outside-config", True, None))
+        self.assertIn(str(ext / src.name), j["hold"]["message"])
+        self.assertIn("oc-upgrade retry --accept data-outside-config", (self.upg / "hold.txt").read_text())
+
+    def test_workspace_outside_config_holds_acceptably_before_any_write(self):
+        self.build_735()
+        self.hooks()
+        ext = self.tmp / "share" / "ws-helper"
+        (ext / "memory").mkdir(parents=True)
+        cfg = json.loads(json.dumps(CFG_735))
+        cfg["agents"]["list"].append({"id": "helper", "workspace": str(ext)})
+        self.write_cfg(cfg)
+        self.assertEqual(self.run_gate(), 20, self.out)
+        j = self.journal()
+        self.assertEqual((j["hold"]["code"], j["hold"]["acceptable"], j["first_write_at"]),
+                         ("data-outside-config", True, None))
+        self.assertIn(str(ext), j["hold"]["message"])
+        self.assertNotIn(str(self.ws), j["hold"]["message"])  # the workspace below /config is fine
+
+    def test_leftovers_with_cleanup_off_are_reported_as_kept(self):
+        self.build_735()
+        old = self.share / "openclaw-upgrade" / "20261001T090000Z-123456"
+        old.mkdir(parents=True)
+        (old / "openclaw-state-20261001-090000-before-2026.9.9.tar.gz").write_bytes(b"plaintext")
+        self.options(gate_cleanup_hours=0)
+        status = "\n".join(G.status_lines())
+        self.assertIn("from earlier add-on versions (kept: gate_cleanup_hours=0, delete them yourself):", status)
+        self.assertNotIn("deleted automatically", status)
+        self.options()
+        self.assertIn("(deleted automatically, see oc-upgrade cleanup):", "\n".join(G.status_lines()))
+        # the precheck names the plaintext leftover in a WARN
+        lines = []
+        self.quiet(G.dry_run, emit=lines.append)
+        text = "\n".join(lines) + "\n" + self.out + self.err
+        self.assertIn("1 plaintext gate archive(s) of 0.5.94-full1", text)
+        self.assertIn("(deleted automatically, see oc-upgrade cleanup)", text)
+
+
+class UnencryptedBackupCountTests(unittest.TestCase):
+    def test_more_than_three_unencrypted_backups_are_counted(self):
+        g = G.Gate(emit=lambda s: None)
+        warned = []
+        g.warn = warned.append
+        g.hooks = {"supervisor_url": "http://127.0.0.1:9"}
+        now = C.utc_now()
+        backups = [{"slug": f"u{i}", "name": f"plain {i}", "date": now.isoformat(), "type": "partial",
+                    "protected": False, "location_attributes": {".local": {"protected": False}},
+                    "content": {"addons": ["self_slug"]}} for i in range(5)]
+        with mock.patch.object(C, "supervisor_token", return_value="t" * 40), \
+                mock.patch.object(C, "supervisor_get", side_effect=[
+                    {"slug": "self_slug", "version": "0.5.94-full3"}, {"backups": backups}]):
+            g.ha_backup_check([], {"backup_max_age_hours": 24})
+        self.assertEqual(sum("UNENCRYPTED in" in w for w in warned), 3)
+        self.assertTrue(any("... and 2 more Home Assistant backup(s)" in w for w in warned), warned)
+
+
+# --- full5 prep: foundation (runtime caps, codes, hooks, 2026.10.x fixtures) ----------------------
+
+FULL5_ACCEPTABLE = ("acp-ledger-unimported", "voicewake-unimported", "conversation-bindings-unimported",
+                    "plugin-approvals-unimported", "restart-sentinel-unimported", "sandbox-registry-unimported",
+                    "skill-workshop-export-failed")
+FULL5_HARD = ("sqlite-fk-violation", "agent-db-held")
+# hooks in the order a gate run calls them, with the existing steps they are anchored to
+HOOK_ANCHORS = ("measure", "quick_checks", "ha_backup_check", "info_items", "mark_first_write", "run_doctor_pass",
+                "config_validate", "oc_json")
+HOOKS = ("skill_workshop_precheck", "fk_checks", "skill_workshop_info", "cron_binding_forecast",
+         "skill_workshop_export", "cron_binding_postcheck", "skill_workshop_postcheck", "_finalize_skill_lines",
+         "_finalize_cron_lines")
+
+
+class Full5CodesTests(unittest.TestCase):
+    def test_new_codes_and_their_advice(self):
+        for code in FULL5_ACCEPTABLE + FULL5_HARD:
+            with self.subTest(code=code):
+                self.assertIn(code, G.ADVICE)
+                self.assertEqual(code in G.ACCEPTABLE, code in FULL5_ACCEPTABLE)
+        for code in FULL5_ACCEPTABLE[:6]:
+            self.assertEqual(G.ADVICE[code], G.RETIRED_RUNTIME_ADVICE)
+        self.assertEqual(G.advice_for(["voicewake-unimported"]),
+                         G.RETIRED_RUNTIME_ADVICE + ", or accept: oc-upgrade retry --accept voicewake-unimported "
+                                                    "(then restart the add-on)")
+        self.assertTrue(G.advice_for(["sqlite-fk-violation", "voicewake-unimported"]).startswith(
+            G.ADVICE["sqlite-fk-violation"]))
+        # 2026.10.4 imports these files only in a doctor run: going back to 0.5.94-full4 keeps nothing once its gate
+        # ran; --accept keeps the file in the quarantine; a rollback only to retry a transiently failed doctor run
+        adv = G.RETIRED_RUNTIME_ADVICE
+        self.assertNotIn("stay on it", adv)
+        self.assertIn("only in a doctor run", adv)
+        self.assertIn("keeps nothing", adv)
+        self.assertIn("/config/.openclaw-upgrade/gate/quarantine/<run>/", adv)
+        self.assertIn("transient reason", adv)
+        self.assertIn("oc-upgrade retry --doctor there, then update again", adv)
+
+    def test_decisions_reflected(self):
+        # agent-db-held is a precheck HOLD on the new image: never advise bypassing the wrapper's HOLD guard
+        self.assertNotIn("OC_ADDON_UNSAFE", G.ADVICE["agent-db-held"])
+        self.assertIn("previous add-on version", G.ADVICE["agent-db-held"])
+        # cron inference accounts are report-only: no cron HOLD codes
+        self.assertFalse([c for c in set(G.ACCEPTABLE) | set(G.ADVICE) if c.startswith("cron-binding")])
+        # the gate never deletes rows: an FK violation has no accept path
+        self.assertNotIn("--accept", G.ADVICE["sqlite-fk-violation"])
+
+
+class Full5FixtureTests(GateEnv):
+    def test_set_runtime_and_image_record(self):
+        self.set_runtime("2026.10.10", 22, 27)
+        pkg = C.runtime_package()
+        self.assertEqual((pkg["version"], pkg["schema_state"], pkg["schema_agent"]), ("2026.10.10", 22, 27))
+        g = G.Gate(emit=lambda s: None)
+        self.assertEqual(g.caps(), dict.fromkeys(C.CAP_NAMES, False))  # package not read yet
+        g.pkg = pkg
+        self.assertTrue(g.caps()["cron_refusal"])
+        self.assertFalse(g.caps()["cron_doctor_migration"])
+        self.set_runtime("2026.11.1", 22, 27)
+        self.features(cron_doctor_migration=True)
+        g.pkg = C.runtime_package()
+        self.assertTrue(g.caps()["cron_doctor_migration"])
+        self.features(version="2026.10.10", cron_doctor_migration=True)
+        self.assertFalse(C.runtime_caps(C.runtime_package())["cron_doctor_migration"])
+
+    def test_make_1004_state(self):
+        make_1004_state(self.state, content=True)
+        sdb = self.state / "state" / "openclaw.sqlite"
+        adb = self.state / "agents" / "main" / "agent" / "openclaw-agent.sqlite"
+        self.assertEqual((C.user_version(sdb), C.user_version(adb)), (20, 24))
+        tables = G.table_names(sdb)
+        for t in ("cron_jobs", "skill_workshop_proposals", "agent_deletion_journal", "operator_approvals",
+                  "config_machine_state", "agent_databases", "schema_meta"):
+            self.assertIn(t, tables)
+        self.assertEqual(len(C.query_ro(sdb, "SELECT job_id FROM cron_jobs")), len(CRON_1004_JOBS))
+        self.assertEqual(json.loads(C.query_ro(sdb, "SELECT job_json FROM cron_jobs WHERE job_id='job-morning'")[0][0])
+                         ["payload"]["fallbacks"], ["anthropic/claude-sonnet-4-6"])
+        self.assertEqual(len(C.query_ro(sdb, "SELECT 1 FROM skill_workshop_proposals")), 2)
+        self.assertEqual(G.schema_meta_primary(sdb)["app_version"], "2026.10.4")
+        profiles = G.read_auth_profiles(self.state, {"main": "agents/main/agent/openclaw-agent.sqlite"})
+        self.assertEqual({(p["id"], p["type"]) for p in profiles},
+                         {("openai:default", "oauth"), ("anthropic:default", "token")})
+        # a 10.4 state is current for 2026.10.4 and needs the gate for 2026.10.10 (22/27)
+        self.assertEqual(G.classify(self.state, {}, 20, 24, "2026.10.4")["verdict"], "ok")
+        c = G.classify(self.state, {}, 22, 27, "2026.10.10")
+        self.assertEqual(c["verdict"], "gate")
+        self.assertEqual(c["gate"], ["state schema 20 < 22", "agents/main/agent/openclaw-agent.sqlite: agent schema "
+                                                              "24 < 27"])
+
+    def test_scripted_doctor_per_pass_lines_and_failure(self):
+        make_1004_state(self.state, content=True)
+        self.write_cfg({"meta": {"lastTouchedVersion": "2026.10.4"}, "gateway": {"mode": "local"}})
+        self.set_runtime("2026.10.10", 22, 27)
+        self.hooks()
+        step = {"state_uv": 22, "agent_uv": 27, "app_version": "2026.10.10"}
+        self.doctor_script(passes=[dict(step, print=["Retired the Skill Workshop proposal tables"],
+                                        drop_tables=["skill_workshop_proposals"],
+                                        sql=["DELETE FROM cron_jobs WHERE enabled=0"],
+                                        agent_sql=["DELETE FROM auth_profile_store"],
+                                        write={"skill-workshop/.retired/x.json": "{}"}),
+                                   dict(step, print=["second pass"])])
+        self.assertEqual(self.run_gate(), 0, self.out)
+        sdb = self.state / "state" / "openclaw.sqlite"
+        self.assertNotIn("skill_workshop_proposals", G.table_names(sdb))
+        self.assertEqual(len(C.query_ro(sdb, "SELECT 1 FROM cron_jobs")), len(CRON_1004_JOBS) - 1)
+        self.assertEqual(G.read_auth_profiles(self.state, {"main": "agents/main/agent/openclaw-agent.sqlite"}), [])
+        self.assertTrue((self.state / "skill-workshop" / ".retired" / "x.json").is_file())
+        self.assertIn("[doctor] │  Retired the Skill Workshop proposal tables │", self.out)
+        self.assertIn("[doctor] │  second pass │", self.out)
+        self.assertEqual(G.classify(self.state, {}, 22, 27, "2026.10.10")["verdict"], "ok")
+        m = json.loads((self.upg / "gate" / "migrated.json").read_text())
+        self.assertEqual((m["runtime"], m["mode"]), ("2026.10.10", "bump"))
+        self.assertEqual(G.schema_meta_primary(self.state / "state" / "openclaw.sqlite")["app_version"], "2026.10.10")
+        self.assertNotIn("SECRET", self.out)
+        # a refusing doctor: rc 1 without the box
+        self.doctor_script(box=False, rc=1, print=["Failing check core/doctor/x"])
+        self.assertEqual(G.retry_cmd(["--doctor"], emit=lambda s: None), 0)
+        self.assertEqual(self.run_gate(), 20, self.out)
+        self.assertEqual((self.journal()["hold"]["code"], self.journal()["phase"]), ("doctor-failed", "doctor1"))
+
+
+class Full5HookTests(GateEnv):
+    def setUp(self):
+        super().setUp()
+        make_1004_state(self.state, content=True)
+        self.write_cfg({"meta": {"lastTouchedVersion": "2026.10.4"}, "gateway": {"mode": "local"},
+                        "agents": {"list": [{"id": "main", "default": True}]}})
+        (self.upg / "gate").mkdir(parents=True)
+        (self.upg / "gate" / "migrated.json").write_text(json.dumps({"runtime": "2026.10.4", "mode": "bump"}))
+        self.set_runtime("2026.10.10", 22, 27)
+        self.hooks()
+        self.calls = []
+
+    def spy(self, name, orig, result=None):
+        calls = self.calls
+
+        def wrapper(gate, *a, **kw):
+            tag = a[0] if name == "config_validate" else (a[2] if name == "oc_json" else None)
+            calls.append((name, tag, bool((gate.j or {}).get("first_write_at")), gate.phase))
+            if result is not None:
+                return result(gate, *a, **kw)
+            return orig(gate, *a, **kw)
+        return wrapper
+
+    def patched(self, **results):
+        ps = [mock.patch.object(G.Gate, n, new=self.spy(n, getattr(G.Gate, n), results.get(n)))
+              for n in HOOK_ANCHORS + HOOKS]
+        for p in ps:
+            p.start()
+            self.addCleanup(p.stop)
+
+    def test_call_sites_in_the_fixed_order(self):
+        """The critic's order: precheck 7 -> 9 -> 9b -> 10b -> 11 -> 11b -> 11c; the export before the first
+        write; pc-config -> cron -> lint ... -> Skill Workshop -> plugin WARNs; finalize skills -> cron -> done."""
+        self.patched()
+        self.assertEqual(self.run_gate(), 0, self.out)
+        keep = {"oc_json": ("pc-lint", "pc-plugins"), "config_validate": ("pc-config",)}
+        names = [f"{n}:{t}" if t else n for n, t, _fw, _ph in self.calls if n not in keep or t in keep[n]]
+        self.assertEqual(names, [
+            "measure", "skill_workshop_precheck", "quick_checks", "fk_checks", "ha_backup_check", "info_items",
+            "skill_workshop_info", "cron_binding_forecast",
+            "skill_workshop_export", "mark_first_write", "run_doctor_pass", "run_doctor_pass",
+            "config_validate:pc-config", "cron_binding_postcheck", "oc_json:pc-lint", "skill_workshop_postcheck",
+            "oc_json:pc-plugins", "_finalize_skill_lines", "_finalize_cron_lines"])
+        export = [c for c in self.calls if c[0] == "skill_workshop_export"]
+        self.assertEqual(export, [("skill_workshop_export", None, False, "doctor1")])  # before the first write
+        self.assertIn("[gate] done: MIGRATED 2026.10.10", self.out)
+
+    def test_readiness_and_status_helpers_are_called(self):
+        seen = []
+        orig = {n: getattr(G, n) for n in ("_readiness_skills", "_readiness_cron", "_status_cron", "_status_skills")}
+
+        def rec(n):
+            def f(arg):
+                seen.append(n)
+                return orig[n](arg) + [f"<{n}>"]
+            return f
+        with mock.patch.multiple(G, **{n: rec(n) for n in orig}):
+            lines = []
+            self.assertEqual(self.quiet(G.dry_run, emit=lines.append), 0, "\n".join(lines))
+            text = "\n".join(lines)
+            self.assertLess(text.index("cleanup plan:"), text.index("<_readiness_skills>"))
+            self.assertLess(text.index("<_readiness_skills>"), text.index("<_readiness_cron>"))
+            self.assertLess(text.index("<_readiness_cron>"), text.rindex("doctor budget"))
+            self.assertEqual(self.run_gate(), 0, self.out)
+            st = G.status_lines()
+        self.assertEqual(seen, ["_readiness_skills", "_readiness_cron", "_status_cron", "_status_skills"])
+        self.assertLess(st.index("<_status_cron>"), next(i for i, x in enumerate(st) if x.startswith("Migrated marker")))
+        self.assertLess(next(i for i, x in enumerate(st) if x.startswith("Quarantine:")), st.index("<_status_skills>"))
+
+    def test_hook_results_reach_the_precheck(self):
+        needs, sizes = [], []
+        orig_measure = G.Gate.measure
+
+        def space(n):
+            needs.append(n)
+            return [], "ok"
+
+        def measure(gate):
+            sizes.append(dict(orig_measure(gate)))
+            return gate.sizes
+        self.hooks(skip_space_check=False)
+        self.patched(fk_checks=lambda g, F, db: "foreign keys ok (2/2)",
+                     skill_workshop_precheck=lambda g: 7 * C.MIB, measure=measure)
+        with mock.patch.object(G, "space_check", side_effect=space):
+            self.assertEqual(self.run_gate(), 0, self.out)
+        line = next(x for x in self.out.splitlines() if x.startswith("[gate] 1/8 precheck:"))
+        self.assertRegex(line, r"quick_check ok \(2/2\); foreign keys ok \(2/2\); network not checked")
+        label, _path, need, code = needs[0][0]
+        self.assertEqual((label, code), ("/config", "low-disk-config"))
+        sz = sizes[0]
+        self.assertEqual(need - (2 * sz["sqlite_total"] + 2 * sz["transcripts_total"] + 2 * C.GIB), 7 * C.MIB)
+
+    def test_export_hold_comes_before_the_first_write(self):
+        def export(gate):
+            if "skill-workshop-export-failed" in gate.accepted:
+                return
+            raise G.HoldError([G.finding("skill-workshop-export-failed", "acceptable",
+                                         "could not export the Skill Workshop proposals: OSError", "doctor1")],
+                              "doctor1")
+        self.patched(skill_workshop_export=export)
+        self.assertEqual(self.run_gate(), 20, self.out)
+        j = self.journal()
+        self.assertEqual((j["hold"]["code"], j["phase"], j["hold"]["acceptable"]),
+                         ("skill-workshop-export-failed", "doctor1", True))
+        self.assertIsNone(j.get("first_write_at"))
+        self.assertFalse(j.get("doctor_started"))
+        self.assertEqual(C.user_version(self.state / "state" / "openclaw.sqlite"), 20)  # doctor never ran
+        self.assertIn("oc-upgrade retry --accept skill-workshop-export-failed", self.out)
+        G.retry_cmd(["--accept", "skill-workshop-export-failed"], emit=lambda s: None)
+        self.assertEqual(self.run_gate(), 0, self.out)
+        self.assertEqual(C.user_version(self.state / "state" / "openclaw.sqlite"), 22)
+
+
+if __name__ == "__main__":
+    unittest.main()

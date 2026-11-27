@@ -1,16 +1,29 @@
 name: OpenClaw Assistant
-version: "0.5.96"
+version: "0.5.94-full6"
 slug: openclaw_assistant
 description: Run OpenClaw Assistant (OpenClaw-compatible) as a Home Assistant add-on.
-url: https://github.com/techartdev/OpenClawHomeAssistant
+url: https://github.com/Nosdave/OpenClawHomeAssistant
+# Pre-built image pulled from a GHCR package (built via GitHub Actions, native
+# aarch64) — Supervisor pulls instead of building locally. {arch} → aarch64.
+# "full" build: chromium + node-llama-cpp + acpx/Claude-Code harness included.
+image: ghcr.io/nosdave/openclaw-assistant-{arch}
 arch:
-  - amd64
   - aarch64
-  - armv7
 startup: services
 boot: auto
 init: false
-hassio_api: false
+# Supervisor API: used only by the migration gate's read-only check for an
+# encrypted Home Assistant backup (GET /addons/self/info, /backups/info,
+# /backups/<slug>/info). The "default" role adds GET of */info endpoints, no
+# writes; "backup" would also allow creating, deleting, restoring and downloading
+# backups. Accepted risk (SECURITY.md, section 9): the token is readable by every
+# process in this container, the OpenClaw agent and its shell tools included
+# (/run/s6/container_environment/SUPERVISOR_TOKEN), so they can read every */info
+# endpoint too: backup list and backup info, host/network/OS/Supervisor/Core/
+# hardware info, other add-ons' info (current Supervisor versions return their
+# options empty, older ones did not).
+hassio_api: true
+hassio_role: default
 homeassistant_api: false
 host_network: true
 
@@ -20,19 +33,25 @@ ingress_port: 48099
 panel_title: OpenClaw Assistant
 panel_icon: mdi:robot
 
-# Liveness probe for the Supervisor: the ingress proxy (nginx) is the add-on's
-# front door, so a dead listener means the add-on page is broken.
-# Users can turn this off with the Watchdog toggle on the add-on page.
-watchdog: tcp://[HOST]:48099
+# No Supervisor `watchdog:` in this fork (upstream probes tcp://[HOST]:48099).
+# nginx comes up late in run.sh, after the config repair steps, and a restart
+# triggered mid-startup could interrupt a future pre-upgrade backup or state
+# migration. Crash handling stays in run.sh's own supervisor loop.
+
+# Give run.sh time to stop the gateway cleanly (it drains in-flight work and
+# flushes SQLite) before the Supervisor sends SIGKILL. Default is 10 s; 300 s
+# is the Supervisor maximum.
+timeout: 300
 
 # Keep Home Assistant backups small by excluding regenerable caches and
 # tooling from the add-on backup. Patterns are matched against the full path
 # of each item; a matching directory is skipped without descending into it.
 # NOTE: restoring a backup replaces /config wholesale, so anything listed here
-# is NOT restored and must be reinstalled (brew/npm tools) or is rebuilt on
-# demand (caches). User data, skills, agents and secrets are never excluded.
+# is NOT restored and must be reinstalled (npm tools) or is rebuilt on demand
+# (caches). User data, skills, agents and secrets are never excluded.
+# Fork: `.linuxbrew` is NOT excluded — this fork defaults persist_brew_tools to
+# true, so brew-installed tools are part of the add-on and must survive a restore.
 backup_exclude:
-  - ".linuxbrew"      # Homebrew install + cellar (persist_brew_tools)
   - ".node_global"    # npm/pnpm global installs (persist_node_global)
   - ".npm"            # npm download cache
   - ".cache"          # generic tool caches (Chromium, build artifacts)
@@ -40,7 +59,7 @@ backup_exclude:
   - "*.jsonl.lock"    # stale session locks; never useful to restore
 
 map:
-  - addon_config:rw
+  - app_config:rw
   - share:rw
   - media:rw
 options:
@@ -76,9 +95,12 @@ options:
   clean_session_locks_on_exit: true
 
   # Persist heavy optional tooling across add-on rebuilds.
-  # Disabled by default to keep Home Assistant backups small.
+  # node_global: FALSE on purpose — image-baked OpenClaw must win, otherwise the
+  #   old persisted npm tree shadows it (the 2026-04 "4.15 twin" version-drift bug).
+  # brew_tools: TRUE on purpose — keeps the user's accumulated /config .linuxbrew
+  #   CLI tools (nano-pdf etc.) across rebuilds; brew holds no OC binary, no drift risk.
   persist_node_global: false
-  persist_brew_tools: false
+  persist_brew_tools: true
 
   # Gateway mode:
   # - local: Run gateway locally (recommended for most users)
@@ -191,6 +213,35 @@ options:
   # so a bad change can be rolled back with 'oc-config restore'. 0 disables.
   config_backup_keep: 10
 
+  # GLM thinking levels (applied by the migration gate, OpenClaw 2026.9+ only).
+  # A GLM model configured with compat.thinkingFormat "qwen-chat-template" only
+  # gets thinking on/off. When true (the default), the gate's next run (an
+  # OpenClaw update, or 'oc-upgrade retry --doctor' and a restart; a normal
+  # restart does not apply it) switches it to reasoning_effort, so /think and
+  # thinkingDefault levels reach the model. Off is then sent as "none": the GLM
+  # server must treat that as no thinking. Set false before the update to keep
+  # on/off only; switching it off later does not undo the change (see DOCS).
+  glm_thinking_levels: true
+  # Hours after a finished gate run ([gate] done, or when a hold after it was
+  # cleared, if later) before the add-on deletes OpenClaw's doctor captures of
+  # that run (/config/.openclaw.update-captures/doctor-*) and the SQLite copies
+  # its doctor passes saved beside the databases (*.pre-startup-migration-*.bak,
+  # .scoped.bak, its pre-repair cron backups
+  # state/openclaw.sqlite.doctor-cron-*.bak and its pre-repair recovery
+  # directories openclaw-*-recovery-*/), and the gate's own plaintext copies of
+  # openclaw.json in the run directory (/config/.openclaw-upgrade/gate/runs/<run>/config.*.json, with
+  # the saved models status output). Copies earlier add-on versions left (gate archives in
+  # /share/openclaw-upgrade/, rehearsal exports in /share/openclaw-rehearsal/,
+  # the plaintext 2026.7 archives in /config/.openclaw/upgrade-backups/) go after
+  # the same hours, counted from their own time. 0 = never delete. A change
+  # applies from the next add-on start.
+  gate_cleanup_hours: 48
+  # Before it changes the state, the gate requires an encrypted Home Assistant
+  # backup that contains this add-on (taken before the update) and is at most
+  # this many hours old; otherwise it holds (acceptable: ha-backup-missing).
+  # That backup is the only rollback point: the gate writes no archive of its own.
+  gate_backup_max_age_hours: 24
+
 
 schema:
   timezone: str
@@ -229,3 +280,6 @@ schema:
   ha_health_interval: int(15,3600)?
   ha_base_url: str?
   config_backup_keep: int(0,100)?
+  glm_thinking_levels: bool?
+  gate_cleanup_hours: int(0,720)?
+  gate_backup_max_age_hours: int(1,168)?

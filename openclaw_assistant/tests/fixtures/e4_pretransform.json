@@ -1,0 +1,93 @@
+{
+  "gateway": {
+    "mode": "local",
+    "port": 18789,
+    "bind": "loopback",
+    "auth": {
+      "mode": "token",
+      "token": "fake-gateway-token-for-unit-tests"
+    },
+    "controlUi": {
+      "dangerouslyDisableDeviceAuth": true
+    }
+  },
+  "agents": {
+    "defaults": {
+      "workspace": "/config/clawd",
+      "model": {
+        "primary": "openai-codex/gpt-5.5"
+      },
+      "models": {
+        "openai-codex/gpt-5.5": {
+          "alias": "gpt",
+          "agentRuntime": {
+            "id": "openclaw"
+          }
+        },
+        "openai-codex/gpt-6-astra": {
+          "agentRuntime": {
+            "id": "openclaw"
+          }
+        },
+        "openai-codex/gpt-5.6-sol": {
+          "agentRuntime": {
+            "id": "openclaw"
+          }
+        },
+        "openai-codex/gpt-5.6-terra": {
+          "agentRuntime": {
+            "id": "openclaw"
+          }
+        },
+        "openai-codex/gpt-5.6-luna": {
+          "agentRuntime": {
+            "id": "openclaw"
+          }
+        },
+        "openai-codex/gpt-5.5-pro": {
+          "agentRuntime": {
+            "id": "openclaw"
+          }
+        },
+        "openai-codex/gpt-5.4": {
+          "agentRuntime": {
+            "id": "openclaw"
+          }
+        },
+        "openai-codex/gpt-5.4-pro": {
+          "agentRuntime": {
+            "id": "openclaw"
+          }
+        },
+        "openai-codex/gpt-5.4-mini": {
+          "agentRuntime": {
+            "id": "openclaw"
+          }
+        },
+        "openai-codex/gpt-5.3-codex-spark": {
+          "agentRuntime": {
+            "id": "openclaw"
+          }
+        }
+      }
+    }
+  },
+  "plugins": {
+    "entries": {
+      "brave": {
+        "enabled": true
+      }
+    }
+  },
+  "meta": {
+    "lastTouchedVersion": "2026.7.35",
+    "lastTouchedAt": "2026-10-09T12:35:06.002Z"
+  },
+  "channels": {
+    "telegram": {
+      "enabled": true,
+      "botToken": "123456:FAKE-TOKEN-FOR-UNIT-TESTS",
+      "dmPolicy": "pairing"
+    }
+  }
+}

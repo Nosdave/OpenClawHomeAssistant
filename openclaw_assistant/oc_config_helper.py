@@ -9,6 +9,7 @@ import json
 import os
 import re
 import sys
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -19,35 +20,94 @@ BACKUP_SUFFIX = ".json"
 
 
 
+# First OpenClaw release line in which gateway.controlUi.dangerouslyDisableDeviceAuth is inert.
+DEVICE_AUTH_RETIRED_IN = (2026, 8, 0)
+
+
+def _runtime_version():
+    """Bundled OpenClaw version as a tuple, from OPENCLAW_RUNTIME_VERSION (set by run.sh).
+
+    Returns None when unknown.
+    """
+    raw = os.environ.get("OPENCLAW_RUNTIME_VERSION", "")
+    m = re.match(r"^\s*(\d{4})\.(\d+)\.(\d+)", raw)
+    if not m:
+        return None
+    return tuple(int(x) for x in m.groups())
+
+
+def _runtime_at_least(version):
+    """True when the bundled runtime is known and >= version.
+
+    An unknown runtime is treated as current (retired-key handling applies),
+    matching the upstream add-on's behaviour.
+    """
+    current = _runtime_version()
+    return current is None or current >= version
+
+
+class ConfigReadError(Exception):
+    """openclaw.json exists but cannot be read or parsed."""
+
+
 def read_config():
-    """Read and parse openclaw.json."""
+    """Read and parse openclaw.json.
+
+    Returns None only when the file does not exist. An existing file that
+    cannot be read or parsed raises ConfigReadError: callers treat None as
+    "start from an empty config", and doing that for a damaged file would
+    overwrite every agent, channel and credential in it with a near-empty
+    config.
+    """
     if not CONFIG_PATH.exists():
         return None
     try:
         return json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, IOError) as e:
-        print(f"ERROR: Failed to read config: {e}", file=sys.stderr)
-        return None
+    except (json.JSONDecodeError, OSError, UnicodeDecodeError) as e:
+        raise ConfigReadError(f"{CONFIG_PATH}: {e}") from e
+
+
+def _atomic_write_text(path, content, default_mode=0o600):
+    """Atomically replace `path` with `content`.
+
+    The content goes to a temp file in the same directory, is fsynced, then
+    renamed over the target, so an interrupted write (disk full, power loss,
+    SIGKILL on add-on stop) never leaves a truncated file behind. The existing
+    file mode is preserved; new files get `default_mode`.
+    """
+    path = Path(path)
+    tmp_path = None
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            mode = path.stat().st_mode & 0o777
+        except FileNotFoundError:
+            mode = default_mode
+        fd, tmp_path = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent))
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(content)
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(tmp_path, mode)
+        os.replace(tmp_path, path)
+        tmp_path = None
+    finally:
+        if tmp_path is not None:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
 
 
 def write_config(cfg):
-    """Write config back to file with nice formatting."""
+    """Write config back to file with nice formatting (atomically)."""
     try:
-        CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
-        CONFIG_PATH.write_text(json.dumps(cfg, indent=2) + "\n", encoding="utf-8")
+        _atomic_write_text(CONFIG_PATH, json.dumps(cfg, indent=2) + "\n")
         return True
-    except IOError as e:
+    except OSError as e:
         print(f"ERROR: Failed to write config: {e}", file=sys.stderr)
         return False
 
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Config snapshots
-#
-# The add-on rewrites openclaw.json on every start (gateway settings, controlUi,
-# repair rules). A snapshot is taken before the first write of each boot so a bad
-# merge or an unwanted repair can always be rolled back with `oc-config restore`.
-# ──────────────────────────────────────────────────────────────────────────────
 
 def _sanitize_label(label):
     """Reduce a free-form label to a filename-safe token."""
@@ -123,9 +183,10 @@ def create_snapshot(keep, label="manual", force=False):
 
     try:
         current = CONFIG_PATH.read_text(encoding="utf-8")
-    except IOError as e:
+    except (OSError, UnicodeDecodeError) as e:
+        # Report failure; the startup caller already treats it as non-fatal.
         print(f"WARN: Could not read config for snapshot: {e}", file=sys.stderr)
-        return True
+        return False
 
     existing = list_snapshots()
     if not force and existing:
@@ -145,15 +206,13 @@ def create_snapshot(keep, label="manual", force=False):
     target = BACKUP_DIR / f"{BACKUP_PREFIX}{stamp}.{_sanitize_label(label)}{BACKUP_SUFFIX}"
 
     try:
-        BACKUP_DIR.mkdir(parents=True, exist_ok=True)
-        target.write_text(current, encoding="utf-8")
-        try:
-            target.chmod(0o600)
-        except OSError:
-            pass
-    except IOError as e:
+        _atomic_write_text(target, current)
+    except OSError as e:
+        # Report failure (exit 1): `oc-config snapshot` must not claim success and
+        # `restore` must not proceed without its safety copy. The startup caller
+        # in run.sh already treats a failed snapshot as non-fatal.
         print(f"WARN: Could not write snapshot {target.name}: {e}", file=sys.stderr)
-        return True  # never block startup on a failed backup
+        return False
 
     removed = prune_snapshots(keep)
     suffix = f" (pruned {removed} old)" if removed else ""
@@ -260,12 +319,15 @@ def restore_snapshot(target, keep=10):
         return False
 
     # Safety net: the config being replaced becomes a snapshot of its own.
-    create_snapshot(keep, label="pre-restore", force=True)
+    # Refuse to restore without it (keep=0 disables snapshots entirely, and a
+    # missing live config has nothing to protect).
+    if keep > 0 and CONFIG_PATH.exists() and not create_snapshot(keep, label="pre-restore", force=True):
+        print("ERROR: Could not back up the current config first; refusing to restore")
+        return False
 
     try:
-        CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
-        CONFIG_PATH.write_text(content, encoding="utf-8")
-    except IOError as e:
+        _atomic_write_text(CONFIG_PATH, content)
+    except OSError as e:
         print(f"ERROR: Could not write config: {e}")
         return False
 
@@ -479,8 +541,8 @@ def set_control_ui_origins(origins_csv: str, additional_origins_csv: str = "", d
     Args:
         origins_csv: Comma-separated list of default origins provided by the add-on.
         additional_origins_csv: Comma-separated list of user-provided extra origins.
-        disable_device_auth: Accepted for backward compatibility and ignored —
-            gateway.controlUi.dangerouslyDisableDeviceAuth is retired upstream.
+        disable_device_auth: Desired gateway.controlUi.dangerouslyDisableDeviceAuth
+            value on runtimes before 2026.8; ignored (key stripped) from 2026.8 on.
     """
     cfg = read_config()
     if cfg is None:
@@ -512,14 +574,23 @@ def set_control_ui_origins(origins_csv: str, additional_origins_csv: str = "", d
         control_ui["allowedOrigins"] = merged_origins
         changes.append(f"allowedOrigins: {current_origins} -> {merged_origins}")
 
-    # --- dangerouslyDisableDeviceAuth (retired upstream) ---
-    # OpenClaw retired this flag in the 2026.8.x line: it is inert, the security
-    # audit lists it as a dangerous key, and `openclaw doctor --fix` removes it.
-    # Writing it back every boot would fight Doctor, so the add-on now strips it.
-    # Browsers pair once instead (`openclaw devices approve <requestId>`).
-    if "dangerouslyDisableDeviceAuth" in control_ui:
-        del control_ui["dangerouslyDisableDeviceAuth"]
-        changes.append("removed retired key: dangerouslyDisableDeviceAuth (now inert upstream)")
+    # --- dangerouslyDisableDeviceAuth ---
+    # Up to the 2026.7.x line this flag still works: it skips the per-browser
+    # pairing ceremony (token auth is still enforced), driven by the
+    # controlui_disable_device_auth option. OpenClaw retired it in the 2026.8.x
+    # line: it is inert there, the security audit lists it as a dangerous key and
+    # `openclaw doctor --fix` removes it, so on those runtimes the add-on strips
+    # it and browsers pair once (`openclaw devices approve <requestId>`).
+    if _runtime_at_least(DEVICE_AUTH_RETIRED_IN):
+        if "dangerouslyDisableDeviceAuth" in control_ui:
+            del control_ui["dangerouslyDisableDeviceAuth"]
+            changes.append("removed retired key: dangerouslyDisableDeviceAuth (inert since OpenClaw 2026.8)")
+    else:
+        desired_device_auth_flag = bool(disable_device_auth)
+        if control_ui.get("dangerouslyDisableDeviceAuth") is not desired_device_auth_flag:
+            prev = control_ui.get("dangerouslyDisableDeviceAuth")
+            control_ui["dangerouslyDisableDeviceAuth"] = desired_device_auth_flag
+            changes.append(f"dangerouslyDisableDeviceAuth: {prev} -> {desired_device_auth_flag}")
 
     # --- Remove invalid keys from earlier add-on versions ---
     for stale_key in ("pairingMode",):
@@ -535,6 +606,39 @@ def set_control_ui_origins(origins_csv: str, additional_origins_csv: str = "", d
         print(f"INFO: Updated controlUi: {', '.join(changes)}")
         return True
     print("ERROR: Failed to write config")
+    return False
+
+
+def _brave_plugin_installed(cfg):
+    """Best-effort check whether the Brave web-search plugin is installed.
+
+    Brave is an external official plugin that installs into the persistent
+    config-dir extensions folder (~/.openclaw/extensions) and/or registers a
+    plugins.entries.brave block. If present we must NOT strip a
+    tools.web.search.provider=brave selection; if absent we still strip to avoid
+    the gateway boot-loop on an unavailable provider.
+    """
+    # Primary signal: `openclaw plugins install` records plugins.entries.brave
+    # in openclaw.json (verified on 2026.6.11: {"entries": {"brave": {...}}}).
+    plugins = cfg.get("plugins")
+    if isinstance(plugins, dict):
+        entries = plugins.get("entries")
+        if isinstance(entries, dict) and any("brave" in str(k).lower() for k in entries):
+            return True
+    # Fallback: the installed package dir. Verified location is
+    # ~/.openclaw/npm/projects/openclaw-brave-plugin-<hash>/ (NOT extensions/);
+    # extensions/ kept as a harmless future-proof secondary.
+    cfg_dir = Path(os.environ.get("OPENCLAW_CONFIG_DIR") or str(CONFIG_PATH.parent))
+    try:  # verified real location: npm/projects/openclaw-brave-plugin-<hash>/
+        for _ in (cfg_dir / "npm" / "projects").glob("*rave*"):
+            return True
+    except OSError:
+        pass
+    try:  # speculative future-proof fallback (recursive)
+        for _ in (cfg_dir / "extensions").rglob("*rave*"):
+            return True
+    except OSError:
+        pass
     return False
 
 
@@ -559,9 +663,13 @@ def repair_known_invalid_settings():
     provider = search.get("provider")
     changes = []
 
-    if provider == "brave":
+    # Only strip the Brave provider if the Brave plugin is genuinely absent.
+    # When it IS installed, stripping would silently disable the user's chosen
+    # web search on every restart. When absent, stripping still prevents the
+    # gateway boot-loop on an unavailable provider.
+    if provider == "brave" and not _brave_plugin_installed(cfg):
         del search["provider"]
-        changes.append("removed unavailable tools.web.search.provider=brave")
+        changes.append("removed unavailable tools.web.search.provider=brave (plugin not installed)")
 
     if not changes:
         print("INFO: No known invalid OpenClaw config settings found")
@@ -688,4 +796,9 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except ConfigReadError as e:
+        print(f"ERROR: openclaw.json is unreadable; not modifying it: {e}", file=sys.stderr)
+        print("ERROR: Restore a snapshot with 'oc-config list' / 'oc-config restore <n>', or fix the file by hand.", file=sys.stderr)
+        sys.exit(2)

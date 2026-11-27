@@ -1,0 +1,3436 @@
+"""Unit tests for oc_migrate (Stage B migration gate: pure transforms and checks).
+
+Run: cd openclaw_assistant && PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -v
+
+Golden fixtures (tests/fixtures/, tokens replaced by fake values) come from the experiments with a real
+OpenClaw 2026.9.9 doctor on a real 7.35 state (contract E3/E4):
+  e4_before.json          7.35 config before the gate (exp1 .openclaw/openclaw.json)
+  e4_pretransform.json    the R1+R2 config doctor accepted (exp2 openclaw.json.bak.2)
+  e4_after_pass2.json     config after doctor pass 2 with the pre-transform (exp2/out/after2.json)
+  e3_raw_after_pass2.json config after doctor without the pre-transform (exp1raw .openclaw/openclaw.json)
+  pins_final_99.json      pins validated against the 9.9 schema (specwf/config-keys/pins_final.json)
+The scratchpad originals are compared too when they still exist (skipped otherwise).
+"""
+
+import copy
+import json
+import os
+import socket
+import sqlite3
+import sys
+import tempfile
+import unittest
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, os.path.dirname(HERE))
+
+import oc_migrate as m  # noqa: E402
+
+FIX = os.path.join(HERE, "fixtures")
+SCRATCH = "/tmp/claude-0/-home-user-OpenClawHomeAssistant/6503d59a-0f4b-5f0f-b521-f4389a32b335/scratchpad"
+SCRATCH_GOLDEN = {
+    "e4_before.json": SCRATCH + "/exp1/config/.openclaw/openclaw.json",
+    "e4_pretransform.json": SCRATCH + "/exp2/config/.openclaw/openclaw.json.bak.2",
+    "e4_after_pass2.json": SCRATCH + "/exp2/out/after2.json",
+    "e3_raw_after_pass2.json": SCRATCH + "/exp1raw/config/.openclaw/openclaw.json",
+    "pins_final_99.json": SCRATCH + "/specwf/config-keys/pins_final.json",
+    # contract addendum 1b: live-user-shaped config through real 9.9 doctor (pass 1; after2 is the
+    # superseded addendum-1 F1c result, kept as a "canonical keys were pinned" counter-example)
+    "exp5_pre_gate.json": SCRATCH + "/exp5/out/pre-gate.json",
+    "exp5_after_pass1.json": SCRATCH + "/exp5/out/after1.json",
+    "exp5_after_pass2.json": SCRATCH + "/exp5/out/after2.json",
+}
+UUID = "3f2b8c1e-9a4d-4e6f-8b7a-1c2d3e4f5a6b"
+
+
+def fix(name):
+    path = os.path.join(FIX, name)
+    if not os.path.exists(path):
+        raise unittest.SkipTest("golden fixture missing: %s" % path)
+    with open(path, encoding="utf-8") as f:
+        return json.load(f)
+
+
+def sanitize(cfg):
+    cfg = copy.deepcopy(cfg)
+    a = cfg.get("gateway", {}).get("auth")
+    if isinstance(a, dict) and "token" in a:
+        a["token"] = "fake-gateway-token-for-unit-tests"
+    t = cfg.get("channels", {}).get("telegram")
+    if isinstance(t, dict) and "botToken" in t:
+        t["botToken"] = "123456:FAKE-TOKEN-FOR-UNIT-TESTS"
+    return cfg
+
+
+def spec_example():
+    """§7.4.2 'before' example plus the F-735 builder additions (§15.2) and a vLLM provider."""
+    return {
+        "meta": {"lastTouchedVersion": "2026.7.35"},
+        "agents": {
+            "defaults": {
+                "model": {"primary": "openai-codex/gpt-5.5", "fallbacks": ["openai-codex/gpt-5.4-mini"]},
+                "heartbeat": {"model": "openai-codex/gpt-5.4-mini"},
+                "compaction": {"model": "openai-codex/gpt-5.4-mini"},
+                "models": {"openai-codex/*": {}, "openai-codex/gpt-5.5": {"alias": "main"},
+                           "anthropic/claude-sonnet-4-6": {"alias": "sonnet"}},
+            },
+            "list": [{"id": "main", "default": True},
+                     {"id": "helper", "models": {"openai-codex/*": {"alias": "x", "params": {"temperature": 0.2},
+                                                                    "agentRuntime": {"id": "auto"}}}}],
+        },
+        "hooks": {"mappings": [{"model": "openai-codex/gpt-5.4-mini"}]},
+        "channels": {"telegram": {"enabled": True, "botToken": "123456:FAKE"}},
+        "auth": {"order": {"openai-codex": ["openai-codex:default"]}},
+    }
+
+
+def vllm_block():
+    return {"baseUrl": "http://192.168.1.20:8000/v1", "api": "openai-completions", "apiKey": "sk-local-fake",
+            "models": [{"id": "qwen3.5-122b", "name": "Qwen 3.5 122B", "contextWindow": 131072}]}
+
+
+def live_like():
+    """A common shape: vLLM primary, Codex only as fallback / in the models map."""
+    return {
+        "meta": {"lastTouchedVersion": "2026.7.35"},
+        "models": {"providers": {"vllm": vllm_block()}},
+        "agents": {"defaults": {
+            "model": {"primary": "vllm/qwen3.5-122b", "fallbacks": ["openai-codex/gpt-5.5", "vllm/qwen3.5-122b"]},
+            "models": {"vllm/qwen3.5-122b": {"alias": "qwen"}, "vllm/*": {}, "openai-codex/gpt-5.5": {}},
+            "workspace": "/config/clawd"}},
+        "channels": {"telegram": {"enabled": True, "botToken": "123456:FAKE", "dmPolicy": "pairing"}},
+        "gateway": {"controlUi": {"allowInsecureAuth": True, "dangerouslyDisableDeviceAuth": True}},
+        "hooks": {"allowRequestSessionKey": True},
+    }
+
+
+# --- regexes ----------------------------------------------------------------------------------
+
+
+class TestRegexes(unittest.TestCase):
+    def test_transient_sqlite_positive(self):
+        names = [
+            "openclaw-agent.sqlite.reindex-lock.sqlite",
+            "openclaw-agent.sqlite.reindex-lock.sqlite-journal",
+            "openclaw-agent.sqlite.generation-lock.sqlite",
+            "openclaw-agent.sqlite.generation-writer.sqlite",
+            "openclaw-agent.sqlite.generation-writer.sqlite-wal",
+            "openclaw-agent.sqlite.memory-reindex-" + UUID,
+            "openclaw-agent.sqlite.memory-reindex-" + UUID + "-wal",
+            "openclaw-agent.sqlite.memory-reindex-" + UUID + "-shm",
+            "openclaw-agent.sqlite.memory-reindex-" + UUID + "-journal",
+            "openclaw-agent.sqlite.backup-" + UUID,
+            "openclaw-agent.sqlite.tmp-" + UUID.upper(),     # flag i (JS /iu)
+            "OPENCLAW-AGENT.SQLITE.REINDEX-LOCK.SQLITE",
+            "x.sqlite.tmp-" + UUID + "-shm",
+        ]
+        for n in names:
+            with self.subTest(n=n):
+                self.assertTrue(m.TRANSIENT_SQLITE_RE.match(n))
+                self.assertTrue(m.TRANSIENT_SQLITE_RE.fullmatch(n))
+
+    def test_transient_sqlite_negative(self):
+        names = [
+            "openclaw-agent.sqlite", "openclaw-agent.sqlite-wal", "openclaw-agent.sqlite-shm",
+            "openclaw-agent.sqlite.migrated",
+            "openclaw-agent.sqlite.memory-reindex-1234",                       # not a uuid
+            "openclaw-agent.sqlite.memory-reindex-" + UUID + ".bak",
+            "openclaw-agent.sqlite.memory-reindex-" + UUID[:-1],
+            "openclaw-agent.sqlite.reindex-lock.sqlite-wal\n",                # Python '$' trap
+            "openclaw-agent.sqlite.reindex-lock.sqlite.bak",
+            "a/b.sqlite.reindex-lock.sqlite",                                 # basename only
+            ".sqlite.reindex-lock.sqlite",                                    # [^/]+ needs a stem
+            "openclaw-agent.sqlite.generation-1.sqlite",
+        ]
+        for n in names:
+            with self.subTest(n=n):
+                self.assertIsNone(m.TRANSIENT_SQLITE_RE.match(n))
+                self.assertIsNone(m.TRANSIENT_SQLITE_RE.search(n))
+
+    def test_telegram_cache_names(self):
+        pos = ["bot-info-default.json", "sticker-cache.json", "thread-bindings-default.json",
+               "thread-bindings-acc2.json", "update-offset-default.json", "update-offset-123456789.json",
+               "bot-info-a.b.json"]
+        neg = ["bot-info-.json", "sticker-cache.json.migrated", "thread-bindings-default.json.migrated",
+               "thread-bindings-default.json.migrated.2", "sessions.json.telegram-messages.json",
+               "ingress-spool-default", "sticker-cache-2.json", "Sticker-cache.json", "update-offset-default.json\n",
+               "update-offset-x\n.json", "thread-bindings.json", "bot-info-default.JSON"]
+        for n in pos:
+            with self.subTest(pos=n):
+                self.assertTrue(m.TELEGRAM_CACHE_RE.match(n))
+        for n in neg:
+            with self.subTest(neg=n):
+                self.assertIsNone(m.TELEGRAM_CACHE_RE.match(n))
+
+    def test_empty_bindings_variants(self):
+        pos = ['{"version":1,"bindings":[]}', '{"bindings":[],"version":1}',
+               '  {\n  "version" : 1 ,\n  "bindings" : [ ]\n}\n', '{\t"bindings":[\n],"version":1}\r\n']
+        neg = ['{"version":2,"bindings":[]}', '{"version":1,"bindings":[{}]}', '{"bindings":[]}',
+               '{"version":1,"bindings":[],"x":1}', '{"version":"1","bindings":[]}', '{"version":1.0,"bindings":[]}',
+               '{"version":1,"bindings":[]}x', '[]', '']
+        for raw in pos:
+            with self.subTest(pos=raw):
+                self.assertTrue(any(rx.match(raw) for rx in m.EMPTY_BINDINGS_RES))
+                json.loads(raw)
+        for raw in neg:
+            with self.subTest(neg=raw):
+                self.assertFalse(any(rx.match(raw) for rx in m.EMPTY_BINDINGS_RES))
+
+    def test_legacy_ref_regex(self):
+        cases = {"openai-codex/gpt-5.5": ("gpt-5.5", None), " OpenAI-Codex / gpt-5.4-mini ": ("gpt-5.4-mini", None),
+                 "openai-codex/*": ("*", None), "openai-codex/gpt-5.5@openai-codex:default": ("gpt-5.5", "openai-codex:default")}
+        for s, (x, prof) in cases.items():
+            mm = m.LEGACY_REF_RE.match(s)
+            self.assertTrue(mm, s)
+            self.assertEqual((mm.group(1), mm.group(2)), (x, prof))
+        for s in ("openai/gpt-5.5", "vllm/qwen3.5-122b", "codex/gpt-5", "openai-codex", "openai-codex/gpt 5.5",
+                  "xopenai-codex/gpt-5.5", "openai-codex/gpt-5.5\nfoo"):
+            self.assertIsNone(m.LEGACY_REF_RE.match(s), s)
+
+
+class TestPathsAndRedaction(unittest.TestCase):
+    def test_fmt_parse_roundtrip(self):
+        for parts in (["agents", "defaults", "models", "openai-codex/gpt-5.5", "agentRuntime"],
+                      ["agents", "list", 1, "models", "openai-codex/*"],
+                      ["plugins", "entries", "memory-core", "config"],
+                      ["agent:main:telegram:group:-100.5", "agentRuntimeOverride"],
+                      ["a", "", 'we"ird', "x y", 0]):
+            self.assertEqual(m.parse_path(m.fmt_path(parts)), parts)
+        self.assertEqual(m.fmt_path(["agents", "defaults", "models", "openai-codex/gpt-5.5"]),
+                         'agents.defaults.models["openai-codex/gpt-5.5"]')
+        self.assertEqual(m.fmt_path(["plugins", "entries", "memory-core", "config", "dreaming", "enabled"]),
+                         "plugins.entries.memory-core.config.dreaming.enabled")
+
+    def test_redact_value(self):
+        self.assertEqual(m.redact_value("gateway.auth.token", "abc"), "***")
+        self.assertEqual(m.redact_value("channels.telegram.botToken", "1:x"), "***")
+        self.assertEqual(m.redact_value("models.providers.vllm.apiKey", "sk"), "***")
+        self.assertEqual(m.redact_value("auth.profiles", {"openai:default": {"type": "oauth"}}), "***")
+        self.assertEqual(m.redact_value('auth.profiles["openai:default"].email', "a@b"), "***")
+        self.assertEqual(m.redact_value("x.client_secret", "s"), "***")
+        self.assertEqual(m.redact_value("x.password", "s"), "***")
+        self.assertEqual(m.redact_value("agents.defaults.model.primary", "openai/gpt-5.5"), "openai/gpt-5.5")
+        self.assertIsNone(m.redact_value("gateway.auth.token", None))
+        nested = m.redact_value("channels.telegram", {"enabled": True, "botToken": "1:x", "accounts": {"a": {"botToken": "2"}}})
+        self.assertEqual(nested, {"enabled": True, "botToken": "***", "accounts": {"a": {"botToken": "***"}}})
+        whole = m.redact_value("", {"auth": {"profiles": {"p": {"access": "t"}}, "order": {"openai": ["p"]}}})
+        self.assertEqual(whole, {"auth": {"profiles": "***", "order": {"openai": ["p"]}}})
+        self.assertEqual(m.redact_value(["gateway", "auth", "token"], "abc"), "***")
+
+    def test_flatten_paths(self):
+        cfg = {"a": {"b": 1, "c": {}}, "l": [{"x": 1}, 2], "e": []}
+        self.assertEqual(m.flatten_paths(cfg), {"a.b", "a.c", "l[0].x", "l[1]", "e"})
+        before = fix("e4_before.json")
+        after = fix("e4_after_pass2.json")
+        removed = m.flatten_paths(before) - m.flatten_paths(after)
+        self.assertIn("meta.lastTouchedAt", removed)
+        self.assertIn("gateway.controlUi.dangerouslyDisableDeviceAuth", removed)
+
+
+# --- refs scan, preflight, EXPLICIT ------------------------------------------------------------------
+
+
+class TestScanAndPreflight(unittest.TestCase):
+    def test_scan_domains(self):
+        cfg = spec_example()
+        cfg["agents"]["entries"] = {"ops": {"models": {"openai-codex/gpt-5.4@openai-codex:work": {}},
+                                            "heartbeat": {"model": "openai-codex/gpt-5.4-pro@openai-codex:work"}}}
+        cfg["models"] = {"providers": {"openai-codex": {"models": [{"id": "openai-codex/gpt-5.5"}]},
+                                       "vllm": vllm_block()}}
+        cfg["auth"]["profiles"] = {"openai-codex:default": {"provider": "openai-codex", "note": "openai-codex/gpt-5.5"}}
+        cfg["misc"] = {"openai-codex/gpt-5.5": "not-a-models-map"}
+        refs = {(r["path"], r["where"]) for r in m.scan_legacy_refs(cfg)}
+        self.assertIn(("agents.defaults.model.primary", "value"), refs)
+        self.assertIn(("agents.defaults.model.fallbacks[0]", "value"), refs)
+        self.assertIn(("agents.defaults.heartbeat.model", "value"), refs)
+        self.assertIn(("hooks.mappings[0].model", "value"), refs)
+        self.assertIn(('agents.defaults.models["openai-codex/*"]', "key"), refs)
+        self.assertIn(('agents.list[1].models["openai-codex/*"]', "key"), refs)
+        self.assertIn(('agents.entries.ops.models["openai-codex/gpt-5.4@openai-codex:work"]', "key"), refs)
+        self.assertIn(("agents.entries.ops.heartbeat.model", "value"), refs)
+        self.assertFalse(any(p.startswith("auth") for p, _ in refs), "auth must not be scanned")
+        self.assertFalse(any(p.startswith("models.providers") for p, _ in refs), "provider model ids excluded")
+        self.assertFalse(any(p.startswith("misc") for p, _ in refs), "keys only inside models maps")
+        prof = [r for r in m.scan_legacy_refs(cfg) if r["path"] == "agents.entries.ops.heartbeat.model"][0]
+        self.assertEqual((prof["id"], prof["profile"], prof["agent_id"]), ("gpt-5.4-pro", "openai-codex:work", "ops"))
+        helper = [r for r in m.scan_legacy_refs(cfg) if r["path"].startswith("agents.list[1]")][0]
+        self.assertEqual(helper["agent_id"], "helper")
+
+    def test_vllm_refs_not_legacy(self):
+        self.assertEqual(m.scan_legacy_refs({"agents": {"defaults": {"model": "vllm/qwen3.5-122b",
+                                                                     "models": {"vllm/*": {}}}}}), [])
+        self.assertEqual(m.models_preflight(live_like()), [])
+
+    def codes(self, cfg):
+        return {f["code"]: f["cls"] for f in m.models_preflight(cfg)}
+
+    def test_preflight_clean_examples(self):
+        self.assertEqual(self.codes(spec_example()), {})
+        self.assertEqual(self.codes(fix("e4_before.json")), {})
+
+    def test_preflight_codex_provider(self):
+        cfg = spec_example()
+        cfg["agents"]["defaults"]["imageModel"] = "codex/gpt-5"
+        self.assertEqual(self.codes(cfg)["models-codex-provider"], "hard")
+        cfg = spec_example()
+        cfg["agents"]["defaults"]["models"]["Codex-CLI / gpt-5"] = {}
+        self.assertIn("models-codex-provider", self.codes(cfg))
+        cfg = spec_example()
+        cfg["models"] = {"providers": {"Codex": {"models": []}}}
+        self.assertIn("models-codex-provider", self.codes(cfg))
+
+    def test_preflight_codex_runtime_legacy_entries_only(self):
+        """F3: a Codex pin on a legacy openai-codex/codex entry is hard; on a canonical openai/ entry,
+        models.providers.openai or any other holder it is the documented 7.35 choice: kept (info)."""
+        def pinned(where, rid):
+            cfg = spec_example()
+            cfg["agents"]["defaults"]["models"]["openai/o3"] = {}
+            cfg["agents"]["list"][0]["models"] = {"openai-codex/gpt-5.4": {}}
+            cfg["models"] = {"providers": {"openai": {"models": [{"id": "o3"}]},
+                                           "openai-codex": {"models": [{"id": "gpt-5.5"}]}}}
+            node = cfg
+            for p in where:
+                node = node[p]
+            node["agentRuntime"] = {"id": rid}
+            return self.codes(cfg)
+        for rid in ("codex", " Codex-App-Server ", "codex-cli"):
+            for where in (["agents", "defaults", "models", "openai-codex/gpt-5.5"],
+                          ["agents", "defaults", "models", "openai-codex/*"],
+                          ["agents", "list", 0, "models", "openai-codex/gpt-5.4"],
+                          ["models", "providers", "openai-codex"], ["models", "providers", "openai-codex", "models", 0]):
+                with self.subTest(where=where, rid=rid):
+                    self.assertEqual(pinned(where, rid).get("models-codex-runtime"), "hard")
+            for where in (["agents", "defaults", "models", "openai/o3"],
+                          ["agents", "defaults", "models", "anthropic/claude-sonnet-4-6"], ["agents", "defaults"],
+                          ["agents", "list", 0], ["models", "providers", "openai"],
+                          ["models", "providers", "openai", "models", 0]):
+                with self.subTest(where=where, rid=rid):
+                    codes = pinned(where, rid)
+                    self.assertNotIn("models-codex-runtime", codes)
+                    self.assertEqual(codes.get("codex-runtime-kept"), "info")
+        cfg = spec_example()
+        cfg["agents"]["defaults"]["models"]["Codex/gpt-5"] = {"agentRuntime": {"id": "codex"}}
+        self.assertEqual(self.codes(cfg).get("models-codex-runtime"), "hard")
+
+    def test_preflight_documented_735_codex_pins_are_kept(self):
+        """Reviewer repro userpin.py: v735 docs/providers/openai.md forces the Codex app-server this way."""
+        for cfg in ({"agents": {"defaults": {"model": {"primary": "vllm/q", "fallbacks": ["openai/gpt-5.5"]},
+                                             "models": {"openai/gpt-5.5": {"agentRuntime": {"id": "codex"}}}}}},
+                    {"models": {"providers": {"openai": {"agentRuntime": {"id": "codex"}, "models": []}}},
+                     "agents": {"defaults": {"model": {"primary": "openai/gpt-5.6-sol"}}}}):
+            codes = self.codes(cfg)
+            self.assertEqual(codes, {"codex-runtime-kept": "info", "canonical-openai-refs": "info"})
+            msg = [f["message"] for f in m.models_preflight(cfg) if f["code"] == "codex-runtime-kept"][0]
+            self.assertIn("agentRuntime.id=codex", msg)
+
+    def test_preflight_provider_merge(self):
+        cfg = spec_example()
+        cfg["models"] = {"providers": {"openai-codex": {"models": [{"id": "gpt-5.5"}, {"id": "gpt-5.4-mini"}]},
+                                       "openai": {"apiKey": "sk-x", "models": [{"id": "gpt-5.5"}]}}}
+        self.assertEqual(self.codes(cfg).get("models-provider-merge"), "hard")
+        cfg["models"]["providers"]["openai"]["models"].append({"id": "gpt-5.4-mini"})
+        self.assertNotIn("models-provider-merge", self.codes(cfg))
+        del cfg["models"]["providers"]["openai"]
+        self.assertNotIn("models-provider-merge", self.codes(cfg))
+
+    def test_preflight_wildcard_pinned(self):
+        for rid, held in (("", False), ("auto", False), ("default", False), ("openclaw", False), ("pi", False),
+                          ("claude-cli", True), ("codex", True)):
+            cfg = spec_example()
+            cfg["agents"]["defaults"]["models"]["openai-codex/*"] = {"agentRuntime": {"id": rid}}
+            with self.subTest(rid=rid):
+                self.assertEqual("models-wildcard-pinned" in self.codes(cfg), held)
+
+    def test_preflight_platform_only_and_canonical(self):
+        cfg = spec_example()
+        cfg["agents"]["defaults"]["model"]["fallbacks"].append("openai-codex/GPT-5.6")
+        cfg["agents"]["defaults"]["imageModel"] = "openai-codex/chat-latest"
+        self.assertEqual(self.codes(cfg).get("models-platform-only"), "acceptable")
+        cfg = spec_example()
+        cfg["tools"] = {"media": {"model": "openai/whisper-1"}}
+        # contract addendum 2 (D12 replaced): logged only, never a HOLD, never re-pinned
+        self.assertEqual(self.codes(cfg).get("canonical-openai-refs"), "info")
+        msg = [f["message"] for f in m.models_preflight(cfg) if f["code"] == "canonical-openai-refs"][0]
+        self.assertTrue(msg.startswith("1 canonical openai/* refs keep their runtime (Codex app-server by default, "
+                                       "as on 7.35)"), msg)
+        cfg = spec_example()
+        cfg["agents"]["defaults"]["models"]["OpenAI/o3"] = {}
+        self.assertIn("canonical-openai-refs", self.codes(cfg))
+        # F2: an id that is also a legacy ref is a route collision, not "keeps its runtime"
+        cfg["agents"]["defaults"]["models"]["OpenAI/gpt-5.5"] = {}
+        self.assertEqual(self.codes(cfg).get("models-route-collision"), "acceptable")
+        msg = [f["message"] for f in m.models_preflight(cfg) if f["code"] == "canonical-openai-refs"][0]
+        self.assertIn("OpenAI/o3", msg)
+        self.assertNotIn("gpt-5.5", msg)
+        cfg = spec_example()
+        cfg["models"] = {"providers": {"openai": {"models": [{"id": "openai/gpt-5.5"}]}}}
+        self.assertNotIn("canonical-openai-refs", self.codes(cfg), "provider model ids are not scanned")
+
+    def test_findings_shape(self):
+        cfg = spec_example()
+        cfg["agents"]["defaults"]["imageModel"] = "codex/gpt-5"
+        for f in m.models_preflight(cfg):
+            self.assertEqual(set(f), {"code", "cls", "message", "phase"})
+            self.assertEqual(f["phase"], "precheck")
+
+    def test_explicit_ids(self):
+        cfg = spec_example()
+        cfg["models"] = {"providers": {"openai-codex": {"models": [{"id": "gpt-5.2"}, {"id": "bad id"}]}}}
+        cfg["agents"]["defaults"]["imageModel"] = "openai-codex/gpt-5.4-nano@openai-codex:x"
+        ids = m.explicit_ids(cfg)
+        self.assertEqual(ids, sorted(set(ids)))
+        for x in m.EXPLICIT_DEFAULT_IDS + ["gpt-5.2", "gpt-5.4-nano"]:
+            self.assertIn(x, ids)
+        self.assertNotIn("*", ids)
+        self.assertNotIn("bad id", ids)
+        self.assertEqual(m.explicit_ids({}), sorted(m.EXPLICIT_DEFAULT_IDS))
+
+    def test_remap(self):
+        self.assertEqual(m.remap_model_id("gpt-5.2-codex"), "gpt-5.5")
+        self.assertEqual(m.remap_model_id("GPT-5.2"), "gpt-5.5")
+        self.assertEqual(m.remap_model_id("gpt-5.1-codex"), "gpt-5.5")
+        self.assertEqual(m.remap_model_id("gpt-5-codex"), "gpt-5.5")
+        self.assertEqual(m.remap_model_id("gpt-4.1-nano"), "gpt-5.4-mini")
+        self.assertEqual(m.remap_model_id("gpt-5-nano"), "gpt-5.4-mini")
+        self.assertEqual(m.remap_model_id("gpt-5-mini"), "gpt-5.4-mini")      # generic retired-OpenAI table
+        self.assertEqual(m.remap_model_id("gpt-5-pro"), "gpt-5.5-pro")
+        self.assertEqual(m.remap_model_id("gpt-5.5"), "gpt-5.5")
+        self.assertEqual(m.remap_model_id("My-Model"), "My-Model")
+
+
+# --- R1-R3 ------------------------------------------------------------------------------------------
+
+
+class TestPremigrateConfig(unittest.TestCase):
+    def test_golden_e4(self):
+        before = fix("e4_before.json")
+        expected = fix("e4_pretransform.json")
+        snapshot = copy.deepcopy(before)
+        new, ledger, summary = m.premigrate_config(before)
+        self.assertEqual(before, snapshot, "input mutated")
+        self.assertEqual(new["agents"]["defaults"]["models"], expected["agents"]["defaults"]["models"])
+        self.assertEqual(new, expected, "only agents.defaults.models may change")
+        self.assertNotIn("modelPolicy", new["agents"]["defaults"])
+        self.assertFalse(summary["model_policy_written"])
+        self.assertEqual(summary["scopes"], ["defaults"])
+        self.assertEqual(summary["pinned"], 10)
+        self.assertEqual(set(summary["explicit"]), set(m.EXPLICIT_DEFAULT_IDS))
+        self.assertEqual({s["path"] for s in summary["legacy_slots"]},
+                         {"agents.defaults.model.primary", 'agents.defaults.models["openai-codex/gpt-5.5"]'})
+        self.assertEqual(new["meta"], before["meta"])
+        steps = [e["step"] for e in ledger]
+        self.assertEqual(steps.count("R1"), 1 + 9)   # wildcard removed + 9 new keys
+        for e in ledger:
+            self.assertEqual(set(e) - {"note"}, {"step", "file", "path", "before", "after"})
+        json.dumps(ledger)
+        json.dumps(summary)
+
+    def test_golden_scratch_originals(self):
+        for name, path in SCRATCH_GOLDEN.items():
+            if not os.path.exists(path):
+                self.skipTest("scratchpad golden missing: %s" % path)
+            with open(path, encoding="utf-8") as f:
+                original = json.load(f)
+            if name != "pins_final_99.json":
+                original = sanitize(original)
+            self.assertEqual(original, fix(name), name)
+
+    def test_spec_example(self):
+        cfg = spec_example()
+        new, ledger, summary = m.premigrate_config(cfg)
+        dm = new["agents"]["defaults"]["models"]
+        self.assertNotIn("openai-codex/*", dm)
+        self.assertEqual(dm["openai-codex/gpt-5.5"], {"alias": "main", "agentRuntime": {"id": "openclaw"}})
+        self.assertEqual(dm["openai-codex/gpt-5.4-mini"], {"agentRuntime": {"id": "openclaw"}})
+        for x in m.EXPLICIT_DEFAULT_IDS:
+            self.assertEqual(dm["openai-codex/" + x]["agentRuntime"], {"id": "openclaw"})
+        self.assertEqual(dm["anthropic/claude-sonnet-4-6"], {"alias": "sonnet"}, "non-legacy entries untouched")
+        # refs stay legacy (R4)
+        self.assertEqual(new["agents"]["defaults"]["model"]["primary"], "openai-codex/gpt-5.5")
+        self.assertEqual(new["hooks"], cfg["hooks"])
+        self.assertEqual(new["auth"], cfg["auth"])
+        # per-agent wildcard (agents.list[1]): expanded with params, without alias/agentRuntime, then pinned
+        hm = new["agents"]["list"][1]["models"]
+        self.assertNotIn("openai-codex/*", hm)
+        for x in m.EXPLICIT_DEFAULT_IDS:
+            self.assertEqual(hm["openai-codex/" + x], {"params": {"temperature": 0.2}, "agentRuntime": {"id": "openclaw"}})
+        self.assertEqual(sorted(summary["scopes"]), sorted(["defaults", "agents.list[1]"]))
+        # never: canonical keys, provider runtime, agent-level runtime
+        self.assertFalse(any(k.startswith("openai/") for k in dm))
+        self.assertNotIn("agentRuntime", new["agents"]["defaults"])
+        self.assertNotIn("agentRuntime", new["agents"]["list"][1])
+        self.assertNotIn("models", new)
+        self.assertFalse(summary["model_policy_written"])
+
+    def test_per_agent_entries_wildcard(self):
+        cfg = {"agents": {"defaults": {"model": "vllm/qwen3.5-122b"},
+                          "entries": {"ops": {"models": {"OpenAI-Codex / * ": {"streaming": True},
+                                                         "openai-codex/gpt-5.5": {"alias": "g"}}}}}}
+        new, ledger, summary = m.premigrate_config(cfg)
+        om = new["agents"]["entries"]["ops"]["models"]
+        self.assertNotIn("OpenAI-Codex / * ", om)
+        self.assertEqual(om["openai-codex/gpt-5.5"], {"alias": "g", "agentRuntime": {"id": "openclaw"}})
+        self.assertEqual(om["openai-codex/gpt-6-astra"], {"streaming": True, "agentRuntime": {"id": "openclaw"}})
+        self.assertEqual(summary["scopes"], ["agents.entries.ops"])
+        # defaults map created for the explicit ref (i) -> R3 writes modelPolicy {}
+        self.assertEqual(new["agents"]["defaults"]["models"], {"openai-codex/gpt-5.5": {"agentRuntime": {"id": "openclaw"}}})
+        self.assertEqual(new["agents"]["defaults"]["modelPolicy"], {})
+        self.assertTrue(summary["model_policy_written"])
+
+    def test_r1_existing_key_variants_not_duplicated(self):
+        cfg = {"agents": {"defaults": {"models": {"openai-codex/*": {}, "OPENAI-CODEX / gpt-5.4": {"alias": "four"}}}}}
+        new, _ledger, _summary = m.premigrate_config(cfg)
+        dm = new["agents"]["defaults"]["models"]
+        self.assertNotIn("openai-codex/gpt-5.4", dm)
+        self.assertEqual(dm["OPENAI-CODEX / gpt-5.4"], {"alias": "four", "agentRuntime": {"id": "openclaw"}})
+
+    def test_r2_runtime_values(self):
+        cases = {None: {"id": "openclaw"}, "": {"id": "openclaw", "x": 1}, "auto": {"id": "openclaw", "x": 1},
+                 "default": {"id": "openclaw", "x": 1}, "openclaw": {"id": "openclaw", "x": 1}, "pi": {"id": "pi", "x": 1}}
+        for prior, want in cases.items():
+            entry = {} if prior is None else {"agentRuntime": {"id": prior, "x": 1}}
+            cfg = {"agents": {"defaults": {"model": "openai-codex/gpt-5.5", "models": {"openai-codex/gpt-5.5": entry}}}}
+            new, _l, _s = m.premigrate_config(cfg)
+            with self.subTest(prior=prior):
+                self.assertEqual(new["agents"]["defaults"]["models"]["openai-codex/gpt-5.5"]["agentRuntime"], want)
+
+    def test_r2_profile_refs_pin_bare_key(self):
+        cfg = {"agents": {"defaults": {"model": {"primary": "openai-codex/gpt-5.5@openai-codex:work"},
+                                       "models": {"vllm/qwen": {}}}}}
+        new, _l, summary = m.premigrate_config(cfg)
+        self.assertEqual(new["agents"]["defaults"]["models"]["openai-codex/gpt-5.5"], {"agentRuntime": {"id": "openclaw"}})
+        self.assertEqual(new["agents"]["defaults"]["model"]["primary"], "openai-codex/gpt-5.5@openai-codex:work")
+        self.assertNotIn("modelPolicy", new["agents"]["defaults"])
+        self.assertEqual(summary["legacy_slots"][0]["profile"], "openai-codex:work")
+
+    def test_r3_variants(self):
+        for models, written in ((None, True), ({}, True), ({"anthropic/x": {}}, False)):
+            d = {"model": {"primary": "openai-codex/gpt-5.5"}}
+            if models is not None:
+                d["models"] = models
+            new, ledger, summary = m.premigrate_config({"agents": {"defaults": d}})
+            with self.subTest(models=models):
+                self.assertEqual(summary["model_policy_written"], written)
+                self.assertEqual("modelPolicy" in new["agents"]["defaults"], written)
+                self.assertEqual(any(e["step"] == "R3" for e in ledger), written)
+        new, _l, summary = m.premigrate_config({"agents": {"defaults": {"model": "openai-codex/gpt-5.5",
+                                                                         "modelPolicy": {"allow": ["x"]}}}})
+        self.assertEqual(new["agents"]["defaults"]["modelPolicy"], {"allow": ["x"]})
+        self.assertFalse(summary["model_policy_written"])
+
+    def test_no_legacy_refs_is_noop(self):
+        for cfg in (live_like_without_codex(), {"agents": {"defaults": {}}}, {}):
+            new, ledger, summary = m.premigrate_config(cfg)
+            self.assertEqual(new, cfg)
+            self.assertEqual(ledger, [])
+            self.assertEqual(summary, {"explicit": [], "pinned": 0, "scopes": [], "model_policy_written": False,
+                                       "legacy_slots": []})
+
+    def test_live_like_vllm_untouched(self):
+        cfg = live_like()
+        new, ledger, summary = m.premigrate_config(cfg)
+        self.assertEqual(new["models"], cfg["models"])
+        self.assertEqual(new["agents"]["defaults"]["model"], cfg["agents"]["defaults"]["model"])
+        dm = new["agents"]["defaults"]["models"]
+        self.assertEqual(dm["vllm/qwen3.5-122b"], {"alias": "qwen"})
+        self.assertEqual(dm["vllm/*"], {})
+        self.assertEqual(dm["openai-codex/gpt-5.5"], {"agentRuntime": {"id": "openclaw"}})
+        self.assertEqual(summary["pinned"], 1)
+        self.assertEqual(summary["scopes"], [])
+        self.assertFalse(summary["model_policy_written"])
+        self.assertFalse(any("vllm" in e["path"] for e in ledger))
+
+    def test_non_object_models_map_raises(self):
+        with self.assertRaises(ValueError):
+            m.premigrate_config({"agents": {"defaults": {"model": "openai-codex/gpt-5.5", "models": []}}})
+        with self.assertRaises(ValueError):
+            m.premigrate_config([])
+
+    def test_deterministic_rerun(self):
+        cfg = spec_example()
+        a = m.premigrate_config(cfg)
+        b = m.premigrate_config(cfg)
+        self.assertEqual(a, b)
+
+
+def live_like_without_codex():
+    cfg = live_like()
+    cfg["agents"]["defaults"]["model"]["fallbacks"] = ["vllm/qwen3.5-122b"]
+    del cfg["agents"]["defaults"]["models"]["openai-codex/gpt-5.5"]
+    return cfg
+
+
+# --- R5 sessions -----------------------------------------------------------------------------------
+
+
+class TestSessions(unittest.TestCase):
+    def store(self):
+        return {
+            "agent:main:main": {"sessionId": "a", "updatedAt": 1, "modelProvider": "openai-codex", "model": "gpt-5.5"},
+            "agent:main:telegram:direct:1": {"sessionId": "b", "providerOverride": "openai-codex",
+                                             "modelOverride": "gpt-5.4-mini"},
+            "agent:main:x": {"sessionId": "c", "agentRuntimeOverride": "openclaw"},
+            "agent:main:auto": {"modelProvider": " OpenAI-Codex ", "agentRuntimeOverride": "auto"},
+            "agent:main:empty": {"model": "openai-codex/gpt-5.5", "agentRuntimeOverride": ""},
+            "agent:main:none": {"modelOverride": "codex/gpt-5", "agentRuntimeOverride": None},
+            "agent:main:pi": {"modelProvider": "codex", "agentRuntimeOverride": "pi"},
+            "agent:main:user": {"modelProvider": "openai-codex", "agentRuntimeOverride": "codex"},
+            "agent:main:harness": {"modelProvider": "openai-codex", "agentHarnessId": "codex-supervisor"},
+            "agent:main:vllm": {"modelProvider": "vllm", "model": "qwen3.5-122b"},
+            "agent:main:noneprov": {"modelProvider": None, "model": None},
+            "weird": "not-a-dict",
+        }
+
+    def test_r5(self):
+        store = self.store()
+        snap = copy.deepcopy(store)
+        new, ledger, summary = m.premigrate_sessions(store, "agents/main/sessions/sessions.json")
+        self.assertEqual(store, snap)
+        for k in ("agent:main:main", "agent:main:telegram:direct:1", "agent:main:auto", "agent:main:empty",
+                  "agent:main:none"):
+            self.assertEqual(new[k]["agentRuntimeOverride"], "openclaw", k)
+            self.assertIn(k, summary["pinned"])
+        self.assertIn("agent:main:pi", summary["pinned"])
+        self.assertEqual(new["agent:main:pi"]["agentRuntimeOverride"], "pi")
+        self.assertEqual(summary["user_explicit"], ["agent:main:user"])
+        self.assertEqual(new["agent:main:user"]["agentRuntimeOverride"], "codex")
+        self.assertEqual(summary["harness"], ["agent:main:harness"])
+        self.assertNotIn("agentRuntimeOverride", new["agent:main:harness"])
+        for k in ("agent:main:x", "agent:main:vllm", "agent:main:noneprov", "weird"):
+            self.assertEqual(new[k], snap[k])
+        notes = {e["path"]: e.get("note") for e in ledger}
+        self.assertEqual(notes["agent:main:user.agentRuntimeOverride"], "user-explicit")
+        self.assertEqual(notes["agent:main:harness.agentRuntimeOverride"], "harness")
+        changed = [e for e in ledger if "note" not in e]
+        self.assertEqual(len(changed), 5)
+        for e in ledger:
+            self.assertEqual(e["step"], "R5")
+            self.assertEqual(e["file"], "agents/main/sessions/sessions.json")
+        with self.assertRaises(ValueError):
+            m.premigrate_sessions([], "x")
+
+    def test_scan_sessions_files(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            os.makedirs(os.path.join(tmp, "agents", "main", "sessions"))
+            os.makedirs(os.path.join(tmp, "agents", "bad", "sessions"))
+            os.makedirs(os.path.join(tmp, "agents", "list", "sessions"))
+            os.makedirs(os.path.join(tmp, "agents", "link", "sessions"))
+            os.makedirs(os.path.join(tmp, "agents", "nosess"))
+            os.makedirs(os.path.join(tmp, "sessions"))
+            with open(os.path.join(tmp, "agents/main/sessions/sessions.json"), "w") as f:
+                json.dump(self.store(), f)
+            with open(os.path.join(tmp, "sessions/sessions.json"), "w") as f:
+                f.write("{}")
+            with open(os.path.join(tmp, "agents/bad/sessions/sessions.json"), "w") as f:
+                f.write("{not json")
+            with open(os.path.join(tmp, "agents/list/sessions/sessions.json"), "w") as f:
+                f.write("[]")
+            os.symlink(os.path.join(tmp, "sessions/sessions.json"), os.path.join(tmp, "agents/link/sessions/sessions.json"))
+            stores, findings = m.scan_sessions_files(tmp)
+            self.assertEqual([r for r, _ in stores], ["sessions/sessions.json", "agents/main/sessions/sessions.json"])
+            self.assertEqual(stores[1][1]["agent:main:main"]["model"], "gpt-5.5")
+            self.assertEqual(len(findings), 1)
+            self.assertEqual((findings[0]["code"], findings[0]["cls"]), ("sessions-unreadable", "hard"))
+            for bad in ("agents/bad", "agents/list", "agents/link"):
+                self.assertIn(bad, findings[0]["message"])
+            stores, findings = m.scan_sessions_files(os.path.join(tmp, "missing"))
+            self.assertEqual((stores, findings), ([], []))
+
+
+# --- F1-F3 -------------------------------------------------------------------------------------------
+
+
+def doctor_pass1_like():
+    """What doctor pass 1 writes on spec_example() after R1/R2 (refs canonical, list -> entries, plus the
+    doctor-side effects F1-F3 must repair)."""
+    return {
+        "meta": {"lastTouchedVersion": "2026.9.9", "migrations": {"modelPolicyAllowlist": True}},
+        "agents": {
+            "defaults": {
+                "model": {"primary": "openai/gpt-5.5", "fallbacks": ["openai/gpt-5.4-mini"]},
+                "heartbeat": {"model": "openai/gpt-5.4-mini"},
+                "models": {"openai/gpt-5.5": {"alias": "main", "agentRuntime": {"id": "openclaw"}},
+                           "openai/gpt-5.4-mini": {"agentRuntime": {"id": "codex", "authProfileId": "openai:default"}},
+                           "openai/gpt-6-astra": {"agentRuntime": {"id": "openclaw"}},
+                           "anthropic/claude-sonnet-4-6": {"alias": "sonnet"}},
+                "modelPolicy": {"allow": ["openai/gpt-5.5", "openai/gpt-5.4-mini", "anthropic/claude-sonnet-4-6"]},
+            },
+            "entries": {"main": {"default": True},
+                        "helper": {"models": {"openai/gpt-5.5": {"agentRuntime": {"id": "codex-app-server"}},
+                                              "openai-codex/gpt-5.2-codex": {"params": {"t": 1}}},
+                                   "heartbeat": {"model": "openai-codex/gpt-5.4-mini"}}},
+        },
+        "hooks": {"mappings": [{"model": "openai-codex/gpt-5.4-mini"}]},
+        "channels": {"telegram": {"enabled": True}, "modelByChannel": {"telegram": {"default": "openai-codex/gpt-5-nano"}}},
+        "models": {"providers": {"openai": {"agentRuntime": {"id": "codex"},
+                                            "models": [{"id": "gpt-5.5", "agentRuntime": {"id": "codex"}}]},
+                                 "vllm": vllm_block()}},
+        "plugins": {"entries": {"codex": {"enabled": True}, "openai": {"enabled": True}}},
+    }
+
+
+class TestFixups(unittest.TestCase):
+    def setUp(self):
+        self.pre_gate = spec_example()
+        self.pre_pass1, _l, _s = m.premigrate_config(self.pre_gate)
+        self.now = doctor_pass1_like()
+
+    def run_fixups(self):
+        snap = (copy.deepcopy(self.now), copy.deepcopy(self.pre_gate), copy.deepcopy(self.pre_pass1))
+        out = m.fixups(self.now, self.pre_gate, self.pre_pass1)
+        self.assertEqual((self.now, self.pre_gate, self.pre_pass1), snap, "inputs mutated")
+        return out
+
+    def test_f1_codex_pins_to_openclaw(self):
+        new, ledger, s = self.run_fixups()
+        d = new["agents"]["defaults"]["models"]
+        self.assertEqual(d["openai/gpt-5.4-mini"]["agentRuntime"], {"id": "openclaw", "authProfileId": "openai:default"})
+        self.assertEqual(new["agents"]["entries"]["helper"]["models"]["openai/gpt-5.5"]["agentRuntime"], {"id": "openclaw"})
+        # contract addendum 2 rule 3: only models-map keys of migrated slots; provider blocks never
+        self.assertEqual(new["models"]["providers"]["openai"], self.now["models"]["providers"]["openai"])
+        self.assertEqual(s["codex_pins"], 2)
+        self.assertEqual(new["models"]["providers"]["vllm"], vllm_block())
+        self.assertEqual(m.check_codex_runtime(new, pre_cfg=self.pre_gate), [])
+
+    def test_f1_list_scope(self):
+        now = {"agents": {"list": [{"id": "a", "models": {"openai/x": {"agentRuntime": {"id": "CODEX"}}}}]}}
+        new, _l, s = m.fixups(now, {}, {})
+        self.assertEqual(new, now, "no legacy slot before the gate: nothing to flip")
+        pre = {"agents": {"list": [{"id": "A", "model": "openai-codex/x"}]}}
+        new, _l, s = m.fixups(now, pre, pre)
+        self.assertEqual(new["agents"]["list"][0]["models"]["openai/x"]["agentRuntime"]["id"], "openclaw")
+        self.assertEqual(s["codex_pins"], 1)
+
+    def test_f1_never_touches_canonical_keys_or_refs(self):
+        """Addendum 2 rules 2/3: keys that existed canonically, an agent's own canonical refs (doctor's
+        shield) and the openai/* wildcard keep doctor's runtime; legacy-derived keys are flipped."""
+        pre = {"agents": {"defaults": {"model": {"primary": "openai-codex/gpt-5.5",
+                                                 "fallbacks": ["openai-codex/gpt-5.4-mini"]},
+                                       "models": {"openai/gpt-5.4-mini": {"alias": "mini"}, "openai/*": {}}},
+                          "list": [{"id": "main"}, {"id": "ops", "model": "openai/gpt-5.5"}]},
+               "hooks": {"mappings": [{"model": "openai-codex/gpt-5.6-sol"}]}}
+        codex = {"agentRuntime": {"id": "codex"}}
+        now = {"agents": {"defaults": {"model": {"primary": "openai/gpt-5.5", "fallbacks": ["openai/gpt-5.4-mini"]},
+                                       "models": {"openai/gpt-5.5": dict(codex), "openai/gpt-5.4-mini": dict(codex),
+                                                  "openai/*": dict(codex),
+                                                  "openai/gpt-5.6-sol": {"agentRuntime": {"id": "openclaw"}}}},
+                          "entries": {"main": {"models": {"openai/gpt-5.5": dict(codex),
+                                                          "openai/gpt-5.6-sol": dict(codex),
+                                                          "openai/gpt-5.4": dict(codex)}},
+                                      "ops": {"model": "openai/gpt-5.5",
+                                              "models": {"openai/gpt-5.5": dict(codex)}}}},
+               "hooks": {"mappings": [{"model": "openai/gpt-5.6-sol"}]}}
+        new, ledger, s = m.fixups(now, pre, pre)
+        rt = lambda *p: m._get(new, list(p) + ["agentRuntime", "id"])  # noqa: E731
+        self.assertEqual(rt("agents", "defaults", "models", "openai/gpt-5.5"), "openclaw")          # legacy
+        self.assertEqual(rt("agents", "defaults", "models", "openai/gpt-5.4-mini"), "codex")        # canonical key
+        self.assertEqual(rt("agents", "defaults", "models", "openai/*"), "codex")                   # wildcard
+        self.assertEqual(rt("agents", "entries", "main", "models", "openai/gpt-5.5"), "openclaw")   # inherited legacy
+        self.assertEqual(rt("agents", "entries", "main", "models", "openai/gpt-5.6-sol"), "openclaw")  # hooks slot
+        self.assertEqual(rt("agents", "entries", "main", "models", "openai/gpt-5.4"), "codex")      # never legacy
+        self.assertEqual(rt("agents", "entries", "ops", "models", "openai/gpt-5.5"), "codex")       # ops' own canonical
+        self.assertEqual(s["codex_pins"], 3)
+        # PC2 then reports only the deliberate conflicts: the legacy fallback lands on the canonical
+        # gpt-5.4-mini key, and agent ops' own canonical gpt-5.5 key (shield) for the inherited primary
+        probs = m.check_codex_runtime(new, pre)
+        self.assertTrue(probs and all("gpt-5.4-mini" in p or "agent ops" in p for p in probs), probs)
+        self.assertFalse(any(p.startswith("Codex runtime pin on migrated") for p in probs), probs)
+        before = m.check_codex_runtime(now, pre)
+        self.assertEqual(sum(1 for p in before if p.startswith("Codex runtime pin on migrated")), 3, before)
+        # cron-only legacy ids (doctor: "migrated cron runtime intent")
+        new2, _l, s2 = m.fixups(now, pre, pre, extra_legacy_ids=["gpt-5.4"])
+        self.assertEqual(m._get(new2, ["agents", "entries", "main", "models", "openai/gpt-5.4", "agentRuntime", "id"]),
+                         "openclaw")
+        self.assertEqual(s2["codex_pins"], 4)
+
+    def test_legacy_key_context(self):
+        pre = spec_example()
+        pre["agents"]["list"][0]["model"] = {"primary": "openai/gpt-5.4-pro"}
+        ctx = m.legacy_key_context(pre, {"openai/gpt-5.4-mini": "openai/gpt-5.6-luna"})
+        self.assertTrue(m.is_migrated_legacy_key(ctx, None, "gpt-5.6-luna"), "retirement successor of a legacy id")
+        self.assertTrue(m.is_migrated_legacy_key(ctx, "helper", "gpt-6-astra"), "R1 expansion (EXPLICIT)")
+        self.assertTrue(m.is_migrated_legacy_key(ctx, "main", "gpt-5.5"))
+        self.assertFalse(m.is_migrated_legacy_key(ctx, "main", "gpt-5.4-pro"), "main's own canonical ref")
+        self.assertTrue(m.is_migrated_legacy_key(ctx, "helper", "gpt-5.4-pro"))
+        self.assertFalse(m.is_migrated_legacy_key(ctx, None, "*"))
+        self.assertFalse(m.is_migrated_legacy_key(ctx, None, "gpt-9-unknown"))
+        self.assertFalse(m.is_migrated_legacy_key(m.legacy_key_context({}), None, "gpt-5.5"))
+
+    def test_f1b_codex_plugin(self):
+        new, ledger, s = self.run_fixups()
+        self.assertNotIn("codex", new["plugins"]["entries"])
+        self.assertTrue(s["codex_plugin_restored"])
+        self.assertFalse(s["codex_needed"])
+        self.assertEqual([e for e in ledger if e["step"] == "F1b"][0]["after"], None)
+        # pre value restored exactly
+        self.pre_pass1["plugins"] = {"entries": {"codex": {"enabled": False, "config": {"a": 1}}}}
+        new, _l, s = self.run_fixups()
+        self.assertEqual(new["plugins"]["entries"]["codex"], {"enabled": False, "config": {"a": 1}})
+        # unchanged -> nothing
+        self.now["plugins"]["entries"]["codex"] = {"enabled": False, "config": {"a": 1}}
+        new, ledger, s = self.run_fixups()
+        self.assertFalse(s["codex_plugin_restored"])
+        self.assertFalse(any(e["step"] == "F1b" for e in ledger))
+        # deleted by doctor -> restored
+        del self.now["plugins"]["entries"]["codex"]
+        new, _l, s = self.run_fixups()
+        self.assertEqual(new["plugins"]["entries"]["codex"], {"enabled": False, "config": {"a": 1}})
+
+    def test_f1b_rule4_codex_in_use_before(self):
+        """Addendum 2 rule 4: doctor's codex plugin value stays when Codex was in use before the gate
+        (canonical openai/ refs or keys, or an installed codex plugin package)."""
+        new, ledger, s = m.fixups(self.now, self.pre_gate, self.pre_pass1, codex_pkg_before=True)
+        self.assertEqual(new["plugins"]["entries"]["codex"], {"enabled": True})
+        self.assertEqual((s["codex_plugin_restored"], s["codex_needed"]), (False, True))
+        self.assertFalse(any(e["step"] == "F1b" for e in ledger))
+        # F15: only text-model uses count; image/TTS/PDF/media/memory-search models never ran on Codex
+        not_text = ({"agents": {"defaults": {"imageModel": "openai/gpt-image-1"}}},
+                    {"agents": {"defaults": {"imageGenerationModel": {"primary": "openai/gpt-image-1"}}}},
+                    {"agents": {"defaults": {"pdfModel": "openai/gpt-5.5"}}},
+                    {"agents": {"defaults": {"memorySearch": {"model": "openai/text-embedding-3-small"}}}},
+                    {"messages": {"tts": {"openai": {"model": "openai/gpt-4o-mini-tts"}}}},
+                    {"tools": {"media": {"audio": {"models": [{"model": "openai/whisper-1"}]}}}})
+        text = ({"agents": {"defaults": {"model": {"primary": "vllm/q", "fallbacks": ["openai/gpt-5.5"]}}}},
+                {"agents": {"defaults": {"heartbeat": {"model": "openai/o3"}}}},
+                {"agents": {"defaults": {"subagents": {"model": {"primary": "openai/o3"}}}}},
+                {"agents": {"defaults": {"compaction": {"model": "openai/o3"}}}},
+                {"agents": {"defaults": {"utilityModel": "openai/o3"}}},
+                {"agents": {"list": [{"id": "a", "model": "openai/o3"}]}},
+                {"agents": {"entries": {"a": {"heartbeat": {"model": "openai/o3"}}}}},
+                {"agents": {"defaults": {"models": {"openai/o3": {}}}}},
+                {"hooks": {"mappings": [{"model": "openai/o3"}]}})
+        for extra, needed in [(x, False) for x in not_text] + [(x, True) for x in text]:
+            with self.subTest(extra=extra):
+                self.assertEqual(bool(m.canonical_text_model_refs(extra)), needed)
+                pre = copy.deepcopy(self.pre_gate)
+                for k, v in copy.deepcopy(extra).items():
+                    if k != "agents":
+                        pre[k] = v
+                        continue
+                    for ak, av in v.items():
+                        if ak == "defaults":
+                            pre["agents"]["defaults"].update(av)
+                        else:
+                            pre["agents"][ak] = av
+                new, _l, s = m.fixups(self.now, pre, self.pre_pass1)
+                self.assertEqual(s["codex_needed"], needed)
+                self.assertEqual("codex" in new["plugins"]["entries"], needed)
+        # the same rule after pass 2/3 and in bump/maintenance mode
+        now = {"plugins": {"entries": {"codex": {"enabled": True}}}}
+        self.assertEqual(m.post_doctor_fixups(now, {})[2]["codex_plugin_restored"], True)
+        self.assertEqual(m.post_doctor_fixups(now, {}, codex_pkg_before=True)[1], [])
+        self.assertEqual(m.post_doctor_fixups(now, {"agents": {"defaults": {"models": {"openai/*": {}}}}})[1], [])
+
+    def test_f2_rewrites_and_pins(self):
+        new, ledger, s = self.run_fixups()
+        self.assertEqual(new["agents"]["entries"]["helper"]["heartbeat"]["model"], "openai/gpt-5.4-mini")
+        self.assertEqual(new["hooks"]["mappings"][0]["model"], "openai/gpt-5.4-mini")
+        self.assertEqual(new["channels"]["modelByChannel"]["telegram"]["default"], "openai/gpt-5.4-mini")  # gpt-5-nano
+        hm = new["agents"]["entries"]["helper"]["models"]
+        self.assertNotIn("openai-codex/gpt-5.2-codex", hm)
+        # renamed key merged into the existing canonical entry without overwriting its fields
+        self.assertEqual(hm["openai/gpt-5.5"], {"agentRuntime": {"id": "openclaw"}, "params": {"t": 1}})
+        self.assertEqual(s["refs_rewritten"], 4)
+        d = new["agents"]["defaults"]["models"]
+        self.assertEqual(d["openai/gpt-5.5"]["agentRuntime"]["id"], "openclaw")
+        self.assertEqual(d["openai/gpt-5.4-mini"]["agentRuntime"]["id"], "openclaw")
+        self.assertEqual(s["policy_failures"], [])
+        self.assertEqual(m.check_legacy_refs(new), [])
+
+    def test_f2_profile_and_wildcard_left(self):
+        self.now["agents"]["defaults"]["imageModel"] = "openai-codex/gpt-5.4@openai-codex:work"
+        self.now["agents"]["defaults"]["modelPolicy"]["allow"].append("openai-codex/*")
+        new, _l, _s = self.run_fixups()
+        self.assertEqual(new["agents"]["defaults"]["imageModel"], "openai-codex/gpt-5.4@openai-codex:work")
+        self.assertIn("openai-codex/*", new["agents"]["defaults"]["modelPolicy"]["allow"])
+        problems = m.check_legacy_refs(new)
+        self.assertTrue(any("imageModel" in p for p in problems))
+        self.assertTrue(any("modelPolicy.allow" in p for p in problems))
+
+    def test_f2_key_rename_without_canonical(self):
+        now = {"meta": {"migrations": {"modelPolicyAllowlist": True}},
+               "agents": {"defaults": {"models": {"a/b": {}, "openai-codex/gpt-5.4": {"alias": "four"}, "z/z": {}}}}}
+        new, ledger, s = m.fixups(now, {}, {})
+        self.assertEqual(list(new["agents"]["defaults"]["models"]), ["a/b", "openai/gpt-5.4", "z/z"])
+        self.assertEqual(new["agents"]["defaults"]["models"]["openai/gpt-5.4"],
+                         {"alias": "four", "agentRuntime": {"id": "openclaw"}})
+
+    def test_f2_merge_canonical_later_in_map(self):
+        now = {"meta": {"migrations": {"modelPolicyAllowlist": True}},
+               "agents": {"defaults": {"models": {"openai-codex/gpt-5.5": {"alias": "old", "params": {"p": 1}},
+                                                  "openai/gpt-5.5": {"alias": "new"}}}}}
+        new, _l, _s = m.fixups(now, {}, {})
+        self.assertEqual(new["agents"]["defaults"]["models"],
+                         {"openai/gpt-5.5": {"alias": "new", "params": {"p": 1}, "agentRuntime": {"id": "openclaw"}}})
+
+    def test_f2_pin_policy_failure(self):
+        now = {"agents": {"defaults": {"heartbeat": {"model": "openai-codex/gpt-5.4-mini"}}}}
+        new, _l, s = m.fixups(now, {}, {})
+        self.assertEqual(new["agents"]["defaults"]["heartbeat"]["model"], "openai/gpt-5.4-mini")
+        self.assertNotIn("models", new["agents"]["defaults"])
+        self.assertEqual([(f["code"], f["cls"]) for f in s["policy_failures"]], [("pc-runtime-pin", "acceptable")])
+        now["agents"]["defaults"]["modelPolicy"] = {}
+        new, _l, s = m.fixups(now, {}, {})
+        self.assertEqual(new["agents"]["defaults"]["models"], {"openai/gpt-5.4-mini": {"agentRuntime": {"id": "openclaw"}}})
+        self.assertEqual(s["policy_failures"], [])
+
+    def test_f3_compaction_restore(self):
+        self.pre_gate["agents"]["defaults"]["compaction"]["provider"] = "safeguard"
+        self.pre_gate["agents"]["list"][1]["compaction"] = {"model": "openai-codex/gpt-5.2", "provider": "lossless-claw"}
+        self.pre_pass1, _l, _s = m.premigrate_config(self.pre_gate)
+        self.now["agents"]["entries"]["helper"]["compaction"] = {"reserveTokens": 100}
+        new, ledger, s = self.run_fixups()
+        self.assertTrue(s["compaction_restored"])
+        self.assertEqual(new["agents"]["defaults"]["compaction"], {"model": "openai/gpt-5.4-mini", "provider": "safeguard"})
+        # agents.list[1] (pre) -> agents.entries.helper (now); lossless-claw provider is not restored
+        self.assertEqual(new["agents"]["entries"]["helper"]["compaction"],
+                         {"reserveTokens": 100, "model": "openai/gpt-5.5"})
+        self.assertEqual(new["agents"]["defaults"]["models"]["openai/gpt-5.5"]["agentRuntime"]["id"], "openclaw")
+
+    def test_f3_provider_not_restored_when_context_engine_changed(self):
+        self.pre_gate["agents"]["defaults"]["compaction"]["provider"] = "LOSSLESS-CLAW"
+        new, _l, _s = self.run_fixups()
+        self.assertEqual(new["agents"]["defaults"]["compaction"], {"model": "openai/gpt-5.4-mini"})
+        self.pre_gate["agents"]["defaults"]["compaction"]["provider"] = "custom-engine"
+        self.now["plugins"]["slots"] = {"contextEngine": "custom-engine"}
+        new, _l, _s = self.run_fixups()
+        self.assertEqual(new["agents"]["defaults"]["compaction"], {"model": "openai/gpt-5.4-mini"})
+
+    def test_f2_f3_follow_doctor_retirements(self):
+        """Addendum 2 item 8: remap o retired_map, so doctor pass 2 does not replace the value again."""
+        retired = {"openai/gpt-5.4-mini": "openai/gpt-5.6-luna"}
+        new, ledger, s = m.fixups(self.now, self.pre_gate, self.pre_pass1, retired_map=retired)
+        self.assertEqual(new["agents"]["defaults"]["compaction"], {"model": "openai/gpt-5.6-luna"})
+        self.assertEqual(new["hooks"]["mappings"][0]["model"], "openai/gpt-5.6-luna")
+        self.assertEqual(new["channels"]["modelByChannel"]["telegram"]["default"], "openai/gpt-5.6-luna")  # gpt-5-nano
+        self.assertEqual(new["agents"]["defaults"]["models"]["openai/gpt-5.6-luna"], {"agentRuntime": {"id": "openclaw"}})
+        # a canonical pre value doctor retired elsewhere follows doctor's choice too (no F2 pin for it)
+        self.pre_gate["agents"]["defaults"]["compaction"]["model"] = "anthropic/claude-sonnet-4-5"
+        new, _l, _s = m.fixups(self.now, self.pre_gate, self.pre_pass1,
+                               retired_map={"anthropic/claude-sonnet-4-5": "anthropic/claude-sonnet-4-6"})
+        self.assertEqual(new["agents"]["defaults"]["compaction"], {"model": "anthropic/claude-sonnet-4-6"})
+
+    def test_retired_chain_helpers(self):
+        rmap = {"openai/gpt-5.4-mini": "openai/gpt-5.6-luna", "OpenAI/GPT-5.6-luna": "openai/gpt-5.7-luna",
+                "a/x": "a/y", "a/y": "a/x"}
+        self.assertEqual(m.retired_chain("openai/gpt-5.4-mini", rmap), ["openai/gpt-5.6-luna", "openai/gpt-5.7-luna"])
+        self.assertEqual(m.apply_retired("openai/gpt-5.4-mini@openai:work", rmap), "openai/gpt-5.7-luna@openai:work")
+        self.assertEqual(m.apply_retired("vllm/qwen3.5-122b", rmap), "vllm/qwen3.5-122b")
+        self.assertEqual(m.retired_chain("a/x", rmap), ["a/y"], "cycles end")
+        self.assertEqual(m.apply_retired("openai/gpt-5.5", None), "openai/gpt-5.5")
+
+    def test_f3_present_value_kept(self):
+        self.now["agents"]["defaults"]["compaction"] = {"model": "anthropic/claude-sonnet-4-6"}
+        new, ledger, s = self.run_fixups()
+        self.assertEqual(new["agents"]["defaults"]["compaction"], {"model": "anthropic/claude-sonnet-4-6"})
+        self.assertFalse(s["compaction_restored"])
+
+    def test_golden_e4_noop(self):
+        after = fix("e4_after_pass2.json")
+        new, ledger, s = m.fixups(after, fix("e4_before.json"), fix("e4_pretransform.json"))
+        self.assertEqual(new, after)
+        self.assertEqual(ledger, [])
+        self.assertEqual(s, {"codex_pins": 0, "refs_rewritten": 0, "compaction_restored": False,
+                             "codex_plugin_restored": False, "codex_needed": False, "policy_failures": []})
+
+    def test_vllm_untouched_by_fixups(self):
+        before = live_like()
+        pre_pass1, _l, _s = m.premigrate_config(before)
+        now = copy.deepcopy(pre_pass1)
+        now["meta"] = {"lastTouchedVersion": "2026.9.9", "migrations": {"modelPolicyAllowlist": True}}
+        dm = now["agents"]["defaults"]["models"]
+        dm["openai/gpt-5.5"] = dm.pop("openai-codex/gpt-5.5")
+        now["agents"]["defaults"]["model"]["fallbacks"][0] = "openai/gpt-5.5"
+        new, ledger, s = m.fixups(now, before, pre_pass1)
+        self.assertEqual(new, now)
+        self.assertEqual(ledger, [])
+        self.assertEqual(new["models"]["providers"]["vllm"], vllm_block())
+
+
+# --- PC1-PC3 ---------------------------------------------------------------------------------------
+
+
+class TestPostconditions(unittest.TestCase):
+    def test_golden_after2_passes(self):
+        before = fix("e4_before.json")
+        _new, _l, summary = m.premigrate_config(before)
+        after = fix("e4_after_pass2.json")
+        self.assertEqual(m.check_legacy_refs(after), [])
+        self.assertEqual(m.check_codex_runtime(after), [])
+        self.assertEqual(m.check_codex_runtime(after, pre_cfg=before), [])
+        self.assertEqual(m.check_runtime_pins(after, summary["legacy_slots"]), [])
+        # slots survive a JSON round trip (journal) and the bare {path, value} form
+        slots = json.loads(json.dumps(summary["legacy_slots"]))
+        self.assertEqual(m.check_runtime_pins(after, slots), [])
+        self.assertEqual(m.check_runtime_pins(after, [{"path": s["path"], "value": s["value"]} for s in slots]), [])
+
+    def test_golden_raw_fails(self):
+        before = fix("e4_before.json")
+        _new, _l, summary = m.premigrate_config(before)
+        raw = fix("e3_raw_after_pass2.json")
+        pc3 = m.check_runtime_pins(raw, summary["legacy_slots"])
+        self.assertTrue(any("model.primary" in p and "gpt-6-astra" in p for p in pc3), pc3)
+        self.assertTrue(any("no openai/gpt-5.5 entry" in p for p in pc3), pc3)
+        pc2 = m.check_codex_runtime(raw, pre_cfg=before)
+        self.assertTrue(any("plugins.entries.codex" in p for p in pc2), pc2)
+        self.assertTrue(m.check_codex_runtime(raw))
+        self.assertTrue(any("modelPolicy.allow" in p for p in m.check_legacy_refs(raw)))
+
+    def test_pc1_auth_and_providers(self):
+        cfg = {"auth": {"order": {"openai-codex": ["x"], "openai": ["openai:default", "OpenAI-Codex:old"]},
+                        "profiles": {"openai-codex:default": {"access": "secret-token-value"}}},
+               "models": {"providers": {"openai-codex": {}, "Codex": {}, "vllm": vllm_block()}},
+               "agents": {"defaults": {"models": {"codex-cli/gpt-5": {}}}},
+               "x": {"y": " codex / gpt"}}
+        problems = m.check_legacy_refs(cfg)
+        text = "\n".join(problems)
+        for needle in ("auth.order.openai-codex", "OpenAI-Codex:old", "auth.profiles", "models.providers.openai-codex",
+                       "models.providers.Codex", "codex-cli/gpt-5", "x.y"):
+            self.assertIn(needle, text)
+        self.assertNotIn("secret-token-value", text)
+        self.assertNotIn("vllm", text)
+        self.assertEqual(m.check_legacy_refs({"agents": {"defaults": {"model": "vllm/qwen3.5-122b"}},
+                                              "models": {"providers": {"vllm": vllm_block()}}}), [])
+
+    def test_pc1_redacts_secret_paths(self):
+        problems = m.check_legacy_refs({"x": {"apiKey": "openai-codex/should-not-print"}})
+        self.assertEqual(len(problems), 1)
+        self.assertNotIn("should-not-print", problems[0])
+
+    def test_pc2(self):
+        """Addendum 2 rule 5: only migrated openai-codex slots count; canonical refs keep their runtime."""
+        cfg = {"a": [{"b": {"agentRuntime": {"id": "Codex-CLI"}}}], "agents": {"defaults": {"agentRuntime": "codex"}}}
+        self.assertEqual(m.check_codex_runtime(cfg), [], "pins outside migrated legacy keys are not PC2's")
+        enabled = {"plugins": {"entries": {"codex": {"enabled": True}}}}
+        self.assertEqual(len(m.check_codex_runtime(enabled)), 1)
+        self.assertEqual(m.check_codex_runtime(enabled, pre_cfg=enabled), [], "enabled before the migration")
+        self.assertEqual(m.check_codex_runtime({"plugins": {"entries": {"codex": {"enabled": False}}}}), [])
+        self.assertEqual(m.check_codex_runtime(enabled, codex_pkg_before=True), [], "codex package installed before")
+        # canonical openai/ refs before the gate: Codex was in use, doctor's plugin setting and pins are fine
+        pre_canonical = {"agents": {"defaults": {"model": {"primary": "vllm/qwen3.5-122b",
+                                                           "fallbacks": ["openai/gpt-5.6-sol"]}}}}
+        self.assertEqual(m.check_codex_runtime(enabled, pre_cfg=pre_canonical), [])
+        self.assertEqual(len(m.check_codex_runtime(enabled, pre_cfg=live_like())), 1, "legacy refs only: not in use")
+        pinned = {"plugins": {"entries": {"codex": {"enabled": True}}},
+                  "agents": {"defaults": {"models": {"openai/gpt-5.6-sol": {"agentRuntime": {"id": "codex"}}}}}}
+        self.assertEqual(m.check_codex_runtime(pinned, pre_cfg=pre_canonical), [])
+        # the same key from a legacy openai-codex ref (live_like: openai-codex/gpt-5.5) must not be Codex
+        legacy = {"agents": {"defaults": {"model": {"fallbacks": ["openai/gpt-5.5"]},
+                                          "models": {"openai/gpt-5.5": {"agentRuntime": {"id": "codex-app-server"}}}}}}
+        probs = m.check_codex_runtime(legacy, pre_cfg=live_like())
+        self.assertEqual(len(probs), 3, probs)  # the key, and the fallback and map-key slots resolving to it
+        self.assertIn('agents.defaults.models["openai/gpt-5.5"].agentRuntime.id', probs[0])
+        self.assertIn("resolves to the Codex runtime", probs[1])
+        legacy["agents"]["defaults"]["models"]["openai/gpt-5.5"]["agentRuntime"]["id"] = "openclaw"
+        self.assertEqual(m.check_codex_runtime(legacy, pre_cfg=live_like()), [])
+
+    def test_pc3_accepts_doctor_retirements_only(self):
+        """Addendum 2 item 9: doctor's retirement successor counts as kept; any other value still fails."""
+        pre = {"agents": {"defaults": {"model": {"primary": "openai-codex/gpt-5.5",
+                                                 "fallbacks": ["openai-codex/gpt-5.4-mini"]},
+                                       "heartbeat": {"model": "openai-codex/gpt-5.4-mini"},
+                                       "models": {"openai-codex/gpt-5.4-mini": {}}}}}
+        slots = self.slots(pre)
+        cfg = {"agents": {"defaults": {"model": {"primary": "openai/gpt-5.5", "fallbacks": ["openai/gpt-5.6-luna"]},
+                                       "heartbeat": {"model": "openai/gpt-5.6-luna"},
+                                       "models": {"openai/gpt-5.5": {"agentRuntime": {"id": "openclaw"}},
+                                                  "openai/gpt-5.6-luna": {"agentRuntime": {"id": "openclaw"}}}}}}
+        self.assertEqual(len(m.check_runtime_pins(cfg, slots)), 3, "without the doctor log map")
+        retired = {"openai/gpt-5.4-mini": "openai/gpt-5.6-luna"}
+        self.assertEqual(m.check_runtime_pins(cfg, slots, retired), [])
+        # the successor must still resolve to openclaw
+        cfg["agents"]["defaults"]["models"]["openai/gpt-5.6-luna"]["agentRuntime"]["id"] = "codex"
+        probs = m.check_runtime_pins(cfg, slots, retired)
+        self.assertTrue(probs and all("gpt-5.6-luna" in p for p in probs), probs)
+        self.assertEqual(m.check_runtime_pins(cfg, slots, retired, skip_codex=True), [], "left to PC2")
+        self.assertTrue(m.check_codex_runtime(cfg, pre, retired_map=retired))
+        # raw-path damage: the primary replaced by a default that is no retirement successor
+        cfg["agents"]["defaults"]["models"]["openai/gpt-5.6-luna"]["agentRuntime"]["id"] = "openclaw"
+        cfg["agents"]["defaults"]["model"]["primary"] = "openai/gpt-6-astra"
+        probs = m.check_runtime_pins(cfg, slots, retired)
+        self.assertEqual(len(probs), 1, probs)
+        self.assertIn("now openai/gpt-6-astra, expected openai/gpt-5.5", probs[0])
+        # retired to another provider: kept, no OpenAI runtime to resolve
+        cfg["agents"]["defaults"]["model"]["primary"] = "anthropic/claude-x"
+        self.assertEqual(m.check_runtime_pins(cfg, slots, dict(retired, **{"openai/gpt-5.5": "anthropic/claude-x"})),
+                         [])
+
+    def slot_cfg(self):
+        return {"agents": {"defaults": {"model": {"primary": "openai/gpt-5.5"},
+                                        "models": {"openai/gpt-5.5": {"agentRuntime": {"id": "openclaw"}}}},
+                           "entries": {"main": {}, "helper": {}}}}
+
+    def slots(self, cfg):
+        return [s for s in m.premigrate_config(cfg)[2]["legacy_slots"]]
+
+    def test_pc3_precedence(self):
+        pre = {"agents": {"defaults": {"model": {"primary": "openai-codex/gpt-5.5"}}}}
+        slots = self.slots(pre)
+        cfg = self.slot_cfg()
+        self.assertEqual(m.check_runtime_pins(cfg, slots), [])
+        # an agent's own exact entry beats the defaults
+        cfg["agents"]["entries"]["helper"]["models"] = {"openai/gpt-5.5": {"agentRuntime": {"id": "codex"}}}
+        problems = m.check_runtime_pins(cfg, slots)
+        self.assertEqual(len(problems), 1)
+        self.assertIn("agent helper", problems[0])
+        # pi counts as openclaw
+        cfg["agents"]["entries"]["helper"]["models"]["openai/gpt-5.5"]["agentRuntime"]["id"] = "pi"
+        self.assertEqual(m.check_runtime_pins(cfg, slots), [])
+        # auto / default fail; empty id does not count as a policy
+        for rid in ("auto", "default"):
+            cfg = self.slot_cfg()
+            cfg["agents"]["defaults"]["models"]["openai/gpt-5.5"]["agentRuntime"]["id"] = rid
+            self.assertTrue(m.check_runtime_pins(cfg, slots), rid)
+        cfg = self.slot_cfg()
+        cfg["agents"]["defaults"]["models"]["openai/gpt-5.5"]["agentRuntime"]["id"] = ""
+        self.assertTrue(any("none (implicit choice)" in p for p in m.check_runtime_pins(cfg, slots)))
+        # provider models[] beats wildcards; wildcard beats provider-level
+        cfg = self.slot_cfg()
+        del cfg["agents"]["defaults"]["models"]["openai/gpt-5.5"]
+        cfg["agents"]["defaults"]["models"]["openai/*"] = {"agentRuntime": {"id": "codex"}}
+        cfg["models"] = {"providers": {"openai": {"agentRuntime": {"id": "codex"},
+                                                  "models": [{"id": "gpt-5.5", "agentRuntime": {"id": "openclaw"}}]}}}
+        self.assertEqual(m.check_runtime_pins(cfg, slots), [])
+        cfg["models"]["providers"]["openai"]["models"][0].pop("agentRuntime")
+        self.assertTrue(m.check_runtime_pins(cfg, slots))
+        cfg["agents"]["defaults"]["models"]["openai/*"]["agentRuntime"]["id"] = "openclaw"
+        self.assertEqual(m.check_runtime_pins(cfg, slots), [])
+        del cfg["agents"]["defaults"]["models"]["openai/*"]
+        self.assertTrue(m.check_runtime_pins(cfg, slots))
+        cfg["models"]["providers"]["openai"]["agentRuntime"]["id"] = "openclaw"
+        self.assertEqual(m.check_runtime_pins(cfg, slots), [])
+
+    def test_pc3_list_slot_maps_to_entries(self):
+        pre = {"agents": {"list": [{"id": "main"}, {"id": "helper", "heartbeat": {"model": "openai-codex/gpt-5.4-mini"},
+                                                     "models": {"openai-codex/gpt-5.4-mini": {}}}]}}
+        slots = self.slots(pre)
+        self.assertEqual({s["agent_id"] for s in slots}, {"helper"})
+        cfg = {"agents": {"entries": {"main": {}, "helper": {
+            "heartbeat": {"model": "openai/gpt-5.4-mini"},
+            "models": {"openai/gpt-5.4-mini": {"agentRuntime": {"id": "openclaw"}}}}}}}
+        self.assertEqual(m.check_runtime_pins(cfg, slots), [])
+        cfg["agents"]["entries"]["helper"]["heartbeat"]["model"] = "openai-codex/gpt-5.4-mini"
+        self.assertTrue(any("still a legacy ref" in p for p in m.check_runtime_pins(cfg, slots)))
+        del cfg["agents"]["entries"]["helper"]["heartbeat"]
+        self.assertTrue(any("value missing" in p for p in m.check_runtime_pins(cfg, slots)))
+
+    def test_pc3_remap_and_fallback_membership(self):
+        pre = {"agents": {"defaults": {"model": {"primary": "openai-codex/gpt-5.5",
+                                                 "fallbacks": ["openai-codex/gpt-5.5", "openai-codex/gpt-5.2-codex"]},
+                                       "imageModel": "openai-codex/gpt-5.6"}}}
+        slots = self.slots(pre)
+        cfg = {"agents": {"defaults": {"model": {"primary": "openai/gpt-5.5", "fallbacks": ["openai/gpt-5.5"]},
+                                       "imageModel": "openai/gpt-5.6-sol",
+                                       "models": {"openai/gpt-5.5": {"agentRuntime": {"id": "openclaw"}},
+                                                  "openai/gpt-5.6-sol": {"agentRuntime": {"id": "openclaw"}}}}}}
+        self.assertEqual(m.check_runtime_pins(cfg, slots), [])
+        cfg["agents"]["defaults"]["model"]["fallbacks"] = ["openai/gpt-5.4"]
+        self.assertTrue(any("missing from agents.defaults.model.fallbacks" in p for p in m.check_runtime_pins(cfg, slots)))
+
+    def test_pc3_string_model_became_object(self):
+        pre = {"agents": {"defaults": {"model": "openai-codex/gpt-5.5"}}}
+        slots = self.slots(pre)
+        self.assertEqual(m.check_runtime_pins(self.slot_cfg(), slots), [])
+
+    def test_pc3_non_agent_slot_checked_for_every_agent(self):
+        pre = {"hooks": {"mappings": [{"model": "openai-codex/gpt-5.5"}]}}
+        slots = self.slots(pre)
+        cfg = self.slot_cfg()
+        cfg["hooks"] = {"mappings": [{"model": "openai/gpt-5.5"}]}
+        self.assertEqual(m.check_runtime_pins(cfg, slots), [])
+        cfg["agents"]["entries"]["helper"]["models"] = {"openai/*": {"agentRuntime": {"id": "codex"}},
+                                                        "openai/gpt-5.5": {"agentRuntime": {"id": "codex"}}}
+        self.assertTrue(m.check_runtime_pins(cfg, slots))
+
+
+# --- canonical refs keep their runtime (contract addendum 2) ------------------------------------------
+
+
+class TestCanonicalRefs(unittest.TestCase):
+    def test_golden_exp5_left_as_doctor_leaves_it(self):
+        """Live-user-shaped config through real 9.9 doctor pass 1: canonical openai/ refs only, doctor
+        enabled the codex plugin. Nothing is pinned or restored and PC2 passes (rules 2, 4, 5)."""
+        pre, a1 = fix("exp5_pre_gate.json"), fix("exp5_after_pass1.json")
+        self.assertEqual(m.check_codex_runtime(a1, pre_cfg=pre), [])
+        self.assertEqual(m.check_codex_runtime(a1, pre_cfg={}),
+                         ["plugins.entries.codex.enabled is true (Codex agent runtime enabled by the migration)"])
+        new, ledger, s = m.fixups(a1, pre, pre)
+        self.assertEqual((new, ledger), (a1, []))
+        self.assertEqual((s["codex_pins"], s["codex_plugin_restored"], s["codex_needed"]), (0, False, True))
+        self.assertEqual(m.post_doctor_fixups(a1, pre)[1], [])
+        self.assertEqual(m.check_legacy_refs(a1), [])
+        for prov in ("vllm", "vllm-nothink", "vllm-fast"):
+            self.assertEqual(a1["models"]["providers"][prov], pre["models"]["providers"][prov])
+        self.assertTrue(m.canonical_openai_refs(pre))
+        # the superseded addendum-1 result (canonical keys pinned to openclaw) is never produced
+        a2 = fix("exp5_after_pass2.json")
+        self.assertNotEqual(new, a2)
+
+    def test_canonical_codex_pins_left_alone(self):
+        pre = {"agents": {"defaults": {"model": {"primary": "openai/gpt-5.5"},
+                                       "models": {"openai/gpt-5.5": {"alias": "g"}, "openai/*": {}}}}}
+        now = {"agents": {"defaults": {"model": {"primary": "openai/gpt-5.5"},
+                                       "models": {"openai/gpt-5.5": {"alias": "g", "agentRuntime": {"id": "codex"}},
+                                                  "openai/*": {"agentRuntime": {"id": "codex"}}}}},
+               "plugins": {"entries": {"codex": {"enabled": True}}}}
+        new, ledger, s = m.fixups(now, pre, pre)
+        self.assertEqual((new, ledger), (now, []))
+        self.assertEqual(m.check_codex_runtime(now, pre), [])
+        self.assertEqual(m.post_doctor_fixups(now, pre)[1], [])
+
+    def test_canonical_openai_refs(self):
+        cfg = {"agents": {"defaults": {"model": {"fallbacks": [" OpenAI/gpt-5.5"]}, "models": {"openai/*": {}}}},
+               "auth": {"order": {"openai": ["openai/not-a-ref"]}},
+               "models": {"providers": {"openai": {"models": [{"id": "openai/gpt-5.5"}]}}}}
+        self.assertEqual(m.canonical_openai_refs(cfg), ['agents.defaults.model.fallbacks[0]=OpenAI/gpt-5.5',
+                                                        'agents.defaults.models["openai/*"]=openai/*'])
+        self.assertEqual(m.canonical_openai_refs(live_like()), [])
+
+
+class TestRouteCollision(unittest.TestCase):
+    """F2: a model used both as openai-codex/<id> and as openai/<id> ends up on one openai/<id> route."""
+
+    def codes(self, cfg):
+        return {f["code"]: f["cls"] for f in m.models_preflight(cfg)}
+
+    @staticmethod
+    def mixed():
+        """Reviewer repro collision.py: E3-shaped wildcard plus a live-user-style canonical fallback."""
+        return {"agents": {"defaults": {
+            "model": {"primary": "vllm/qwen3.5-122b", "fallbacks": ["openai/gpt-5.5", "openai-codex/gpt-5.4-mini"]},
+            "models": {"openai-codex/*": {}, "vllm/qwen3.5-122b": {}, "openai/gpt-5.5": {"alias": "gpt"}}}}}
+
+    def test_r1_skips_expansions_with_an_existing_canonical_key(self):
+        cfg = self.mixed()
+        self.assertEqual(m.route_collisions(cfg), {})
+        self.assertNotIn("models-route-collision", self.codes(cfg))
+        new, ledger, summary = m.premigrate_config(cfg)
+        dm = new["agents"]["defaults"]["models"]
+        self.assertNotIn("openai-codex/gpt-5.5", dm)
+        self.assertEqual(dm["openai/gpt-5.5"], {"alias": "gpt"}, "the canonical entry keeps its runtime")
+        self.assertEqual(dm["openai-codex/gpt-5.4-mini"], {"agentRuntime": {"id": "openclaw"}})
+        for x in set(m.EXPLICIT_DEFAULT_IDS) - {"gpt-5.5"}:
+            self.assertIn("openai-codex/" + x, dm)
+        self.assertFalse(any(e["path"].endswith('"openai-codex/gpt-5.5"]') for e in ledger))
+        # the info line still claims "keep their runtime" for the canonical refs, and it is true now
+        msg = [f["message"] for f in m.models_preflight(cfg) if f["code"] == "canonical-openai-refs"][0]
+        self.assertIn("openai/gpt-5.5", msg)
+        # F1/PC2 never treat the skipped id as a migrated slot (defaults or any agent)
+        ctx = m.legacy_key_context(cfg)
+        self.assertFalse(m.is_migrated_legacy_key(ctx, None, "gpt-5.5"))
+        self.assertFalse(m.is_migrated_legacy_key(ctx, "main", "gpt-5.5"))
+        self.assertTrue(m.is_migrated_legacy_key(ctx, None, "gpt-5.4"))
+        # doctor merges nothing into openai/gpt-5.5, so the canonical fallback keeps the implicit choice
+        post = copy.deepcopy(new)
+        post["agents"]["defaults"]["models"] = {
+            ("openai/" + m.remap_model_id(k.split("/", 1)[1]) if k.startswith("openai-codex/") else k): v
+            for k, v in dm.items()}
+        self.assertEqual(m._resolve_openai_runtime(post, "gpt-5.5", None), (None, "none"))
+
+    def test_real_legacy_ref_plus_canonical_use_is_acceptable_hold(self):
+        cfg = self.mixed()
+        cfg["agents"]["defaults"]["model"]["primary"] = "openai-codex/gpt-5.5"
+        col = m.route_collisions(cfg)
+        self.assertEqual(sorted(col), ["gpt-5.5"])
+        self.assertEqual(col["gpt-5.5"], ["agents.defaults.model.fallbacks[0]", 'agents.defaults.models["openai/gpt-5.5"]'])
+        codes = self.codes(cfg)
+        self.assertEqual(codes["models-route-collision"], "acceptable")
+        self.assertNotIn("canonical-openai-refs", codes, "no 'keep their runtime' claim for a collided id")
+        msg = [f["message"] for f in m.models_preflight(cfg) if f["code"] == "models-route-collision"][0]
+        self.assertIn("gpt-5.5 (agents.defaults.model.fallbacks[0]", msg)
+        # a real legacy ref is still expanded and pinned (it is reported, not silently dropped)
+        self.assertIn("openai-codex/gpt-5.5", m.premigrate_config(cfg)[0]["agents"]["defaults"]["models"])
+
+    def test_remapped_legacy_id_and_agent_scopes(self):
+        # openai-codex/gpt-5.2 becomes openai/gpt-5.5; R2 pins it in agents.defaults.models (every scope)
+        cfg = {"agents": {"list": [{"id": "work", "model": "openai-codex/gpt-5.2"},
+                                   {"id": "home", "model": {"fallbacks": ["openai/gpt-5.5"]}}]}}
+        self.assertEqual(m.route_collisions(cfg), {"gpt-5.5": ["agents.list[1].model.fallbacks[0]"]})
+        # an agent-scope wildcard expands only into that agent's map
+        cfg = {"agents": {"defaults": {"model": "openai/gpt-5.4"},
+                          "list": [{"id": "work", "models": {"openai-codex/*": {}}},
+                                   {"id": "home", "model": "openai/gpt-5.4-mini"}]}}
+        self.assertEqual(sorted(m.route_collisions(cfg)), ["gpt-5.4"], "defaults overlaps every agent")
+        cfg["agents"]["defaults"]["model"] = "vllm/q"
+        self.assertEqual(m.route_collisions(cfg), {}, "another agent's scope does not overlap")
+        cfg["agents"]["list"][0]["model"] = "openai/gpt-5.4-mini"
+        self.assertEqual(m.route_collisions(cfg), {"gpt-5.4-mini": ["agents.list[0].model"]})
+        self.assertEqual(m.route_collisions(live_like()), {})
+        self.assertEqual(m.route_collisions(spec_example()), {})
+
+
+# --- pins --------------------------------------------------------------------------------------------
+
+
+class TestPins(unittest.TestCase):
+    def test_table_matches_validated_pins(self):
+        ref = fix("pins_final_99.json")
+        self.assertEqual([(p["path"], p["value"]) for p in m.PINS], [(p["path"], p["value"]) for p in ref])
+        self.assertEqual(len(m.PINS), 31)
+        paths = {m.fmt_path(p["path"]) for p in m.PINS}
+        for dropped in ("dreaming.enabled", "heartbeat.target", "cyberFailover.mode", "utilityModel", "agentRuntime.id",
+                        "agents.defaults.agentRuntime.id", "skills.workshop.autonomous.enabled"):
+            self.assertNotIn(dropped, paths)
+
+    def test_table_matches_spec_99_conditions(self):
+        path = SCRATCH + "/specwf/config-keys/pins_spec_99.json"
+        if not os.path.exists(path):
+            self.skipTest("scratchpad pins_spec_99.json missing: %s" % path)
+        with open(path, encoding="utf-8") as f:
+            spec = json.load(f)
+        self.assertEqual([(m.fmt_path(p["path"]), p["value"]) for p in m.PINS],
+                         [(p["path"], p["value"]) for p in spec["pins"]])
+        conditional = {p["path"] for p in spec["pins"] if "only" in p.get("condition", "")}
+        ours = {m.fmt_path(p["path"]) for p in m.PINS if p["cond"]}
+        self.assertTrue(conditional <= ours, conditional - ours)
+
+    def test_approval_policy_pin_skipped_when_proposals_retired(self):
+        """full5: OpenClaw 2026.10.10+ has no Skill Workshop proposals (strict skills.workshop schema, doctor removes
+        approvalPolicy); the pin is skipped there and written as before on 2026.10.4."""
+        cfg = {"skills": {"workshop": {}}}
+        new, written, skipped = m.apply_pins(cfg, set(), retires_skill_proposals=True)
+        self.assertNotIn("approvalPolicy", new["skills"]["workshop"])
+        self.assertEqual(self.skipped(skipped)["skills.workshop.approvalPolicy"],
+                         "condition:Skill Workshop proposals were removed in this OpenClaw version")
+        self.assertEqual(new["skills"]["workshop"]["autonomous"]["mode"], "off")
+        self.assertEqual(len(written) + len(skipped), 31)
+        new, written, skipped = self.apply(cfg)
+        self.assertEqual(new["skills"]["workshop"]["approvalPolicy"], "pending")
+        self.assertNotIn("skills.workshop.approvalPolicy", self.skipped(skipped))
+
+    def apply(self, cfg, ledgered=()):
+        snap = copy.deepcopy(cfg)
+        out = m.apply_pins(cfg, set(ledgered))
+        self.assertEqual(cfg, snap, "input mutated")
+        return out
+
+    def skipped(self, skipped):
+        return {s["path"]: s["reason"] for s in skipped}
+
+    def test_empty_config(self):
+        new, written, skipped = self.apply({})
+        sk = self.skipped(skipped)
+        self.assertEqual(len(written) + len(skipped), 31)
+        self.assertEqual(new["agents"]["defaults"]["maxConcurrent"], 4)
+        self.assertEqual(new["session"]["reset"], {"mode": "daily", "atHour": 4})
+        self.assertFalse(new["plugins"]["entries"]["memory-core"]["config"]["dreaming"]["enabled"])
+        self.assertNotIn("channels", new)
+        self.assertNotIn("heartbeat", new["agents"]["defaults"])
+        self.assertTrue(sk["agents.defaults.heartbeat.target"].startswith("condition:"))
+        for p in ("channels.telegram.streaming.mode", "channels.telegram.streaming.preview.commandText",
+                  "channels.telegram.joinIntro"):
+            self.assertEqual(sk[p], "condition:channels.telegram not configured")
+        self.assertNotIn("enabled", new["skills"]["workshop"]["autonomous"])
+
+    def test_golden_after2(self):
+        after = fix("e4_after_pass2.json")
+        new, written, skipped = self.apply(after)
+        self.assertEqual(new["agents"]["defaults"]["heartbeat"], {"target": "none"}, "roster has exactly 1 agent")
+        self.assertEqual(new["channels"]["telegram"]["streaming"], {"mode": "partial", "preview": {"commandText": "raw"}})
+        self.assertFalse(new["channels"]["telegram"]["joinIntro"])
+        self.assertEqual(len(written), 30)
+        self.assertEqual(skipped, [{"path": "agents.defaults.heartbeat.agentId", "reason": "condition:not needed"}])
+        self.assertEqual(new["channels"]["telegram"]["botToken"], after["channels"]["telegram"]["botToken"])
+
+    def test_heartbeat_multi_agent_roster(self):
+        # two agents, no heartbeat block; doctor seeds systemAgent "main".
+        # 9.9 then runs the heartbeat for main only, with target "owner" (DM) unless pinned.
+        base = {"agents": {"defaults": {"systemAgent": {"agentId": "main"}},
+                           "entries": {"main": {}, "other_agent": {"sandbox": {"mode": "all"}}}}}
+        new, written, skipped = self.apply(base)
+        self.assertEqual(new["agents"]["defaults"]["heartbeat"], {"agentId": "main", "target": "none"})
+        self.assertIn({"path": "agents.defaults.heartbeat.agentId", "value": "main"}, written)
+        # an agent with its own heartbeat block: only those agents are enrolled, so no agentId is needed
+        expl = json.loads(json.dumps(base))
+        expl["agents"]["entries"]["other_agent"]["heartbeat"] = {"every": "2h"}
+        new, written, skipped = self.apply(expl)
+        self.assertEqual(new["agents"]["defaults"]["heartbeat"], {"target": "none"})
+        # no system agent: 9.9 leaves heartbeats disabled for an ownerless roster -> nothing to pin
+        orphan = json.loads(json.dumps(base))
+        del orphan["agents"]["defaults"]["systemAgent"]
+        new, written, skipped = self.apply(orphan)
+        sk = self.skipped(skipped)
+        self.assertNotIn("heartbeat", new["agents"]["defaults"])
+        self.assertEqual(sk["agents.defaults.heartbeat.agentId"],
+                         "condition:agents.defaults.systemAgent.agentId not set")
+        self.assertTrue(sk["agents.defaults.heartbeat.target"].startswith("condition:"))
+        # an existing defaults block is left alone apart from the missing target
+        own = json.loads(json.dumps(base))
+        own["agents"]["defaults"]["heartbeat"] = {"every": "1h"}
+        new, written, skipped = self.apply(own)
+        self.assertEqual(new["agents"]["defaults"]["heartbeat"], {"every": "1h", "target": "none"})
+
+    def test_union_keys_any_value_counts(self):
+        for v in ({"enabled": True}, "auto", True, None, {}):
+            new, written, skipped = self.apply({"tools": {"codeMode": v, "toolSearch": v, "swarm": v}})
+            sk = self.skipped(skipped)
+            with self.subTest(v=v):
+                for k in ("tools.codeMode", "tools.toolSearch", "tools.swarm"):
+                    self.assertEqual(sk[k], "already-set")
+                    self.assertEqual(new["tools"][k.split(".")[1]], v)
+
+    def test_telegram_rules(self):
+        new, _w, skipped = self.apply({"channels": {"telegram": {"streaming": "partial", "accounts": {"a": {}}}}})
+        sk = self.skipped(skipped)
+        self.assertEqual(new["channels"]["telegram"]["streaming"], "partial")
+        self.assertEqual(sk["channels.telegram.streaming.mode"], "condition:channels.telegram.streaming is a scalar")
+        self.assertTrue(sk["channels.telegram.streaming.preview.commandText"].startswith("condition:"))
+        self.assertFalse(new["channels"]["telegram"]["joinIntro"])
+        self.assertEqual(new["channels"]["telegram"]["accounts"], {"a": {}}, "accounts never touched")
+        new, _w, skipped = self.apply({"channels": {"telegram": {"streaming": {"progress": {"commandText": "status"}}}}})
+        sk = self.skipped(skipped)
+        self.assertEqual(new["channels"]["telegram"]["streaming"]["mode"], "partial")
+        self.assertNotIn("preview", new["channels"]["telegram"]["streaming"])
+        self.assertIn("progress.commandText", sk["channels.telegram.streaming.preview.commandText"])
+        new, _w, skipped = self.apply({"channels": {"telegram": {"streaming": {"mode": "off", "preview": "x"},
+                                                                 "joinIntro": True}}})
+        sk = self.skipped(skipped)
+        self.assertEqual(sk["channels.telegram.streaming.mode"], "already-set")
+        self.assertEqual(sk["channels.telegram.streaming.preview.commandText"], "parent-not-dict")
+        self.assertEqual(sk["channels.telegram.joinIntro"], "already-set")
+        new, _w, skipped = self.apply({"channels": {"telegram": True}})
+        self.assertEqual(new["channels"]["telegram"], True)
+
+    def test_heartbeat_roster(self):
+        cases = [({"agents": {"defaults": {"heartbeat": {"every": "30m"}}, "entries": {"a": {}, "b": {}}}}, True),
+                 ({"agents": {"entries": {"main": {}}}}, True),
+                 ({"agents": {"list": [{"id": "main"}]}}, True),
+                 ({"agents": {"entries": {"a": {}, "b": {}}}}, False),
+                 ({"agents": {"entries": {}}}, False),
+                 ({"agents": {"defaults": {"heartbeat": {"target": "owner"}}}}, False)]
+        for cfg, written in cases:
+            new, w, skipped = self.apply(cfg)
+            with self.subTest(cfg=cfg):
+                self.assertEqual("agents.defaults.heartbeat.target" in {x["path"] for x in w}, written)
+        new, _w, _s = self.apply({"agents": {"defaults": {"heartbeat": {"target": "owner"}}, "entries": {"main": {}}}})
+        self.assertEqual(new["agents"]["defaults"]["heartbeat"]["target"], "owner")
+
+    def test_dreaming_slot_rule(self):
+        for slot, written in ((None, True), ("memory-core", True), ("memory-lancedb", False), ("", True)):
+            cfg = {} if slot is None else {"plugins": {"slots": {"memory": slot}}}
+            new, w, skipped = self.apply(cfg)
+            with self.subTest(slot=slot):
+                self.assertEqual("plugins.entries.memory-core.config.dreaming.enabled" in {x["path"] for x in w}, written)
+        new, w, skipped = self.apply({"plugins": {"entries": {"memory-core": {"config": {"dreaming": {"enabled": True}}}}}})
+        self.assertTrue(new["plugins"]["entries"]["memory-core"]["config"]["dreaming"]["enabled"])
+
+    def test_session_reset_whole_object(self):
+        new, _w, skipped = self.apply({"session": {"reset": {"mode": "idle"}}})
+        self.assertEqual(new["session"]["reset"], {"mode": "idle"})
+        self.assertEqual(self.skipped(skipped)["session.reset"], "already-set")
+        new, _w, _s = self.apply({"session": {"dmScope": "main"}})
+        self.assertEqual(new["session"]["reset"], {"mode": "daily", "atHour": 4})
+        self.assertEqual(new["session"]["dmScope"], "main")
+        # written value is a copy, not the PINS object
+        new["session"]["reset"]["mode"] = "changed"
+        self.assertEqual([p for p in m.PINS if p["path"] == ["session", "reset"]][0]["value"]["mode"], "daily")
+
+    def test_parent_not_dict_and_ledgered(self):
+        new, w, skipped = self.apply({"gateway": {"terminal": True, "controlUi": []}},
+                                     ledgered={"tools.codeMode", "agents.defaults.maxConcurrent"})
+        sk = self.skipped(skipped)
+        self.assertEqual(sk["gateway.terminal.enabled"], "parent-not-dict")
+        self.assertEqual(sk["gateway.controlUi.sessionObserver"], "parent-not-dict")
+        self.assertEqual(sk["tools.codeMode"], "ledgered")
+        self.assertEqual(sk["agents.defaults.maxConcurrent"], "ledgered")
+        self.assertNotIn("codeMode", new["tools"])
+        self.assertEqual(new["gateway"]["terminal"], True)
+
+    def test_false_and_zero_values_count_as_set(self):
+        new, _w, skipped = self.apply({"agents": {"defaults": {"maxConcurrent": 0, "utilityModel": None}}})
+        sk = self.skipped(skipped)
+        self.assertEqual(sk["agents.defaults.maxConcurrent"], "already-set")
+        self.assertEqual(sk["agents.defaults.utilityModel"], "already-set")
+        self.assertEqual(new["agents"]["defaults"]["maxConcurrent"], 0)
+
+    def test_vllm_untouched_by_pins(self):
+        cfg = live_like()
+        new, _w, _s = self.apply(cfg)
+        self.assertEqual(new["models"], cfg["models"])
+        self.assertEqual(new["agents"]["defaults"]["model"], cfg["agents"]["defaults"]["model"])
+        self.assertEqual(new["agents"]["defaults"]["models"], cfg["agents"]["defaults"]["models"])
+
+
+# --- auth order -----------------------------------------------------------------------------------
+
+
+class TestAuthOrder(unittest.TestCase):
+    PROFILES = [{"id": "openai:default", "type": "oauth"}, {"id": "openai:key", "type": "api_key"},
+                {"id": "openai:tok", "type": "token"}]
+
+    def test_no_api_key_noop(self):
+        self.assertEqual(m.auth_order_adjust({}, [{"id": "openai:default", "type": "oauth"}], None), (None, None, []))
+
+    def test_write_oauth_first(self):
+        cfg = {"auth": {"profiles": {"openai:default": {"x": 1}}}}
+        new, finding, ledger = m.auth_order_adjust(cfg, self.PROFILES, None)
+        self.assertIsNone(finding)
+        self.assertEqual(new["auth"]["order"]["openai"], ["openai:default", "openai:tok", "openai:key"])
+        self.assertEqual(ledger, [{"step": "auth-order", "file": "openclaw.json", "path": "auth.order.openai",
+                                   "before": None, "after": ["openai:default", "openai:tok", "openai:key"]}])
+        self.assertNotIn("order", cfg["auth"])
+        new, finding, ledger = m.auth_order_adjust({}, self.PROFILES, [])
+        self.assertEqual(new["auth"]["order"]["openai"][0], "openai:default")
+
+    def test_store_order_api_key_first_is_policy(self):
+        new, finding, ledger = m.auth_order_adjust({}, self.PROFILES, ["openai:key", "openai:default"])
+        self.assertIsNone(new)
+        self.assertEqual((finding["code"], finding["cls"], finding["phase"]), ("pc-auth-order", "acceptable", "postconditions"))
+        self.assertEqual(ledger, [])
+
+    def test_store_order_oauth_first_and_config_present(self):
+        self.assertEqual(m.auth_order_adjust({}, self.PROFILES, ["openai:default"]), (None, None, []))
+        cfg = {"auth": {"order": {"openai": ["openai:key"]}}}
+        self.assertEqual(m.auth_order_adjust(cfg, self.PROFILES, None), (None, None, []))
+
+    def test_api_key_only_not_written(self):
+        self.assertEqual(m.auth_order_adjust({}, [{"id": "openai:key", "type": "api_key"}], None), (None, None, []))
+
+    def test_auth_not_object(self):
+        new, finding, ledger = m.auth_order_adjust({"auth": []}, self.PROFILES, None)
+        self.assertIsNone(new)
+        self.assertEqual(finding["code"], "pc-auth-order")
+
+
+# --- config precheck ----------------------------------------------------------------------------------
+
+
+class TestConfigPrecheck(unittest.TestCase):
+    def codes(self, cfg, raw=""):
+        return {f["code"]: f["cls"] for f in m.config_precheck(cfg, raw)}
+
+    def test_includes(self):
+        self.assertEqual(self.codes({"agents": {"$include": "./agents.json5"}}), {"config-includes": "hard"})
+        self.assertEqual(self.codes({"a": [{"b": {"$include": ["x"]}}]}), {"config-includes": "hard"})
+        self.assertEqual(self.codes({"$include": "x"}), {"config-includes": "hard"})
+        self.assertEqual(self.codes({}, '{"$include": "x", "$include": "y"}'), {"config-includes": "hard"})
+        self.assertEqual(self.codes({"a": "text mentioning $include"}, '{"a": "text mentioning $include"}'), {})
+
+    def test_session_store(self):
+        self.assertEqual(self.codes({"session": {"store": "/data/{agentId}.json"}}), {"custom-session-store": "hard"})
+        self.assertEqual(self.codes({"session": {"store": "  "}}), {})
+        self.assertEqual(self.codes({"session": {"store": None}}), {})
+
+    def test_not_object(self):
+        self.assertEqual(self.codes([]), {"config-unreadable": "hard"})
+        self.assertEqual(self.codes(fix("e4_before.json")), {})
+
+
+# --- state-file classification ------------------------------------------------------------------------
+
+
+def _write(root, rel, text=""):
+    path = os.path.join(root, rel)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(text)
+    return path
+
+
+def _sqlite(path, statements):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    con = sqlite3.connect(path)
+    try:
+        for s in statements:
+            con.execute(s)
+        con.commit()
+    finally:
+        con.close()
+
+
+def _agent_db(root, profiles):
+    store = json.dumps({"version": 1, "profiles": profiles})
+    _sqlite(os.path.join(root, "agents/main/agent/openclaw-agent.sqlite"), [
+        "PRAGMA user_version=1",
+        "CREATE TABLE auth_profile_store (store_key TEXT NOT NULL PRIMARY KEY, store_json TEXT NOT NULL, updated_at INTEGER NOT NULL)",
+        "INSERT INTO auth_profile_store VALUES ('primary', '%s', 0)" % store.replace("'", "''"),
+    ])
+
+
+def _snapshot(root):
+    out = {}
+    for dirpath, dirnames, filenames in os.walk(root):
+        for n in dirnames + filenames:
+            p = os.path.join(dirpath, n)
+            st = os.lstat(p)
+            out[os.path.relpath(p, root)] = (st.st_mode, st.st_size, st.st_mtime_ns)
+    return out
+
+
+class TestClassify(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = r = self.tmp.name
+        self.cfg = {"channels": {"telegram": {"enabled": True}}}
+        _agent_db(r, {"openai-codex:default": {"type": "oauth", "provider": "openai-codex"}})
+        _write(r, "agents/main/agent/openclaw-agent.sqlite-wal")                       # empty WAL: family, ignored
+        _sqlite(os.path.join(r, "agents/main/agent/openclaw-agent.sqlite.reindex-lock.sqlite"), ["CREATE TABLE t(x)"])
+        _write(r, "agents/main/agent/openclaw-agent.sqlite.memory-reindex-" + UUID, "x")
+        _write(r, "agents/main/agent/openclaw-agent.sqlite.memory-reindex-" + UUID + "-wal", "x")
+        _write(r, "agents/main/agent/other.sqlite", "x")
+        _write(r, "agents/main/agent/openclaw-agent.sqlite.migrated", "x")
+        _write(r, "telegram/bot-info-default.json", "{}")
+        _write(r, "telegram/sticker-cache.json", '{"a":1}')
+        _write(r, "telegram/update-offset-default.json", "{}")
+        _write(r, "telegram/thread-bindings-default.json", '{"version":1,"bindings":[]}')
+        _write(r, "telegram/thread-bindings-acc2.json", '{"version":1,"bindings":[{"k":1}]}')
+        _write(r, "telegram/sticker-cache.json.migrated", "{}")
+        _write(r, "telegram/notes.txt", "x")
+        os.symlink("/nonexistent/target", os.path.join(r, "telegram/update-offset-link.json"))
+        _write(r, "telegram/ingress-spool-default/1.json", "{}")
+        _write(r, "telegram/ingress-spool-default/2.json.tmp", "{}")
+        _write(r, "telegram/ingress-spool-default/lock", "")
+        for suf in m.TELEGRAM_SESSION_SUFFIXES:
+            _write(r, "agents/main/sessions/sessions.json.%s.json" % suf, "{}")
+        _write(r, "agents/main/sessions/sessions.json", "{}")
+        _write(r, "agents/main/sessions/sessions.json.telegram-message-dispatch-default.json", "{}")
+        _write(r, "sessions/sessions.json.telegram-messages.json", "{}")
+        _write(r, "plugins/active-memory/session-toggles.json", '{"sessions":{}}')
+        _write(r, "credentials/oauth.json", '{"openai-codex":{"type":"oauth"}}')
+        _sqlite(os.path.join(r, "tasks/runs.sqlite"), ["CREATE TABLE runs(id)", "INSERT INTO runs VALUES (1)"])
+        _sqlite(os.path.join(r, "flows/registry.sqlite"), ["CREATE TABLE flows(id)"])
+        _write(r, "flows/registry.sqlite.migrated", "x")
+        _write(r, "plugin-state/state.sqlite", "this is not a database")
+        _write(r, "memory/main.sqlite", "x")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def classify(self, **kw):
+        args = {"from_checkpoint": "2026.7.35", "accepted": set(), "mode": "from-7x"}
+        args.update(kw)
+        before = _snapshot(self.root)
+        out = m.classify_state_files(self.root, self.cfg, **args)
+        self.assertEqual(_snapshot(self.root), before, "classification must not touch the state dir")
+        json.dumps(out)
+        return out
+
+    def plan(self, out):
+        return {p["rel"]: (p["kind"], p["action"]) for p in out["plan"]}
+
+    def codes(self, out):
+        return {f["code"]: f["cls"] for f in out["findings"]}
+
+    def test_from_7x_plan(self):
+        out = self.classify()
+        plan = self.plan(out)
+        q = lambda kind: ("%s" % kind, "quarantine")  # noqa: E731
+        self.assertEqual(plan["agents/main/agent/openclaw-agent.sqlite.reindex-lock.sqlite"], q("sqlite-transient"))
+        self.assertEqual(plan["agents/main/agent/openclaw-agent.sqlite.memory-reindex-" + UUID], q("sqlite-transient"))
+        self.assertEqual(plan["agents/main/agent/openclaw-agent.sqlite.memory-reindex-" + UUID + "-wal"], q("sqlite-transient"))
+        self.assertEqual(plan["agents/main/agent/other.sqlite"], ("sqlite-other", "leave"))
+        self.assertEqual(plan["agents/main/agent/openclaw-agent.sqlite.migrated"], ("migrated-archive", "leave"))
+        self.assertNotIn("agents/main/agent/openclaw-agent.sqlite", plan)
+        self.assertNotIn("agents/main/agent/openclaw-agent.sqlite-wal", plan)
+        for n in ("bot-info-default.json", "sticker-cache.json", "update-offset-default.json", "update-offset-link.json",
+                  "thread-bindings-acc2.json"):
+            self.assertEqual(plan["telegram/" + n], q("telegram-cache"), n)
+        self.assertEqual(plan["telegram/thread-bindings-default.json"], ("telegram-cache", "leave"))
+        self.assertEqual(plan["telegram/sticker-cache.json.migrated"], ("migrated-archive", "leave"))
+        self.assertNotIn("telegram/notes.txt", plan)
+        for suf in m.TELEGRAM_SESSION_SUFFIXES:
+            self.assertEqual(plan["agents/main/sessions/sessions.json.%s.json" % suf], q("telegram-session-cache"))
+        self.assertEqual(plan["sessions/sessions.json.telegram-messages.json"], q("telegram-session-cache"))
+        self.assertEqual(plan["agents/main/sessions/sessions.json.telegram-message-dispatch-default.json"],
+                         ("telegram-dispatch", "leave"))
+        self.assertEqual(plan["plugins/active-memory/session-toggles.json"], q("active-memory-toggles"))
+        self.assertEqual(plan["credentials/oauth.json"], q("oauth-json"))
+        self.assertEqual(plan["tasks/runs.sqlite"], ("legacy-db", "leave"))
+        self.assertEqual(plan["flows/registry.sqlite"], ("legacy-db", "leave"))
+        self.assertEqual(plan["flows/registry.sqlite.migrated"], ("migrated-archive", "leave"))
+        self.assertEqual(plan["memory/main.sqlite"], ("legacy-memory-sidecar", "leave"))
+        out_acc = self.classify(accepted={"legacy-memory-sidecar"})
+        self.assertEqual(self.plan(out_acc)["memory/main.sqlite"], ("legacy-memory-sidecar", "quarantine"))
+        codes = self.codes(out)
+        self.assertEqual(codes, {"legacy-db-unimported": "acceptable", "legacy-memory-sidecar": "acceptable"})
+        msg = [f["message"] for f in out["findings"] if f["code"] == "legacy-db-unimported"][0]
+        self.assertIn("tasks/runs.sqlite (1 rows)", msg)
+        self.assertIn("plugin-state/state.sqlite (unreadable)", msg)
+        self.assertNotIn("flows/registry.sqlite", msg)
+        # the 7.x spool is reported by classify_retired_state (2026.10 doctor imports it); "1.json" is no
+        # 2026.10 spool file name, so nothing is counted here
+        self.assertFalse(any("spool" in i for i in out["info"]), out["info"])
+        for p in out["plan"]:
+            self.assertEqual(set(p), {"rel", "kind", "action", "reason", "size"})
+            self.assertIn(p["action"], ("quarantine", "leave"))
+            if p["action"] == "quarantine":
+                self.assertIn(p["kind"], m.QUARANTINE_KINDS)
+        sizes = {p["rel"]: p["size"] for p in out["plan"]}
+        self.assertEqual(sizes["telegram/sticker-cache.json"], 7)
+
+    def test_bump_mode_transient_only(self):
+        out = self.classify(mode="bump")
+        kinds = {p["kind"] for p in out["plan"] if p["action"] == "quarantine"}
+        self.assertEqual(kinds, {"sqlite-transient"})
+        self.assertEqual(out["findings"], [])
+        self.assertFalse(any(p["rel"].startswith("telegram/") for p in out["plan"]))
+
+    def test_bindings_rules(self):
+        out = self.classify(from_checkpoint="2026.7.34")
+        self.assertEqual(self.plan(out)["telegram/thread-bindings-acc2.json"], ("telegram-cache", "leave"))
+        self.assertEqual(self.codes(out)["telegram-bindings-nonempty"], "acceptable")
+        out = self.classify(from_checkpoint=None, accepted={"telegram-bindings-nonempty"})
+        self.assertEqual(self.plan(out)["telegram/thread-bindings-acc2.json"], ("telegram-cache", "quarantine"))
+        self.assertIn("telegram-bindings-nonempty", self.codes(out))
+        self.cfg = {"channels": {"telegram": True}}
+        out = self.classify()
+        self.assertIn("telegram-bindings-nonempty", self.codes(out))
+        # symlinked "empty" bindings are not verified-empty
+        os.remove(os.path.join(self.root, "telegram/thread-bindings-default.json"))
+        _write(self.root, "elsewhere/b.json", '{"version":1,"bindings":[]}')
+        os.symlink(os.path.join(self.root, "elsewhere/b.json"), os.path.join(self.root, "telegram/thread-bindings-default.json"))
+        self.cfg = {"channels": {"telegram": {}}}
+        out = self.classify()
+        self.assertEqual(self.plan(out)["telegram/thread-bindings-default.json"], ("telegram-cache", "quarantine"))
+
+    def test_active_memory_optouts(self):
+        _write(self.root, "plugins/active-memory/session-toggles.json",
+               '{"sessions":{"agent:main:main":{"disabled":true},"x":{"disabled":false}," ":{"disabled":true}}}')
+        out = self.classify()
+        self.assertEqual(self.plan(out)["plugins/active-memory/session-toggles.json"], ("active-memory-toggles", "leave"))
+        self.assertIn("(1 disabled session(s))", [f for f in out["findings"] if f["code"] == "active-memory-optouts"][0]["message"])
+        out = self.classify(accepted={"active-memory-optouts"})
+        self.assertEqual(self.plan(out)["plugins/active-memory/session-toggles.json"],
+                         ("active-memory-toggles", "quarantine"))
+        _write(self.root, "plugins/active-memory/session-toggles.json", "{broken")
+        out = self.classify()
+        self.assertEqual(self.plan(out)["plugins/active-memory/session-toggles.json"],
+                         ("active-memory-toggles", "quarantine"))
+        self.assertNotIn("active-memory-optouts", self.codes(out))
+
+    def test_oauth_json_only(self):
+        os.remove(os.path.join(self.root, "agents/main/agent/openclaw-agent.sqlite"))
+        out = self.classify()
+        self.assertEqual(self.plan(out)["credentials/oauth.json"], ("oauth-json", "leave"))
+        self.assertEqual(self.codes(out)["oauth-json-only"], "acceptable")
+        out = self.classify(accepted={"oauth-json-only"})
+        self.assertEqual(self.plan(out)["credentials/oauth.json"], ("oauth-json", "quarantine"))
+        _agent_db(self.root, {})
+        out = self.classify()
+        self.assertIn("has no profiles", [f for f in out["findings"] if f["code"] == "oauth-json-only"][0]["message"])
+
+    def test_injected_query(self):
+        calls = []
+
+        def query(path, sql):
+            calls.append(os.path.basename(path))
+            raise sqlite3.DatabaseError("boom")
+
+        out = m.classify_state_files(self.root, self.cfg, from_checkpoint="2026.7.35", accepted=set(),
+                                     mode="from-7x", query=query)
+        self.assertIn("openclaw-agent.sqlite", calls)
+        self.assertIn("oauth-json-only", self.codes(out))
+        msg = [f["message"] for f in out["findings"] if f["code"] == "legacy-db-unimported"][0]
+        self.assertIn("flows/registry.sqlite (unreadable)", msg)
+
+    def test_sockets_never_opened(self):
+        path = os.path.join(self.root, "telegram", "bot-info-sock.json")
+        if len(path.encode()) > 100:
+            self.skipTest("temp path too long for AF_UNIX")
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            s.bind(path)
+            tog = os.path.join(self.root, "plugins/active-memory/session-toggles.json")
+            os.remove(tog)
+            os.mkfifo(tog)
+            out = self.classify()
+            plan = self.plan(out)
+            self.assertNotIn("telegram/bot-info-sock.json", plan, "9.9 only matches files and symlinks")
+            self.assertEqual(plan["plugins/active-memory/session-toggles.json"], ("active-memory-toggles", "quarantine"))
+        finally:
+            s.close()
+
+    def test_wal_mode_legacy_db(self):
+        path = os.path.join(self.root, "tasks/runs.sqlite")
+        os.remove(path)
+        con = sqlite3.connect(path)
+        try:
+            con.execute("PRAGMA journal_mode=WAL")
+            con.execute("PRAGMA wal_autocheckpoint=0")
+            con.execute("CREATE TABLE runs(id)")
+            con.execute("INSERT INTO runs VALUES (1)")
+            con.execute("INSERT INTO runs VALUES (2)")
+            con.commit()
+            self.assertGreater(os.path.getsize(path + "-wal"), 0)
+            out = self.classify()
+            msg = [f["message"] for f in out["findings"] if f["code"] == "legacy-db-unimported"][0]
+            self.assertIn("tasks/runs.sqlite (2 rows)", msg)  # read through the WAL index (readonly_shm)
+        finally:
+            con.close()
+
+    def test_missing_state_dir(self):
+        out = m.classify_state_files(os.path.join(self.root, "nope"), {}, from_checkpoint=None, accepted=None,
+                                     mode="from-7x")
+        self.assertEqual(out, {"plan": [], "findings": [], "info": []})
+
+
+class TestRetiredFormats(unittest.TestCase):
+    """OpenClaw 2026.10 refuses pre-July-2026 settings/files that 2026.9.9 still imported (classify_retired_state,
+    retired_config_keys, retired_db_findings, retired_tuning_dropped; mirrors of the 10.2 dist)."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = self.tmp.name
+        _sqlite(os.path.join(self.root, "state/openclaw.sqlite"), [
+            "CREATE TABLE installed_plugin_index (index_key TEXT PRIMARY KEY, install_records_json TEXT)",
+            "INSERT INTO installed_plugin_index VALUES ('installed-plugin-index', '{\"brave\":{},\"acpx\":{}}')",
+            "CREATE TABLE migration_sources (migration_kind TEXT, source_path TEXT, source_sha256 TEXT, status TEXT)",
+            "CREATE TABLE cron_jobs (store_key TEXT, job_id TEXT)",
+        ])
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def run_cls(self, cfg=None, **kw):
+        before = _snapshot(self.root)
+        out = m.classify_retired_state(self.root, cfg or {}, accepted=kw.pop("accepted", set()), home="/config", **kw)
+        self.assertEqual(_snapshot(self.root), before, "classification must not touch the state dir")
+        json.dumps(out)
+        return out
+
+    def plan(self, out):
+        return {p["rel"]: (p["kind"], p["action"]) for p in out["plan"]}
+
+    def codes(self, out):
+        return {f["code"]: f["cls"] for f in out["findings"]}
+
+    def test_config_keys_port(self):
+        cfg = {"heartbeat": {}, "plugins": {"installs": {}}, "messages": {"queue": {"mode": "steer-backlog",
+               "byChannel": {"telegram": "queue", "discord": "collect"}}},
+               "agents": {"defaults": {"model": {"primary": "a/b", "timeoutMs": 1}, "llm": {}},
+                          "list": [{"id": "x", "agentRuntime": {"id": "codex"}}]},
+               "channels": {"telegram": {"streaming": "partial", "dm": {}, "accounts": {"b": {"streamMode": "x"}}},
+                            "feishu": {"botName": "root ok", "accounts": {"a": {"botName": "n"}}}}}
+        keys, bridge = m.retired_config_keys(cfg)
+        for k in ("heartbeat", "plugins.installs", "messages.queue.mode", "messages.queue.byChannel.telegram",
+                  "agents.defaults.model.timeoutMs", "agents.defaults.llm", "agents.list[0].agentRuntime",
+                  "channels.telegram.streaming", "channels.telegram.dm", "channels.telegram.accounts.b.streamMode",
+                  "channels.feishu.accounts.a.botName"):
+            self.assertIn(k, keys)
+        self.assertNotIn("messages.queue.byChannel.discord", keys)
+        self.assertNotIn("channels.feishu.botName", keys)
+        self.assertEqual(bridge, "2026.9.5")
+        self.assertEqual(m.retired_config_keys({"channels": {"discord": {"voice": {"tts": {"edge": {}}}}}})[1], "2026.9.7")
+        # agents.entries wins over agents.list; the object form of Telegram streaming is current
+        keys, _ = m.retired_config_keys({"agents": {"entries": {"main": {}}, "list": [{"agentRuntime": {}}]},
+                                         "channels": {"telegram": {"streaming": {"mode": "partial"}}}})
+        self.assertEqual(keys, [])
+
+    def test_config_findings_modes(self):
+        cfg = {"plugins": {"installs": {"x": {}}}}
+        self.assertEqual(m.retired_config_findings(cfg, "from-7x"), [])
+        f = m.retired_config_findings(cfg, "bump")
+        self.assertEqual([(x["code"], x["cls"]) for x in f], [("config-retired-keys", "hard")])
+        f = m.retired_config_findings({"talk": {"voice": "x"}}, "from-7x")
+        self.assertIn("talk.voice", f[0]["message"])
+        self.assertEqual(m.retired_config_findings(live_like(), "from-7x"), [])
+
+    def test_cron_files(self):
+        store = os.path.join(self.root, "cron/jobs.json")
+        _write(self.root, "cron/jobs.json", json.dumps({"jobs": [{"id": "j1"}]}))
+        _write(self.root, "cron/jobs-state.json", "{}")
+        _write(self.root, "cron/runs/j1.jsonl", "{}\n")
+        _write(self.root, "cron/runs/j0.jsonl.migrated", "{}\n")
+        out = self.run_cls()
+        plan = self.plan(out)
+        self.assertEqual(plan["cron/jobs.json"], ("cron-json", "leave"))
+        self.assertEqual(self.codes(out), {"cron-json-unimported": "acceptable"})
+        self.assertEqual(plan["cron/jobs-state.json"], ("cron-json-state", "quarantine"))
+        self.assertEqual(plan["cron/runs/j1.jsonl"], ("cron-run-log", "quarantine"))
+        self.assertNotIn("cron/runs/j0.jsonl.migrated", plan)
+        self.assertEqual(self.plan(self.run_cls(accepted={"cron-json-unimported"}))["cron/jobs.json"],
+                         ("cron-json", "quarantine"))
+        # every job already in SQLite -> safe
+        _sqlite(os.path.join(self.root, "state/openclaw.sqlite"),
+                ["INSERT INTO cron_jobs VALUES ('%s', 'j1')" % store])
+        out = self.run_cls()
+        self.assertEqual(self.plan(out)["cron/jobs.json"], ("cron-json", "quarantine"))
+        self.assertEqual(out["findings"], [])
+
+    def test_cron_receipt_and_custom_store(self):
+        import hashlib
+        _write(self.root, "x/my-jobs.json", "garbage")
+        store = os.path.join(self.root, "x/my-jobs.json")
+        sha = hashlib.sha256(b"garbage").hexdigest()
+        _sqlite(os.path.join(self.root, "state/openclaw.sqlite"),
+                ["INSERT INTO migration_sources VALUES ('legacy-cron-json', '%s', '%s', 'ok')" % (store, sha)])
+        out = self.run_cls({"cron": {"store": store}})
+        self.assertEqual(self.plan(out)["x/my-jobs.json"], ("cron-json", "quarantine"))
+        out = self.run_cls({"cron": {"store": "/elsewhere/jobs.json"}})
+        self.assertEqual(out["findings"], [])  # nothing there
+        with tempfile.TemporaryDirectory() as other:
+            _write(other, "jobs.json", "{}")
+            out = self.run_cls({"cron": {"store": os.path.join(other, "jobs.json")}})
+            self.assertEqual(self.codes(out).get("retired-state-outside"), "hard")
+
+    def test_delivery_queue_rules(self):
+        for n in ("a.json", "b.delivered", "c.json.doctor-importing",
+                  "d.json.doctor-importing-12-01234567-89ab-cdef-0123-456789abcdef", ".h.json", "failed/e.json"):
+            _write(self.root, "delivery-queue/" + n, "{}")
+        for n in ("y.json.migrated", "z.json.doctor-importing.2", "q.txt"):
+            _write(self.root, "delivery-queue/" + n, "{}")
+        os.makedirs(os.path.join(self.root, "delivery-queue/sub.json"))
+        out = self.run_cls()
+        plan = self.plan(out)
+        got = sorted(r for r, (k, a) in plan.items() if k == "delivery-queue-json" and a == "quarantine")
+        self.assertEqual(got, sorted("delivery-queue/" + n for n in (
+            "a.json", "b.delivered", "c.json.doctor-importing",
+            "d.json.doctor-importing-12-01234567-89ab-cdef-0123-456789abcdef", ".h.json", "failed/e.json")))
+        self.assertTrue(any("6 retired JSON delivery queue" in i for i in out["info"]), out["info"])
+        _write(self.root, "session-delivery-queue", "not a dir")
+        self.assertEqual(self.codes(self.run_cls())["retired-state-uninspectable"], "hard")
+
+    def test_oauth_sidecars(self):
+        hex1, hex2 = "0123456789abcdef" * 2, "fedcba9876543210" * 2
+        _write(self.root, "credentials/auth-profiles/%s.json" % hex1, "{}")
+        _write(self.root, "credentials/auth-profiles/%s.json" % hex2, "{}")
+        _write(self.root, "credentials/auth-profiles/%s.json" % hex1.upper(), "{}")
+        _write(self.root, "credentials/auth-profiles/%s.json.migrated" % hex1, "{}")
+        _agent_db(self.root, {"openai-codex:default": {"type": "oauth", "provider": "openai-codex",
+                                                       "oauthRef": {"id": hex1}}})
+        out = self.run_cls()
+        plan = self.plan(out)
+        self.assertEqual(plan["credentials/auth-profiles/%s.json" % hex1], ("oauth-sidecar", "leave"))
+        self.assertEqual(plan["credentials/auth-profiles/%s.json" % hex2], ("oauth-sidecar", "quarantine"))
+        self.assertEqual(len([r for r in plan if r.startswith("credentials/")]), 2)
+        self.assertEqual(self.codes(out), {"oauth-sidecar-referenced": "acceptable"})
+        out = self.run_cls(accepted={"oauth-sidecar-referenced"})
+        self.assertEqual(self.plan(out)["credentials/auth-profiles/%s.json" % hex1], ("oauth-sidecar", "quarantine"))
+        # OPENCLAW_OAUTH_DIR outside the state dir -> hard (cannot quarantine relative to the state)
+        with tempfile.TemporaryDirectory() as other:
+            _write(other, "auth-profiles/%s.json" % hex2, "{}")
+            out = self.run_cls(env={"OPENCLAW_OAUTH_DIR": other})
+            self.assertEqual(self.codes(out).get("retired-state-outside"), "hard")
+
+    def test_oauth_dir_candidates_symlinks_and_unreadable_stores(self):
+        hexa = "abcdef0123456789" * 2
+        # top-level env.OPENCLAW_OAUTH_DIR (outside the state dir) is checked too
+        with tempfile.TemporaryDirectory() as other:
+            _write(other, "auth-profiles/%s.json" % hexa, "{}")
+            out = self.run_cls({"env": {"OPENCLAW_OAUTH_DIR": other}}, env={})
+            self.assertEqual(self.codes(out).get("retired-state-outside"), "hard")
+            out = self.run_cls({"env": {"OPENCLAW_OAUTH_DIR": "${OAUTH}"}}, env={})  # unresolved reference: skipped
+            self.assertEqual(out["findings"], [])
+            # a symlinked delivery queue directory is followed like 10.2's readdir
+            os.symlink(other, os.path.join(self.root, "delivery-queue"))
+            _write(other, "q.json", "{}")
+            out = self.run_cls(env={})
+            self.assertEqual(self.plan(out).get("delivery-queue/q.json"), ("delivery-queue-json", "quarantine"))
+            os.remove(os.path.join(self.root, "delivery-queue"))
+        # an auth store that cannot be read means "referenced": never quarantine a credential silently
+        _write(self.root, "credentials/auth-profiles/%s.json" % hexa, "{}")
+        _write(self.root, "agents/main/agent/openclaw-agent.sqlite", "not a database")
+        out = self.run_cls(env={})
+        self.assertEqual(self.plan(out)["credentials/auth-profiles/%s.json" % hexa], ("oauth-sidecar", "leave"))
+        self.assertEqual(self.codes(out), {"oauth-sidecar-referenced": "acceptable"})
+        # a reference in an agent DB registered outside agents/<id>/agent counts
+        os.remove(os.path.join(self.root, "agents/main/agent/openclaw-agent.sqlite"))
+        with tempfile.TemporaryDirectory() as adir:
+            db = os.path.join(adir, "openclaw-agent.sqlite")
+            _sqlite(db, ["CREATE TABLE auth_profile_store (store_key TEXT, store_json TEXT)",
+                         "INSERT INTO auth_profile_store VALUES ('primary', '{\"x\": \"%s\"}')" % hexa])
+            _sqlite(os.path.join(self.root, "state/openclaw.sqlite"),
+                    ["CREATE TABLE agent_databases (agent_id TEXT, path TEXT)",
+                     "INSERT INTO agent_databases VALUES ('w', '%s')" % db])
+            out = self.run_cls(env={})
+            self.assertEqual(self.codes(out), {"oauth-sidecar-referenced": "acceptable"})
+
+    def test_plugin_index_and_config_installs(self):
+        _write(self.root, "plugins/installs.json", json.dumps({"installRecords": {"brave": {}}}))
+        out = self.run_cls({"plugins": {"installs": {"acpx": {"spec": "x"}}}})
+        self.assertEqual(self.plan(out)["plugins/installs.json"], ("plugin-install-index", "quarantine"))
+        self.assertEqual(out["config_removals"], [["plugins", "installs"]])
+        self.assertEqual(out["findings"], [])
+        _write(self.root, "plugins/installs.json", json.dumps({"plugins": [{"pluginId": "zz", "installRecord": {}}]}))
+        out = self.run_cls({"plugins": {"installs": {"zz": {}}}})
+        self.assertEqual(self.plan(out)["plugins/installs.json"], ("plugin-install-index", "leave"))
+        self.assertEqual(self.codes(out), {"plugin-index-unimported": "acceptable",
+                                           "plugins-installs-unindexed": "acceptable"})
+        self.assertEqual(out["config_removals"], [])
+        out = self.run_cls({"plugins": {"installs": {"zz": {}}}}, accepted={"plugins-installs-unindexed"})
+        self.assertEqual(out["config_removals"], [["plugins", "installs"]])
+        out = self.run_cls({"plugins": {"installs": {}}}, mode="bump")
+        self.assertEqual(out["config_removals"], [])
+
+    def test_device_pair_voice_call_spool(self):
+        _write(self.root, "device-pair-notify.json", '{"subscribers": []}')
+        self.assertEqual(self.plan(self.run_cls())["device-pair-notify.json"], ("device-pair-notify", "quarantine"))
+        _write(self.root, "device-pair-notify.json", '{"subscribers": [{"id": 1}]}')
+        out = self.run_cls()
+        self.assertEqual(self.plan(out)["device-pair-notify.json"], ("device-pair-notify", "leave"))
+        self.assertEqual(self.codes(out)["device-pair-subscribers"], "acceptable")
+        os.remove(os.path.join(self.root, "device-pair-notify.json"))
+        _write(self.root, "voice-calls/calls.jsonl", "{}\n")
+        self.assertEqual(self.codes(self.run_cls())["voice-call-log"], "acceptable")
+        os.remove(os.path.join(self.root, "voice-calls/calls.jsonl"))
+        ok = json.dumps({"version": 1, "updateId": 7, "receivedAt": 1, "update": {"update_id": 7}})
+        _write(self.root, "telegram/ingress-spool-default/0000000000000007.json", ok)
+        _write(self.root, "telegram/ingress-spool-default/0000000000000008.json",
+               json.dumps({"version": 1, "updateId": 9, "receivedAt": 1, "update": {"update_id": 9}}))
+        _write(self.root, "telegram/ingress-spool-default/1.json", "{}")  # not a 2026.10 spool name: ignored
+        out = self.run_cls()
+        self.assertEqual(self.plan(out)["telegram/ingress-spool-default/0000000000000008.json"],
+                         ("telegram-spool-invalid", "leave"))
+        self.assertEqual(self.codes(out), {"telegram-spool-invalid": "acceptable"})
+        self.assertTrue(any("1 legacy Telegram update" in i for i in out["info"]), out["info"])
+        os.makedirs(os.path.join(self.root, "telegram/ingress-spool-bad name"))
+        self.assertEqual(self.codes(self.run_cls())["telegram-spool-unsupported"], "hard")
+
+    def test_dreaming_json(self):
+        import hashlib
+        with tempfile.TemporaryDirectory() as cfgroot:
+            ws = os.path.join(cfgroot, "clawd")
+            _write(ws, "memory/.dreams/daily-ingestion.json", "{}")
+            _write(ws, "memory/.dreams/short-term-recall.json", "{}")
+            _write(ws, "memory/.dreams/notes.json", "{}")  # not a retired source
+            out = self.run_cls(workspaces=[ws], config_root=cfgroot)
+            plan = {p["rel"]: (p["kind"], p["action"], p.get("root")) for p in out["plan"]}
+            self.assertEqual(plan["clawd/memory/.dreams/daily-ingestion.json"], ("dreaming-json", "leave", "config"))
+            self.assertEqual(plan["clawd/memory/.dreams/short-term-recall.json"], ("dreaming-json", "leave", "config"))
+            self.assertNotIn("clawd/memory/.dreams/notes.json", plan)
+            self.assertEqual(self.codes(out), {"dreaming-json-unmigrated": "acceptable"})
+            out = self.run_cls(workspaces=[ws], config_root=cfgroot, accepted={"dreaming-json-unmigrated"})
+            self.assertTrue(all(p["action"] == "quarantine" for p in out["plan"]))
+            # SQLite already holds that workspace's recall rows (and a meta row) -> 2026.10 skips those files
+            wk = hashlib.sha256(os.path.abspath(ws).encode()).hexdigest()
+            _sqlite(os.path.join(self.root, "state/openclaw.sqlite"), [
+                "CREATE TABLE plugin_state_entries (plugin_id TEXT, namespace TEXT, entry_key TEXT, value_json TEXT)",
+                "INSERT INTO plugin_state_entries VALUES ('memory-core', 'dreaming-daily-ingestion', '%s:x', '%s')"
+                % (wk, json.dumps({"workspaceKey": wk, "key": "a", "value": 1})),
+                "INSERT INTO plugin_state_entries VALUES ('memory-core', 'short-term-meta', '%s:y', '%s')"
+                % (wk, json.dumps({"workspaceKey": wk, "key": "recall", "value": 1})),
+            ])
+            out = self.run_cls(workspaces=[ws], config_root=cfgroot)
+            self.assertEqual(out["plan"], [])
+            self.assertEqual(out["findings"], [])
+            # a workspace outside the config root cannot be quarantined
+            with tempfile.TemporaryDirectory() as other:
+                _write(other, "memory/.dreams/phase-signals.json", "{}")
+                out = self.run_cls(workspaces=[other], config_root=cfgroot)
+                self.assertEqual(self.codes(out).get("retired-state-outside"), "hard")
+
+    def test_db_findings(self):
+        mem = os.path.join(self.root, "agents/main/agent/openclaw-agent.sqlite")
+        _sqlite(mem, ["CREATE TABLE meta(key, value)", "CREATE TABLE files(path, source, hash, mtime, size)",
+                      "CREATE TABLE chunks(id, path, source, start_line, end_line, hash, model, text, embedding, "
+                      "updated_at)", "PRAGMA user_version=1"])
+        other = os.path.join(self.root, "agents/other/agent/openclaw-agent.sqlite")
+        _sqlite(other, ["CREATE TABLE session_transcript_files(x)", "PRAGMA user_version=1"])
+        done = os.path.join(self.root, "agents/done/agent/openclaw-agent.sqlite")
+        _sqlite(done, ["CREATE TABLE session_transcript_files(x)", "PRAGMA user_version=24"])
+        _sqlite(os.path.join(self.root, "state/openclaw.sqlite"),
+                ["CREATE TABLE agent_databases(agent_id TEXT, path TEXT, PRIMARY KEY(agent_id))"])
+        out = m.retired_db_findings([("main", mem, 1, 24), ("other", other, 1, 24), ("done", done, 24, 24)],
+                                    os.path.join(self.root, "state/openclaw.sqlite"))
+        codes = {f["code"]: f for f in out}
+        self.assertEqual(set(codes), {"retired-memory-index", "pre-july-schema"})
+        self.assertIn("main", codes["retired-memory-index"]["message"])
+        self.assertIn("other (agent DB schema 1)", codes["pre-july-schema"]["message"])
+        self.assertNotIn("done", codes["pre-july-schema"]["message"])
+        self.assertIn("agent_databases primary key ['agent_id']", codes["pre-july-schema"]["message"])
+        # a canonical 7.35 state passes
+        ok = os.path.join(self.root, "ok.sqlite")
+        _sqlite(ok, ["CREATE TABLE agent_databases(agent_id TEXT, path TEXT, PRIMARY KEY(agent_id, path))",
+                     "CREATE TABLE memory_index_sources(path TEXT)"])
+        self.assertEqual(m.retired_db_findings([("main", ok, 1, 24)], ok), [])
+
+    def test_tuning_dropped_and_r0(self):
+        pre = {"agents": {"defaults": {"memorySearch": {"model": "m", "query": {"hybrid": {
+            "vectorWeight": 0.95, "textWeight": 0.05, "mmr": {"lambda": 0.5}}}}}}}
+        moved = {"memory": {"search": {"model": "m", "query": {"hybrid": {"mmr": {"lambda": 0.5}}}}}}
+        self.assertEqual(m.retired_tuning_dropped(pre, moved),
+                         ["agents.defaults.memorySearch.query.hybrid.vectorWeight=0.95",
+                          "agents.defaults.memorySearch.query.hybrid.textWeight=0.05"])
+        self.assertEqual(m.retired_tuning_dropped(moved, moved), [])
+        cfg = {"plugins": {"installs": {"a": {"spec": "x"}}, "entries": {}}}
+        new, ledger, _s = m.premigrate_config(cfg, removals=[["plugins", "installs"]])
+        self.assertNotIn("installs", new["plugins"])
+        self.assertEqual([(e["step"], e["path"], e["after"]) for e in ledger], [("R0", "plugins.installs", None)])
+        self.assertIn("installs", cfg["plugins"], "input must not be mutated")
+
+
+DDL_STATE_1004 = os.path.join(FIX, "openclaw-state-schema-2026.10.4.sql")  # verbatim OpenClaw v2026.10.4 DDL
+
+
+def _caps(version):
+    """oc_common.runtime_caps of a bundled OpenClaw `version` (no build-time features record)."""
+    from unittest import mock
+    import oc_common as C
+    with mock.patch.dict(os.environ, {"OC_ADDON_FEATURES_FILE": os.path.join(HERE, "no-such-features.json")}):
+        return C.runtime_caps(version)
+
+
+RUNTIME_FILES = ("acp/event-ledger.json", "acp/event-ledger.json.doctor-import", "settings/voicewake.json",
+                 "settings/voicewake-routing.json", "bindings/current-conversations.json",
+                 "plugin-binding-approvals.json", "restart-sentinel.json", "restart-sentinel.json.doctor-importing")
+SANDBOX_REGISTRIES = ("sandbox/containers.json", "sandbox/browsers.json")
+SANDBOX_DIRS = ("sandbox/containers", "sandbox/browsers")
+
+
+class TestRetiredRuntimeFiles(unittest.TestCase):
+    """OpenClaw 2026.10.5+ refuses pre-July runtime files 2026.10.4 still imported (#165402, #164669): quarantine
+    only with proof that OpenClaw imported them (or when 2026.10.4 would import nothing), otherwise an acceptable
+    HOLD per file type; retired config keys of 2026.10.5/10.6 (runtime_caps)."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.home = self.tmp.name
+        self.root = os.path.join(self.home, ".openclaw")  # the default home of HOME=self.home
+        self.db = os.path.join(self.root, "state", "openclaw.sqlite")
+        os.makedirs(os.path.dirname(self.db))
+        con = sqlite3.connect(self.db)
+        with open(DDL_STATE_1004, encoding="utf-8") as f:
+            con.executescript(f.read())
+        con.close()
+        self.c1010 = _caps("2026.10.10")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def sql(self, *statements, params=()):
+        con = sqlite3.connect(self.db)
+        try:
+            for s in statements:
+                con.execute(s, params) if params else con.execute(s)
+            con.commit()
+        finally:
+            con.close()
+
+    def run_cls(self, cfg=None, caps="1010", env=None, **kw):
+        before = _snapshot(self.home)
+        out = m.classify_retired_state(self.root, cfg or {}, accepted=kw.pop("accepted", set()), home="/config",
+                                       caps=self.c1010 if caps == "1010" else caps,
+                                       env={"HOME": self.home} if env is None else env, **kw)
+        self.assertEqual(_snapshot(self.home), before, "classification must not touch the state dir")
+        json.dumps(out)
+        return out
+
+    def plan(self, out):
+        return {p["rel"]: (p["kind"], p["action"]) for p in out["plan"]}
+
+    def proof(self, out, rel):
+        return next(p.get("proof") for p in out["plan"] if p["rel"] == rel)
+
+    def codes(self, out):
+        return {f["code"]: f["cls"] for f in out["findings"]}
+
+    def ledger(self, sessions):
+        return json.dumps({"version": 1, "sessions": sessions})
+
+    # ----- version gating -----
+    def test_runtime_files_left_to_doctor_for_10_4(self):
+        for rel in RUNTIME_FILES + SANDBOX_REGISTRIES:
+            _write(self.root, rel, "{}")
+        for rel in SANDBOX_DIRS:
+            os.makedirs(os.path.join(self.root, rel))
+        for caps in (None, _caps("2026.10.4"), _caps("2026.10.4-2")):
+            out = self.run_cls(caps=caps)
+            self.assertEqual(out["plan"], [], caps)
+            self.assertEqual(out["findings"], [], caps)
+        # 2026.10.5 and later: every path is checked
+        for v in ("2026.10.5", "2026.10.10", "2026.11.1"):
+            out = self.run_cls(caps=_caps(v))
+            self.assertEqual(set(self.plan(out)), set(RUNTIME_FILES + SANDBOX_REGISTRIES + SANDBOX_DIRS), v)
+        # "{}" is nothing 2026.10.4 would import for Voice Wake (defaults), bindings, approvals and the empty
+        # shard directories; the ledger, the sentinel and the registry files need proof
+        self.assertEqual(self.codes(out), {c: "acceptable" for c in (
+            "acp-ledger-unimported", "restart-sentinel-unimported", "sandbox-registry-unimported")})
+        for rel in ("settings/voicewake.json", "settings/voicewake-routing.json", "bindings/current-conversations.json",
+                    "plugin-binding-approvals.json") + SANDBOX_DIRS:
+            self.assertEqual(self.plan(out)[rel][1], "quarantine", rel)
+            self.assertTrue(self.proof(out, rel).startswith("nothing to import"), rel)
+
+    # ----- ACP replay ledger -----
+    def acp_rows(self, session_key="agent:main:acp", update2=None, run_id2="run-1"):
+        self.sql("INSERT INTO acp_replay_sessions (session_id, session_key, cwd, complete, created_at, updated_at, "
+                 "next_seq) VALUES ('s1', '%s', '/config/clawd', 1, 1000, 2000, 3)" % session_key)
+        self.sql("INSERT INTO acp_replay_events (session_id, seq, at, session_key, run_id, update_json) VALUES "
+                 "('s1', 1, 1100, 'agent:main:acp', NULL, ?)", params=(json.dumps({"sessionUpdate": "a", "n": 1}),))
+        self.sql("INSERT INTO acp_replay_events (session_id, seq, at, session_key, run_id, update_json) VALUES "
+                 "('s1', 2, 1200, 'agent:main:acp', ?, ?)",
+                 params=(run_id2, json.dumps(update2 or {"sessionUpdate": "b", "ok": True})))
+
+    def acp_file(self, rel="acp/event-ledger.json", **over):
+        s = {"sessionId": "s1", "sessionKey": "agent:main:acp", "cwd": "/config/clawd", "complete": True,
+             "createdAt": 1000, "updatedAt": 2000.0, "nextSeq": 3, "events": [
+                 {"seq": 2, "at": 1200, "sessionId": "s1", "sessionKey": "agent:main:acp", "runId": "run-1",
+                  "update": {"ok": True, "sessionUpdate": "b"}},
+                 {"seq": 1, "at": 1100, "sessionId": "s1", "sessionKey": "agent:main:acp",
+                  "update": {"sessionUpdate": "a", "n": 1}}]}
+        s.update(over)
+        _write(self.root, rel, self.ledger({"s1": s}))
+
+    def test_acp_ledger_proof(self):
+        self.acp_rows()
+        self.acp_file()
+        out = self.run_cls()
+        self.assertEqual(self.plan(out)["acp/event-ledger.json"], ("acp-replay-ledger", "quarantine"))
+        self.assertEqual(self.proof(out, "acp/event-ledger.json"), "1 session(s), 2 event(s) in acp_replay_*")
+        self.assertEqual(out["findings"], [])
+        # the doctor claim file is checked the same way
+        os.rename(os.path.join(self.root, "acp/event-ledger.json"),
+                  os.path.join(self.root, "acp/event-ledger.json.doctor-import"))
+        self.assertEqual(self.plan(self.run_cls())["acp/event-ledger.json.doctor-import"],
+                         ("acp-replay-ledger", "quarantine"))
+        os.remove(os.path.join(self.root, "acp/event-ledger.json.doctor-import"))
+        # nextSeq not above the last event, invalid JSON, a null run id: 2026.10.4 could not import it either
+        for bad in ({"nextSeq": 2}, {"complete": 1}):
+            self.acp_file(**bad)
+            out = self.run_cls()
+            self.assertEqual(self.plan(out)["acp/event-ledger.json"], ("acp-replay-ledger", "leave"), bad)
+            self.assertEqual(self.codes(out), {"acp-ledger-unimported": "acceptable"})
+        _write(self.root, "acp/event-ledger.json", "{not json")
+        self.assertIn("invalid JSON", self.run_cls()["findings"][0]["message"])
+        # nothing to import: no sessions
+        _write(self.root, "acp/event-ledger.json", self.ledger({}))
+        out = self.run_cls()
+        self.assertEqual((self.plan(out)["acp/event-ledger.json"], self.proof(out, "acp/event-ledger.json")),
+                         (("acp-replay-ledger", "quarantine"), "nothing to import"))
+        self.assertEqual(out["findings"], [])
+
+    def test_acp_ledger_proof_needs_exact_rows(self):
+        self.acp_rows(update2={"sessionUpdate": "b", "ok": 1})  # true is not 1 (isDeepStrictEqual)
+        self.acp_file()
+        out = self.run_cls()
+        self.assertEqual(self.plan(out)["acp/event-ledger.json"], ("acp-replay-ledger", "leave"))
+        self.assertIn("acp/event-ledger.json (1 of 1 session(s) not in SQLite)", out["findings"][0]["message"])
+        out = self.run_cls(accepted={"acp-ledger-unimported"})
+        self.assertEqual(self.plan(out)["acp/event-ledger.json"], ("acp-replay-ledger", "quarantine"))
+        self.assertIsNone(self.proof(out, "acp/event-ledger.json"))
+        self.sql("DELETE FROM acp_replay_events", "DELETE FROM acp_replay_sessions")
+        self.acp_rows(run_id2=None)  # NULL run_id against a recorded runId
+        self.assertEqual(self.codes(self.run_cls()), {"acp-ledger-unimported": "acceptable"})
+        self.sql("DELETE FROM acp_replay_events", "DELETE FROM acp_replay_sessions")
+        self.acp_rows(session_key="agent:main:other")
+        self.assertEqual(self.codes(self.run_cls()), {"acp-ledger-unimported": "acceptable"})
+        self.sql("DROP TABLE acp_replay_events")  # unreadable tables: never proof
+        self.assertEqual(self.codes(self.run_cls()), {"acp-ledger-unimported": "acceptable"})
+
+    # ----- Voice Wake -----
+    def test_voicewake_proof(self):
+        rel = "settings/voicewake.json"
+        _write(self.root, rel, json.dumps({"triggers": [" hey ", "computer", 7, "  "]}))
+        self.sql("INSERT INTO config_machine_state VALUES ('voicewake.triggers', '[\"hey\",\"computer\"]', 1)")
+        out = self.run_cls()
+        self.assertEqual((self.plan(out)[rel], self.proof(out, rel)),
+                         (("voicewake-json", "quarantine"), "voicewake.triggers in SQLite"))
+        self.sql("UPDATE config_machine_state SET value_json='[\"other\"]'")
+        out = self.run_cls()
+        self.assertEqual(self.plan(out)[rel], ("voicewake-json", "leave"))
+        self.assertEqual(self.codes(out), {"voicewake-unimported": "acceptable"})
+        # an identical archived copy (2026.10.4 archives only after the SQLite commit) is proof; .migrated.N too
+        self.sql("DELETE FROM config_machine_state")
+        _write(self.root, rel + ".migrated", "different")
+        self.assertEqual(self.plan(self.run_cls())[rel], ("voicewake-json", "leave"))
+        _write(self.root, rel + ".migrated.2", json.dumps({"triggers": [" hey ", "computer", 7, "  "]}))
+        out = self.run_cls()
+        self.assertEqual((self.plan(out)[rel], self.proof(out, rel)),
+                         (("voicewake-json", "quarantine"), "identical archived copy voicewake.json.migrated.2"))
+        # the default trigger words without a SQLite row: nothing to import (the runtime uses the defaults)
+        for n in (".migrated", ".migrated.2"):
+            os.remove(os.path.join(self.root, rel + n))
+        _write(self.root, rel, json.dumps({"triggers": []}))
+        out = self.run_cls()
+        self.assertEqual(self.plan(out)[rel], ("voicewake-json", "quarantine"))
+        self.assertTrue(self.proof(out, rel).startswith("nothing to import"))
+        os.remove(os.path.join(self.root, rel))
+        # routing: the stored defaultTarget and routes equal the file's
+        routing = {"version": 1, "defaultTarget": {"agentId": "main"},
+                   "routes": [{"trigger": "hey", "target": {"mode": "current"}}]}
+        _write(self.root, "settings/voicewake-routing.json", json.dumps(routing))
+        self.assertEqual(self.codes(self.run_cls()), {"voicewake-unimported": "acceptable"})
+        self.sql("INSERT INTO config_machine_state VALUES ('voicewake.routing', ?, 1)",
+                 params=(json.dumps(dict(routing, updatedAtMs=5)),))
+        out = self.run_cls()
+        self.assertEqual(self.plan(out)["settings/voicewake-routing.json"], ("voicewake-json", "quarantine"))
+        self.assertEqual(out["findings"], [])
+
+    # ----- current-conversation bindings -----
+    def binding_row(self, channel, account, parent, conv, target):
+        self.sql("INSERT INTO current_conversation_bindings (binding_key, binding_id, target_session_key, channel, "
+                 "account_id, conversation_kind, parent_conversation_id, conversation_id, target_kind, status, "
+                 "bound_at, record_json, updated_at) VALUES (?, 'b', ?, ?, ?, 'current', ?, ?, 'session', 'active', "
+                 "1, '{}', 1)", params=("%s|%s|%s|%s" % (channel, account, parent, conv), target, channel, account,
+                                         parent, conv))
+
+    def test_current_conversation_bindings_proof(self):
+        rel = "bindings/current-conversations.json"
+        _write(self.root, rel, json.dumps({"version": 1, "bindings": [
+            {"conversation": {"channel": " Telegram ", "accountId": "Main", "conversationId": " 42 ",
+                              "parentConversationId": "42"}, "targetSessionKey": " agent:main:x "},
+            {"conversation": {"channel": "discord", "accountId": "", "conversationId": "c1",
+                              "parentConversationId": "g1"}, "targetSessionKey": "agent:main:y"},
+            {"conversation": {"channel": "slack", "conversationId": "c9"}}]}))  # no target: ignored
+        self.binding_row("telegram", "main", None, "42", "agent:main:x")
+        out = self.run_cls()
+        self.assertEqual(self.plan(out)[rel], ("conversation-bindings-json", "leave"))
+        self.assertIn("1 of 2 binding(s) not in SQLite", out["findings"][0]["message"])
+        self.binding_row("discord", "default", "g1", "c1", "agent:main:other")  # another target session
+        self.assertEqual(self.codes(self.run_cls()), {"conversation-bindings-unimported": "acceptable"})
+        self.sql("UPDATE current_conversation_bindings SET target_session_key='agent:main:y' WHERE channel='discord'")
+        out = self.run_cls()
+        self.assertEqual((self.plan(out)[rel], self.proof(out, rel)),
+                         (("conversation-bindings-json", "quarantine"), "2 binding(s) in current_conversation_bindings"))
+        _write(self.root, rel, json.dumps({"version": 2, "bindings": [{"conversation": {"conversationId": "x"}}]}))
+        out = self.run_cls()
+        self.assertEqual(self.plan(out)[rel], ("conversation-bindings-json", "quarantine"))
+        self.assertTrue(self.proof(out, rel).startswith("nothing to import"))
+
+    # ----- plugin binding approvals (default home only) -----
+    def test_plugin_binding_approvals_default_home_only(self):
+        rel = "plugin-binding-approvals.json"
+        _write(self.root, rel, json.dumps({"version": 1, "approvals": [
+            {"pluginRoot": "/p/brave", "pluginId": "brave", "channel": " Telegram ", "approvedAt": 1},
+            {"pluginRoot": "/p/x", "pluginId": "x"}]}))  # no channel: ignored
+        out = self.run_cls()
+        self.assertEqual(self.plan(out)[rel], ("plugin-approvals-json", "leave"))
+        self.assertEqual(self.codes(out), {"plugin-approvals-unimported": "acceptable"})
+        self.sql("INSERT INTO plugin_binding_approvals VALUES ('/p/brave', 'telegram', 'default', 'brave', NULL, 1)")
+        out = self.run_cls()
+        self.assertEqual((self.plan(out)[rel], self.proof(out, rel)),
+                         (("plugin-approvals-json", "quarantine"), "1 approval(s) in plugin_binding_approvals"))
+        self.sql("DELETE FROM plugin_binding_approvals")
+        # only the default home's state dir: OPENCLAW_HOME wins over HOME; a leading ~ is the OS home
+        for env, checked in (({"HOME": "/elsewhere"}, False), ({"HOME": self.home}, True),
+                             ({"HOME": "/elsewhere", "OPENCLAW_HOME": self.home}, True),
+                             ({"HOME": self.home, "OPENCLAW_HOME": "/elsewhere"}, False),
+                             ({"HOME": self.home, "OPENCLAW_HOME": " ~ "}, True),
+                             ({"HOME": self.home + "/./"}, True), ({}, False)):
+            out = self.run_cls(env=env)
+            self.assertEqual(rel in self.plan(out), checked, env)
+            self.assertEqual("plugin-approvals-unimported" in self.codes(out), checked, env)
+        # path.resolve semantics: a symlinked home is not resolved (OpenClaw compares the paths as given)
+        link_home = os.path.join(self.home, "linked")
+        os.makedirs(link_home)
+        os.symlink(self.root, os.path.join(link_home, ".openclaw"))
+        self.assertNotIn(rel, self.plan(self.run_cls(env={"HOME": link_home})))
+
+    # ----- restart sentinel -----
+    def receipt(self, sha, decision="legacy-imported", status="completed", source_row=True, path="/old/x.json"):
+        import hashlib
+        key = "restart-sentinel-json:" + hashlib.sha256(path.encode()).hexdigest()
+        report = json.dumps({"source": "legacy-restart-sentinel-json", "target": "gateway_restart_sentinel",
+                             "decision": decision, "sourceSha256": sha, "sourceValid": True,
+                             "importedRecordCount": 1, "preservedSqliteRecordCount": 0})
+        run_id = "%s:%s" % (key, sha[:16])
+        self.sql("INSERT INTO migration_runs VALUES (?, 1, 1, ?, ?)", params=(run_id, status, report))
+        if source_row:
+            self.sql("INSERT INTO migration_sources (source_key, migration_kind, source_path, target_table, "
+                     "source_sha256, last_run_id, status, imported_at, report_json) VALUES (?, "
+                     "'legacy-restart-sentinel-json', ?, 'gateway_restart_sentinel', ?, ?, 'completed', 1, ?)",
+                     params=(key, path, sha, run_id, report))
+
+    def test_restart_sentinel_receipts(self):
+        import hashlib
+        body = '{"version":1,"payload":{"kind":"restart"}}'
+        sha = hashlib.sha256(body.encode()).hexdigest()
+        _write(self.root, "restart-sentinel.json", body)
+        out = self.run_cls()
+        self.assertEqual(self.plan(out)["restart-sentinel.json"], ("restart-sentinel-json", "leave"))
+        self.assertEqual(self.codes(out), {"restart-sentinel-unimported": "acceptable"})
+        self.receipt(hashlib.sha256(b"other bytes").hexdigest())  # a receipt for other content
+        self.assertEqual(self.codes(self.run_cls()), {"restart-sentinel-unimported": "acceptable"})
+        # any recorded decision for exactly these bytes, whatever path it was recorded for
+        self.receipt(sha, decision="canonical-preserved", path="/old/y.json")
+        out = self.run_cls()
+        self.assertEqual((self.plan(out)["restart-sentinel.json"], self.proof(out, "restart-sentinel.json")),
+                         (("restart-sentinel-json", "quarantine"), "receipt canonical-preserved"))
+        # the doctor claim with only a migration_runs row: completed counts, running or an unknown decision not
+        os.rename(os.path.join(self.root, "restart-sentinel.json"),
+                  os.path.join(self.root, "restart-sentinel.json.doctor-importing"))
+        self.sql("DELETE FROM migration_sources", "DELETE FROM migration_runs")
+        self.receipt(sha, status="running", source_row=False)
+        self.assertEqual(self.codes(self.run_cls()), {"restart-sentinel-unimported": "acceptable"})
+        self.sql("DELETE FROM migration_runs")
+        self.receipt(sha, decision="made-up", source_row=False)
+        self.assertEqual(self.codes(self.run_cls()), {"restart-sentinel-unimported": "acceptable"})
+        self.sql("DELETE FROM migration_runs")
+        self.receipt(sha, source_row=False)
+        out = self.run_cls()
+        self.assertEqual(self.plan(out)["restart-sentinel.json.doctor-importing"],
+                         ("restart-sentinel-json", "quarantine"))
+        self.assertEqual(out["findings"], [])
+
+    # ----- sandbox registries (strict) -----
+    def test_sandbox_registry_proof(self):
+        _write(self.root, "sandbox/containers.json", json.dumps({"entries": [{"containerName": "a", "x": 1}]}))
+        _write(self.root, "sandbox/browsers/x.json", json.dumps({"containerName": "b"}))
+        _write(self.root, "sandbox/browsers/notes.txt", "ignored")
+        os.makedirs(os.path.join(self.root, "sandbox/skills-workspaces/w"))  # live runtime path: never planned
+        out = self.run_cls()
+        plan = self.plan(out)
+        self.assertEqual(plan["sandbox/containers.json"], ("sandbox-registry", "leave"))
+        self.assertEqual(plan["sandbox/browsers"], ("sandbox-registry", "leave"))  # the directory is the entry
+        self.assertEqual(set(plan), {"sandbox/containers.json", "sandbox/browsers"})
+        self.assertEqual(self.codes(out), {"sandbox-registry-unimported": "acceptable"})
+        self.sql("INSERT INTO sandbox_registry_entries (registry_kind, container_name, entry_json, updated_at) "
+                 "VALUES ('container', 'a', '{}', 1)")
+        out = self.run_cls()
+        self.assertEqual((self.plan(out)["sandbox/containers.json"], self.proof(out, "sandbox/containers.json")),
+                         (("sandbox-registry", "quarantine"), "1 entr(ies) in sandbox_registry_entries"))
+        self.sql("INSERT INTO sandbox_registry_entries (registry_kind, container_name, entry_json, updated_at) "
+                 "VALUES ('container', 'b', '{}', 1)")  # a container row does not prove a browser entry
+        self.assertEqual(self.plan(self.run_cls())["sandbox/browsers"], ("sandbox-registry", "leave"))
+        self.sql("INSERT INTO sandbox_registry_entries (registry_kind, container_name, entry_json, updated_at) "
+                 "VALUES ('browser', 'b', '{}', 1)")
+        self.assertEqual(self.plan(self.run_cls())["sandbox/browsers"], ("sandbox-registry", "quarantine"))
+        # strict: an invalid shard or registry file holds even though 2026.10.4 would have set it aside
+        _write(self.root, "sandbox/browsers/y.json", "{not json")
+        self.assertEqual(self.plan(self.run_cls())["sandbox/browsers"], ("sandbox-registry", "leave"))
+        _write(self.root, "sandbox/containers.json", json.dumps({"entries": [{"name": "a"}]}))
+        self.assertEqual(self.plan(self.run_cls())["sandbox/containers.json"], ("sandbox-registry", "leave"))
+        # an empty registry directory or file: nothing to import
+        os.remove(os.path.join(self.root, "sandbox/containers.json"))
+        os.makedirs(os.path.join(self.root, "sandbox/containers"))
+        _write(self.root, "sandbox/browsers.json", json.dumps({"entries": []}))
+        out = self.run_cls()
+        for rel in ("sandbox/containers", "sandbox/browsers.json"):
+            self.assertEqual((self.plan(out)[rel], self.proof(out, rel)),
+                             (("sandbox-registry", "quarantine"), "nothing to import"))
+        # a regular file where the shard directory belongs
+        os.rmdir(os.path.join(self.root, "sandbox/containers"))
+        _write(self.root, "sandbox/containers", "x")
+        self.assertEqual(self.plan(self.run_cls())["sandbox/containers"], ("sandbox-registry", "leave"))
+
+    def test_runtime_files_uninspectable_and_symlinks(self):
+        _write(self.root, "settings", "a file where a directory belongs")
+        out = self.run_cls()
+        self.assertEqual(self.codes(out), {"retired-state-uninspectable": "hard"})
+        self.assertIn("settings/voicewake.json (", out["findings"][0]["message"])
+        os.remove(os.path.join(self.root, "settings"))
+        # a symlink is never followed (2026.10.10 refuses the link itself): accepting quarantines the link
+        self.acp_rows()
+        self.acp_file(rel="../ledger.json")  # a valid ledger OpenClaw imported, outside the state dir
+        os.makedirs(os.path.join(self.root, "acp"))
+        os.symlink(os.path.join(self.home, "ledger.json"), os.path.join(self.root, "acp", "event-ledger.json"))
+        out = self.run_cls()
+        self.assertEqual(self.plan(out)["acp/event-ledger.json"], ("acp-replay-ledger", "leave"))
+        self.assertIn("not a regular file", out["findings"][0]["message"])
+        out = self.run_cls(accepted={"acp-ledger-unimported"})
+        self.assertEqual(self.plan(out)["acp/event-ledger.json"], ("acp-replay-ledger", "quarantine"))
+        os.remove(os.path.join(self.home, "ledger.json"))  # a broken link still counts as present
+        self.assertEqual(self.plan(self.run_cls())["acp/event-ledger.json"], ("acp-replay-ledger", "leave"))
+
+    # ----- retired config keys -----
+    def test_config_keys_targets(self):
+        c104, c105, c106 = _caps("2026.10.4"), _caps("2026.10.5"), _caps("2026.10.6")
+        empty = {"plugins": {"installs": {}}}
+        self.assertEqual(m.retired_config_keys(empty)[0], ["plugins.installs"])
+        for caps, flagged in ((c104, True), (c105, True), (c106, False), (self.c1010, False)):
+            self.assertEqual("plugins.installs" in m.retired_config_keys(empty, caps)[0], flagged, caps)
+        for installs in (None, [], {"x": {}}):
+            for caps in (None, self.c1010):
+                self.assertIn("plugins.installs", m.retired_config_keys({"plugins": {"installs": installs}}, caps)[0])
+        cfg = {"models": {"providers": {
+                   "p": {"api": "openai-codex-responses",
+                         "models": [{"id": "a"}, {"id": "b", "api": "openai-codex-responses"}, "x"]},
+                   "q": {"api": "openai-chatgpt-responses"}, "r": {"api": " openai-codex-responses"}}},
+               "browser": {"profiles": {"e": {"driver": " extension ", "cdpUrl": "ws://x"},
+                                        "blank": {"driver": "extension", "cdpUrl": "  "},
+                                        "other": {"driver": "openclaw", "cdpUrl": "ws://y"},
+                                        "num": {"driver": "extension", "cdpUrl": 9222}}}}
+        want = ["models.providers.p.api", "models.providers.p.models[1].api", "browser.profiles.e.cdpUrl"]
+        for caps in (c105, self.c1010):
+            self.assertEqual(m.retired_config_keys(cfg, caps)[0], want)
+        for caps in (None, c104):
+            self.assertEqual(m.retired_config_keys(cfg, caps)[0], [])
+
+    def test_config_rewrites_and_findings_modes(self):
+        cfg = {"models": {"providers": {"openai": {"api": "openai-codex-responses",
+                                                   "models": [{"id": "gpt-5.5", "api": "openai-codex-responses"}]}}},
+               "browser": {"profiles": {"e": {"driver": "extension", "cdpUrl": "ws://x"}}}}
+        self.assertEqual(m.retired_config_rewrites(cfg, _caps("2026.10.4")), [])
+        self.assertEqual(m.retired_config_rewrites(cfg), [])
+        rw = m.retired_config_rewrites(cfg, self.c1010)
+        self.assertEqual([(e["parts"], e["op"], e.get("value")) for e in rw], [
+            (["models", "providers", "openai", "api"], "set", "openai-chatgpt-responses"),
+            (["models", "providers", "openai", "models", 0, "api"], "set", "openai-chatgpt-responses"),
+            (["browser", "profiles", "e", "cdpUrl"], "delete", None)])
+        # from-7x: the pre-migrate step fixes them; bump/maintenance: a hard HOLD naming the exact fix
+        self.assertEqual(m.retired_config_findings(cfg, "from-7x", self.c1010, "2026.10.10"), [])
+        f = m.retired_config_findings(cfg, "bump", self.c1010, "2026.10.10")
+        self.assertEqual([(x["code"], x["cls"]) for x in f], [("config-retired-keys", "hard")])
+        self.assertIn("OpenClaw 2026.10.10 refuses", f[0]["message"])
+        self.assertIn('set models.providers.openai.api to "openai-chatgpt-responses"', f[0]["message"])
+        self.assertIn("delete browser.profiles.e.cdpUrl", f[0]["message"])
+        self.assertNotIn("remove the others", f[0]["message"])
+        f = m.retired_config_findings(dict(cfg, heartbeat={}), "maintenance", self.c1010, "2026.10.10")
+        self.assertIn("; remove the others (or migrate them with OpenClaw 2026.9.5); then oc-upgrade retry",
+                      f[0]["message"])
+        self.assertEqual(m.retired_config_findings(cfg, "bump", _caps("2026.10.4")), [])
+        # the classify result carries the rewrites in from-7x mode only; an empty installs {} is an info on 10.6+
+        self.assertEqual(self.run_cls(cfg)["config_rewrites"], rw)
+        self.assertEqual(self.run_cls(cfg, mode="bump")["config_rewrites"], [])
+        out = self.run_cls({"plugins": {"installs": {}}}, mode="bump")
+        self.assertEqual(out["info"], ["openclaw.json plugins.installs is an empty object; OpenClaw doctor removes it "
+                                       "(install records stay in SQLite)"])
+        self.assertEqual(self.run_cls({"plugins": {"installs": {}}}, mode="bump", caps=None)["info"], [])
+        self.assertEqual(self.run_cls({"plugins": {"installs": {}}})["config_removals"], [["plugins", "installs"]])
+
+    def test_premigrate_r0_rewrites(self):
+        cfg = {"models": {"providers": {"openai": {"api": "openai-codex-responses",
+                                                   "models": [{"id": "gpt-5.5", "api": "openai-codex-responses"}]}}},
+               "browser": {"profiles": {"e": {"driver": "extension", "cdpUrl": "ws://user:pw@127.0.0.1:18792/x?t=1"},
+                                        "f": {"driver": "extension", "cdpUrl": "http://h"}}}}
+        snap = copy.deepcopy(cfg)
+        rw = m.retired_config_rewrites(cfg, self.c1010)
+        cfg["browser"]["profiles"]["f"]["cdpUrl"] = "http://h"  # unchanged
+        new, ledger, _s = m.premigrate_config(cfg, rewrites=rw)
+        self.assertEqual(cfg, snap, "input must not be mutated")
+        self.assertEqual(new["models"]["providers"]["openai"]["api"], "openai-chatgpt-responses")
+        self.assertEqual(new["models"]["providers"]["openai"]["models"][0]["api"], "openai-chatgpt-responses")
+        self.assertEqual(new["browser"]["profiles"], {"e": {"driver": "extension"}, "f": {"driver": "extension"}})
+        self.assertEqual([(e["step"], e["path"], e["before"], e["after"]) for e in ledger if e["step"] == "R0"], [
+            ("R0", "models.providers.openai.api", "openai-codex-responses", "openai-chatgpt-responses"),
+            ("R0", "models.providers.openai.models[0].api", "openai-codex-responses", "openai-chatgpt-responses"),
+            ("R0", "browser.profiles.e.cdpUrl", "ws://127.0.0.1:18792", None),  # no credentials in the ledger
+            ("R0", "browser.profiles.f.cdpUrl", "http://h", None)])
+        # idempotent; a value already changed by hand is left alone
+        again, ledger2, _s = m.premigrate_config(new, rewrites=rw)
+        self.assertEqual([e for e in ledger2 if e["step"] == "R0"], [])
+        self.assertEqual(again["models"], new["models"])
+        hand = copy.deepcopy(cfg)
+        hand["models"]["providers"]["openai"]["api"] = "openai-responses"
+        out, ledger3, _s = m.premigrate_config(hand, rewrites=rw)
+        self.assertEqual(out["models"]["providers"]["openai"]["api"], "openai-responses")
+        self.assertNotIn("models.providers.openai.api", [e["path"] for e in ledger3])
+
+
+class TestVllmUntouched(unittest.TestCase):
+    """With a vllm primary (vllm/qwen3.5-122b): no transform may touch vllm refs or the provider block."""
+
+    def vllm_view(self, cfg):
+        refs = sorted((m.fmt_path(p), s) for p, s, _w in m._iter_scanned(cfg, keys_everywhere=True)
+                      if s.strip().lower().startswith("vllm/"))
+        return refs, m._get(cfg, ["models", "providers", "vllm"], None)
+
+    def test_every_transform(self):
+        before = live_like()
+        want = self.vllm_view(before)
+        self.assertEqual(m.models_preflight(before), [])
+        self.assertEqual(m.config_precheck(before, json.dumps(before)), [])
+        pre, _l, summary = m.premigrate_config(before)
+        self.assertEqual(self.vllm_view(pre), want)
+        # simulated doctor pass 1: legacy refs canonicalised, codex pin written, codex plugin enabled
+        now = copy.deepcopy(pre)
+        now["meta"] = {"lastTouchedVersion": "2026.9.9", "migrations": {"modelPolicyAllowlist": True}}
+        dm = now["agents"]["defaults"]["models"]
+        dm["openai/gpt-5.5"] = {"agentRuntime": {"id": "codex"}}
+        del dm["openai-codex/gpt-5.5"]
+        now["agents"]["defaults"]["model"]["fallbacks"][0] = "openai/gpt-5.5"
+        now["agents"]["defaults"]["modelPolicy"] = {"allow": list(dm)}
+        now["plugins"] = {"entries": {"codex": {"enabled": True}}}
+        want = self.vllm_view(now)  # doctor copied the vllm keys into modelPolicy.allow
+        self.assertIn(("agents.defaults.modelPolicy.allow[1]", "vllm/*"), want[0])
+        fixed, _l, s = m.fixups(now, before, pre)
+        self.assertEqual(self.vllm_view(fixed), want)
+        self.assertEqual(s["codex_pins"], 1)
+        self.assertTrue(s["codex_plugin_restored"])
+        self.assertEqual(m.check_legacy_refs(fixed), [])
+        self.assertEqual(m.check_codex_runtime(fixed, pre_cfg=before), [])
+        self.assertEqual(m.check_runtime_pins(fixed, summary["legacy_slots"]), [])
+        new, _f, _ledger = m.auth_order_adjust(fixed, TestAuthOrder.PROFILES, None)
+        self.assertEqual(self.vllm_view(new), want)
+        pinned, _w, _s = m.apply_pins(new, set())
+        self.assertEqual(self.vllm_view(pinned), want)
+        self.assertEqual(pinned["models"]["providers"]["vllm"], vllm_block())
+
+    def test_sessions(self):
+        store = {"agent:main:main": {"modelProvider": "vllm", "model": "qwen3.5-122b"},
+                 "agent:main:telegram:direct:1": {"modelOverride": "vllm/qwen3.5-122b"}}
+        new, ledger, summary = m.premigrate_sessions(store, "agents/main/sessions/sessions.json")
+        self.assertEqual(new, store)
+        self.assertEqual(ledger, [])
+        self.assertEqual(summary, {"pinned": [], "user_explicit": [], "harness": []})
+
+
+def glm_cfg():
+    """Live-shaped GLM block (provider glm, qwen-chat-template) next to a non-GLM qwen model."""
+    return {
+        "agents": {"defaults": {"model": {"primary": "glm/GLM-5.3-Flash-EXL3"}, "thinkingDefault": "low",
+                                "models": {"glm/GLM-5.3-Flash-EXL3": {"alias": "GLM"}, "vllm/qwen3.5-122b": {}}}},
+        "models": {"providers": {
+            "glm": {"api": "openai-completions", "baseUrl": "http://192.0.2.10:8888/v1",
+                    "models": [{"id": "GLM-5.3-Flash-EXL3", "reasoning": True,
+                                "compat": {"thinkingFormat": "qwen-chat-template"}}]},
+            "vllm": {"api": "openai-completions", "baseUrl": "http://192.0.2.10:8000/v1",
+                     "models": [{"id": "qwen3.5-122b", "reasoning": True,
+                                 "compat": {"thinkingFormat": "qwen-chat-template"}}]}}},
+    }
+
+
+class TestGlmThinkingLevels(unittest.TestCase):
+    """G1 (add-on option glm_thinking_levels): the level goes out as the root reasoning_effort."""
+
+    EFFORTS = ["none", "low", "high", "max"]
+    MAP = {"minimal": "low", "medium": "high", "xhigh": "max"}
+
+    def test_converts_glm_only(self):
+        before = glm_cfg()
+        snap = copy.deepcopy(before)
+        self.assertEqual(m.glm_thinking_scan(before), {"convert": [("glm", 0, "GLM-5.3-Flash-EXL3")], "skip": []})
+        new, ledger, refs = m.glm_thinking_levels(before)
+        self.assertEqual(before, snap)  # input untouched
+        self.assertEqual(new["models"]["providers"]["glm"]["models"][0]["compat"],
+                         {"supportsReasoningEffort": True, "supportedReasoningEfforts": self.EFFORTS,
+                          "reasoningEffortMap": self.MAP})
+        snap["models"]["providers"]["glm"]["models"][0]["compat"] = new["models"]["providers"]["glm"]["models"][0]["compat"]
+        self.assertEqual(new, snap)  # nothing else changed: no params, no agents.defaults.models entry
+        self.assertEqual(refs, ["glm/GLM-5.3-Flash-EXL3"])
+        self.assertEqual([(e["step"], e["path"], e["before"], e["after"]) for e in ledger], [
+            ("G1", "models.providers.glm.models[0].compat.thinkingFormat", "qwen-chat-template", None),
+            ("G1", "models.providers.glm.models[0].compat.supportsReasoningEffort", None, True),
+            ("G1", "models.providers.glm.models[0].compat.supportedReasoningEfforts", None, self.EFFORTS),
+            ("G1", "models.providers.glm.models[0].compat.reasoningEffortMap", None, self.MAP)])
+        # idempotent: a second run (resume, maintenance, a later update) finds nothing to do
+        self.assertEqual(m.glm_thinking_scan(new)["convert"], [])
+        again, ledger2, refs2 = m.glm_thinking_levels(new)
+        self.assertEqual((again, ledger2, refs2), (new, [], []))
+
+    def test_own_efforts_vllm_and_disabled_are_left_alone(self):
+        cfg = glm_cfg()
+        prov = cfg["models"]["providers"]
+        prov["vllm"]["models"].append({"id": "zai-org/GLM-4.7", "reasoning": True,
+                                       "compat": {"thinkingFormat": "qwen-chat-template"}})
+        base = prov["glm"]["models"][0]
+        prov["glm"]["models"] += [
+            dict(copy.deepcopy(base), id="glm-own-list",
+                 compat={"thinkingFormat": "qwen-chat-template", "supportedReasoningEfforts": ["low", "high"]}),
+            dict(copy.deepcopy(base), id="glm-own-map",
+                 compat={"thinkingFormat": "qwen-chat-template", "reasoningEffortMap": {"medium": "low"}}),
+            dict(copy.deepcopy(base), id="glm-empty",
+                 compat={"thinkingFormat": "qwen-chat-template", "supportedReasoningEfforts": []}),
+            dict(copy.deepcopy(base), id="glm-off",
+                 compat={"thinkingFormat": "qwen-chat-template", "supportsReasoningEffort": False}),
+        ]
+        scan = m.glm_thinking_scan(cfg)
+        self.assertEqual(scan["convert"], [("glm", 0, "GLM-5.3-Flash-EXL3")])
+        self.assertEqual([r for r, _w in scan["skip"]], ["glm/glm-own-list", "glm/glm-own-map", "glm/glm-empty",
+                                                         "glm/glm-off", "vllm/zai-org/GLM-4.7"])
+        self.assertIn("vllm", dict(scan["skip"])["vllm/zai-org/GLM-4.7"])
+        new, _l, refs = m.glm_thinking_levels(cfg)
+        self.assertEqual(refs, ["glm/GLM-5.3-Flash-EXL3"])
+        self.assertEqual(new["models"]["providers"]["glm"]["models"][1:], prov["glm"]["models"][1:])
+        self.assertEqual(new["models"]["providers"]["vllm"], prov["vllm"])
+
+    def test_static_reasoning_effort_param_is_dropped(self):
+        # live shape (2026-10-14): models.providers.glm.models[0].params = {"reasoning_effort": "low"}
+        cfg = glm_cfg()
+        cfg["models"]["providers"]["glm"]["models"][0]["params"] = {"reasoning_effort": "low"}
+        new, ledger, _r = m.glm_thinking_levels(cfg)
+        self.assertNotIn("params", new["models"]["providers"]["glm"]["models"][0])
+        self.assertEqual(ledger[-1], {"step": "G1", "file": "openclaw.json",
+                                      "path": "models.providers.glm.models[0].params.reasoning_effort",
+                                      "before": "low", "after": None})
+        cfg = glm_cfg()
+        cfg["models"]["providers"]["glm"]["models"][0]["params"] = {"reasoningEffort": "high", "temperature": 0.6}
+        new, ledger, _r = m.glm_thinking_levels(cfg)
+        self.assertEqual(new["models"]["providers"]["glm"]["models"][0]["params"], {"temperature": 0.6})
+        self.assertEqual(len(ledger), 5)
+
+    def test_supports_true_already_is_not_ledgered_again(self):
+        cfg = glm_cfg()
+        cfg["models"]["providers"]["glm"]["models"][0]["compat"]["supportsReasoningEffort"] = True
+        _n, ledger, _r = m.glm_thinking_levels(cfg)
+        self.assertEqual([e["path"].rsplit(".", 1)[1] for e in ledger],
+                         ["thinkingFormat", "supportedReasoningEfforts", "reasoningEffortMap"])
+
+    def test_which_models_match(self):
+        def cand(provider_api="openai-completions", **model):
+            cfg = glm_cfg()
+            if provider_api is None:
+                del cfg["models"]["providers"]["glm"]["api"]
+            else:
+                cfg["models"]["providers"]["glm"]["api"] = provider_api
+            cfg["models"]["providers"]["glm"]["models"][0].update(model)
+            return [r[2] for r in m.glm_thinking_scan(cfg)["convert"]]
+        q = {"thinkingFormat": "qwen-chat-template"}
+        self.assertEqual(cand(), ["GLM-5.3-Flash-EXL3"])
+        self.assertEqual(cand(id="zai-org/glm-4.6", compat=dict(q)), ["zai-org/glm-4.6"])
+        self.assertEqual(cand(provider_api=None), ["GLM-5.3-Flash-EXL3"])  # OpenClaw's default api
+        self.assertEqual(cand(provider_api=None, api="openai-completions"), ["GLM-5.3-Flash-EXL3"])
+        self.assertEqual(cand(id="qwen3.5-122b"), [])                      # not GLM
+        self.assertEqual(cand(id="chatglm3-6b"), [])                       # "glm" inside a word
+        self.assertEqual(cand(reasoning=False), [])
+        self.assertEqual(cand(compat={"thinkingFormat": "qwen"}), [])
+        self.assertEqual(cand(api="anthropic-messages"), [])               # model api wins over the provider's
+        self.assertEqual(cand(provider_api="ollama"), [])
+        for bad in (None, [], {"models": []}, {"models": {"providers": []}}):
+            self.assertEqual(m.glm_thinking_scan(bad), {"convert": [], "skip": []})
+        with self.assertRaises(ValueError):
+            m.glm_thinking_levels([])
+
+    def test_preview_lines(self):
+        cfg = glm_cfg()
+        cfg["models"]["providers"]["vllm"]["models"].append({"id": "GLM-4.7", "reasoning": True,
+                                                             "compat": {"thinkingFormat": "qwen-chat-template"}})
+        on = m.glm_thinking_preview(cfg, True)
+        self.assertEqual(on[0], "GLM thinking levels (option glm_thinking_levels on): glm/GLM-5.3-Flash-EXL3 "
+                                "would send the level as reasoning_effort at the next gate run (G1)")
+        self.assertTrue(on[1].startswith("GLM thinking levels: vllm/GLM-4.7 left as is (provider id vllm"))
+        self.assertIn("(option glm_thinking_levels off): glm/GLM-5.3-Flash-EXL3 only switch thinking on/off",
+                      m.glm_thinking_preview(cfg, False)[0])
+        self.assertEqual(m.glm_thinking_preview(m.glm_thinking_levels(glm_cfg())[0], True), [])
+
+
+class TestCronAccountForecast(unittest.TestCase):
+    """full5 (report only): which cron jobs OpenClaw 2026.10.10/2026.11.1 refuses or stops at a fallback because
+    they have no recorded inference account (openclaw/openclaw#192195). Synthetic jobs and profiles only."""
+
+    CFG = {"agents": {"defaults": {"model": {"primary": "vllm/qwen", "fallbacks": ["openai/gpt-5.5", "google/g"]},
+                                   "models": {"openai/gpt-5.5": {"alias": "GPT"}}},
+                      "list": [{"id": "main", "default": True},
+                               {"id": "mail", "model": "vllm/small"},
+                               {"id": "ops", "model": {"primary": "vllm/small", "fallbacks": ["anthropic/c"]}},
+                               {"id": "lab", "model": {"primary": "vllm/small"}}, {"id": "dev", "model": {}}]},
+           "models": {"providers": {"vllm": {"baseUrl": "http://127.0.0.1:8000/v1"}}}}
+    PROFILES = [{"id": "openai:default", "provider": "openai"}, {"id": "anthropic:default", "provider": "anthropic"}]
+
+    def job(self, jid="j1", enabled=True, **kw):
+        payload = {"kind": "agentTurn", "message": "synthetic prompt"}
+        payload.update(kw.pop("payload", {}))
+        return {"id": jid, "name": f"Job {jid}", "enabled": enabled, "runtime_authority": kw.pop("authority", False),
+                "job": dict({"agentId": "main", "sessionTarget": "isolated", "payload": payload}, **kw)}
+
+    def forecast(self, *jobs, cfg=None, profiles=None):
+        return m.cron_account_forecast(list(jobs), self.CFG if cfg is None else cfg,
+                                       lambda aid: self.PROFILES if profiles is None else profiles, "main")
+
+    def test_split_trailing_auth_profile_matches_openclaw(self):
+        # agents/model-ref-profile.ts (identical in 2026.10.4 and 2026.10.10)
+        for raw, want in [("openai/gpt-5.5@openai:a", ("openai/gpt-5.5", "openai:a")),
+                          ("p/m@20250101", ("p/m@20250101", None)), ("p/m@q4_k_m@work", ("p/m@q4_k_m", "work")),
+                          ("p/m@20250101@Q4_K_M@w", ("p/m@20250101@Q4_K_M", "w")), ("p/m@8bit", ("p/m@8bit", None)),
+                          ("@x", ("@x", None)), ("p/m@ ", ("p/m@", None)), ("", ("", None)), (None, ("", None)),
+                          ("a@b/c@d", ("a@b/c", "d")), (" openai/gpt-5.5 ", ("openai/gpt-5.5", None)),
+                          ("p/m@١٢٣٤٥٦٧٨", ("p/m", "١٢٣٤"
+                                                                                   "٥٦٧٨"))]:
+            with self.subTest(raw=raw):
+                self.assertEqual(m.split_trailing_auth_profile(raw), want)
+
+    def test_model_chain_follows_the_cron_fallback_policy(self):
+        chain = lambda job, aid="main": m.cron_model_chain(job, self.CFG, aid)  # noqa: E731
+        # no job model: the defaults' primary and fallbacks
+        self.assertEqual(chain({"payload": {}}), ("vllm/qwen", ["openai/gpt-5.5", "google/g"], "defaults"))
+        # job model without job fallbacks: the agent's override, else the defaults' fallbacks
+        self.assertEqual(chain({"payload": {"model": "anthropic/c"}}),
+                         ("anthropic/c", ["openai/gpt-5.5", "google/g"], "defaults"))
+        # job fallbacks (also []) replace everything
+        self.assertEqual(chain({"payload": {"fallbacks": []}}), ("vllm/qwen", [], "job"))
+        self.assertEqual(chain({"payload": {"fallbacks": ["x/y", 3, " "]}}), ("vllm/qwen", ["x/y"], "job"))
+        # an agent with a primary of its own and no fallbacks has none; an explicit list replaces the defaults
+        self.assertEqual(chain({"payload": {}}, "mail"), ("vllm/small", [], "agent"))
+        self.assertEqual(chain({"payload": {}}, "OPS"), ("vllm/small", ["anthropic/c"], "agent"))
+        self.assertEqual(chain({"payload": {}}, "lab"), ("vllm/small", [], "agent"))
+        self.assertEqual(chain({"payload": {}}, "dev"), ("vllm/qwen", ["openai/gpt-5.5", "google/g"], "defaults"))
+        self.assertEqual(m.cron_model_chain({"payload": {}}, {}, "main"), (None, [], "defaults"))
+
+    def test_model_chain_agent_string_model_repeating_the_default_primary(self):
+        """Review (gate1010): an agent model "provider/model" equal to the defaults' primary keeps the defaults'
+        fallbacks for a job without its own model (run-prepare.ts inheritDefaultFallbacksForAgentStringModel,
+        run-fallback-policy.ts), although a string agent model otherwise means no fallbacks."""
+        cfg = copy.deepcopy(self.CFG)
+        cfg["agents"]["list"] = [{"id": "main", "default": True, "model": " vllm/qwen "}, {"id": "obj",
+                                 "model": {"primary": "vllm/qwen"}}, {"id": "mail", "model": "vllm/small"}]
+        chain = lambda job, aid="main", c=cfg: m.cron_model_chain(job, c, aid)  # noqa: E731
+        self.assertEqual(chain({"payload": {}}), ("vllm/qwen", ["openai/gpt-5.5", "google/g"], "defaults"))
+        # only a string: an object with that primary and no fallbacks still has none
+        self.assertEqual(chain({"payload": {}}, "obj"), ("vllm/qwen", [], "agent"))
+        self.assertEqual(chain({"payload": {}}, "mail"), ("vllm/small", [], "agent"))
+        # a job model owns its chain: the agent's override (none) applies; job fallbacks replace everything
+        self.assertEqual(chain({"payload": {"model": "vllm/qwen"}}), ("vllm/qwen", [], "agent"))
+        self.assertEqual(chain({"payload": {"fallbacks": ["anthropic/c"]}}), ("vllm/qwen", ["anthropic/c"], "job"))
+        # without default fallbacks the agent's override (none) applies
+        cfg2 = copy.deepcopy(cfg)
+        cfg2["agents"]["defaults"]["model"] = {"primary": "vllm/qwen", "fallbacks": []}
+        self.assertEqual(chain({"payload": {}}, c=cfg2), ("vllm/qwen", [], "agent"))
+        # this shape: every enabled job is reported for the fallbacks on a stored login (was: nothing)
+        res = self.forecast(self.job("s1"), cfg=cfg)
+        self.assertEqual(res["affected"], [{"id": "s1", "name": "Job s1", "agent": "main", "primary": "vllm/qwen",
+                                            "primary_affected": False, "refs": ["openai/gpt-5.5"]}])
+
+    def test_model_chain_follows_the_subagent_model_rules(self):
+        """Review (gate1010): without a job model, cron selects the model as a sub-agent spawn does
+        (model-selection.ts, agents/agent-scope.ts resolveSubagentModelConfigSelectionResult): the agent's
+        subagents.model, then agents.defaults.subagents.model, then the agent's model, then the defaults; the
+        fallbacks of a subagents.model come from resolveSubagentModelFallbacksOverride."""
+        def cfg_with(defaults_sub=None, **agents):
+            c = copy.deepcopy(self.CFG)
+            if defaults_sub is not None:
+                c["agents"]["defaults"]["subagents"] = {"model": defaults_sub}
+            for e in c["agents"]["list"]:
+                if e["id"] in agents:
+                    e["subagents"] = {"model": agents[e["id"]]}
+            return c
+        chain = lambda c, job=None, aid="main": m.cron_model_chain(job or {"payload": {}}, c, aid)  # noqa: E731
+        # a string sub-agent model has no fallbacks: the job runs on it alone
+        c = cfg_with("openai/gpt-5.5")
+        self.assertEqual(chain(c), ("openai/gpt-5.5", [], "subagent"))
+        self.assertEqual(chain(c, aid="ops"), ("openai/gpt-5.5", [], "subagent"))  # before the agent's model too
+        self.assertEqual(chain(c, {"payload": {"model": "vllm/qwen"}}),  # a job model wins
+                         ("vllm/qwen", ["openai/gpt-5.5", "google/g"], "defaults"))
+        self.assertEqual(chain(c, {"payload": {"fallbacks": ["google/g"]}}), ("openai/gpt-5.5", ["google/g"], "job"))
+        # the agent's own subagents.model wins over the defaults'; its fallback list is used
+        c = cfg_with("openai/gpt-5.5", main={"primary": "vllm/sub", "fallbacks": ["anthropic/c"]})
+        self.assertEqual(chain(c), ("vllm/sub", ["anthropic/c"], "subagent"))
+        c = cfg_with({"primary": "vllm/sub", "fallbacks": ["google/g"]})
+        self.assertEqual(chain(c), ("vllm/sub", ["google/g"], "subagent"))
+        # an agent subagents.model without a primary is not selected but its list is the override
+        c = cfg_with("vllm/d", mail={"fallbacks": ["anthropic/c"]})
+        self.assertEqual(chain(c, aid="mail"), ("vllm/d", ["anthropic/c"], "subagent"))
+        c = cfg_with(None, mail={"fallbacks": ["anthropic/c"]})
+        self.assertEqual(chain(c, aid="mail"), ("vllm/small", [], "agent"))
+        # forecast in both directions: a default sub-agent model on a stored login is refused every run; a local
+        # one with an openai default primary runs without fallbacks and is not reported
+        res = self.forecast(self.job("a"), cfg=cfg_with("openai/gpt-5.5"))
+        self.assertEqual(res["affected"], [{"id": "a", "name": "Job a", "agent": "main", "primary": "openai/gpt-5.5",
+                                           "primary_affected": True, "refs": ["openai/gpt-5.5"]}])
+        c = cfg_with("vllm/local")
+        c["agents"]["defaults"]["model"] = {"primary": "openai/gpt-5.5"}
+        self.assertEqual(self.forecast(self.job("b"), cfg=c)["affected"], [])
+
+    def test_job_agent(self):
+        self.assertEqual(m.cron_job_agent({"agentId": " Mail "}), "mail")
+        self.assertEqual(m.cron_job_agent({"sessionKey": "agent:ops:telegram:dm:1"}), "ops")
+        self.assertEqual(m.cron_job_agent({"sessionKey": "main"}, "Main"), "main")
+
+    def test_model_ref_alias_and_profile(self):
+        self.assertEqual(m.cron_model_ref(self.CFG, "OpenAI/gpt-5.5@openai:b"), ("openai", "gpt-5.5", "openai:b"))
+        self.assertEqual(m.cron_model_ref(self.CFG, "gpt"), ("openai", "gpt-5.5", None))
+        self.assertIsNone(m.cron_model_ref(self.CFG, "unknown-alias"))
+        self.assertIsNone(m.cron_model_ref(self.CFG, "openai/"))
+
+    def test_stored_profile_rules(self):
+        uses = lambda cfg, prov="openai", explicit=None, profiles=self.PROFILES: \
+            m.cron_ref_uses_stored_profile(cfg, prov, explicit, profiles)  # noqa: E731
+        prov = lambda **p: {"models": {"providers": {"OpenAI": p}}}  # noqa: E731
+        self.assertTrue(uses({}))
+        self.assertFalse(uses({}, "vllm"))  # local route, no stored account
+        self.assertFalse(uses({}, "google"))  # environment / configured key
+        self.assertTrue(uses({}, "vllm", explicit="vllm:x"))  # model@profile names a stored account
+        # a configured key suppresses the profiles (prepare-auth.ts providerBindingSuppressesProfiles)
+        self.assertFalse(uses(prov(apiKey={"source": "env", "provider": "default", "id": "OPENAI_API_KEY"})))
+        self.assertFalse(uses(prov(apiKey="${OPENAI_API_KEY}")))
+        self.assertFalse(uses(prov(apiKey="OPENAI_API_KEY")))
+        self.assertFalse(uses(prov(apiKey="sk-synthetic", auth="api-key")))
+        # a literal key without explicit api-key auth: the stored profiles still come first
+        self.assertTrue(uses(prov(apiKey="sk-synthetic")))
+        # apiKey naming a stored profile pins it
+        self.assertTrue(uses(prov(apiKey="anthropic:default")))
+        # rehearsal D1: OpenClaw's SecretRef grammar (config/types.secrets.ts): "${VAR}" and "$VAR" with VAR upper
+        # case, trimmed; anything else is a literal key (the stored profiles come first)
+        for ref in ("$OPENAI_API_KEY", " ${OPENAI_API_KEY} ", "${A" + "B" * 127 + "}",
+                    {"source": "file", "provider": "vault", "id": "/openai"}):
+            with self.subTest(ref=ref):
+                self.assertFalse(uses(prov(apiKey=ref)))
+        for literal in ("${openai_key}", "${_OPENAI}", "${OPENAI:-x}", "Bearer ${OPENAI}", "${A" + "B" * 128 + "}",
+                        "$openai"):
+            with self.subTest(literal=literal):
+                self.assertTrue(uses(prov(apiKey=literal)))
+                self.assertFalse(uses(prov(apiKey=literal, auth="api-key")))
+
+    def test_stored_profile_rules_non_env_markers(self):
+        """Rehearsal D1 research: a non-env marker suppresses the stored profiles only while usable
+        (model-auth-provider-config.ts resolveUsableCustomProviderApiKey): on a local base URL with api
+        "openai-completions" or "ollama"; auth "api-key" does not make a marker a key."""
+        vllm = [{"id": "vllm:default", "provider": "vllm"}]
+        uses = lambda pcfg: m.cron_ref_uses_stored_profile(  # noqa: E731
+            {"models": {"providers": {"vllm": pcfg}}}, "vllm", None, vllm)
+        local = {"baseUrl": "http://127.0.0.1:8000/v1", "api": "openai-completions"}
+        self.assertFalse(uses(dict(local, apiKey="custom-local")))
+        self.assertFalse(uses(dict(local, apiKey="ollama-local", api="ollama")))
+        self.assertFalse(uses(dict(local, apiKey="lmstudio-local", baseUrl="http://192.168.1.5:1234/v1")))
+        self.assertFalse(uses(dict(local, apiKey="custom-local", baseUrl="http://host.docker.internal:8000")))
+        self.assertTrue(uses(dict(local, apiKey="custom-local", baseUrl="https://api.example.org/v1")))
+        self.assertTrue(uses(dict(local, apiKey="custom-local", api="anthropic-messages")))
+        self.assertTrue(uses(dict(local, apiKey="custom-local", baseUrl="https://api.example.org/v1", auth="api-key")))
+        self.assertTrue(uses(dict(local, apiKey="oauth:vllm", baseUrl="https://api.example.org/v1")))
+        self.assertFalse(uses(dict(local, apiKey="VLLM_API_KEY", baseUrl="https://api.example.org/v1")))
+
+    def test_stored_profile_rules_aws_sdk_and_unknown_markers(self):
+        """Review (gate1010): auth "aws-sdk" is a direct source OpenClaw does not count as a configured key
+        (refused without a recorded account, profiles or not); only the env-var names OpenClaw knows are markers
+        (model-auth-markers.ts), any other ALL_CAPS value is a literal key."""
+        vllm = [{"id": "vllm:default", "provider": "vllm"}]
+        uses = lambda pcfg, prov="vllm", profiles=vllm: m.cron_ref_uses_stored_profile(  # noqa: E731
+            {"models": {"providers": {prov: pcfg}}}, prov, None, profiles)
+        self.assertTrue(uses({"auth": "aws-sdk"}, "amazon-bedrock", []))
+        self.assertTrue(uses({"auth": "aws-sdk", "apiKey": "${AWS_KEY}"}, "amazon-bedrock", []))
+        for literal in ("EMPTY", "NONE", "LOCAL", "MY_LOCAL_KEY", "AWS_PROFILE"):
+            with self.subTest(literal=literal):
+                self.assertTrue(uses({"apiKey": literal}))  # the stored vllm profile comes first
+                self.assertFalse(uses({"apiKey": literal}, profiles=[]))  # nothing stored: not affected
+        self.assertFalse(uses({"apiKey": "EMPTY", "auth": "api-key"}))
+        self.assertTrue(uses({"apiKey": "AWS_PROFILE", "auth": "api-key"}))  # a marker, never a usable key
+        for marker in ("VLLM_API_KEY", "OPENAI_API_KEY", "GEMINI_API_KEY", "DEEPSEEK_API_KEY", "${EMPTY}"):
+            with self.subTest(marker=marker):
+                self.assertFalse(uses({"apiKey": marker}))
+        res = self.forecast(self.job("e", payload={"model": "vllm/qwen", "fallbacks": []}), profiles=vllm,
+                            cfg={"models": {"providers": {"vllm": {"apiKey": "EMPTY"}}}})
+        self.assertEqual([a["refs"] for a in res["affected"]], [["vllm/qwen"]])
+
+    def test_forecast_tells_aws_sdk_from_a_stored_login(self):
+        """Recheck: AWS SDK credentials are refused like a stored login, but no account can be recorded for them
+        (model@profile needs a stored one), so the forecast keeps the reason: "aws_sdk" lists those refs. An explicit
+        profile is a stored login also on an aws-sdk provider (prepare-auth.ts drops the configured auth then)."""
+        cfg = json.loads(json.dumps(self.CFG))
+        cfg["models"]["providers"]["amazon-bedrock"] = {"auth": "aws-sdk"}
+        why = lambda prov, explicit=None: m.cron_ref_refusal(cfg, prov, explicit, self.PROFILES)  # noqa: E731
+        self.assertEqual((why("amazon-bedrock"), why("openai"), why("vllm"), why("amazon-bedrock", "bedrock:work")),
+                         ("aws-sdk", "profile", None, "profile"))
+        res = self.forecast(
+            self.job("a", payload={"model": "amazon-bedrock/claude", "fallbacks": ["openai/gpt-5.5"]}),
+            self.job("b", payload={"fallbacks": ["amazon-bedrock/claude", "google/g"]}),
+            self.job("c", payload={"model": "openai/gpt-5.5", "fallbacks": []}), cfg=cfg)
+        self.assertEqual(res["affected"], [
+            {"id": "a", "name": "Job a", "agent": "main", "primary": "amazon-bedrock/claude", "primary_affected": True,
+             "refs": ["amazon-bedrock/claude", "openai/gpt-5.5"], "aws_sdk": ["amazon-bedrock/claude"]},
+            {"id": "b", "name": "Job b", "agent": "main", "primary": "vllm/qwen", "primary_affected": False,
+             "refs": ["amazon-bedrock/claude"], "aws_sdk": ["amazon-bedrock/claude"]},
+            {"id": "c", "name": "Job c", "agent": "main", "primary": "openai/gpt-5.5", "primary_affected": True,
+             "refs": ["openai/gpt-5.5"]}])
+        # the recheck's setup: the default model on aws-sdk and no auth profile at all
+        cfg["agents"]["defaults"]["model"] = "amazon-bedrock/claude"
+        res = self.forecast(self.job("d"), cfg=cfg, profiles=[])
+        self.assertEqual([(a["primary_affected"], a["refs"], a.get("aws_sdk")) for a in res["affected"]],
+                         [(True, ["amazon-bedrock/claude"], ["amazon-bedrock/claude"])])
+
+    def test_forecast_primary_and_fallbacks(self):
+        res = self.forecast(self.job("a", payload={"model": "openai/gpt-5.5@openai:default",
+                                                   "fallbacks": ["anthropic/c", "vllm/qwen", "openai/gpt-5.5"]}),
+                            self.job("b"), self.job("c", agentId="mail"), self.job("d", payload={"model": "gpt"}))
+        self.assertEqual((res["checked"], res["bound"]), (4, 0))
+        self.assertEqual(res["affected"], [
+            {"id": "a", "name": "Job a", "agent": "main", "primary": "openai/gpt-5.5", "primary_affected": True,
+             "refs": ["openai/gpt-5.5", "anthropic/c"]},
+            {"id": "b", "name": "Job b", "agent": "main", "primary": "vllm/qwen", "primary_affected": False,
+             "refs": ["openai/gpt-5.5"]},
+            {"id": "d", "name": "Job d", "agent": "main", "primary": "openai/gpt-5.5", "primary_affected": True,
+             "refs": ["openai/gpt-5.5"]}])
+        # without any stored profile nothing is affected (configured keys, local models)
+        self.assertEqual(self.forecast(self.job("a", payload={"model": "openai/gpt-5.5"}), profiles=[])["affected"], [])
+
+    def test_forecast_never_keeps_a_profile_id_and_counts_an_explicit_profile(self):
+        """Security review: a bare model id that is no alias but names a profile ("glm-local@lan:someone@example.org")
+        runs on that stored login (OpenClaw gives the bare id the default provider), so the primary is affected; the
+        report keeps neither the profile id of the primary nor that of a fallback."""
+        cfg = {"agents": {"defaults": {"model": {"primary": "glm-local@lan:someone@example.org",
+                                                 "fallbacks": ["openai/gpt-5.5", "other-bare@work:ops@example.org"]}},
+                          "list": [{"id": "main", "default": True}]}}
+        res = self.forecast(self.job("j1"), self.job("j2", payload={"model": "bare-local"}), cfg=cfg)
+        self.assertEqual(res["affected"], [
+            {"id": "j1", "name": "Job j1", "agent": "main", "primary": "glm-local", "primary_affected": True,
+             "refs": ["glm-local", "openai/gpt-5.5", "other-bare"]},
+            {"id": "j2", "name": "Job j2", "agent": "main", "primary": "bare-local", "primary_affected": False,
+             "refs": ["openai/gpt-5.5", "other-bare"]}])
+        self.assertNotIn("example.org", json.dumps(res))
+
+    def test_forecast_skips_what_openclaw_does_not_refuse(self):
+        jobs = [self.job("off", enabled=False), self.job("ev", payload={"kind": "systemEvent"}),
+                self.job("main", sessionTarget="main"), self.job("auth", authority=True),
+                self.job("bound", inferenceBinding={"version": 1, "provider": "openai"}),
+                {"id": "bad", "name": "Bad", "enabled": True, "runtime_authority": False, "job": None}]
+        res = self.forecast(*jobs)
+        self.assertEqual((res["checked"], res["bound"], res["affected"]), (0, 1, []))
+
+    def test_forecast_leaves_its_inputs_alone(self):
+        jobs = [self.job("a", payload={"model": "gpt"})]
+        snap, cfg_snap = copy.deepcopy(jobs), copy.deepcopy(self.CFG)
+        self.forecast(*jobs)
+        self.assertEqual((jobs, self.CFG), (snap, cfg_snap))
+
+
+class TestCronCodexRuntimeForecast(unittest.TestCase):
+    """wf4 (11.3 rehearsal, Codex runtime fallback): an affected openai ref on the Codex app-server runtime is marked
+    ("codex"): OpenClaw 2026.10.10+ loads Codex's model catalog with the stored login before its auth plan refuses
+    the candidate, and a failed lookup is no chain stop. Implicit Codex needs the plugin active (codex_active) and no
+    authored route, request params or cloudWorkers.requiredProfile; discovery.enabled false skips the lookup.
+    Synthetic config, jobs and profiles only."""
+
+    CFG = {"agents": {"defaults": {"model": {"primary": "glm/glm-5",
+                                             "fallbacks": ["openai/gpt-5.5", "anthropic/claude-sonnet-4-6"]}},
+                      "list": [{"id": "main", "default": True}]},
+           "models": {"providers": {"glm": {"baseUrl": "http://127.0.0.1:8000/v1", "api": "openai-completions",
+                                            "apiKey": {"source": "env", "provider": "default", "id": "GLM_KEY"}}}}}
+    PROFILES = [{"id": "openai:synthetic", "provider": "openai"}, {"id": "anthropic:manual", "provider": "anthropic"}]
+    BASE = {"id": "j1", "name": "Job j1", "agent": "main", "primary": "glm/glm-5", "primary_affected": False,
+            "refs": ["openai/gpt-5.5", "anthropic/claude-sonnet-4-6"]}
+
+    def job(self, **payload):
+        return {"id": "j1", "name": "Job j1", "enabled": True, "runtime_authority": False,
+                "job": {"agentId": "main", "sessionTarget": "isolated",
+                        "payload": dict({"kind": "agentTurn", "message": "synthetic prompt"}, **payload)}}
+
+    def forecast(self, cfg=None, codex_active=True, env=None, **payload):
+        return m.cron_account_forecast([self.job(**payload)], self.CFG if cfg is None else cfg,
+                                       lambda aid: self.PROFILES, "main", codex_active=codex_active, env=env)
+
+    def cfg(self, *path_value):
+        cfg = copy.deepcopy(self.CFG)
+        for path, value in path_value:
+            cur = cfg
+            for k in path[:-1]:
+                cur = cur.setdefault(k, {})
+            cur[path[-1]] = value
+        return cfg
+
+    def test_codex_active_marks_the_openai_fallback(self):
+        self.assertEqual(self.forecast()["affected"], [dict(self.BASE, codex=["openai/gpt-5.5"])])
+
+    def test_defaults_keep_todays_result(self):
+        # without the plugin (the default) nothing changes: the embedded runner refuses before any request
+        self.assertEqual(self.forecast(codex_active=False)["affected"], [self.BASE])
+        self.assertEqual(m.cron_account_forecast([self.job()], self.CFG, lambda aid: self.PROFILES, "main")["affected"],
+                         [self.BASE])
+
+    def test_runtime_pins(self):
+        pin = {"agentRuntime": {"id": "openclaw"}}
+        for cfg in (self.cfg((["agents", "defaults", "models"], {"openai/gpt-5.5": pin})),
+                    self.cfg((["agents", "defaults", "models"], {"openai/*": {"agentRuntime": {"id": "pi"}}})),
+                    self.cfg((["agents", "list"], [{"id": "main", "default": True,
+                                                    "models": {"openai/gpt-5.5": pin}}])),
+                    self.cfg((["models", "providers", "openai"], {"agentRuntime": {"id": "openclaw"}})),
+                    self.cfg((["models", "providers", "openai"], {"models": [dict(pin, id="gpt-5.5")]}))):
+            with self.subTest(cfg=json.dumps(cfg)[-90:]):
+                self.assertEqual(self.forecast(cfg)["affected"], [self.BASE])
+        codex = self.cfg((["agents", "defaults", "models"], {"openai/gpt-5.5": {"agentRuntime": {"id": "codex"}}}))
+        self.assertEqual(self.forecast(codex)["affected"], [dict(self.BASE, codex=["openai/gpt-5.5"])])
+        # an explicit codex pin without the plugin: not modelled (fails closed), no mark
+        self.assertEqual(self.forecast(codex, codex_active=False)["affected"], [self.BASE])
+        # an agent's pin wins over the defaults' (model-runtime-policy.ts precedence)
+        both = self.cfg((["agents", "defaults", "models"], {"openai/gpt-5.5": {"agentRuntime": {"id": "codex"}}}),
+                        (["agents", "list"], [{"id": "main", "default": True, "models": {"openai/gpt-5.5": pin}}]))
+        self.assertEqual(self.forecast(both)["affected"], [self.BASE])
+
+    def test_authored_route_params_and_cloud_workers_keep_the_embedded_runner(self):
+        for name, cfg, env in (
+                ("custom baseUrl", self.cfg((["models", "providers", "openai"],
+                                             {"baseUrl": "https://llm.example.invalid/v1"})), None),
+                ("api completions", self.cfg((["models", "providers", "openai"], {"api": "openai-completions"})), None),
+                ("model row route", self.cfg((["models", "providers", "openai"], {"models": [
+                    {"id": "gpt-5.5", "baseUrl": "https://llm.example.invalid/v1"}]})), None),
+                ("env OPENAI_BASE_URL", None, {"OPENAI_BASE_URL": "https://llm.example.invalid/v1"}),
+                ("defaults params", self.cfg((["agents", "defaults", "params"], {"temperature": 0.2})), None),
+                ("model params", self.cfg((["agents", "defaults", "models"], {"openai/gpt-5.5": {
+                    "params": {"temperature": 0.2}}})), None),
+                ("agent params", self.cfg((["agents", "list"], [{"id": "main", "default": True,
+                                                                 "params": {"temperature": 0.2}}])), None),
+                ("cloud workers", self.cfg((["cloudWorkers", "requiredProfile"], "synthetic-profile")), None),
+                ("discovery off", self.cfg((["plugins", "entries", "codex", "config", "discovery"],
+                                            {"enabled": False})), None)):
+            with self.subTest(name):
+                self.assertEqual(self.forecast(cfg, env=env)["affected"], [self.BASE])
+        # an empty params object and an empty OPENAI_BASE_URL author nothing
+        cfg = self.cfg((["agents", "defaults", "params"], {}))
+        self.assertEqual(self.forecast(cfg, env={"OPENAI_BASE_URL": " "})["affected"],
+                         [dict(self.BASE, codex=["openai/gpt-5.5"])])
+
+    def test_codex_home_scope_user(self):
+        cfg = self.cfg((["plugins", "entries", "codex", "config", "appServer"], {"homeScope": "user"}))
+        self.assertEqual(self.forecast(cfg)["affected"],
+                         [dict(self.BASE, codex=["openai/gpt-5.5"], codex_home="user")])
+        self.assertEqual(self.forecast(cfg, codex_active=False)["affected"], [self.BASE])
+
+    def test_explicit_runtime_of_the_own_model(self):
+        cfg = self.cfg((["agents", "defaults", "models"], {"openai/gpt-5.5": {"agentRuntime": {"id": "codex"}}}))
+        got = self.forecast(cfg, model="openai/gpt-5.5", fallbacks=[])["affected"]
+        self.assertEqual(got, [{"id": "j1", "name": "Job j1", "agent": "main", "primary": "openai/gpt-5.5",
+                                "primary_affected": True, "refs": ["openai/gpt-5.5"], "codex": ["openai/gpt-5.5"],
+                                "own_runtime": "codex",
+                                "own_runtime_at": 'agents.defaults.models["openai/gpt-5.5"].agentRuntime'}])
+        # also without the plugin (doctor skips the job either way); an implicit Codex runtime is no own_runtime
+        got = self.forecast(cfg, codex_active=False, model="openai/gpt-5.5", fallbacks=[])["affected"]
+        self.assertEqual(got[0]["own_runtime"], "codex")
+        self.assertNotIn("codex", got[0])
+        got = self.forecast(model="openai/gpt-5.5", fallbacks=[])["affected"]
+        self.assertNotIn("own_runtime", got[0])
+        self.assertEqual(got[0]["codex"], ["openai/gpt-5.5"])
+        # a pin of a fallback is no own_runtime
+        got = self.forecast(cfg)["affected"]
+        self.assertNotIn("own_runtime", got[0])
+
+    def test_ref_runtime_helper(self):
+        rt = m.cron_ref_runtime
+        self.assertEqual(rt(self.CFG, "openai", "gpt-5.5", "main", True), "codex")
+        self.assertEqual(rt(self.CFG, "openai", "gpt-5.5", "main", False), "openclaw")
+        self.assertEqual(rt(self.CFG, "anthropic", "claude-sonnet-4-6", "main", True), "openclaw")
+        self.assertEqual(rt(self.CFG, None, "gpt-5.5", "main", True), "openclaw")
+        acpx = self.cfg((["models", "providers", "openai"], {"agentRuntime": {"id": "acpx"}}))
+        self.assertEqual(rt(acpx, "openai", "gpt-5.5", "main", True), "acpx")
+        auto = self.cfg((["models", "providers", "openai"], {"agentRuntime": {"id": "auto"}}))
+        self.assertEqual(rt(auto, "openai", "gpt-5.5", "main", True), "codex")
+
+
+class TestDoctorKeyCopies(unittest.TestCase):
+    """Rehearsal D1: OpenClaw's doctor (2026.8.1+, unchanged in 2026.10.10 and 2026.11.1) copies a literal provider
+    apiKey into its auth store as "<provider>:default" (doctor-model-catalog-credentials.ts collectCredentials), and
+    OpenClaw 2026.10.10/2026.11.1 then refuse every cron run on that provider without a recorded inference account.
+    The cases follow doctor's skip rules; synthetic values only."""
+
+    COPIED = ["sk-synth-1", "EMPTY", "NONE", "none", " EMPTY ", "LOCAL", "MY_LOCAL_KEY", "openai_api_key",
+              "Ollama-Local", "oauth", "llama-cpp-local", "${glm_key}", "${_GLM}", "${GLM:-x}", "Bearer ${GLM}",
+              "${" + "A" * 129 + "}", "$glm", "glm:default"]
+    KEPT = ["", "  ", "${GLM_API_KEY}", " ${GLM_API_KEY} ", "$GLM_API_KEY", "${EMPTY}", "OPENAI_API_KEY",
+            "VLLM_API_KEY", "AWS_PROFILE", "AWS_BEARER_TOKEN_BEDROCK", "AWS_ACCESS_KEY_ID", "secretref-env:X",
+            "oauth:glm", "custom-local", "codex-app-server", "gcp-vertex-credentials", "ollama-local",
+            "secretref-managed", "openclaw:claude-cli-native-auth", "apple-fm-local", "lmstudio-local",
+            "minimax-oauth", None, 3, {"source": "env", "provider": "default", "id": "GLM_API_KEY"}]
+    REFS = [{"source": s, "provider": "default", "id": "GLM_API_KEY"} for s in ("env", "file", "exec", "store")]
+
+    def test_doctor_copies_follows_the_skip_rules(self):
+        for v in self.COPIED:
+            with self.subTest(copied=v):
+                self.assertTrue(m.doctor_copies(v, {"apiKey": v}))
+                self.assertTrue(m.doctor_copies(v, {"apiKey": v, "auth": "api-key"}))  # auth plays no part
+        for v in self.KEPT:
+            with self.subTest(kept=v):
+                self.assertFalse(m.doctor_copies(v, {"apiKey": v}))
+        for ref in self.REFS:
+            with self.subTest(ref=ref):
+                self.assertTrue(m.is_secret_ref(ref))
+                self.assertFalse(m.doctor_copies(ref, {"apiKey": ref}))
+                # a catalog literal of a provider whose openclaw.json entry is a SecretRef is not copied either
+                self.assertFalse(m.doctor_copies("sk-synth-catalog", {"apiKey": ref}))
+        self.assertFalse(m.doctor_copies("sk-synth-catalog", {"apiKey": "${GLM_API_KEY}"}))
+        # a catalog value is copied as it is: only the openclaw.json entry is checked for a reference
+        self.assertTrue(m.doctor_copies("${GLM_API_KEY}", None))
+        self.assertTrue(m.doctor_copies("${GLM_API_KEY}", {"apiKey": "sk-synth-1"}))
+        # a value that is the id of a stored profile is a reference to it, not a key
+        self.assertFalse(m.doctor_copies("glm:default", {"apiKey": "glm:default"}, {"glm:default"}))
+        self.assertTrue(m.doctor_copies("glm:work", {"apiKey": "glm:work"}, {"glm:default"}))
+
+    def test_secret_ref_and_marker_grammar(self):
+        for v in ({"source": "env", "provider": "default"}, {"source": "env", "provider": " ", "id": "X"},
+                  {"source": "keychain", "provider": "default", "id": "X"},
+                  {"source": "env", "provider": "default", "id": "X", "extra": 1}, "${glm}", "$1X", "${X}y", ""):
+            with self.subTest(v=v):
+                self.assertFalse(m.is_secret_ref(v))
+        self.assertTrue(m.is_key_marker(" oauth:x "))
+        self.assertFalse(m.is_key_marker("OAuth:x"))
+        self.assertFalse(m.is_key_marker("EMPTY"))
+        self.assertEqual(len(m._KNOWN_ENV_KEY_MARKERS), 54)  # the 2026.11.1 set (core, legacy, bundled manifests)
+
+    def test_model_catalog_json_is_parsed_like_openclaw(self):
+        text = '{\n // comment\n "providers": {"glm": {"apiKey": "a//b", "models": [1, 2,],},}, // end\n}\n'
+        self.assertEqual(m.parse_model_catalog_json(text), {"providers": {"glm": {"apiKey": "a//b", "models": [1, 2]}}})
+        for bad in ("{", "\ufeff{}", '{"a": NaN}', "{'a': 1}"):
+            with self.subTest(bad=bad):
+                with self.assertRaises(ValueError):
+                    m.parse_model_catalog_json(bad)
+
+    def test_config_path_follows_append_config_path_segment(self):
+        self.assertEqual(m.config_path("glm"), "models.providers.glm")
+        self.assertEqual(m.config_path("GLM_2:x-y"), "models.providers.GLM_2:x-y")
+        self.assertEqual(m.config_path("my.glm"), 'models.providers["my.glm"]')
+        self.assertEqual(m.config_path("2glm"), 'models.providers["2glm"]')
+
+    def test_doctor_key_copies_destinations(self):
+        cfg = {"models": {"providers": {
+            "GLM": {"apiKey": "sk-synth-1"}, "vllm": {"apiKey": "VLLM_API_KEY"},
+            "envref": {"apiKey": {"source": "env", "provider": "default", "id": "ENVREF_KEY"}},
+            "pinned": {"apiKey": "pinned:work"}, "blank": {"apiKey": " "}}}}
+        catalogs = [("main", True, {"cat": "sk-synth-2", "envref": "sk-synth-3", "glm": "sk-synth-4"}),
+                    ("haus", False, {"local": "EMPTY", "vllm": "VLLM_API_KEY", "x": None}),
+                    ("Ops", False, {"dup": "sk-synth-5", "dup ": "sk-synth-6"})]
+        stores = {None: {"pinned:work"}, "haus": set()}
+        res = m.doctor_key_copies(cfg, catalogs, lambda aid: stores.get(aid, set()))
+        self.assertEqual(res, {
+            "shared": [{"id": "glm:default", "provider": "glm", "copy": "config"},
+                       {"id": "cat:default", "provider": "cat", "copy": "catalog"}],
+            "agents": {"haus": [{"id": "local:default", "provider": "local", "copy": "catalog"}],
+                       "ops": [{"id": "dup:default", "provider": "dup", "copy": "catalog"}]}})
+        self.assertNotIn("sk-synth", json.dumps(res))
+        self.assertEqual(m.doctor_key_copies({}, [], None), {"shared": [], "agents": {}})
+
+    def test_doctor_key_copies_skip_catalog_keys_beside_a_stored_secret_ref(self):
+        """OpenClaw 2026.11.4 (#179802, hasProviderSecretRef): no catalog copy for a provider whose effective store
+        holds a keyRef/tokenRef profile (store_refs_for: None for the main agent dir, the agent id otherwise); a key
+        of openclaw.json is still copied; 2026.11.3 and callers without caps or the callback copy as before."""
+        cfg = {"models": {"providers": {"cfgkey": {"apiKey": "sk-synth-1"}}}}
+        catalogs = [("main", True, {"Cat": "sk-synth-2", "cfgkey": "sk-synth-3", "free": "sk-synth-4"}),
+                    ("haus", False, {"cat": "sk-synth-5", "own": "sk-synth-6", "free": "sk-synth-7"})]
+        refs = {None: {"cat", "cfgkey"}, "haus": {"cat", "own"}}
+        args = (cfg, catalogs, lambda aid: set(), lambda aid: refs.get(aid, set()))
+        on = m.doctor_key_copies(*args, _caps("2026.11.4"))
+        self.assertEqual(on, {"shared": [{"id": "cfgkey:default", "provider": "cfgkey", "copy": "config"},
+                                         {"id": "free:default", "provider": "free", "copy": "catalog"}],
+                              "agents": {"haus": [{"id": "free:default", "provider": "free", "copy": "catalog"}]}})
+        before = m.doctor_key_copies(cfg, catalogs, lambda aid: set())
+        self.assertEqual([x["provider"] for x in before["shared"]], ["cfgkey", "cat", "free"])
+        self.assertEqual([x["provider"] for x in before["agents"]["haus"]], ["cat", "own", "free"])
+        for caps in (_caps("2026.11.3"), _caps("2026.10.10"), None):
+            with self.subTest(caps=caps):
+                self.assertEqual(m.doctor_key_copies(*args, caps), before)
+        self.assertEqual(m.doctor_key_copies(cfg, catalogs, None, None, _caps("2026.11.4")), before)
+        asked = []
+        m.doctor_key_copies(cfg, catalogs, None, lambda aid: asked.append(aid) or set(), _caps("2026.11.4"))
+        self.assertEqual(asked, [None, "haus"])
+        self.assertNotIn("sk-synth", json.dumps([on, before]))
+
+
+class TestCronKeyCopyForecast(unittest.TestCase):
+    """Rehearsal D1 (report only): the precheck forecast counts the stored login doctor creates from a literal
+    provider key during the migration (copies_pending) and names the fix that keeps the job and its fallbacks."""
+
+    PROFILES = [{"id": "openai:default", "provider": "openai"}]
+
+    def cfg(self, **glm):
+        return {"agents": {"defaults": {"model": {"primary": "glm/glm-5", "fallbacks": ["openai/gpt-5.5"]}},
+                           "list": [{"id": "main", "default": True}, {"id": "haus"}]},
+                "models": {"providers": {"glm": dict({"baseUrl": "http://127.0.0.1:8000/v1",
+                                                      "api": "openai-completions"}, **glm),
+                                         "vllm": {"baseUrl": "http://127.0.0.1:8001/v1"}}}}
+
+    def job(self, jid, agent="haus", **payload):
+        return {"id": jid, "name": f"Job {jid}", "enabled": True, "runtime_authority": False,
+                "job": {"agentId": agent, "sessionTarget": "isolated",
+                        "payload": dict({"kind": "agentTurn", "message": "synthetic prompt"}, **payload)}}
+
+    def forecast(self, cfg, *jobs, pending=True, profiles=None, catalogs=()):
+        copies = m.doctor_key_copies(cfg, catalogs, lambda aid: set())
+        return m.cron_account_forecast(list(jobs), cfg, lambda aid: self.PROFILES if profiles is None else profiles,
+                                       "main", lambda aid: copies["shared"] + copies["agents"].get(aid, []), pending)
+
+    def test_literal_key_is_refused_after_the_copy(self):
+        """The D1 regression: a glm-only job on a literal glm key with no stored glm login was "not affected"."""
+        res = self.forecast(self.cfg(apiKey="sk-synth-glm"), self.job("only", fallbacks=[]))
+        self.assertEqual(res["affected"], [{"id": "only", "name": "Job only", "agent": "haus", "primary": "glm/glm-5",
+                                            "primary_affected": True, "refs": ["glm/glm-5"],
+                                            "key_copy": ["glm/glm-5"]}])
+        self.assertEqual(res["key_fix"], [{"provider": "glm", "path": "models.providers.glm", "auth": None,
+                                           "where": "config", "pending": True}])
+        # without the pending copy (the old forecast) it was not affected
+        self.assertEqual(self.forecast(self.cfg(apiKey="sk-synth-glm"), self.job("only", fallbacks=[]),
+                                       pending=False)["affected"], [])
+        self.assertNotIn("sk-synth", json.dumps(res))
+
+    def test_what_keeps_a_literal_key_job_working(self):
+        for glm in ({"apiKey": "sk-synth-glm", "auth": "api-key"},
+                    {"apiKey": {"source": "env", "provider": "default", "id": "GLM_API_KEY"}},
+                    {"apiKey": "${GLM_API_KEY}"}, {"apiKey": "$GLM_API_KEY"}, {"apiKey": "VLLM_API_KEY"},
+                    {"apiKey": "custom-local"}, {}, {"apiKey": ""}):
+            with self.subTest(glm=glm):
+                res = self.forecast(self.cfg(**glm), self.job("only", fallbacks=[]))
+                self.assertEqual((res["affected"], res["key_fix"]), ([], []))
+        for literal in ("EMPTY", "NONE", "${glm_key}"):
+            with self.subTest(literal=literal):
+                res = self.forecast(self.cfg(apiKey=literal), self.job("only", fallbacks=[]))
+                self.assertEqual([a.get("key_copy") for a in res["affected"]], [["glm/glm-5"]])
+
+    def test_auth_modes(self):
+        res = self.forecast(self.cfg(apiKey="sk-synth-glm", auth="oauth"), self.job("only", fallbacks=[]))
+        self.assertEqual([(k["auth"], k["pending"]) for k in res["key_fix"]], [("oauth", True)])
+        # aws-sdk stays AWS SDK credentials (no stored login, no key fix)
+        res = self.forecast(self.cfg(apiKey="sk-synth-glm", auth="aws-sdk"), self.job("only", fallbacks=[]))
+        self.assertEqual([(a["refs"], a.get("aws_sdk"), a.get("key_copy")) for a in res["affected"]],
+                         [(["glm/glm-5"], ["glm/glm-5"], None)])
+        self.assertEqual(res["key_fix"], [])
+
+    def test_fallback_on_a_copied_provider_and_explicit_profiles(self):
+        res = self.forecast(self.cfg(apiKey="sk-synth-glm"),
+                            self.job("fb", model="vllm/q", fallbacks=["glm/glm-5", "openai/gpt-5.5"]),
+                            self.job("pin", model="glm/glm-5@glm:work", fallbacks=[]))
+        self.assertEqual(res["affected"], [
+            {"id": "fb", "name": "Job fb", "agent": "haus", "primary": "vllm/q", "primary_affected": False,
+             "refs": ["glm/glm-5", "openai/gpt-5.5"], "key_copy": ["glm/glm-5"]},
+            {"id": "pin", "name": "Job pin", "agent": "haus", "primary": "glm/glm-5", "primary_affected": True,
+             "refs": ["glm/glm-5"]}])
+        self.assertEqual([k["provider"] for k in res["key_fix"]], ["glm"])
+        # an explicit @profile is no key: alone it gives no key fix
+        res = self.forecast(self.cfg(apiKey="sk-synth-glm"), self.job("pin", model="glm/glm-5@glm:work",
+                                                                       fallbacks=[]))
+        self.assertEqual(res["key_fix"], [])
+
+    def test_after_the_migration_the_key_fix_stays(self):
+        """Postconditions: doctor's copy is in the stores; the literal key still names the fix (pending False)."""
+        stored = [{"id": "glm:default", "provider": "glm"}]
+        res = self.forecast(self.cfg(apiKey="sk-synth-glm"), self.job("only", fallbacks=[]), pending=False,
+                            profiles=stored)
+        self.assertEqual([(a["primary_affected"], a.get("key_copy")) for a in res["affected"]], [(True, None)])
+        self.assertEqual(res["key_fix"], [{"provider": "glm", "path": "models.providers.glm", "auth": None,
+                                           "where": "config", "pending": False}])
+        # a stored glm login without a literal key: no key fix (only the binding helps)
+        res = self.forecast(self.cfg(), self.job("only", fallbacks=[]), pending=False, profiles=stored)
+        self.assertEqual((len(res["affected"]), res["key_fix"]), (1, []))
+
+    def test_catalog_keys_reach_their_agent_only(self):
+        cfg = self.cfg()
+        jobs = (self.job("h", fallbacks=[]), self.job("m", agent="main", fallbacks=[]))
+        res = self.forecast(cfg, *jobs, catalogs=[("haus", False, {"glm": "sk-synth-cat"})])
+        self.assertEqual([(a["id"], a.get("key_copy")) for a in res["affected"]], [("h", ["glm/glm-5"])])
+        self.assertEqual(res["key_fix"], [{"provider": "glm", "path": "models.providers.glm", "auth": None,
+                                           "where": "catalog", "pending": True}])
+        res = self.forecast(cfg, *jobs, catalogs=[("main", True, {"GLM": "sk-synth-cat"})])
+        self.assertEqual([a["id"] for a in res["affected"]], ["h", "m"])
+        # an env SecretRef in openclaw.json stops the catalog copy too
+        cfg = self.cfg(apiKey={"source": "env", "provider": "default", "id": "GLM_API_KEY"})
+        self.assertEqual(self.forecast(cfg, *jobs, catalogs=[("main", True, {"glm": "sk-synth-cat"})])["affected"], [])
+
+    def test_no_catalog_key_fix_beside_a_stored_secret_ref_on_2026_11_4(self):
+        """#179802: OpenClaw 2026.11.4 doctor copies no catalog key of a provider whose effective store holds a
+        keyRef/tokenRef profile. The job is still refused on that stored login, but no key fix names the catalog key
+        (cron_key_fix_lines would say doctor copies it); 2026.11.3 copies it as before."""
+        cfg = self.cfg()
+        stored = self.PROFILES + [{"id": "glm:vault", "provider": "glm", "ref": True}]
+        catalogs = [("haus", False, {"glm": "sk-synth-cat"})]
+        old_fix = [{"provider": "glm", "path": "models.providers.glm", "auth": None, "where": "catalog",
+                    "pending": False}]
+        for rt, want in (("2026.11.4", []), ("2026.11.3", old_fix)):
+            with self.subTest(runtime=rt):
+                copies = m.doctor_key_copies(cfg, catalogs, lambda aid: set(), lambda aid: {"glm"}, _caps(rt))
+                res = m.cron_account_forecast([self.job("h", fallbacks=[])], cfg, lambda aid: stored, "main",
+                                              lambda aid: copies["shared"] + copies["agents"].get(aid, []), True)
+                self.assertEqual(res["key_fix"], want)
+                self.assertEqual([(a["id"], a["refs"], a.get("key_copy")) for a in res["affected"]],
+                                 [("h", ["glm/glm-5"], None)])
+                self.assertNotIn("sk-synth", json.dumps([copies, res]))
+
+    def test_bracket_path_for_a_provider_key_that_is_no_identifier(self):
+        cfg = self.cfg()
+        cfg["models"]["providers"]["my.glm"] = {"apiKey": "sk-synth-glm"}
+        res = self.forecast(cfg, self.job("only", model="my.glm/glm-5", fallbacks=[]))
+        self.assertEqual(res["key_fix"], [{"provider": "my.glm", "path": 'models.providers["my.glm"]', "auth": None,
+                                           "where": "config", "pending": True}])
+
+
+class TestEnvSubstituted(unittest.TestCase):
+    """OpenClaw's ${NAME} / ${NAME:-default} substitution (config/env-substitution.ts, 2026.11.1), which the config
+    doctor copies a literal key from has gone through: the gate compares doctor's earlier copy with this value."""
+
+    def test_substitution_grammar(self):
+        env = {"A": "va", "_X": "vx", "EMPTY_ONE": ""}
+        for raw, want in (("${A}", "va"), ("pre-${A}-post", "pre-va-post"), ("${MISSING}", "${MISSING}"),
+                          ("${MISSING:-dflt}", "dflt"), ("${EMPTY_ONE:-dflt}", "dflt"), ("${EMPTY_ONE}", "${EMPTY_ONE}"),
+                          ("${A:-dflt}", "va"), ("${MISSING:-}", ""), ("${_X}", "vx"), ("$${A}", "${A}"),
+                          ("$${A:-d}", "${A:-d}"), ("${a}", "${a}"), ("${A:-x$y}", "${A:-x$y}"),
+                          ("${A:-x{y}", "${A:-x{y}"), ("${A", "${A"), ("$A", "$A"), ("no-dollar", "no-dollar"),
+                          ("${A}${_X}", "vavx"), ("$$${A}", "$${A}")):
+            with self.subTest(raw=raw):
+                self.assertEqual(m.env_substituted(raw, env), want)
+        self.assertEqual(m.env_substituted("${A}", None), "${A}")
+        self.assertIsNone(m.env_substituted(None, env))
+
+
+class TestCronKeyAutofix(unittest.TestCase):
+    """The gate sets models.providers.<p>.auth "api-key" itself before doctor pass 1
+    for a provider whose literal openclaw.json key doctor copies and that a cron job uses (pure part)."""
+
+    KEY = "sk-synth-glm-autofix"
+
+    def cfg(self):
+        return {"models": {"providers": {
+            "glm": {"baseUrl": "http://127.0.0.1:8000/v1", "apiKey": self.KEY},
+            "tok": {"apiKey": self.KEY, "auth": "token"},
+            "cat": {"baseUrl": "http://127.0.0.1:8002/v1"},
+            "My.Glm": {"apiKey": self.KEY},
+            "acct": {"apiKey": self.KEY}}}}
+
+    def key_fix(self, *provs, where="config"):
+        return [{"provider": p, "path": m.config_path(p), "auth": None, "where": where, "pending": True}
+                for p in provs]
+
+    def test_which_providers_are_fixed(self):
+        cfg = self.cfg()
+        snap = copy.deepcopy(cfg)
+        seen = []
+
+        def own(cand):
+            seen.append(dict(cand))
+            return {"acct"}
+        kf = self.key_fix("glm", "tok", "my.glm", "acct") + self.key_fix("cat", where="catalog") \
+            + [{"provider": ""}, "x", None]
+        fix, kept = m.cron_key_autofix(cfg, kf, own)
+        self.assertEqual(fix, [{"provider": "glm", "entry": "glm", "path": "models.providers.glm.auth"},
+                               {"provider": "my.glm", "entry": "My.Glm", "path": 'models.providers["My.Glm"].auth'}])
+        self.assertEqual(kept, [{"provider": "tok", "path": "models.providers.tok.auth", "why": "auth"},
+                                {"provider": "cat", "path": "models.providers.cat.auth", "why": "catalog"},
+                                {"provider": "acct", "path": "models.providers.acct.auth", "why": "login"}])
+        # the stored-login check sees only the candidates, each with its literal key (compared in memory)
+        self.assertEqual(seen, [{"glm": self.KEY, "my.glm": self.KEY, "acct": self.KEY}])
+        self.assertNotIn(self.KEY, json.dumps([fix, kept]))
+        # a resume never repeats a provider this run set; a catalog-only provider never gets an entry
+        fix, kept = m.cron_key_autofix(cfg, self.key_fix("glm"), done={"glm"})
+        self.assertEqual((fix, kept), ([], [{"provider": "glm", "path": "models.providers.glm.auth", "why": "done"}]))
+        fix, kept = m.cron_key_autofix(cfg, self.key_fix("nope", where="catalog"))
+        self.assertEqual((fix, [k["why"] for k in kept]), ([], ["catalog"]))
+        # an entry whose key doctor does not copy (SecretRef, marker) is no candidate
+        cfg2 = {"models": {"providers": {"glm": {"apiKey": "${GLM_API_KEY}"}, "v": {"apiKey": "VLLM_API_KEY"}}}}
+        self.assertEqual(m.cron_key_autofix(cfg2, self.key_fix("glm", "v"))[0], [])
+        self.assertEqual(cfg, snap)
+
+    def test_set_provider_auth(self):
+        cfg = self.cfg()
+        snap = copy.deepcopy(cfg)
+        fix, _kept = m.cron_key_autofix(cfg, self.key_fix("glm", "my.glm"))
+        new, ledger = m.set_provider_auth(cfg, fix)
+        self.assertEqual(cfg, snap)  # pure
+        self.assertEqual(new["models"]["providers"]["glm"], dict(snap["models"]["providers"]["glm"], auth="api-key"))
+        self.assertEqual(new["models"]["providers"]["My.Glm"]["auth"], "api-key")
+        expect = copy.deepcopy(snap)
+        expect["models"]["providers"]["glm"]["auth"] = "api-key"
+        expect["models"]["providers"]["My.Glm"]["auth"] = "api-key"
+        self.assertEqual(new, expect)  # nothing else changes
+        self.assertEqual(ledger, [{"step": "C1", "path": "models.providers.glm.auth", "before": None, "after": "api-key"},
+                                  {"step": "C1", "path": 'models.providers["My.Glm"].auth', "before": None,
+                                   "after": "api-key"}])
+        # idempotent: an entry that has auth by now is left as it is
+        again, ledger = m.set_provider_auth(new, fix)
+        self.assertEqual((again, ledger), (new, []))
+
+    def test_auth_api_key_lifts_the_refusal_after_the_copy(self):
+        """research_d1 section 2: a literal key with auth "api-key" is not refused, also with doctor's copy stored."""
+        cfg = {"models": {"providers": {"glm": {"apiKey": self.KEY}}}}
+        copy_ = [{"id": "glm:default", "provider": "glm"}]
+        self.assertEqual(m.cron_ref_refusal(cfg, "glm", None, copy_), "profile")
+        new, _l = m.set_provider_auth(cfg, m.cron_key_autofix(cfg, self.key_fix("glm"))[0])
+        self.assertIsNone(m.cron_ref_refusal(new, "glm", None, copy_))
+        self.assertEqual(m.cron_ref_refusal(new, "glm", "glm:default", copy_), "profile")  # model@profile stays bound
+
+    def test_include_paths(self):
+        self.assertEqual(m.include_paths({"a": {"$include": "x.json5"}}), ["a.$include"])
+        self.assertEqual(m.include_paths({"a": [{"$include": "x"}]}), ["a[0].$include"])
+        self.assertEqual(m.include_paths({}, '{"x": {"$include" : "y"}}'), ["(raw text)"])
+        self.assertEqual(m.include_paths({"a": 1}, '{"a": 1}'), [])
+        self.assertEqual(m.include_paths(None), [])
+
+
+class TestPurity(unittest.TestCase):
+    def test_all_transforms_leave_inputs_alone(self):
+        before = spec_example()
+        snap = copy.deepcopy(before)
+        m.scan_legacy_refs(before)
+        m.models_preflight(before)
+        m.explicit_ids(before)
+        pre, _l, summary = m.premigrate_config(before)
+        snap_pre = copy.deepcopy(pre)
+        now = doctor_pass1_like()
+        snap_now = copy.deepcopy(now)
+        fixed, _l, _s = m.fixups(now, before, pre)
+        m.check_legacy_refs(fixed)
+        m.check_codex_runtime(fixed, pre_cfg=before)
+        m.check_runtime_pins(fixed, summary["legacy_slots"])
+        m.apply_pins(fixed, set())
+        m.auth_order_adjust(fixed, TestAuthOrder.PROFILES, None)
+        m.config_precheck(before, json.dumps(before))
+        m.flatten_paths(before)
+        self.assertEqual(before, snap)
+        self.assertEqual(pre, snap_pre)
+        self.assertEqual(now, snap_now)
+
+    def test_end_to_end_spec_example(self):
+        """premigrate -> simulated doctor -> fixups -> PC1/PC2/PC3 -> pins on the §7.4.2 example."""
+        before = spec_example()
+        pre, _l, summary = m.premigrate_config(before)
+        fixed, _l, s = m.fixups(doctor_pass1_like(), before, pre)
+        self.assertEqual(s["policy_failures"], [])
+        fixed.setdefault("auth", {})["order"] = {"openai": ["openai:default"]}
+        self.assertEqual(m.check_legacy_refs(fixed), [])
+        self.assertEqual(m.check_codex_runtime(fixed, pre_cfg=before), [])
+        self.assertEqual(m.check_runtime_pins(fixed, summary["legacy_slots"]), [])
+        pinned, written, skipped = m.apply_pins(fixed, set())
+        self.assertEqual(m.check_runtime_pins(pinned, summary["legacy_slots"]), [])
+        self.assertTrue(written)
+
+
+if __name__ == "__main__":
+    unittest.main()

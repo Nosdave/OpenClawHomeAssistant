@@ -1,0 +1,135 @@
+name: Build & Push OpenClaw image (private GHCR)
+
+# Builds the aarch64 add-on image on GitHub-hosted native ARM runners and pushes
+# it to a GHCR package. Home Assistant pulls this image instead of building
+# locally. No user secrets are involved:
+# only the ephemeral GITHUB_TOKEN is used to push to this repo's own package.
+# A manual run on another branch only test-builds the image (job test-build,
+# nothing pushed): gh workflow run build-image.yaml --ref <branch>
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "openclaw_assistant/**"
+      - ".github/workflows/build-image.yaml"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  IMAGE: ghcr.io/nosdave/openclaw-assistant-aarch64
+  BUILD_FROM: ghcr.io/home-assistant/aarch64-base-debian:bookworm
+
+jobs:
+  build:
+    # Only main publishes version tags and :latest (also for manual dispatches).
+    if: github.ref == 'refs/heads/main'
+    # One publish at a time: the "existing tag" check below is check-then-push,
+    # so two concurrent runs could otherwise both see a version tag as new.
+    # Job-level, so a skipped non-main run never occupies or cancels the slot.
+    concurrency:
+      group: build-image-main
+      cancel-in-progress: false
+    runs-on: ubuntu-24.04-arm   # native aarch64 runner (GA since 2025) — no QEMU
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Read add-on version
+        id: ver
+        run: |
+          V=$(grep -E '^version:' openclaw_assistant/config.yaml | head -1 | sed -E 's/version:\s*"?([^"]+)"?/\1/')
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+          echo "Add-on version: $V"
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # Published version tags are immutable: Home Assistant's rollback ("restore
+      # backup") re-pulls the image by its version tag, so rebuilding an existing
+      # tag would silently change what a rollback restores. A push that does not
+      # bump config.yaml's version therefore builds nothing.
+      - name: Refuse to overwrite an existing version tag
+        id: tagcheck
+        env:
+          REF: ${{ env.IMAGE }}:${{ steps.ver.outputs.version }}
+        run: |
+          if out="$(docker buildx imagetools inspect "$REF" 2>&1)"; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "::warning::$REF is already published; not rebuilding it. Bump 'version' in openclaw_assistant/config.yaml to publish a new image."
+          elif grep -qiE 'not found|manifest unknown|name unknown' <<< "$out"; then
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "$REF is new; building."
+          else
+            echo "::error::Could not determine whether $REF exists:"
+            printf '%s\n' "$out"
+            exit 1
+          fi
+
+      - name: Build & push
+        if: steps.tagcheck.outputs.exists != 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: openclaw_assistant
+          file: openclaw_assistant/Dockerfile
+          platforms: linux/arm64
+          push: true
+          provenance: false
+          build-args: |
+            BUILD_FROM=${{ env.BUILD_FROM }}
+            TARGETARCH=arm64
+            BUILD_VERSION=${{ steps.ver.outputs.version }}
+          tags: |
+            ${{ env.IMAGE }}:${{ steps.ver.outputs.version }}
+            ${{ env.IMAGE }}:latest
+
+  # Test build of a branch without publishing: "Run workflow" on a branch other than
+  # main (workflow_dispatch; pushes only trigger on main) builds the same Dockerfile
+  # with the same build args on the same native runner, so the dist patches, the
+  # version and node checks and the feature record run as for a release, but
+  # nothing is pushed: no registry login, no package write, no tags.
+  test-build:
+    if: github.ref != 'refs/heads/main'
+    permissions:
+      contents: read
+    # One test build per branch; a newer dispatch replaces a running one.
+    concurrency:
+      group: build-image-test-${{ github.ref }}
+      cancel-in-progress: true
+    runs-on: ubuntu-24.04-arm   # native aarch64 runner, as the publish job
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Read add-on version
+        id: ver
+        run: |
+          V=$(grep -E '^version:' openclaw_assistant/config.yaml | head -1 | sed -E 's/version:\s*"?([^"]+)"?/\1/')
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+          echo "Add-on version: $V (test build of ${GITHUB_REF_NAME} at ${GITHUB_SHA}, not published)"
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build (no push)
+        uses: docker/build-push-action@v6
+        with:
+          context: openclaw_assistant
+          file: openclaw_assistant/Dockerfile
+          platforms: linux/arm64
+          push: false
+          provenance: false
+          build-args: |
+            BUILD_FROM=${{ env.BUILD_FROM }}
+            TARGETARCH=arm64
+            BUILD_VERSION=${{ steps.ver.outputs.version }}
