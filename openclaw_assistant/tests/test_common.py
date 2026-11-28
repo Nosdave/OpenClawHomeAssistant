@@ -288,6 +288,16 @@ class RuntimeCapsTests(TmpCase):
     # GHSA-pw3x-g8v8-fvj2 fixed on the release line in 2026.11.4 (#196984), and doctor no longer copies a catalog key
     # beside a stored SecretRef login (#179802): the bundled runtime of 0.5.94-full6
     AT_1114 = dict(AT_1113, delegated_change_approval=True, doctor_catalog_skips_store_refs=True)
+    # the 2026.11.5+ release line (2026.11.8 and 2026.11.9 add nothing here)
+    AT_1115 = dict(AT_1114, cron_partition_binding=True, retired_state_migrated=True, heartbeat_retired=True,
+                   doctor_rc2_engine=True, workshop_drafts_dir=True, doctor_catalog_skips_shared_profile=True)
+    # 2026.11.10, its own release line (0.5.94-full7 bundles its 2026.11.11): the gateway start's copy-and-swap state
+    # upgrade, doctor's settled-exit watchdog, the cron changes and the skill-workshop plugin config; "-beta.1" counts
+    # as 2026.11.10 (version_tuple ignores it)
+    AT_11110 = dict(AT_1115, startup_state_upgrade=True, doctor_exit_watchdog=True, cron_backup_premigration=True,
+                    cron_bound_live_fallbacks=True, cron_load_warn_stored_only=True, cron_doctor_binds_codex=True,
+                    config_rows_openai_default=True,
+                    skill_workshop_plugin_config=True)
 
     def setUp(self):
         super().setUp()
@@ -304,8 +314,9 @@ class RuntimeCapsTests(TmpCase):
                  ("2026.10.5-beta.1", self.AT_1005), ("2026.10.6", self.AT_1006), ("2026.10.9", self.AT_1006),
                  ("2026.10.10", self.AT_1010), ("2026.11.0", self.AT_1010), ("2026.11.1", self.AT_1111),
                  ("2026.11.2", self.AT_1112), ("2026.11.3", self.AT_1113), ("2026.11.3-1", self.AT_1113),
-                 ("2026.11.4", self.AT_1114), ("2026.11.5-beta.3", self.AT_1114),
-                 ("2026.12.1", self.AT_1114)]
+                 ("2026.11.4", self.AT_1114), ("2026.11.5-beta.1", self.AT_1115), ("2026.11.5-beta.3", self.AT_1115),
+                 ("2026.11.8", self.AT_1115), ("2026.11.9", self.AT_1115), ("2026.11.10-beta.1", self.AT_11110),
+                 ("2026.11.10", self.AT_11110), ("2026.12.1", self.AT_11110)]
         for version, want in table:
             with self.subTest(version=version):
                 self.assertEqual(C.runtime_caps(version), want)

@@ -137,6 +137,12 @@ QUARANTINE_KINDS = ("telegram-cache", "telegram-session-cache", "sqlite-transien
 # defaults unchanged in 10.2, and `config validate` runs after the pins on every gate run).
 # The leaf is written only if absent from its parent dict; "cond" names an extra condition.
 SYSTEM_AGENT = "@agents.defaults.systemAgent.agentId"  # pin value resolved at apply time
+# OpenClaw 2026.11.10+ (runtime_caps skill_workshop_plugin_config): the skills schema has no workshop key any more
+# (zod-schema.root-shape.ts:585-630), and doctor moves skills.workshop to plugins.entries.skill-workshop.config
+# (legacy-config-migrations.runtime.skills.ts:89-101; values already in the plugin config win). The bundled plugin's
+# schema has autonomous.mode off|propose|auto (extensions/skill-workshop/openclaw.plugin.json); without a value the
+# plugin runs "auto" (extensions/skill-workshop/src/config.ts:30).
+SKILL_WORKSHOP_PLUGIN_MODE = ["plugins", "entries", "skill-workshop", "config", "autonomous", "mode"]
 
 PINS = [
     {"path": ["agents", "defaults", "maxConcurrent"], "value": 4, "cond": None},
@@ -153,7 +159,9 @@ PINS = [
     {"path": ["gateway", "cliAgents", "enabled"], "value": False, "cond": None},
     # gone with the Skill Workshop proposals in OpenClaw 2026.10.10 (strict skills.workshop schema; doctor removes it)
     {"path": ["skills", "workshop", "approvalPolicy"], "value": "pending", "cond": "workshop-proposals"},
-    {"path": ["skills", "workshop", "autonomous", "mode"], "value": "off", "cond": None},  # never .enabled
+    # never .enabled; on 2026.11.10+ written at moved_to instead (apply_pins skill_workshop_plugin)
+    {"path": ["skills", "workshop", "autonomous", "mode"], "value": "off", "cond": None,
+     "moved_to": SKILL_WORKSHOP_PLUGIN_MODE},
     {"path": ["plugins", "entries", "memory-core", "config", "dreaming", "enabled"], "value": False,
      "cond": "memory-slot"},
     {"path": ["transcripts", "enabled"], "value": False, "cond": None},
@@ -1726,10 +1734,12 @@ def check_runtime_pins(cfg, legacy_slots, retired_map=None, *, skip_codex=False)
 # --- pins ---------------------------------------------------------------------------------
 
 
-def _pin_condition(cfg, cond, retires_skill_proposals=False):
+def _pin_condition(cfg, cond, retires_skill_proposals=False, heartbeat_retired=False):
     """None if the condition holds, else a short reason text."""
     if cond is None:
         return None
+    if cond in ("heartbeat-roster", "heartbeat-system-agent") and heartbeat_retired:
+        return "heartbeat config is retired in this OpenClaw version (doctor moves it into a cron job)"
     if cond == "workshop-proposals":
         return "Skill Workshop proposals were removed in this OpenClaw version" if retires_skill_proposals else None
     if cond == "memory-slot":
@@ -1776,11 +1786,55 @@ def _system_agent_id(cfg):
     return v.strip() if isinstance(v, str) and v.strip() else None
 
 
-def apply_pins(cfg, ledgered_paths, retires_skill_proposals=False):
+def _is_workshop_id(value):
+    """skill-workshop-plugin-migration.ts isWorkshopId (2026.11.10)."""
+    return isinstance(value, str) and value.strip().lower() == "skill-workshop"
+
+
+def _workshop_plugin_pin(cfg):
+    """(reason or None, write the marker) for the 2026.11.10 Skill Workshop pin at SKILL_WORKSHOP_PLUGIN_MODE.
+
+    A skills.workshop key still in the config skips it: doctor moves that value, and a value already in the plugin
+    config would win over it (skill-workshop-plugin-migration.ts:175-208). OpenClaw 2026.11.10 ignores the whole
+    plugins.entries.skill-workshop entry of a config without meta.migrations.skillWorkshopPlugin true (materialize.ts:
+    54-55, validation-plugin-rules.ts:93-95), and the next doctor --fix deletes it
+    (legacy-config-migrations.runtime.skills.ts:9-28). OpenClaw's config writer records the marker on any write when no
+    older plugin policy needs repair (io.meta.ts:74-90, skill-workshop-plugin-migration.ts:124-131); the pin does the
+    same. Older policy (materializeSkillWorkshopPlugin, :33-85: a skill-workshop entry, a skill-workshop deny entry, or
+    a non-empty allowlist without it) is doctor's to repair: the pin is skipped then."""
+    skills = cfg.get("skills")
+    if isinstance(skills, dict) and "workshop" in skills:
+        return "skills.workshop is still set (doctor moves it to plugins.entries.skill-workshop.config)", False
+    meta = cfg.get("meta", _MISSING)
+    migrations = meta.get("migrations", _MISSING) if isinstance(meta, dict) else _MISSING
+    if isinstance(migrations, dict) and migrations.get("skillWorkshopPlugin") is True:
+        return None, False
+    if (meta is not _MISSING and not isinstance(meta, dict)) or \
+            (migrations is not _MISSING and not isinstance(migrations, dict)) or \
+            (isinstance(migrations, dict) and "skillWorkshopPlugin" in migrations):
+        return "meta.migrations.skillWorkshopPlugin cannot be set to true", False
+    plugins = cfg.get("plugins")
+    if isinstance(plugins, dict):
+        entries, deny, allow = plugins.get("entries"), plugins.get("deny"), plugins.get("allow")
+        if (isinstance(entries, dict) and any(_is_workshop_id(k) for k in entries)) or \
+                (isinstance(deny, list) and any(_is_workshop_id(x) for x in deny)) or \
+                (isinstance(allow, list) and allow and not any(_is_workshop_id(x) for x in allow)):
+            return ("plugin policy written while Skill Workshop was built in waits for openclaw doctor --fix "
+                    "(OpenClaw ignores the skill-workshop entry until then)"), False
+    return None, True
+
+
+def apply_pins(cfg, ledgered_paths, retires_skill_proposals=False, heartbeat_retired=False,
+               skill_workshop_plugin=False):
     """§7.9: write each pin only where its leaf key is absent; never re-apply a ledgered path.
 
     retires_skill_proposals: the bundled OpenClaw has no Skill Workshop proposals any more (runtime_caps, 2026.10.10+),
-    so skills.workshop.approvalPolicy is not written (its strict schema refuses the key).
+    so skills.workshop.approvalPolicy is not written (its strict schema refuses the key). heartbeat_retired
+    (runtime_caps, 2026.11.5+): agents.defaults/agents.list heartbeat blocks are rejected by the schema once doctor
+    moved them into cron, so the two heartbeat pins are not written. skill_workshop_plugin (runtime_caps
+    skill_workshop_plugin_config, 2026.11.10+): no skills.workshop.* key is written (the schema has none); a pin with
+    "moved_to" is written there instead, its earlier path counts as ledgered too, and _workshop_plugin_pin decides
+    whether meta.migrations.skillWorkshopPlugin is written with it (then also listed in `written`).
     Returns (new_cfg, written[{path, value}], skipped[{path, reason}]) with reasons
     "ledgered", "already-set", "parent-not-dict" or "condition:<text>".
     """
@@ -1790,12 +1844,19 @@ def apply_pins(cfg, ledgered_paths, retires_skill_proposals=False):
     ledgered = set(ledgered_paths or ())
     written, skipped = [], []
     for pin in PINS:
-        parts = pin["path"]
+        parts, old_path, marker = pin["path"], None, False
+        workshop = skill_workshop_plugin and parts[:2] == ["skills", "workshop"]
+        if workshop and pin.get("moved_to"):
+            old_path, parts = fmt_path(parts), pin["moved_to"]
         path = fmt_path(parts)
-        if path in ledgered:
+        if path in ledgered or (old_path is not None and old_path in ledgered):
             skipped.append({"path": path, "reason": "ledgered"})
             continue
-        why = _pin_condition(new, pin["cond"], retires_skill_proposals)
+        why = _pin_condition(new, pin["cond"], retires_skill_proposals, heartbeat_retired)
+        if why is None and workshop and old_path is None:
+            why = "skills.workshop moved to plugins.entries.skill-workshop.config in this OpenClaw version"
+        if why is None and old_path is not None:
+            why, marker = _workshop_plugin_pin(new)
         if why is not None:
             skipped.append({"path": path, "reason": "condition:" + why})
             continue
@@ -1819,6 +1880,9 @@ def apply_pins(cfg, ledgered_paths, retires_skill_proposals=False):
         parent = _ensure_dict_path(new, parts[:-1])
         parent[parts[-1]] = copy.deepcopy(value)
         written.append({"path": path, "value": copy.deepcopy(value)})
+        if marker:  # without it OpenClaw ignores the entry just written (_workshop_plugin_pin)
+            _ensure_dict_path(new, ["meta", "migrations"])["skillWorkshopPlugin"] = True
+            written.append({"path": "meta.migrations.skillWorkshopPlugin", "value": True})
     return new, written, skipped
 
 
@@ -1973,11 +2037,15 @@ def auth_order_adjust(cfg, profiles, store_order):
 # (embedded-agent-runner/run/auth-plan.ts), and
 # the refusal stops the fallback chain (recordModelFallbackStop). OpenClaw's own doctor migration (#172792)
 # was backported into 2026.11.2 (9716cc4c964e; main line from 2026.11.5-beta.1; oc_common.RUNTIME_CAPS
-# cron_doctor_migration), so it runs in the gate's doctor passes with the bundled 2026.11.4 (unchanged from
-# 2026.11.3: the refusal in embedded-agent-runner/run/auth-plan.ts, cli-runner/prepare.ts,
+# cron_doctor_migration), so it runs in the gate's doctor passes with the bundled 2026.11.4 and 2026.11.10 (the
+# refusal in embedded-agent-runner/run/auth-plan.ts, cli-runner/prepare.ts,
 # auto-reply/reply/agent-runner-cli-candidate.ts and cron/isolated-agent/run-prompt-executor.ts, and the migration in
-# doctor/cron/inference-binding-migration.ts); it records only the account of a job's own model, so a job that only
-# stops at a fallback stays refused there. The gate only forecasts which jobs are affected; it writes nothing.
+# doctor/cron/inference-binding-migration.ts; in 2026.11.10 only the refusal text changed,
+# scheduled-unrecorded-account.ts). It records only the account of a job's own model. On 2026.11.4 a job that only
+# stops at a fallback stays refused there. From 2026.11.10 the migration also binds Codex-runtime jobs
+# (cron_doctor_binds_codex), and a job with a recorded account runs its fallbacks on other providers with live
+# credentials (run-inference.ts scheduledLiveProviderAuth, e8ff306f741 #196539; cron_bound_live_fallbacks); an
+# unbound job is refused as before. The gate only forecasts which jobs are affected; it writes nothing.
 # The stored logins include the ones OpenClaw's doctor creates during the migration from literal provider keys
 # (doctor_key_copies; found in the add-on's 10.10 rehearsal): a job on such a provider is refused unless the key is a
 # SecretRef or has auth "api-key".
@@ -2007,13 +2075,17 @@ _KNOWN_ENV_KEY_MARKERS = frozenset((
     "MODELSTUDIO_API_KEY", "NOVITA_API_KEY", "NVIDIA_API_KEY", "OLLAMA_API_KEY", "OPENAI_ADMIN_KEY", "OPENAI_API_KEY",
     "OPENCODE_API_KEY", "OPENCODE_ZEN_API_KEY", "OPENROUTER_API_KEY", "PERPLEXITY_API_KEY", "QWEN_API_KEY",
     "RUNWAYML_API_SECRET", "RUNWAY_API_KEY", "SENSEAUDIO_API_KEY", "SGLANG_API_KEY", "SPEECH_KEY", "SPEECH_REGION",
-    "TOGETHER_API_KEY", "VLLM_API_KEY", "VOYAGE_API_KEY", "XAI_API_KEY", "XI_API_KEY"))
+    "TOGETHER_API_KEY", "VLLM_API_KEY", "VOYAGE_API_KEY", "XAI_API_KEY", "XI_API_KEY",
+    # new in the 2026.11.5+ line (2026.11.8 provider plugins bifrost, omlx, requesty)
+    "BIFROST_VIRTUAL_KEY", "OMLX_API_KEY", "REQUESTY_API_KEY",
+    # new in 2026.11.10 (the rerank plugin, enabledByDefault; the core lists and the other manifests are unchanged)
+    "RERANK_API_KEY"))
 # AWS SDK markers are markers, but never a usable key: the stored profiles still come first
 _AWS_SDK_KEY_MARKERS = frozenset(("AWS_BEARER_TOKEN_BEDROCK", "AWS_ACCESS_KEY_ID", "AWS_PROFILE"))
 _CORE_KEY_MARKERS = frozenset(("custom-local", "codex-app-server", "gcp-vertex-credentials", "ollama-local",
                                "secretref-managed"))
 _BUNDLED_KEY_MARKERS = frozenset(("openclaw:claude-cli-native-auth", "apple-fm-local", "lmstudio-local",
-                                  "minimax-oauth", "ollama-local"))
+                                  "minimax-oauth", "ollama-local", "omlx-local"))  # omlx-local: 2026.11.5+
 _KEY_MARKERS = _KNOWN_ENV_KEY_MARKERS | _AWS_SDK_KEY_MARKERS | _CORE_KEY_MARKERS | _BUNDLED_KEY_MARKERS
 # model-auth-provider-config.ts MODEL_AUTH_LOCAL_HOST_ALIASES (with model-provider-local.ts isLocalProviderBaseUrl)
 _LOCAL_HOST_ALIASES = frozenset(("localhost", "0.0.0.0", "docker.orb.internal", "host.docker.internal",
@@ -2136,7 +2208,7 @@ def config_path(provider_key):
     return f"models.providers[{json.dumps(provider_key, ensure_ascii=False)}]"
 
 
-def doctor_key_copies(cfg, catalogs=(), store_ids_for=None, store_refs_for=None, caps=None):
+def doctor_key_copies(cfg, catalogs=(), store_ids_for=None, store_refs_for=None, caps=None, shared_providers=None):
     """The auth profiles OpenClaw's doctor creates from plaintext provider keys (pure; port of
     maybeMigrateModelCatalogCredentials, 2026.10.10 to 2026.11.3, and 2026.11.4 with caps
     doctor_catalog_skips_store_refs): {"shared": [...], "agents": {agent id: [...]}}, each {"id", "provider", "copy"},
@@ -2152,6 +2224,9 @@ def doctor_key_copies(cfg, catalogs=(), store_ids_for=None, store_refs_for=None,
     catalogs: [(agent id, is the main agent dir, {provider key: apiKey value})]; store_ids_for(agent id, or None for
     the shared store) -> the ids of its stored profiles; store_refs_for(agent id, or None for the main agent dir) ->
     the providers (lower case) with such a SecretRef profile in that effective store (flags only, no ref or key).
+    With doctor_catalog_skips_shared_profile (2026.11.5+, #187698 skipCatalogCredential) also none for a provider
+    the shared store already has a profile for (shared_providers, lower case; doctor reads its auth order for the
+    provider, which this approximates by the stored profiles' providers).
     The id is allocateProfileId's first choice, "<provider>:default"; one entry per provider and store (doctor
     stores a second key as "<provider>:models-json")."""
     cfg = cfg if isinstance(cfg, dict) else {}
@@ -2159,6 +2234,8 @@ def doctor_key_copies(cfg, catalogs=(), store_ids_for=None, store_refs_for=None,
     refs = store_refs_for if store_refs_for is not None and _cap(caps, "doctor_catalog_skips_store_refs") \
         else (lambda _aid: ())
     res = {"shared": [], "agents": {}}
+    shared_have = {str(x).strip().lower() for x in shared_providers or ()} \
+        if _cap(caps, "doctor_catalog_skips_shared_profile") else set()
 
     def add(dest, key, how):
         p = key.strip().lower()
@@ -2174,7 +2251,7 @@ def doctor_key_copies(cfg, catalogs=(), store_ids_for=None, store_refs_for=None,
         own = shared_ids if is_main else shared_ids | set(ids(aid))
         ref = set(refs(None if is_main else aid))
         for k, value in providers.items() if isinstance(providers, dict) else []:
-            if isinstance(k, str) and k.strip() and k.strip().lower() not in ref \
+            if isinstance(k, str) and k.strip() and k.strip().lower() not in ref | shared_have \
                     and doctor_copies(value, _provider_cfg(cfg, k.strip().lower()), own):
                 add(res["shared"] if is_main else res["agents"].setdefault(str(aid).lower(), []), k, "catalog")
     return res
@@ -3770,6 +3847,12 @@ _SANDBOX_REGISTRIES = (("sandbox/containers.json", "container", False), ("sandbo
                        ("sandbox/browsers.json", "browser", False), ("sandbox/browsers", "browser", True))
 
 
+_MIGRATES_NOTE = "OpenClaw 2026.11.5 and later doctor %s during the migration"
+# the runtime families OpenClaw 2026.11.5+ doctor imports into SQLite (the others it only archives)
+_RUNTIME_IMPORTED_115 = frozenset({"voicewake-unimported", "conversation-bindings-unimported",
+                                   "plugin-approvals-unimported"})
+
+
 def classify_retired_state(state_dir, cfg, *, accepted, query=None, home="/config", env=None, mode="from-7x",
                            workspaces=(), config_root=None, caps=None):
     """Retired pre-July-2026 files and config keys that 10.2 doctor refuses (every gate mode).
@@ -3790,6 +3873,10 @@ def classify_retired_state(state_dir, cfg, *, accepted, query=None, home="/confi
     env = os.environ if env is None else env
     cfg = cfg if _rec(cfg) else {}
     plan, info, removals = [], [], []
+    # 2026.11.5+ (caps retired_state_migrated, 956dd5d98995): doctor imports cron JSON jobs and their state,
+    # referenced OAuth sidecars, Voice Wake settings, current-conversation bindings and plugin-binding approvals
+    # itself, and archives the other retired runtime files: no HOLD and no quarantine for what it imports
+    migrates = _cap(caps, "retired_state_migrated")
     by_code = {}
 
     def add(abs_path, kind, action, reason, root="state", proof=None):
@@ -3866,12 +3953,20 @@ def classify_retired_state(state_dir, cfg, *, accepted, query=None, home="/confi
                     imported = False
         if imported:
             add(store, "cron-json", "quarantine", "retired cron JSON store; its jobs are in SQLite")
+        elif migrates:
+            add(store, "cron-json", "leave", "retired cron JSON store with jobs that are not in SQLite; "
+                + _MIGRATES_NOTE % "imports them (current SQLite jobs win on ID collisions)")
+            info.append("retired cron JSON store %s holds jobs that are not in SQLite: %s" % (
+                store, _MIGRATES_NOTE % "imports them and their run state"))
         else:
             acceptable("cron-json-unimported", store, "cron-json", "accepted: cron-json-unimported",
                        "retired cron JSON store with jobs that are not in SQLite", store)
     sstore = store[:-5] + "-state.json" if store.endswith(".json") else store + "-state.json"
     if _lstat(sstore) is not None:
-        add(sstore, "cron-json-state", "quarantine", "retired cron run state (next/last run times only)")
+        if migrates and _lstat(store) is not None and not imported:  # doctor imports it with its jobs
+            add(sstore, "cron-json-state", "leave", "retired cron run state; " + _MIGRATES_NOTE % "imports it")
+        else:
+            add(sstore, "cron-json-state", "quarantine", "retired cron run state (next/last run times only)")
     runs = os.path.join(os.path.dirname(store), "runs")
     if must_be_dir(runs, "cron runs"):
         for e in _scandir_sorted(runs):
@@ -3909,7 +4004,7 @@ def classify_retired_state(state_dir, cfg, *, accepted, query=None, home="/confi
     d = os.path.join(state_dir, "credentials")  # the default; also checked when an override is set (harmless)
     if d not in oauth_dirs:
         oauth_dirs.append(d)
-    blobs = None
+    blobs, n_side = None, 0
     for oauth_dir in oauth_dirs:
         sdir = os.path.join(oauth_dir, "auth-profiles")
         if not must_be_dir(sdir, "OAuth sidecars"):
@@ -3919,12 +4014,20 @@ def classify_retired_state(state_dir, cfg, *, accepted, query=None, home="/confi
             blobs = _auth_store_blobs(state_dir, q, cfg, home)
         for name in side:
             path = os.path.join(sdir, name)
-            if blobs is True or name[:32] in blobs:
+            if (blobs is True or name[:32] in blobs) and migrates:
+                add(path, "oauth-sidecar", "leave", "pre-June OAuth sidecar an auth profile references; "
+                    + _MIGRATES_NOTE % "imports it (the original bytes stay in a .migrated archive beside it)")
+                n_side += 1
+            elif blobs is True or name[:32] in blobs:
                 acceptable("oauth-sidecar-referenced", path, "oauth-sidecar",
                            "accepted: oauth-sidecar-referenced (the profile needs a new login)",
                            "an auth profile still references it", path)
             else:
                 add(path, "oauth-sidecar", "quarantine", "unreferenced pre-June OAuth sidecar")
+
+    if n_side:
+        info.append("%d pre-June OAuth credential sidecar(s) still referenced by an auth profile: %s" % (
+            n_side, _MIGRATES_NOTE % "imports them (log in again only if it reports one it cannot decrypt)"))
 
     # Plugin install index file and the plugins.installs config key.
     pidx = os.path.join(state_dir, "plugins", "installs.json")
@@ -4047,6 +4150,15 @@ def classify_retired_state(state_dir, cfg, *, accepted, query=None, home="/confi
             elif status == _EMPTY:
                 add(path, kind, "quarantine", "retired pre-July-2026 %s with nothing OpenClaw 2026.10.4 would import"
                     % label, proof=detail)
+            elif migrates and code in _RUNTIME_IMPORTED_115:
+                add(path, kind, "leave", "retired pre-July-2026 %s (%s); %s" % (
+                    label, detail, _MIGRATES_NOTE % "imports it (current SQLite values win)"))
+                info.append("retired pre-July-2026 %s %s (%s): %s" % (label, rel, detail,
+                                                                      _MIGRATES_NOTE % "imports it"))
+            elif migrates:  # doctor would only archive it byte-for-byte: the gate's quarantine instead
+                add(path, kind, "quarantine", "retired pre-July-2026 %s (%s); OpenClaw 2026.11.5 and later archive it "
+                    "without importing it (nothing reads it any more)" % (label, detail), proof="archived, not "
+                    "imported, from OpenClaw 2026.11.5: " + detail)
             else:
                 acceptable(code, path, kind, "accepted: " + code, "retired pre-July-2026 %s (%s)" % (label, detail),
                            "%s (%s)" % (rel, detail))

@@ -532,15 +532,18 @@ class Docs1111Tests(unittest.TestCase):
 
     def test_pins_and_texts_name_the_bundled_version(self):
         version = self.dockerfile_arg("OPENCLAW_VERSION")
-        self.assertEqual(version, "2026.11.4")
-        # after openclaw@2026.11.4 (npm, 2026-11-16T04:06:42.253Z), the last package the image resolves with this cutoff
-        # (its newest exact dependency @openclaw/ai@2026.11.4: 03:48:02Z; the lockstep plugins: 02:09-02:14Z)
-        self.assertGreater(self.dockerfile_arg("NPM_BEFORE"), "2026-11-16T04:06:42.253Z")
-        self.assertLess(self.dockerfile_arg("NPM_BEFORE"), "2026-11-16T04:20:00Z")
+        self.assertEqual(version, "2026.11.11")
+        # after openclaw@2026.11.11 (npm, 2026-11-28T04:05:49.047Z), the last package the image resolves with this cutoff
+        # (its newest exact dependency @openclaw/ai@2026.11.11: 03:44:47Z; the lockstep plugins: 03:15-03:17Z), and
+        # close to it, so later releases of the tree's packages are not resolved
+        self.assertGreater(self.dockerfile_arg("NPM_BEFORE"), "2026-11-28T04:05:49.047Z")
+        self.assertLess(self.dockerfile_arg("NPM_BEFORE"), "2026-11-28T04:30:00Z")
         # the NPM_BEFORE comment names the publish time of the pinned version, not an older pin's
         docker = (ADDON / "Dockerfile").read_text()
-        self.assertIn(f"(openclaw@{version},\n#                         2026-11-16T04:06:42.253Z", docker)
-        self.assertNotIn("2026-11-10T18:00:00Z", docker)
+        self.assertIn(f"(openclaw@{version},\n#                         2026-11-28T04:05:49.047Z", docker)
+        for older in ("2026-11-10T18:00:00Z", "2026-11-24T10:14:12.508Z", "2026-11-24T10:15:00Z",
+                      "2026-11-25T05:07:34.288Z", "2026-11-25T05:08:00Z"):
+            self.assertNotIn(older, docker)
         docs = (self.REPO / "DOCS.md").read_text(encoding="utf-8")
         self.assertIn(f"This fork now ships **OpenClaw `{version}`**", docs)
         log = (ADDON / "CHANGELOG.md").read_text(encoding="utf-8")

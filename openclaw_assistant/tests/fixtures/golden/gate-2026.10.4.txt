@@ -34,7 +34,7 @@ oc-upgrade check — <TIME> (read-only)
 == C Legacy Telegram / Active Memory files (2026.9+ rules)
   none
 
-== C2 Pre-July-2026 files and settings (OpenClaw 2026.10 refuses them)
+== C2 Pre-July-2026 files and settings (OpenClaw 2026.10 and later refuse or retire them)
   none
 
 == D credentials/oauth.json (provider names only)
@@ -296,6 +296,8 @@ WARN [gate] test hook doctor_cmd in use
   }
  ],
  "doctor_copies_before": [],
+ "capture_baseline": [],
+ "doctor_captures": [],
  "doctor_notes": [],
  "finished_at": "<TS>"
 }
@@ -371,7 +373,7 @@ oc-upgrade check — <TIME> (read-only)
 == C Legacy Telegram / Active Memory files (2026.9+ rules)  [informational: migrated]
   none
 
-== C2 Pre-July-2026 files and settings (OpenClaw 2026.10 refuses them)  [informational: migrated]
+== C2 Pre-July-2026 files and settings (OpenClaw 2026.10 and later refuse or retire them)  [informational: migrated]
   none
 
 == D credentials/oauth.json (provider names only)
@@ -652,6 +654,8 @@ WARN [gate] test hook doctor_cmd in use
  "doctor_copies_before": [
   "state/openclaw.sqlite.pre-startup-migration-20261101T000000Z.bak"
  ],
+ "capture_baseline": [],
+ "doctor_captures": [],
  "doctor_notes": [],
  "finished_at": "<TS>"
 }

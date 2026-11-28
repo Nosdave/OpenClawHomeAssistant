@@ -651,7 +651,8 @@ RUNTIME_CAPS = (
     ("empty_installs_tolerated", (2026, 10, 6, 0)),
     # doctor retires the Skill Workshop proposal tables (keeps only pending/quarantined drafts as files)
     ("retires_skill_proposals", (2026, 10, 10, 0)),
-    # a cron agent turn without a recorded inference account stops at a stored-profile fallback (#192195)
+    # a cron agent turn without a recorded inference account stops at a stored-profile fallback (open issue
+    # openclaw/openclaw#192195, not a fix commit; scheduled-unrecorded-account.ts, still so in 2026.11.10)
     ("cron_refusal", (2026, 10, 10, 0)),
     # the gateway skips held stores of agents that are not configured instead of failing on them
     ("held_store_skip", (2026, 10, 10, 0)),
@@ -668,7 +669,8 @@ RUNTIME_CAPS = (
     ("heartbeat_hours_kept", (2026, 11, 1, 0)),
     # doctor records the cron inference accounts itself (#172792, backported to 2026.11.2 in 9716cc4c964e; also on
     # the main line from 2026.11.5-beta.1). The same backport makes the gateway log "cron: automation has no recorded
-    # inference account" at every start for each unbound agentTurn job (server-cron-inference.ts)
+    # inference account" at every start for each unbound agentTurn job (server-cron-inference.ts); from 2026.11.10
+    # only for the jobs whose first credential is a stored login (cron_load_warn_stored_only)
     ("cron_doctor_migration", (2026, 11, 2, 0)),
     # a per-agent memory search whose provider differs from the shared one no longer inherits the shared
     # memory.search.remote apiKey/headers, unless the agent sets no remote.baseUrl and the shared one is non-blank
@@ -677,8 +679,9 @@ RUNTIME_CAPS = (
     # a model row without maxTokens (row, provider level, catalog) gets min(32768, max(min(8192, W), floor(W/2)))
     # instead of min(8192, W) as its output cap (#193899, release line 2026.11.3; not in its changelog)
     ("output_cap_raised", (2026, 11, 3, 0)),
-    # GHSA-pw3x-g8v8-fvj2 fixed (#196984, release line 2026.11.4; main line from 2026.11.5-beta.3, 0016d9fc8dd0): the
-    # openclaw tool's persistent delegated changes need a human approval unless the run has explicit Full Access or
+    # GHSA-pw3x-g8v8-fvj2 fixed (#196984, release line 2026.11.4; main line from 2026.11.5-beta.3 as 0016d9fc8dd0,
+    # which 2026.11.8/11.9 have; 2026.11.10 has it as b8980ca9a0b): the openclaw tool's persistent delegated
+    # changes need a human approval unless the run has explicit Full Access or
     # unrestricted Gateway execution, or tools.openclaw.autoApproveChanges (global, or the agent's override in
     # agents.entries.<id>.tools.openclaw) is true; that key is new in this release (openclaw-delegate-tool.ts).
     # version_tuple ignores "-beta.N", so this floor also counts 2026.11.5-beta.1 and -beta.2 (without the fix) as
@@ -690,6 +693,79 @@ RUNTIME_CAPS = (
     # models.providers key of openclaw.json is still copied (#179802, 0b973c8beb22, release line 2026.11.4; main line
     # from 2026.11.5-beta.1, 3f016b19e313; doctor-model-catalog-credentials.ts hasProviderSecretRef)
     ("doctor_catalog_skips_store_refs", (2026, 11, 4, 0)),
+    # The 2026.11.5+ release line (2026.11.5-beta.1 onwards; 2026.11.4 is the last of the 2026.11.3 line and has none
+    # of these). Default cron partition identity (state schema 34, ded44ccc8e5f #183508): the schema migration binds
+    # config_machine_state "cron.defaultStoreKey" only for a provable legacy default or a single partition; otherwise
+    # cron stays paused until an interactive doctor selects one (non-interactive doctor never does)
+    ("cron_partition_binding", (2026, 11, 5, 0)),
+    # doctor imports or archives the retired pre-July-2026 runtime files instead of refusing them (956dd5d98995
+    # #174489; "Archived retired <label>: <path> -> <backup>"), except the pre-June formats it still refuses
+    ("retired_state_migrated", (2026, 11, 5, 0)),
+    # heartbeat config is retired: doctor turns agents.defaults/agents.list heartbeat blocks into cron jobs and the
+    # schema rejects them afterwards (ec5d369a6f66 #179387)
+    ("heartbeat_retired", (2026, 11, 5, 0)),
+    # doctor exit code 2 is an unresolved database engine: "config could not be parsed" or "database target could not
+    # be resolved" (0636e5523960 #175069, doctor-engine-selection.ts)
+    ("doctor_rc2_engine", (2026, 11, 5, 0)),
+    # doctor exports the pending/quarantined Skill Workshop drafts to the owner agent's workshop-skills/.drafts/ (and
+    # moves earlier exports there from .archive/.retired-proposals/: "Moved N exported ..."; b073ac5c3308)
+    ("workshop_drafts_dir", (2026, 11, 5, 0)),
+    # doctor's model-catalog credential step also skips a catalog key (models.json, generated plugin catalogs) when the
+    # shared auth store already has a profile for that provider ("Skipped models.json credential ... shared auth
+    # profile ... already provides effective credentials", 36383b8ce160 #187698)
+    ("doctor_catalog_skips_shared_profile", (2026, 11, 5, 0)),
+    # 2026.11.10 (a release branch cut from main on 2026-11-16; not the successor of 2026.11.8/11.9, which it
+    # contains only in part). `openclaw gateway run` upgrades the state by copy and swap before it opens it
+    # (ef930ebbad7; state-upgrade.ts, state-upgrade-startup.ts). It does so when a `<state>/.upgrade-*` entry exists,
+    # or when the state database (max of user_version and contentVersion) or an agents/<id> database that the
+    # deletion journal does not hold is at 0 < version < the bundled schema. It copies the state to
+    # `<state>/.upgrade-<ver>-<pid>-<ms>/state`, runs its own doctor on the copy and renames the result into place.
+    # Every replaced file stays as `<file>.pre-<version>`, the copy's doctor log as logs/state-upgrade-<version>.log
+    # (plaintext copies). A state database at version 0 turns it off; a plan.json in a `.upgrade-*` folder (an
+    # interrupted swap) is applied over the live files first
+    ("startup_state_upgrade", (2026, 11, 10, 0)),
+    # doctor (every doctor run, --lint too) and update arm the 10 s settled-exit watchdog (9f69f4d4653 #194229,
+    # register.maintenance.ts, one-shot-exit.ts requestOneShotSettledExitWatchdog): if a handle keeps the process
+    # alive 10 s after the command settled, it writes "command settled but the process is still alive after
+    # 10000ms; ...; terminating" and SIGTERMs itself, whatever exit code it meant (rc -15). No flag or variable
+    # turns it off or lengthens it
+    ("doctor_exit_watchdog", (2026, 11, 10, 0)),
+    # on SQLite, doctor's pre-repair cron backup is a `.pre-startup-migration-<uuid>.bak` copy of the state
+    # database (backupDoctorSqliteDatabases), logged as "Saved pre-repair cron backup: <path>"; the
+    # `.doctor-cron-<ms>-<uuid>.bak` copy is made only on PostgreSQL (dd96854d2e9 #190328, cron/store-repair.ts)
+    ("cron_backup_premigration", (2026, 11, 10, 0)),
+    # a cron job with a recorded inference account runs every candidate on another provider than the recorded one
+    # with live credentials, as an interactive run does: its fallbacks there, and its own model when that is on
+    # another provider (e8ff306f741 #196539, cron/run-inference.ts runParams/scheduledLiveProviderAuth). Only the
+    # candidates on the recorded provider use the recorded account; the record holds one account, there is no
+    # account per fallback. Before, every candidate on another provider was refused (assertCandidate, #192463).
+    # Unbound jobs are still refused at a stored login, and that stops the chain (#192195)
+    ("cron_bound_live_fallbacks", (2026, 11, 10, 0)),
+    # the gateway's start check writes "cron: automation has no recorded inference account; ..." only for an unbound
+    # job whose own model's first credential is not a configured key (isConfiguredKeyAuthSource): a stored login,
+    # AWS SDK credentials, or none at all (a key variable missing from the gateway's environment). A key in
+    # models.providers or in a set variable gets no warning any more. It still runs at every start and after a
+    # cron.* reload, now for 5 s at most ("... reached their time budget; N jobs were not checked. Run openclaw
+    # doctor --lint ...") (b9d66a0da1b #195905, server-cron-inference.ts, cron/service/store.ts)
+    ("cron_load_warn_stored_only", (2026, 11, 10, 0)),
+    # doctor's inference-binding migration also records the account of a job whose own model runs on the Codex
+    # runtime (binding.runtime "codex") when that model's first credential is a stored profile; native or
+    # credentialless Codex auth is skipped. Other runtimes still get "runtime <id> inference ownership was left
+    # unchanged" (74d1342d3ac #189979, commands/doctor/cron/inference-binding-migration.ts)
+    ("cron_doctor_binds_codex", (2026, 11, 10, 0)),
+    # skills.workshop moved to plugins.entries.skill-workshop.config (710b58de2ad #190365; doctor migration
+    # "skills.workshop->plugins.entries.skill-workshop.config", values already in the plugin config win): the skills
+    # schema has no workshop key any more, so config validate refuses one (zod-schema.root-shape.ts)
+    ("skill_workshop_plugin_config", (2026, 11, 10, 0)),
+    # a model row of openclaw.json (models.providers.<p>.models[]) whose row and provider block set neither api nor
+    # baseUrl runs as an OpenAI-compatible model without an endpoint (model.inline-provider.ts
+    # completeInlineProviderModel: api "openai-responses", baseUrl ""), also when the bundled catalog knows the
+    # model; for every provider but "openai" the request then fails with 'Provider "<p>" requires an explicit base
+    # URL before using an OpenAI-compatible API' (@openclaw/ai openai-transport-shared.ts
+    # resolveOpenAIClientBaseUrl). Rehearsed on 2026.11.11 with a google row; 2026.11.4 took the provider's own
+    # API there (its doctor did not yet remove the provider copies from the agents' models.json). Not verified on
+    # 2026.11.5 to 2026.11.10, which the add-on never bundled
+    ("config_rows_openai_default", (2026, 11, 10, 0)),
 )
 CAP_NAMES = tuple(n for n, _v in RUNTIME_CAPS)
 # Build-time record (Dockerfile): {"openclaw_version": ..., <cap>: true|false} for capabilities the image can

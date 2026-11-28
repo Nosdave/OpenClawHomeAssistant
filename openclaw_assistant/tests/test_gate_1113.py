@@ -4,7 +4,8 @@
 - R3/R4: OpenClaw's doctor migration of cron inference accounts (#172792) was backported to 2026.11.2
   (runtime_caps cron_doctor_migration from 2026.11.2). It records only the account of a job's own model on a stored
   login: the precheck says so for those jobs only (info line), keeps the WARN lines of the jobs that only stop at a
-  fallback on a stored login, and says that a bound job's fallbacks to other providers are refused.
+  fallback on a stored login, and says that a bound job's fallbacks to other providers are refused (2026.11.10 runs
+  them on live credentials and also binds Codex-runtime jobs: tests/test_gate_1110_cron.py).
 - R5: whenever doctor commits a cron repair (also that migration) it writes a full plaintext copy of the state database
   <state>/state/openclaw.sqlite.doctor-cron-<ms>-<uuid>.bak and logs "Saved pre-repair cron backup: <path>". The gate
   journals, reports and deletes the ones a gate run made like doctor's pre-migration copies (gate_cleanup_hours),
@@ -14,6 +15,7 @@
   reported and deleted like the cron backups.
 - R6: from 2026.11.2 the gateway warns at every start for each unbound agentTurn job whose own model runs on a
   configured key (doctor leaves those unbound on purpose): an info line in the finalize and `oc-upgrade status`.
+  2026.11.10 no longer warns for a configured key (tests/test_gate_1110_cron.py).
 - R7: from 2026.11.3 an agent whose memory search provider differs from the shared one no longer inherits the shared
   remote apiKey/headers (#184966): a precheck WARN with agent ids and field names only.
 - R8: from 2026.11.3 a model row without maxTokens gets an output cap sized from its context window (#193899): a
@@ -134,8 +136,8 @@ class CronOn1113Tests(T.GateEnv):
         text = "\n".join(lines)
         self.assertIn("[gate] 1/8 info: 1 enabled cron job(s) without a recorded inference account run their own model "
                       "on a stored login: 'Morning summary' (job-morning); OpenClaw 2026.11.4 doctor records that "
-                      "account during the migration when exactly one fits (openclaw/openclaw#172792), but then refuses "
-                      "their fallbacks to other providers (as with openclaw/openclaw#192463); the gate reports the jobs "
+                      "account during the migration (openclaw/openclaw#172792) when an eligible account fits (with "
+                      "several, the one a run would take now), but then refuses their fallbacks to other providers (as with openclaw/openclaw#192463); the gate reports the jobs "
                       "doctor leaves after the migration", lines)
         # the jobs that only stop at a fallback keep their WARN lines (doctor records nothing for them)
         self.assertNotIn("WARN [gate] cron job 'Morning summary'", text)
@@ -144,8 +146,9 @@ class CronOn1113Tests(T.GateEnv):
         self.assertIn("WARN [gate] 2 cron job(s) above: the add-on changes nothing for these jobs apart from the config "
                       f"fixup above; OpenClaw 2026.11.4 doctor {FB_ONLY}. " + G.CRON_FALLBACK, lines)
         self.assertIn("[gate]   cron inference accounts: 1 enabled cron job(s) run their own model on a stored login "
-                      "without a recorded account; OpenClaw 2026.11.4 doctor records it when exactly one account fits "
-                      "(openclaw/openclaw#172792), then refuses their fallbacks to other providers", lines)
+                      "without a recorded account; OpenClaw 2026.11.4 doctor records it (openclaw/openclaw#172792) when "
+                      "an eligible account fits (with several, the one a run would take now), then refuses their "
+                      "fallbacks to other providers", lines)
         self.assertIn("[gate]   cron inference accounts: 2 enabled cron job(s) stop at a stored login on OpenClaw "
                       "2026.11.4 and doctor records no account for them (the WARN lines above, "
                       "openclaw/openclaw#192195); apart from the config fixup above, the gate changes nothing for cron",

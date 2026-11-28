@@ -127,7 +127,7 @@ The Gateway Web UI (Control UI) is OpenClaw's main web interface. It opens in a 
 
 The reason is asset paths, not WebSockets — Ingress proxies WebSockets fine, which is how the embedded terminal works. Home Assistant serves add-on pages under a per-add-on prefix (`/api/hassio_ingress/<token>/`), while the Control UI emits its assets from the origin root unless `gateway.controlUi.basePath` matches that prefix exactly. Serving it under Ingress would therefore require pinning the gateway to that prefix, which would break direct LAN access at the same time.
 
-> **Depends on the bundled OpenClaw version.** This fork now ships **OpenClaw `2026.11.4`** (from `0.5.94-full6`; `0.5.94-full5` bundled `2026.11.3` but was not installed anywhere and must be skipped; `0.5.94-full1` to `0.5.94-full4` shipped `2026.10.4`, `0.5.93-full2` shipped `2026.7.35`):
+> **Depends on the bundled OpenClaw version.** This fork now ships **OpenClaw `2026.11.11`** (from `0.5.94-full7`; `0.5.94-full6` shipped `2026.11.4`; `0.5.94-full5` bundled `2026.11.3` but was not installed anywhere and must be skipped; `0.5.94-full1` to `0.5.94-full4` shipped `2026.10.4`, `0.5.93-full2` shipped `2026.7.35`):
 >
 > - **On `2026.7.x` (up to `0.5.93-full2`):** plain HTTP from the LAN is a non-secure browser context, WebCrypto is blocked, and OpenClaw rejects Control UI connections without device identity. **Use HTTPS** (`lan_https`, a reverse proxy or Tailscale Serve) or `http://127.0.0.1` on the host. The only built-in exception is `controlui_disable_device_auth: true` (default), which sets the break-glass `gateway.controlUi.dangerouslyDisableDeviceAuth` — token auth is still enforced, but over plain HTTP the token travels in clear text.
 > - **From OpenClaw `2026.8.2` on (current):** the Control UI no longer requires a secure context — device identity is signed with pure-JS Ed25519 on any origin. `dangerouslyDisableDeviceAuth` is retired (inert), so **every browser must be paired once**; see [Device pairing](#device-pairing-first-connection) below. HTTPS remains strongly recommended because a plaintext page exposes the gateway token.
@@ -360,7 +360,7 @@ These options control what the [migration gate](#upgrading-to-openclaw-202610-05
 
 | Option | Type | Default | Description |
 |---|---|---|---|
-| `gate_cleanup_hours` | int | `48` | Hours after a gate run (from `[gate] done`, or from when a hold after the run was cleared, whichever is later) before the add-on deletes the doctor captures that run created in `/config/.openclaw.update-captures/`, the SQLite copies its doctor passes saved beside the databases (`*.pre-startup-migration-*.bak`, `.scoped.bak`, doctor's pre-repair cron backups `state/openclaw.sqlite.doctor-cron-*.bak` and its pre-repair recovery directories `openclaw-*-recovery-*/`) and the gate's own plaintext copies of `openclaw.json` in the run directory (`/config/.openclaw-upgrade/gate/runs/<run>/config.*.json`, with the saved `models status` output). Copies that earlier add-on versions left (gate archives in `/share/openclaw-upgrade/`, rehearsal exports in `/share/openclaw-rehearsal/`, the plaintext 2026.7 archives in `/config/.openclaw/upgrade-backups/`) are deleted after the same number of hours, counted from their own time. `0` = never delete. A changed value applies from the next add-on start. Range: 0-720. See [Automatic deletion](#automatic-deletion-gate_cleanup_hours) |
+| `gate_cleanup_hours` | int | `48` | Hours after a gate run (from `[gate] done`, or from when a hold after the run was cleared, whichever is later) before the add-on deletes the doctor captures that run created in `/config/.openclaw.update-captures/`, the SQLite copies its doctor passes saved beside the databases (`*.pre-startup-migration-*.bak`, `.scoped.bak`, doctor's pre-repair cron backups `state/openclaw.sqlite.doctor-cron-*.bak`, its pre-repair recovery directories `openclaw-*-recovery-*/` and its pre-repair SQLite snapshots `*.auth-profile-migration-*.bak`, `*.pre-acp-*-migration-*.bak`, `*.pre-exec-approvals-migration-*.bak`, `*.doctor-gateway-token.*.bak`; with OpenClaw 2026.11.11 also its copies of an agent's `models.json`, `models.json.bak-*`) and the gate's own plaintext copies of `openclaw.json` in the run directory (`/config/.openclaw-upgrade/gate/runs/<run>/config.*.json`, with the saved `models status` output). With OpenClaw 2026.11.11 also what the gateway start's own state upgrade left (`.upgrade-*` without a swap plan, `*.pre-<version>`, `logs/state-upgrade-*.log`, `.<file>.upgrade-*`), the same hours after the newest of it and only after a healthy gateway start; a `.upgrade-*` with `plan.json` is never deleted, one without is deleted by the next gate run at once ([State upgrade at gateway start](#state-upgrade-at-gateway-start-openclaw-20261111)). Copies that earlier add-on versions left (gate archives in `/share/openclaw-upgrade/`, rehearsal exports in `/share/openclaw-rehearsal/`, the plaintext 2026.7 archives in `/config/.openclaw/upgrade-backups/`) are deleted after the same number of hours, counted from their own time. `0` = never delete. A changed value applies from the next add-on start. Range: 0-720. See [Automatic deletion](#automatic-deletion-gate_cleanup_hours) |
 | `gate_backup_max_age_hours` | int | `24` | Before it changes the state, the gate requires an encrypted Home Assistant backup that contains this add-on and is at most this many hours old (for an OpenClaw update: taken before the update). Otherwise it holds (`ha-backup-missing`, acceptable). There is no value that switches the check off; to go ahead without a backup, accept the HOLD for that run. Range: 1-168 |
 
 **Supervisor API access (accepted risk).** For the backup check the add-on has
@@ -974,6 +974,19 @@ the migration gate checks for a recent encrypted Home Assistant backup, runs
 `OC_ADDON_UNSAFE=1 openclaw …` bypasses the wrapper's checks (`openclaw update`
 stays refused).
 
+### `openclaw database` copy and restore commands are refused
+
+OpenClaw 2026.11.11 adds `openclaw database migration-capture create|restore` and
+`openclaw database restore-session-dependencies`. The first writes a plaintext archive of
+the state, its database images and `openclaw.json`; `restore` unpacks one, and
+`restore-session-dependencies` rewrites the live state database. That is a copy with
+secrets the add-on does not track, or a change outside its backup and migration steps, so
+the wrapper refuses these three forms (exit code 2), also outside a HOLD. Back up with an
+encrypted Home Assistant backup of the add-on instead. `openclaw database
+migration-capture capabilities` only prints JSON and passes. `OC_ADDON_UNSAFE=1` bypasses
+the refusal (support-guided recovery only). During a HOLD only the wrapper's read-only
+allow-list passes, as before.
+
 ### Upgrade checks and migration gate (`oc-upgrade`)
 
 ```sh
@@ -987,16 +1000,22 @@ oc-upgrade cleanup          # what the add-on deletes when: doctor captures and 
 
 `oc-upgrade status` also shows the gate options (cleanup hours, backup age), the
 backup the last gate run checked, the doctor captures, doctor's pre-migration SQLite
-copies, pre-repair cron backups and pre-repair recovery directories, the gate's Skill Workshop exports, and copies that earlier add-on versions left: gate archives in `/share/openclaw-upgrade/` and rehearsal exports in
+copies, pre-repair cron backups, pre-repair recovery directories and pre-repair SQLite
+snapshots, the credential archives OpenClaw kept after importing them (`*.migrated*`, kept,
+delete them by hand), the gate's Skill Workshop exports, with OpenClaw 2026.11.11 what its
+gateway start's own state upgrade left
+([State upgrade at gateway start](#state-upgrade-at-gateway-start-openclaw-20261111)), and copies that earlier add-on versions left: gate archives in `/share/openclaw-upgrade/` and rehearsal exports in
 `/share/openclaw-rehearsal/` (`encrypted`, or `PLAINTEXT` for unencrypted ones), and the
-2026.7 pre-upgrade archives in `/config/.openclaw/upgrade-backups/` (`PLAINTEXT`). The
-add-on deletes all of these by itself (see [Automatic deletion](#automatic-deletion-gate_cleanup_hours)).
+2026.7 pre-upgrade archives in `/config/.openclaw/upgrade-backups/` (`PLAINTEXT`). Apart
+from the credential archives the add-on deletes these by itself (doctor's captures and
+copies: those a gate run made; see [Automatic deletion](#automatic-deletion-gate_cleanup_hours)).
 `oc-upgrade gate --dry-run` (and the readiness section of `oc-upgrade check` when a
 migration is pending) runs the backup check, read-only, and names the rollback point.
 
 `oc-upgrade check` only reads. It prints versions, database schema versions,
-leftovers from OpenClaw versions before June 2026, model wildcards and free
-space — file names, sizes and versions only, never tokens. Exit codes: `0`
+leftovers from OpenClaw versions before June 2026, model wildcards, enabled official
+plugins the bundled OpenClaw does not load (a `WARN`; with 2026.11.11 `@openclaw/codex`
+below 2026.11.5-beta.1) and free space — file names, sizes and versions only, never tokens. Exit codes: `0`
 nothing to note, `4` notes (items the next OpenClaw upgrade handles), `2`
 possible bridge case (an old database with data that was never imported — do not
 upgrade, ask first), `3` the state was written by a newer OpenClaw than this image
@@ -1016,16 +1035,31 @@ and files from before July 2026 that 2026.9 still converted. The add-on therefor
 runs a **migration gate** once, before the first 2026.10 gateway start. Its log
 lines start with `[gate]` and are numbered `1/8` … `8/8`.
 
-**OpenClaw 2026.11.4 (this add-on version, `0.5.94-full6`).** The image now bundles OpenClaw 2026.11.4
-instead of 2026.10.4. 2026.11.4 is the next maintenance release of the 2026.11.3 line (220
-commits after 2026.11.3; that line is built on 2026.11.1 and the 2026.10.10 line), with the
-same database schemas as 2026.11.3: from 2026.10.4 the databases change state 20 → 22 and
-agent 24 → 27, one-way. It carries the fix for the security advisory GHSA-pw3x-g8v8-fvj2
-(openclaw/openclaw#196984; see
-[Delegated changes](#delegated-changes-openclaw-2026114-ghsa-pw3x-g8v8-fvj2)) and the
-rejection of ambiguous capability-scoped gateway request paths (openclaw/openclaw#190863).
-`0.5.94-full5` (OpenClaw 2026.11.3) is affected by that advisory: do not install it.
-`0.5.94-full1` … `0.5.94-full4` update straight to `0.5.94-full6`. For the 2026.10.10 line
+**OpenClaw 2026.11.11 (this add-on version, `0.5.94-full7`).** The image now bundles OpenClaw 2026.11.11
+instead of 2026.11.4. 2026.11.11 is the second release of the 2026.11.10 line, a release
+line of its own: OpenClaw branched it from its main line on 2026-11-16. It is not the successor of 2026.11.8 or 2026.11.9 (this add-on
+version was first prepared with 2026.11.8, which was never shipped). It carries the fixes of
+2026.11.4 as forward-ports, not as the same commits, except one security follow-up (the
+delegation policy, accepted; [Delegated changes](#delegated-changes-openclaw-2026114-ghsa-pw3x-g8v8-fvj2)),
+and it lacks a few fixes that 2026.11.8 had, which 2026.11.4 (`0.5.94-full6`) lacks too
+([below](#openclaw-20261111-0594-full7)). The
+databases change state 22 → 40 and agent 27 → 42 (from 2026.10.4: state 20 → 40, agent
+24 → 42), one-way: OpenClaw 2026.11.4 refuses the newer schemas, so the only way back to
+`0.5.94-full6` is the encrypted Home Assistant backup. 2026.11.11 keeps the fix for the
+security advisory GHSA-pw3x-g8v8-fvj2 with the same rules (see
+[Delegated changes](#delegated-changes-openclaw-2026114-ghsa-pw3x-g8v8-fvj2)), and it
+rejects ambiguous capability-scoped gateway request paths itself again
+(openclaw/openclaw#190863), so the add-on needs no patch for that. Its gateway start can
+upgrade the state by itself, by copy and swap; the gate holds before any start that would
+do so ([State upgrade at gateway start](#state-upgrade-at-gateway-start-openclaw-20261111)). The
+behaviour changes and the gate's new checks are in
+[OpenClaw 2026.11.11](#openclaw-20261111-0594-full7). Update from
+`0.5.94-full6` with the runbook below; `0.5.94-full1` … `0.5.94-full4` update straight to
+`0.5.94-full7`; never install `0.5.94-full5` (OpenClaw 2026.11.3, affected by the advisory).
+
+`0.5.94-full6` bundled OpenClaw 2026.11.4, the maintenance release of the 2026.11.3 line
+with the fix for GHSA-pw3x-g8v8-fvj2 (openclaw/openclaw#196984) and the same database
+schemas as 2026.11.3 (from 2026.10.4: state 20 → 22, agent 24 → 27). For the 2026.10.10 line
 the gate has more checks, switched on by the bundled OpenClaw version: the pre-July-2026 runtime files that OpenClaw 2026.10.5 and later
 refuse ("Pre-July-2026 leftovers" below), the agent stores the gateway of the 2026.10.10
 line does not open (kept from a finished or pending deletion while the agent is not
@@ -1037,10 +1071,10 @@ report of [cron jobs without a recorded inference account](#cron-jobs-without-a-
 (with one automatic `openclaw.json` fixup for providers whose literal key doctor stores as a login;
 from 2026.11.2 OpenClaw's doctor records the account of a job whose own model is on a stored
 login itself), the [memory search credentials and model output caps](#memory-search-credentials-and-output-caps-openclaw-2026113)
-that change with 2026.11.3 (also in 2026.11.4), the
+that change with 2026.11.3 (also in 2026.11.4 and 2026.11.11), the
 [delegated changes](#delegated-changes-openclaw-2026114-ghsa-pw3x-g8v8-fvj2) setting of
 2026.11.4, and, after the gate, the [official plugin update](#official-plugins-follow-openclaws-version).
-Read the [known limits](#known-limits-with-openclaw-20261010-to-2026114) of that line
+Read the [known limits](#known-limits-with-openclaw-20261010-to-20261111) of that line
 before you update. With OpenClaw 2026.10.4 (an image built with
 `--build-arg OPENCLAW_VERSION=2026.10.4`) the gate works as before, except for the
 foreign-key check in the precheck, the deletion of doctor's SQLite copies, pre-repair
@@ -1067,23 +1101,97 @@ encrypted Home Assistant backup, and restoring it is the only rollback: the gate
 writes no archive of its own, and the add-on keeps no copy of the state outside the
 Home Assistant backup system.
 
-**Runbook from `0.5.94-full1` … `0.5.94-full4` (OpenClaw 2026.10.4) to `0.5.94-full6`
-(OpenClaw 2026.11.4).** Skip `0.5.94-full5`. The gate runs its shorter update form (mode
-`bump`); the databases change one-way (state 20 → 22, agent 24 → 27). Steps 2–4 and 6
-are those of the runbook from `0.5.93-full2` below. An installation that already runs
-`0.5.94-full5` (OpenClaw 2026.11.3) updates to `0.5.94-full6` with the same steps, but
-without a database change (the schemas are the same): the gate still runs, because the
-OpenClaw version changes, and its backup check needs an encrypted backup taken before the
-update. It refuses only a backup that already holds `0.5.94-full6` and accepts any other
-version inside `gate_backup_max_age_hours` (for example an older `0.5.94-full4` backup), so
-create the backup on `0.5.94-full5` right before the update and check that the precheck line
-names `add-on 0.5.94-full5`.
+**Runbook from `0.5.94-full6` (OpenClaw 2026.11.4) to `0.5.94-full7` (OpenClaw
+2026.11.11).** The gate runs its shorter update form (mode `bump`); the databases change
+one-way (state 22 → 40, agent 27 → 42). Steps 2–4 and 9 follow steps 2–4 and 6 of the
+runbook from `0.5.93-full2` below. Read [OpenClaw 2026.11.11](#openclaw-20261111-0594-full7) first: it lists
+what changes for you, which defaults the add-on leaves as OpenClaw sets them and which
+fixes 2026.11.11 lacks.
+
+1. On `0.5.94-full6`: `oc-upgrade check` → exit code `0` or `4`, and
+   `migrated: 2026.11.4 (…)`. Exit code `2` or `3`: do not update, ask first. This check
+   does not know the checks of 2026.11.11 yet; they run in its precheck, before anything is
+   written. The Control UI needs the same browsers as with 2026.11.4
+   ([Known limits](#known-limits-with-openclaw-20261010-to-20261111)).
+2. Turn auto-update off and pause automatic backups (step 2 below).
+3. Stop the add-on and create the encrypted Home Assistant backup (step 3 below), holding
+   `0.5.94-full6`; a partial backup with only this add-on is enough. Keep it: it is the
+   only rollback.
+4. Check that the add-on store offers `0.5.94-full7` (reload the store), then update with
+   the add-on still stopped, start it and leave the log open (step 4 below).
+5. The precheck line names `HA backup ok ('<name>', … old, encrypted, add-on
+   0.5.94-full6)`. Possible precheck lines of 2026.11.11: `1/8 info: heartbeat (…): OpenClaw
+   2026.11.11 retires the heartbeat settings; …` (doctor turns them into cron jobs), and a
+   `WARN` that ends `… the gate then holds with doctor-cron-partition …` if the default cron
+   store cannot be recorded automatically
+   ([Default cron partition](#default-cron-partition)), and `WARN [gate] 1/8 model providers: …`
+   for model rows of `openclaw.json` without an API, which stop working after the update
+   until you set it ([OpenClaw 2026.11.11](#openclaw-20261111-0594-full7), "Model rows
+   without an API"). The doctor pass lines can count
+   pre-repair SQLite snapshots (`… pre-repair SQLite snapshot (auth profile, ACP, exec
+   approvals or gateway token migration) by doctor …`); they are deleted with the run. A pass
+   line can also say `… doctor finished, but a handle kept it running, so it stopped itself
+   with SIGTERM 10 s later (rc -15, OpenClaw's settled-exit watchdog); its outro says exit 0`:
+   information, the run goes on. The postconditions line names `no gateway-start upgrade
+   pending`. Success ends with `[gate] done: MIGRATED 2026.11.11 …`, then the gateway starts;
+   the plugin step brings `@openclaw/codex`, `@openclaw/acpx` and the Brave plugin to
+   2026.11.11 (`INFO: Official plugins match OpenClaw 2026.11.11: @openclaw/acpx …,
+   @openclaw/codex …` and `INFO: Brave web-search plugin ensured (@2026.11.11).`).
+   2026.11.11 does not load the Codex plugin of 2026.11.4 (minimum 2026.11.5-beta.1). The
+   gate's doctor updates it; if it cannot (npm unreachable, or `no-network` accepted), the
+   gate holds before the gateway starts, with `doctor-plugin-load` or, when doctor only
+   defers Codex's data upgrade, with `doctor-warnings` at the last pass: make the npm registry
+   reachable, then `oc-upgrade retry`. Only after a passed gate can the plugin step's `WARN`
+   say that it is unavailable until it is updated
+   ([Official plugins follow OpenClaw's version](#official-plugins-follow-openclaws-version)).
+   Read the `WARN` and `info` lines of the run as in the runbook below.
+6. If the gate holds: a hard code needs its fix; an acceptable code only after you have
+   read its reason (`oc-upgrade status`). `doctor-cron-partition` and `pc-cron-partition`:
+   see [Default cron partition](#default-cron-partition). `pc-startup-upgrade` and the
+   `startup-upgrade-*` codes: see
+   [State upgrade at gateway start](#state-upgrade-at-gateway-start-openclaw-20261111).
+7. Check `oc-upgrade status` (also the lines `Doctor pre-repair SQLite snapshots …` and
+   `Credential archives OpenClaw kept …`, see
+   [Automatic deletion](#automatic-deletion-gate_cleanup_hours); there must be no
+   `OpenClaw state-upgrade leftovers` line), that the gateway is up (add-on log, add-on
+   page) and that OpenClaw's own log (`openclaw logs`) shows no `Upgrading state to
+   2026.11.11` line, the Control UI on every device you use it on (for example a tablet;
+   pair a browser again if it asks; touch scrolling of dashboard panels is as with
+   2026.11.4), Telegram with a text and a voice message, memory search, MCP, and the next
+   cron run, including the jobs doctor made from the heartbeat (one per agent;
+   `openclaw automations list`). They have no fallbacks of their own, so they run on the
+   agent's model chain as a cron chain: a fallback on a stored login stops them, and
+   2026.11.11 sends a failure notice from the first such run. The add-on does not change these
+   jobs. Give each of them fallbacks that need no stored login, like your other cron jobs:
+   `openclaw automations edit <id> --fallbacks <list>`, for example `google/<model>` when
+   that provider's key is in `models.providers.google.apiKey`, or `--fallbacks ""` for none
+   (see [Cron jobs without a recorded inference account](#cron-jobs-without-a-recorded-inference-account-openclaw-20261010)).
+8. Decide on the three defaults OpenClaw 2026.11.11 changes
+   ([OpenClaw 2026.11.11](#openclaw-20261111-0594-full7)): `tools.exec.applyPatch.workspaceOnly`
+   (set it to `true` to keep `apply_patch` inside the workspace, as with 2026.11.4),
+   `gateway.controlUi.experimental.customPlugins` (set it to `false` to keep plugins' own
+   Control UI code off) and `session.maintenance.coldStorage.enabled` (on: chats inactive
+   for 30 days move into cold archives, which are required history and part of your
+   encrypted backup; the add-on keeps it on).
+9. Keep the encrypted Home Assistant backup until you are sure (step 6 below): restoring it
+   is the rollback to `0.5.94-full6`
+   ([Safe rollback](#safe-rollback-after-an-openclaw-database-upgrade)).
+
+**Runbook from `0.5.94-full1` … `0.5.94-full4` (OpenClaw 2026.10.4) to `0.5.94-full7`
+(OpenClaw 2026.11.11).** Skip `0.5.94-full5`; `0.5.94-full6` is not needed in between. The
+gate runs its shorter update form (mode `bump`); the databases change one-way (state 20 →
+40, agent 24 → 42). Steps 2–4 and 6 are those of the runbook from `0.5.93-full2` below.
+Read [OpenClaw 2026.11.11](#openclaw-20261111-0594-full7) too. An installation that runs
+`0.5.94-full5` (OpenClaw 2026.11.3) updates with the same steps. The gate's backup check
+refuses only a backup that already holds `0.5.94-full7` and accepts any other version
+inside `gate_backup_max_age_hours`, so create the backup on the version you run right
+before the update and check that the precheck line names it.
 
 1. On the version you run now: `oc-upgrade check` → exit code `0` or `4`, and
    `migrated: 2026.10.4 (…)`. Exit code `2` or `3`: do not update, ask first. This
    check does not know the checks of the new version yet; they run in its precheck,
-   before anything is written ([Known limits](#known-limits-with-openclaw-20261010-to-2026114)).
-   Check the browsers and devices you open the Control UI with: OpenClaw 2026.11.4 needs
+   before anything is written ([Known limits](#known-limits-with-openclaw-20261010-to-20261111)).
+   Check the browsers and devices you open the Control UI with: OpenClaw 2026.11.11 needs
    Safari 26.2+, Chrome 147+ or Firefox 150+, and in apps Android System WebView 147+ or
    iOS/iPadOS 26.2+ (same section).
 2. Turn auto-update off and pause automatic backups (step 2 below).
@@ -1099,25 +1207,27 @@ names `add-on 0.5.94-full5`.
    models.providers.<p>.auth = "api-key" …`, and the gate writes it before doctor pass 1
    (`[gate] 4/8 config fixup: …`; see
    [Cron jobs without a recorded inference account](#cron-jobs-without-a-recorded-inference-account-openclaw-20261010)).
-   Success ends with `[gate] done: MIGRATED 2026.11.4 …`, then the gateway starts. Read
+   Success ends with `[gate] done: MIGRATED 2026.11.11 …`, then the gateway starts. Read
    the `WARN` lines of the run (for example cron jobs that stop at a fallback, Skill
    Workshop proposals, agents whose memory search loses the shared credentials, a
    standing approval of delegated changes) and its
    `info` lines (cron jobs doctor binds to their stored login, model rows without
    `maxTokens`); `oc-upgrade status` repeats the cron lines. From the first gateway
    start OpenClaw's own log (`openclaw logs` in the terminal, or the Control UI's Logs
-   page; not the add-on log) shows `cron: automation has no recorded inference account;
-   run openclaw doctor --fix …` for cron jobs on a configured key or a key from the
-   environment: expected, see
+   page; not the add-on log) can show `cron: automation has no recorded inference account;
+   run openclaw doctor --fix …`, with 2026.11.11 only for cron jobs whose own model is on a
+   stored login or on a key variable that is missing for the gateway, see
    [Cron jobs without a recorded inference account](#cron-jobs-without-a-recorded-inference-account-openclaw-20261010).
    Then test the Control UI
    (if a browser asks for pairing: `openclaw devices list`, `openclaw devices approve
-   <id>`), Telegram, your models, memory search, MCP and cron jobs.
+   <id>`), Telegram, your models, memory search, MCP and cron jobs, and give the jobs
+   doctor made from the heartbeat fallbacks without a stored login (step 7 of the runbook
+   above).
 6. Keep the encrypted Home Assistant backup until you are sure (step 6 below): restoring
    it is the rollback ([Safe rollback](#safe-rollback-after-an-openclaw-database-upgrade)).
 
 **Coming from `0.5.94-full1`, `0.5.94-full2` or `0.5.94-full3`.** Follow the runbook
-above: the update to `0.5.94-full6` changes the OpenClaw version (2026.10.4 → 2026.11.4), so the gate
+above: the update to `0.5.94-full7` changes the OpenClaw version (2026.10.4 → 2026.11.11), so the gate
 runs, with the backup check (step 3). There is nothing to set: the archive options of
 0.5.94-full2 no longer exist (the Supervisor ignores a stored value with a warning).
 The add-on deletes what these versions left, each `gate_cleanup_hours` after its own
@@ -1136,7 +1246,7 @@ add-on in **Settings → System → Backups** (the gate names up to three in a `
 its next run and counts the rest).
 
 **Runbook from `0.5.93-full2` (OpenClaw 2026.7.35)** to `0.5.94-full3` or later (the full
-migration gate; to `0.5.94-full6` it ends with `MIGRATED 2026.11.4`)
+migration gate; to `0.5.94-full7` it ends with `MIGRATED 2026.11.11`)
 
 1. On `0.5.93-full2`: `oc-upgrade check` → exit code `0` or `4`, and
    `startup-migrations checkpoint: 2026.7.35`. Exit code `2` or `3`: do not update, ask first.
@@ -1173,7 +1283,8 @@ migration gate; to `0.5.94-full6` it ends with `MIGRATED 2026.11.4`)
 5. The precheck line names
    `HA backup ok ('<name>', … old, encrypted, add-on 0.5.93-full2)`. Success ends with
    `[gate] done: MIGRATED <bundled OpenClaw version> …` (2026.10.4 up to `0.5.94-full4`,
-   2026.11.3 in `0.5.94-full5`, 2026.11.4 from `0.5.94-full6`), then the gateway starts.
+   2026.11.3 in `0.5.94-full5`, 2026.11.4 in `0.5.94-full6`, 2026.11.11 from `0.5.94-full7`),
+   then the gateway starts.
    Pair each browser once (`openclaw devices list`, `openclaw devices approve <id>`),
    then test Telegram, your models, MCP and cron jobs.
 6. Keep the encrypted Home Assistant backup until you are sure: restoring it is the
@@ -1192,14 +1303,14 @@ migration gate; to `0.5.94-full6` it ends with `MIGRATED 2026.11.4`)
 
 | Phase | What happens |
 |---|---|
-| 1 precheck | Read-only checks: runtime package, Node/SQLite, no other OpenClaw process, readable config, state not newer than the image, clean 2026.7 state, no symlinked state or workspace directory (a backup would hold only the link), model preflight, legacy files, sessions, pre-July-2026 leftovers (below), with OpenClaw 2026.11.1+ invalid `heartbeat.activeHours` windows (`config-heartbeat-hours`, hard), agent databases outside the configured agents (orphan, held, or registered for an agent that is no longer configured: information), free space in `/config` (including the Skill Workshop export and, with OpenClaw 2026.10.10+, twice the installed size of the enabled official npm plugins: doctor installs their new version beside the old one and fills the npm cache) and in the temporary directories (SQLite's, and with OpenClaw 2026.10.10+ the size of those plugins once more: doctor copies their files into `/tmp`, `openclaw-plugin-captures-*`, for the length of a pass; all on one disk count together), SQLite `quick_check`, SQLite foreign-key check (`PRAGMA foreign_key_check`, read-only: OpenClaw stops an agent database migration on any violation), npm reachable, an encrypted Home Assistant backup with this add-on (Supervisor API; see step 3 above). Information lines: the installed official plugins; with OpenClaw 2026.10.10+ also the Skill Workshop proposals, cron jobs without a recorded inference account (`WARN`; with OpenClaw 2026.11.2+ one `info` line instead for the jobs doctor binds to their stored login), the config fixup the gate makes before doctor pass 1 for them (`1/8 config fixup: will set …`) and the largest agent database and session; with OpenClaw 2026.11.3+ agents whose memory search loses the shared remote credentials (`WARN`) and model rows without `maxTokens` (`info`, [below](#memory-search-credentials-and-output-caps-openclaw-2026113)); with OpenClaw 2026.11.4+ a `tools.openclaw.autoApproveChanges` that is `true` (`WARN`, [below](#delegated-changes-openclaw-2026114-ghsa-pw3x-g8v8-fvj2)). All findings are collected, then one HOLD if needed. |
-| 2 cleanup | Transient SQLite sidecars, legacy Telegram caches and pre-July-2026 files whose content is already in SQLite are moved to `/config/.openclaw-upgrade/gate/quarantine/<run>/` (kept, listed in the log; with OpenClaw 2026.10.5+ also the retired runtime files OpenClaw already imported, with the proof in the log and in the quarantine's `MANIFEST.json`). |
+| 1 precheck | Read-only checks: runtime package, Node/SQLite, no other OpenClaw process, readable config, state not newer than the image, clean 2026.7 state, no symlinked state or workspace directory (a backup would hold only the link), model preflight, legacy files, sessions, pre-July-2026 leftovers (below), with OpenClaw 2026.11.1+ invalid `heartbeat.activeHours` windows (`config-heartbeat-hours`, hard), agent databases outside the configured agents (orphan, held, or registered for an agent that is no longer configured: information), free space in `/config` (including the Skill Workshop export and, with OpenClaw 2026.10.10+, twice the installed size of the enabled official npm plugins: doctor installs their new version beside the old one and fills the npm cache) and in the temporary directories (SQLite's, and with OpenClaw 2026.10.10+ the size of those plugins once more: doctor copies their files into `/tmp`, `openclaw-plugin-captures-*`, for the length of a pass; all on one disk count together), SQLite `quick_check`, SQLite foreign-key check (`PRAGMA foreign_key_check`, read-only: OpenClaw stops an agent database migration on any violation), npm reachable, an encrypted Home Assistant backup with this add-on (Supervisor API; see step 3 above). Information lines: the installed official plugins; with OpenClaw 2026.10.10+ also the Skill Workshop proposals, cron jobs without a recorded inference account (`WARN`; with OpenClaw 2026.11.2+ one `info` line instead for the jobs doctor binds to their stored login), the config fixup the gate makes before doctor pass 1 for them (`1/8 config fixup: will set …`) and the largest agent database and session; with OpenClaw 2026.11.3+ agents whose memory search loses the shared remote credentials (`WARN`) and model rows without `maxTokens` (`info`, [below](#memory-search-credentials-and-output-caps-openclaw-2026113)); with OpenClaw 2026.11.4+ a `tools.openclaw.autoApproveChanges` that is `true` (`WARN`, [below](#delegated-changes-openclaw-2026114-ghsa-pw3x-g8v8-fvj2)); with OpenClaw 2026.11.5+ (the bundled 2026.11.11) a forecast of the default cron partition (`WARN` when cron would stay paused, [below](#default-cron-partition)) and an `info` line when doctor will turn heartbeat settings into a cron job. With OpenClaw 2026.11.11 the `.upgrade-*` folders of its own state upgrade at a gateway start: one without a swap plan is deleted, one with `plan.json` holds (`startup-upgrade-unfinished`, [below](#state-upgrade-at-gateway-start-openclaw-20261111)). All findings are collected, then one HOLD if needed. |
+| 2 cleanup | Transient SQLite sidecars, legacy Telegram caches and pre-July-2026 files whose content is already in SQLite are moved to `/config/.openclaw-upgrade/gate/quarantine/<run>/` (kept, listed in the log; with OpenClaw 2026.10.5+ also the retired runtime files OpenClaw already imported, with the proof in the log and in the quarantine's `MANIFEST.json`; with OpenClaw 2026.11.5+ also those doctor would only archive). |
 | 3 pre-migrate | `plugins.installs` is removed from `openclaw.json` when its records are in the SQLite plugin index. For legacy `openai-codex/…` refs: wildcards → explicit models; these refs keep the OpenClaw runtime they used on 2026.7. With OpenClaw 2026.10.5+ an `openai-codex-responses` API id becomes `openai-chatgpt-responses` and the `cdpUrl` of an extension browser profile is removed, as 2026.10.4 doctor did. |
-| 4–6 doctor | With OpenClaw 2026.10.10+ the gate first exports every Skill Workshop proposal ([below](#skill-workshop-proposals-openclaw-20261010)) and makes its one cron config fixup: `models.providers.<p>.auth = "api-key"` in `openclaw.json` for a provider whose literal key doctor would store as a login and that an enabled cron job uses (`4/8 config fixup: …`, [below](#cron-jobs-without-a-recorded-inference-account-openclaw-20261010)). Then `openclaw doctor --fix --non-interactive` twice (a third time only if the second still changed the config), each with a time limit and a progress line every minute; scoped fixups in between. An add-on stop during a pass sends SIGTERM to doctor and at once also to the processes it started in a session of their own (its npm installs), so doctor ends its repairs and exits; one that has not stopped after 4 minutes is killed (`4/8 doctor pass 1: stop requested; doctor did not stop within 4m00s and was killed (rc -9)`); the next start resumes the run (after a second interruption it holds: `interrupted-twice`). Canonical `openai/*` refs keep their runtime (Codex app-server by default, as on 2026.7; an `agentRuntime` pin on an `openai/…` entry is kept). A model used both as `openai-codex/<model>` and as `openai/<model>` gets one route in 2026.9+: the precheck holds with the acceptable code `models-route-collision`. Agent databases doctor "held back" (acceptable `doctor-held-back`), plugin data upgrades still "unfinished", login renames still deferred and a dreaming cron inspection still pending after the last pass hold. With `glm_thinking_levels` on, GLM models are switched to thinking levels after the fixups (below). With OpenClaw 2026.11.2+ doctor also records the inference account of cron jobs whose own model is on a stored login (openclaw/openclaw#172792, [below](#cron-jobs-without-a-recorded-inference-account-openclaw-20261010)). Each pass line counts the SQLite copies doctor saved in that pass (full `.bak`, or table-scoped `.scoped.bak` from 2026.10.10, its pre-repair cron backups of the state database, `openclaw.sqlite.doctor-cron-*.bak`, and its pre-repair recovery directories, `openclaw-<repair>-recovery-*/`); they are not the rollback point and are deleted with the doctor captures ([Automatic deletion](#automatic-deletion-gate_cleanup_hours)). With OpenClaw 2026.10.5+ a doctor warning about retired files it left unchanged holds (acceptable `doctor-retired-warning`). With OpenClaw 2026.11.1+ a pass that ends with "Doctor blocked; required repairs remain incomplete." (exit 1) holds with `doctor-blocked`, whose reason lists doctor's findings. |
-| 7 postconditions | Schema versions (with OpenClaw 2026.10.10+ the stores OpenClaw keeps from deleted agents that are not configured are listed, not required: the gateway does not open them), `config validate`, `doctor --lint`, no legacy refs, runtime of migrated refs, `models status`, sessions. With 2026.10.10+ also: the migrated cron jobs are read again for the cron report, and a `WARN` if doctor kept the Skill Workshop proposal storage. |
-| 8 pins | Keeps 2026.7 defaults where you have not set the key (see the 0.5.94-full1 changelog), recorded in `/config/.openclaw-upgrade/gate/pins-ledger.json` and never re-applied (`skills.workshop.approvalPolicy` only with OpenClaw versions that still have Skill Workshop proposals, before 2026.10.10). |
+| 4–6 doctor | With OpenClaw 2026.10.10+ the gate first exports every Skill Workshop proposal ([below](#skill-workshop-proposals-openclaw-20261010)) and makes its one cron config fixup: `models.providers.<p>.auth = "api-key"` in `openclaw.json` for a provider whose literal key doctor would store as a login and that an enabled cron job uses (`4/8 config fixup: …`, [below](#cron-jobs-without-a-recorded-inference-account-openclaw-20261010)). Then `openclaw doctor --fix --non-interactive` twice (a third time only if the second still changed the config; doctor's own time stamp `wizard.lastRunAt`, which it writes on every config change, does not count), each with a time limit and a progress line every minute; scoped fixups in between. An add-on stop during a pass sends SIGTERM to doctor and at once also to the processes it started in a session of their own (its npm installs), so doctor ends its repairs and exits; one that has not stopped after 4 minutes is killed (`4/8 doctor pass 1: stop requested; doctor did not stop within 4m00s and was killed (rc -9)`); the next start resumes the run (after a second interruption it holds: `interrupted-twice`). Canonical `openai/*` refs keep their runtime (Codex app-server by default, as on 2026.7; an `agentRuntime` pin on an `openai/…` entry is kept). A model used both as `openai-codex/<model>` and as `openai/<model>` gets one route in 2026.9+: the precheck holds with the acceptable code `models-route-collision`. Agent databases doctor "held back" (acceptable `doctor-held-back`), plugin data upgrades still "unfinished", login renames still deferred and a dreaming cron inspection still pending after the last pass hold. With `glm_thinking_levels` on, GLM models are switched to thinking levels after the fixups (below). With OpenClaw 2026.11.2+ doctor also records the inference account of cron jobs whose own model is on a stored login (openclaw/openclaw#172792, [below](#cron-jobs-without-a-recorded-inference-account-openclaw-20261010)). Each pass line counts the SQLite copies doctor saved in that pass (full `.bak`, or table-scoped `.scoped.bak` from 2026.10.10, its pre-repair cron backups of the state database, `openclaw.sqlite.doctor-cron-*.bak`, with 2026.11.11 a pre-migration copy instead, its pre-repair recovery directories, `openclaw-<repair>-recovery-*/`, and its pre-repair SQLite snapshots of the auth profile, ACP, exec approvals and gateway token migrations, `*.auth-profile-migration-*.bak` and the like); they are not the rollback point and are deleted with the doctor captures ([Automatic deletion](#automatic-deletion-gate_cleanup_hours)). With OpenClaw 2026.10.5+ a doctor warning about retired files it left unchanged holds (acceptable `doctor-retired-warning`). With OpenClaw 2026.11.1+ a pass that ends with "Doctor blocked; required repairs remain incomplete." (exit 1) holds with `doctor-blocked`, whose reason lists doctor's findings (from 2026.11.5 those of its "Fix now:" block). OpenClaw 2026.11.11 doctor stops itself with SIGTERM when something keeps it running 10 s after it finished (its settled-exit watchdog); the gate then takes the exit code from doctor's closing line, and a pass without one holds with `doctor-crashed`. |
+| 7 postconditions | Schema versions (with OpenClaw 2026.10.10+ the stores OpenClaw keeps from deleted agents that are not configured are listed, not required: the gateway does not open them), `config validate`, `doctor --lint`, no legacy refs, runtime of migrated refs, `models status`, sessions. With 2026.10.10+ also: the migrated cron jobs are read again for the cron report, and a `WARN` if doctor kept the Skill Workshop proposal storage. With 2026.11.5+ the default cron partition: cron paused holds with the acceptable code `pc-cron-partition` ([below](#default-cron-partition)). With 2026.11.11 nothing may be left that the first gateway start would upgrade by copy and swap (hard `pc-startup-upgrade`, [below](#state-upgrade-at-gateway-start-openclaw-20261111)). |
+| 8 pins | Keeps 2026.7 defaults where you have not set the key (see the 0.5.94-full1 changelog), recorded in `/config/.openclaw-upgrade/gate/pins-ledger.json` and never re-applied (`skills.workshop.approvalPolicy` only with OpenClaw versions that still have Skill Workshop proposals, before 2026.10.10; `agents.defaults.heartbeat.agentId` and `.target` only before 2026.11.5, which retires the heartbeat settings; from 2026.11.11, whose schema refuses `skills.workshop`, the Skill Workshop mode pin is written as `plugins.entries.skill-workshop.config.autonomous.mode` with `meta.migrations.skillWorkshopPlugin`, and skipped while doctor still has an older Workshop setting to move). |
 
-Later OpenClaw updates (for example 2026.10.4 → 2026.11.4, the update to `0.5.94-full6`)
+Later OpenClaw updates (for example 2026.11.4 → 2026.11.11, the update to `0.5.94-full7`)
 run the same gate in a shorter form: precheck with the backup check, cleanup, doctor twice,
 postconditions; no pre-migration and no pins. Create the encrypted Home Assistant
 backup right before each of these updates (runbook step 3). Doctor updates the enabled
@@ -1212,14 +1323,31 @@ started on 2026.2–2026.6 can still carry some. 2026.10 doctor refuses them ("U
 through OpenClaw 2026.9.7") after the migration has started, so the gate checks
 them before anything is changed (exception: since 2026.10.4 doctor no longer refuses
 unreferenced OAuth sidecars, openclaw/openclaw#165420; the gate still moves them to
-quarantine because they are outdated). OpenClaw 2026.10.5 and later (also the
-2026.10.10 line up to 2026.11.4) also refuse pre-July runtime files that 2026.10.4 still
+quarantine because they are outdated). OpenClaw 2026.10.5 to 2026.11.4 (also the
+2026.10.10 line) also refuse pre-July runtime files that 2026.10.4 still
 imported itself: `acp/event-ledger.json`, `settings/voicewake.json`,
 `settings/voicewake-routing.json`, `bindings/current-conversations.json`,
 `plugin-binding-approvals.json`, `restart-sentinel.json` and the sandbox registries
 `sandbox/containers.json`, `sandbox/browsers.json`, `sandbox/containers/` and
 `sandbox/browsers/` (the "retired runtime files" below). The gate checks these only when
-the bundled OpenClaw is 2026.10.5 or later:
+the bundled OpenClaw is 2026.10.5 or later. OpenClaw 2026.11.5 and later (the bundled
+2026.11.11, openclaw/openclaw#174489) no longer refuse most of these leftovers: doctor
+imports cron JSON jobs with their run state, referenced OAuth sidecars (and
+`credentials/oauth.json`), Voice Wake settings, current-conversation bindings and
+plugin-binding approvals into SQLite (current SQLite values win; it keeps the original
+bytes in `.migrated` archives), and archives the rest (delivery queues, ACP replay ledgers,
+restart notifications, the JSON plugin install index, sandbox registries,
+`cron/runs/*.jsonl`). With these versions the gate leaves what doctor imports in place
+(no HOLD, no quarantine; an `info` line in the precheck and `2/8 leave …` in the cleanup)
+and moves the ACP replay ledger, the restart sentinel and the sandbox registries to its
+quarantine without a HOLD, since doctor would only archive them
+(`1/8 info: OpenClaw 2026.11.11 would only archive it, goes to quarantine: …`). The other
+rows of the table stay as they are. Pre-June iMessage, Active Memory, Nostr and Teams JSON
+files are not imported (doctor keeps them and points to an intermediate OpenClaw,
+2026.9.5), and session records that need the retired `room` conversion are refused.
+2026.11.11 still carries this import; its compatibility record has the earliest
+removal date 2026-11-29 (OpenClaw's changelog, "Upcoming deprecations"), so a later
+OpenClaw may refuse such files again:
 
 | Found | Gate |
 |---|---|
@@ -1285,8 +1413,9 @@ them.
 
 #### HOLD codes added for the OpenClaw 2026.10.10 line
 
-These codes came with the move to the OpenClaw 2026.10.10 line (`0.5.94-full6`
-bundles 2026.11.4; `orphan-agent-db` existed before, its text is new). They hold before doctor changes
+These codes came with the move to the OpenClaw 2026.10.10 line (`0.5.94-full7` bundles
+2026.11.11; `orphan-agent-db` existed before, its text is new; the codes of 2026.11.5 to
+2026.11.11 are in [HOLD codes added for OpenClaw 2026.11.11](#hold-codes-added-for-openclaw-20261111)). They hold before doctor changes
 anything: `skill-workshop-export-failed` right before doctor pass 1, the others in the
 precheck. Only `doctor-retired-warning` and `doctor-blocked` come after a doctor pass
 (state already migrated).
@@ -1299,7 +1428,9 @@ named. Cron jobs never hold: the gate reports them and makes only its one config
 **Agent databases outside the configured agents.** OpenClaw's doctor migrates the
 database of every agent folder it finds under `/config/.openclaw/agents/`, also of agents
 that are neither configured nor registered, one-way, unless its deletion history holds
-the store back; the gateway opens only the configured agents' databases. A store that
+the store back; the gateway opens only the configured agents' databases (OpenClaw
+2026.11.11 also opens the others read-only at each start, to see whether its own state
+upgrade has work). A store that
 records another agent as its owner (for example a copied agent folder) is not migrated:
 if it is a byte-identical copy of that agent's database (with its `-wal`/`-shm` files
 and transcript archives), doctor renames it to `<file>.corrupt-<time>` ("Preserved the
@@ -1326,17 +1457,23 @@ are only listed (`1/8 info: …`, `7/8 info: held agent database(s) …`, `oc-up
 `oc-upgrade status`) while their agent is not configured: from 2026.10.10 the gateway does
 not open them, so they do not fail the schema postcondition, and the migration marker
 records them. A configured agent whose store is kept that way holds with `agent-db-held`.
+With OpenClaw 2026.11.11 two kinds of such stores hold after doctor (hard
+`pc-startup-upgrade`): an orphan store doctor left below the target, and a store whose
+deletion history doctor could not read ("deletion journal unavailable", "deletion history
+needs repair"). The gateway start would copy the state to upgrade them
+([State upgrade at gateway start](#state-upgrade-at-gateway-start-openclaw-20261111)).
+Stores that the deletion journal or its reconstruction holds stay an `info` line.
 
 | Code | Class | Cause | What to do |
 |---|---|---|---|
 | `orphan-agent-db` | acceptable | Agent databases of agents that are neither configured nor registered (above). | Move agent folders you no longer need out of `/config/.openclaw/agents` (they are in your encrypted backup), then `oc-upgrade retry` and restart; to let doctor migrate them: `oc-upgrade retry --accept orphan-agent-db`. |
 | `agent-db-held` | hard | A configured agent whose database OpenClaw keeps from a deletion (or doctor held back) is below the target schema: doctor does not migrate it, and OpenClaw refuses the agent (the default agent: the gateway does not start or stays not ready). | Remove the agent from `openclaw.json` (`agents.list`) if you no longer use it, then `oc-upgrade retry`. To keep it, restore the encrypted Home Assistant backup of the previous add-on version, run `openclaw agents add <id> --workspace <ws> --agent-dir <dir> --non-interactive` there, then update again. |
 | `sqlite-fk-violation` | hard | A database has rows that break its own foreign keys (read-only `PRAGMA foreign_key_check` after `quick_check`). OpenClaw checks foreign keys at the end of every one-way agent database migration and stops on a violation while other databases are already migrated, and it refuses a state database with violations. Orphaned `task_delivery_state` rows, which doctor repairs itself, are only reported (doctor keeps a full copy of the state database in `state/openclaw-task-delivery-recovery-*/`, which the add-on deletes with the run's doctor captures); a database already at its target schema only warns. | Restore that database from an encrypted Home Assistant backup taken before the damage, or move an agent folder you no longer use out of `/config/.openclaw/agents`; the gate never deletes rows. Then `oc-upgrade retry` and restart. |
-| `acp-ledger-unimported`, `voicewake-unimported`, `conversation-bindings-unimported`, `plugin-approvals-unimported`, `restart-sentinel-unimported`, `sandbox-registry-unimported` | acceptable | OpenClaw 2026.10.5+: a retired runtime file (see "Pre-July-2026 leftovers" above) that the gate cannot prove OpenClaw imported. | `oc-upgrade retry --accept <code>` moves it to the gate's quarantine (`/config/.openclaw-upgrade/gate/quarantine/<run>/`, kept; it is also in your encrypted backup); OpenClaw does not import its data. OpenClaw 2026.10.4 (`0.5.94-full4`) imports these files only in a doctor run: if its gate ran on this state (the 2026.10 migration), that doctor could not import the file either (see its warning in the log of that gate run), so going back to `0.5.94-full4` keeps nothing. Only if that doctor run failed for a transient reason: restore the encrypted backup of `0.5.94-full4`, run `oc-upgrade retry --doctor` there, then update again. |
+| `acp-ledger-unimported`, `voicewake-unimported`, `conversation-bindings-unimported`, `plugin-approvals-unimported`, `restart-sentinel-unimported`, `sandbox-registry-unimported` | acceptable | OpenClaw 2026.10.5 to 2026.11.4: a retired runtime file (see "Pre-July-2026 leftovers" above) that the gate cannot prove OpenClaw imported. With 2026.11.5+ these codes no longer occur: doctor imports or archives such files itself (same section). | `oc-upgrade retry --accept <code>` moves it to the gate's quarantine (`/config/.openclaw-upgrade/gate/quarantine/<run>/`, kept; it is also in your encrypted backup); OpenClaw does not import its data. OpenClaw 2026.10.4 (`0.5.94-full4`) imports these files only in a doctor run: if its gate ran on this state (the 2026.10 migration), that doctor could not import the file either (see its warning in the log of that gate run), so going back to `0.5.94-full4` keeps nothing. Only if that doctor run failed for a transient reason: restore the encrypted backup of `0.5.94-full4`, run `oc-upgrade retry --doctor` there, then update again. |
 | `doctor-retired-warning` | acceptable | OpenClaw 2026.10.5+: doctor ended normally but warned about retired files it left unchanged or could not inspect. | Move the listed pre-July-2026 files out of `/config/.openclaw` (they are in your encrypted backup) or fix the path doctor could not inspect, then `oc-upgrade retry` and restart. |
 | `skill-workshop-export-failed` | acceptable | OpenClaw 2026.10.10+: the export of the Skill Workshop proposals before doctor pass 1 failed. | See [Skill Workshop proposals](#skill-workshop-proposals-openclaw-20261010). |
 | `config-heartbeat-hours` | hard | OpenClaw 2026.11.1+: a `heartbeat.activeHours` window in `agents.defaults` or in an agent entry of `openclaw.json` is invalid: `start` and `end` must be `HH:MM` (24-hour; `24:00` only as `end`), and only `start`, `end` and `timezone` are allowed. A `${VAR}` / `${VAR:-default}` value is checked as OpenClaw reads it, after substitution (with the add-on's environment and the config's `env`): one that yields a valid time passes, an unset variable without a default does not. The doctor of 2026.10.4 and 2026.10.10 removed such a window (heartbeats then ran at any hour); the doctor of 2026.11.1 and later (also 2026.11.3 and 2026.11.4) keeps it (openclaw/openclaw#186305), the configuration stays invalid and doctor stops with "Doctor blocked" after the migration has started. The reason names each field and value. | Edit `/config/.openclaw/openclaw.json` by hand (add-on terminal, for example with `nano`, or a file editor add-on): while the add-on holds, the wrapper refuses `openclaw config set`, and `openclaw config get` stops with "config is invalid" and asks for `openclaw doctor --fix`, which the add-on refuses. Correct each listed value, or remove that `activeHours` (an agent then uses the window in `agents.defaults.heartbeat`; without one, heartbeats run at any hour), then `oc-upgrade retry` and restart. |
-| `doctor-blocked` | hard | OpenClaw 2026.11.1+: a doctor pass ended with "Doctor blocked; required repairs remain incomplete." (exit 1, openclaw/openclaw#187192): the configuration is still invalid after its repairs, or a required migration step was deferred. The reason lists doctor's `[error]` findings (path and message, each redacted on its own, so a path ending in a key name such as `apiKey` keeps doctor's message); `oc-upgrade log` shows each with its `fix:` hint. | Edit the `openclaw.json` values it names (`openclaw config validate` lists them and is allowed during a HOLD; `openclaw config set` and `unset` are not), or remove the blocker of a deferred migration, then `oc-upgrade retry` and restart; doctor resumes from its last committed step. |
+| `doctor-blocked` | hard | OpenClaw 2026.11.1+: a doctor pass ended with "Doctor blocked; required repairs remain incomplete." (exit 1, openclaw/openclaw#187192): the configuration is still invalid after its repairs, or a required migration step was deferred. The reason lists doctor's `[error]` findings, from 2026.11.5 the findings of its "Fix now:" block (location and message, each redacted on its own, so a path ending in a key name such as `apiKey` keeps doctor's message); `oc-upgrade log` shows each with its `fix:` hint (from 2026.11.5: `Next step:`). | Edit the `openclaw.json` values it names (`openclaw config validate` lists them and is allowed during a HOLD; `openclaw config set` and `unset` are not), or remove the blocker of a deferred migration, then `oc-upgrade retry` and restart; doctor resumes from its last committed step. |
 
 `config-retired-keys` (hard) also covers two settings that OpenClaw 2026.10.5 and later
 refuse, an `openai-codex-responses` API id and an extension profile's `cdpUrl` (see
@@ -1347,7 +1484,9 @@ refuse, an `openai-codex-responses` API id and an extension profile's `cdpUrl` (
 OpenClaw 2026.10.10 and later no longer have Skill Workshop proposals. Its doctor keeps
 only the current draft of each pending or quarantined proposal, as files in the owner
 agent's Workshop archive
-(`/config/.openclaw/agents/<agent>/agent/workshop-skills/.archive/.retired-proposals/<id>/`),
+(`/config/.openclaw/agents/<agent>/agent/workshop-skills/.archive/.retired-proposals/<id>/`;
+from OpenClaw 2026.11.5, so with the bundled 2026.11.11, in `workshop-skills/.drafts/`, where
+doctor also moves the drafts an earlier doctor exported; `/learn drafts` lists them),
 and drops everything else: applied, rejected and stale proposals, older draft versions,
 the proposal history, undo records and collection reviews. It also removes
 `skills.workshop.approvalPolicy` and `maxPending` from `openclaw.json` (the add-on's
@@ -1398,7 +1537,7 @@ behaviour pin for `approvalPolicy` is not written on these versions). With OpenC
 #### Cron jobs without a recorded inference account (OpenClaw 2026.10.10+)
 
 Since OpenClaw 2026.10.10 a cron job records the account (auth profile) it runs on. Jobs
-from before have none. OpenClaw 2026.10.10 and later (also 2026.11.4, the bundled
+from before have none. OpenClaw 2026.10.10 and later (also 2026.11.11, the bundled
 version) refuse such a job's run as soon as the model it is about to use would run on a
 stored login (a subscription login, a token or an API key in OpenClaw's auth store) or
 on AWS SDK credentials (`auth: "aws-sdk"`), with "Automation has no recorded inference
@@ -1430,19 +1569,30 @@ a known provider variable that is set, or a literal key with
 **OpenClaw's own migration (2026.11.2 and later).** From 2026.11.2 OpenClaw's doctor
 records the accounts itself (openclaw/openclaw#172792, backported into 2026.11.2; on
 OpenClaw's main line it came with 2026.11.5-beta.1; 2026.10.10 and 2026.11.1 do not have
-it). With the bundled 2026.11.4 this happens in the gate's doctor passes. It records an
-account only for a stored login, and only when exactly one account fits: AWS SDK
+it). With the bundled 2026.11.11 this happens in the gate's doctor passes. It records an
+account only for a stored login, and only when it can tell which account fits (with
+several eligible ones, the one a run would take now): AWS SDK
 credentials are no stored account, so no account can be recorded for them, by doctor or
 by you. It also records only the account of the job's own model: a job whose own model
 needs no account (a local model, a configured key) stays unbound, and its fallback on a
-stored login stays refused; a job it binds runs only on that account's provider, so its
-fallbacks to other providers are refused (as with `@<profileId>`, item 5 below). It
+stored login stays refused. A job it binds runs its own model on that account. Before
+2026.11.10 its fallbacks to other providers were then refused (openclaw/openclaw#192463).
+From 2026.11.10 they run on live credentials, as in an interactive run
+(openclaw/openclaw#196539): only the job's candidates on the recorded provider use the
+recorded account, and there is no account per fallback (item 5 below). From 2026.11.10
+doctor also binds a job whose own model runs on the Codex runtime, when that model's first
+credential is a stored login (openclaw/openclaw#189979). It
 binds disabled jobs too (the gate's report covers enabled jobs only), and before it
 writes the bindings it saves a plaintext copy of the state database, which the add-on
 deletes with the run's doctor captures ([Automatic deletion](#automatic-deletion-gate_cleanup_hours)).
-The gate's `auth: "api-key"` fixup (below) stays necessary: without it doctor would bind
-the jobs whose own model is on such a provider to its copy of the literal key, and their
-fallbacks to other providers would then be refused.
+The gate's `auth: "api-key"` fixup (below) keeps such a provider on its configured key.
+For a job that reaches the provider as a fallback, that is what keeps the fallback
+working. For a job whose own model is on it, doctor would otherwise bind the job to its
+copy of the literal key: before 2026.11.10 that also cost the job's fallbacks to other
+providers; from 2026.11.10 those then run on live credentials, but the provider stays on
+doctor's copy, which does not follow later changes of the configured key. With the fixup
+such a job stays unbound, so a fallback of its on a stored login stays refused (its `WARN`
+line says so). The add-on binds no job itself.
 
 **The gate fixes the literal-key case itself.** Before doctor pass 1 it sets
 `models.providers.<p>.auth` to `"api-key"` in `openclaw.json` for each provider `<p>`
@@ -1457,27 +1607,33 @@ that meets all of these:
   cron jobs. Doctor's copy of the same key does not count, also not a copy of its value
   after OpenClaw's `${NAME}` / `${NAME:-default}` substitution from the environment.
 
-OpenClaw then runs `<p>` on the configured key instead of doctor's copy, and the jobs
-are no longer refused on `<p>`. The rehearsal on 2026.10.10 verified this. A fallback on
-a stored login still ends a job's chain (the `WARN` lines below stay). `auth` is
-part of the provider schema in 2026.10.4, 2026.10.10, 2026.11.1, 2026.11.3 and 2026.11.4. From
-2026.11.2 the fixup also keeps OpenClaw's own migration from binding these jobs to
-doctor's copy of the key (above): they stay unbound and run on the configured key.
+OpenClaw then runs `<p>` on the configured key instead of doctor's copy: a job that
+reaches `<p>` as a fallback is no longer refused there, and a job whose own model is on
+`<p>` stays unbound and runs on that key. The rehearsal on 2026.10.10 verified this. A
+fallback on a stored login still ends an unbound job's chain (the `WARN` lines below
+stay). `auth` is part of the provider schema in 2026.10.4, 2026.10.10, 2026.11.1,
+2026.11.3, 2026.11.4 and 2026.11.11.
 
 What you see:
 
 - In the log, one line per provider: `[gate] 4/8 config fixup:
   models.providers.glm.auth = "api-key" (doctor stores its literal key as a login;
-  without this OpenClaw 2026.11.4 refuses every unbound cron run on glm:
+  without this OpenClaw 2026.11.11 refuses every unbound cron run on glm:
   openclaw/openclaw#192195)`.
 - The precheck says `will set` and lists the jobs the fix keeps working (`kept working by
   the automatic fix`). A job that reaches the provider only after a fallback that stays
   refused is not counted: an info line names it (`… only after a fallback that stays
   refused …`). With OpenClaw 2026.11.2 and later, a job whose own model is on another
-  provider's stored login is not counted either: doctor records that login as its account,
-  and its fallback on `<p>` is refused either way. If only such jobs reach `<p>`, the line
-  says `… for no enabled cron job: …` (the setting is harmless: `<p>` runs on the same
-  key). `oc-upgrade gate --dry-run`, `oc-upgrade gate --plan` and
+  provider's stored login is not counted either: doctor records that login as its account.
+  Before 2026.11.10 its fallback on `<p>` is then refused either way; from 2026.11.10 it runs
+  on live credentials, on the configured key with the fixup and on doctor's copy without
+  it. If only such jobs reach `<p>`, the line says `… for no enabled cron job: …` (the
+  setting is harmless: `<p>` runs on the same key). With 2026.11.11 the precheck splits the
+  jobs the fix keeps: those that reach `<p>` as a fallback (`kept working by the automatic
+  fix …`), and those whose own model is on `<p>` (`… whose own model the automatic fix
+  keeps on the configured key …`: without the fix doctor would bind them to its copy). The
+  readiness line says `keeps N … as a fallback working, and makes M … use its configured
+  key, not doctor's copy`. `oc-upgrade gate --dry-run`, `oc-upgrade gate --plan` and
   `oc-upgrade check` say `would set` and write nothing.
 - The end of the run and `oc-upgrade status` repeat the line. Both also read
   `openclaw.json` again: if the setting is gone or changed later (by hand, for example
@@ -1550,43 +1706,58 @@ never holds. With OpenClaw 2026.10.4 it prints and changes nothing.
   line stays as for any other model. With `appServer.homeScope: "user"` Codex uses the
   login of its own Codex home instead of the stored login. OpenClaw's own migration
   (2026.11.2 and later) records no account for a job whose own model is set to another
-  runtime than `openclaw` (for example `agentRuntime: {"id": "codex"}`); its `WARN` line
-  says so (`… so OpenClaw 2026.11.4 doctor records no inference account for it …`).
+  runtime than `openclaw` (with 2026.11.4 also `agentRuntime: {"id": "codex"}`); its `WARN`
+  line says so (`… so OpenClaw 2026.11.11 doctor records no inference account for it …`).
+  From 2026.11.10 it binds a job on the Codex runtime (`agentRuntime: {"id": "codex"}`) when that
+  model's first credential is a stored login (openclaw/openclaw#189979); such a job is in
+  the info line below, and one it left anyway gets `… its model is set to the codex runtime
+  (…): OpenClaw 2026.11.11 doctor records the account of such a job …, but it left this job
+  unbound …`.
   Then one `WARN [gate] provider <p>: …`
   line per provider whose literal key is the reason, with the fix (below). Only the job
   id, its name (redacted like the log), model names, provider ids and config paths are
   shown, no prompt, no account and no key.
-- **With OpenClaw 2026.11.2 and later** (the bundled 2026.11.4), whose doctor records the
+- **With OpenClaw 2026.11.2 and later** (the bundled 2026.11.11), whose doctor records the
   account of a job's own model itself, the precheck splits the jobs:
   - the jobs whose own model is on a stored login get one info line instead of their
     `WARN` lines: `1/8 info: N enabled cron job(s) without a recorded inference account
-    run their own model on a stored login: …; OpenClaw 2026.11.4 doctor records that
-    account during the migration when exactly one fits (openclaw/openclaw#172792), but
-    then refuses their fallbacks to other providers (as with openclaw/openclaw#192463);
-    the gate reports the jobs doctor leaves after the migration`. If that login would be
-    doctor's copy of a literal key, the line says so and points at the `provider <p>: …`
-    line, which says how to keep the key configured instead;
+    run their own model on a stored login: …; OpenClaw 2026.11.11 doctor records that
+    account during the migration (openclaw/openclaw#172792) when an eligible account fits
+    (with several, the one a run would take now), and their fallbacks on other providers
+    then run on live credentials, as in an interactive run (openclaw/openclaw#196539); the
+    gate reports the jobs doctor leaves after the migration` (with 2026.11.4 the same
+    account, but `… but then refuses their fallbacks to other providers …`). If that
+    login would be doctor's copy of a literal key, the line says so and points at the
+    `provider <p>: …` line, which says how to keep the key configured instead;
   - the jobs that only stop at a fallback on a stored login, and the jobs on AWS SDK
     credentials, keep their `WARN` lines, and the closing note says `… the add-on changes
-    nothing for these jobs …; OpenClaw 2026.11.4 doctor records only the account of a
+    nothing for these jobs …; OpenClaw 2026.11.11 doctor records only the account of a
     job's own model: …`: doctor binds none of them.
 
   The readiness section of `oc-upgrade gate --dry-run` and `oc-upgrade check` shows the
   same split in two `cron inference accounts:` lines. An info line names the jobs that
   reach a key-fixed model only after a fallback that stays refused (their `WARN` lines
-  follow); a job doctor binds is not among them: its own model runs, and a fallback to
-  another provider, also the key-fixed one, is refused once it is bound. After the
-  migration the end of the run and `oc-upgrade status` name every job that has a recorded
-  account, disabled ones too, with the fallbacks OpenClaw now refuses for it (`info: N
-  cron job(s) … have a recorded inference account …: '<name>' (<id>) on <provider>,
-  refused: <provider/model>, …`; no account id). OpenClaw keeps a recorded account when
-  the job's model changes later without `@<profileId>` (an edit with `--model
+  follow); a job doctor binds is not among them: its own model runs, and once it is bound
+  a fallback to another provider, also the key-fixed one, runs on live credentials with
+  2026.11.11 (with 2026.11.4 it is refused). After the migration the end of the run and
+  `oc-upgrade status` name every job that has a recorded account, disabled ones too (no
+  account id). With 2026.11.11 the line says that OpenClaw uses that one account only for
+  the job's candidates on its provider (`info: N cron job(s) … have a recorded inference
+  account …: OpenClaw 2026.11.11 uses that one account only for their candidates on its
+  provider; their fallbacks on other providers run on live credentials, as in an
+  interactive run (openclaw/openclaw#196539; there is no account per fallback): '<name>'
+  (<id>) on <provider>; …`); with 2026.11.4 it lists the fallbacks OpenClaw refuses
+  (`… on <provider>, refused: <provider/model>, …`). OpenClaw keeps a recorded account
+  when the job's model changes later without `@<profileId>` (an edit with `--model
   <provider/model>`, or a new default model that the job inherits). If the job's own
-  model is then on another provider than the account's, OpenClaw refuses that model and
-  tries only the fallbacks on the account's provider. Such a job gets a `WARN` instead
-  (`cron job '<name>' (<id>): its own model … is on …, not on its recorded inference
-  account's provider …`). The fix is `openclaw automations edit <id> --model
-  <provider/model>@<profileId>`; dropping fallbacks does not help.
+  model is then on another provider than the account's, 2026.11.11 runs that model on
+  live credentials too, and the same info line names it (`… its own model … is on another
+  provider, so it runs on live credentials too`). With 2026.11.4 OpenClaw refuses that
+  model and tries only the fallbacks on the account's provider; such a job gets a `WARN`
+  instead (`cron job '<name>' (<id>): its own model … is on …, not on its recorded
+  inference account's provider …`), and the fix is `openclaw automations edit <id>
+  --model <provider/model>@<profileId>`; dropping fallbacks does not help. A record that
+  names no provider gets a `WARN` with every version.
 - **Skill Workshop's retired weekly curator** (its jobs, for example
   `skill-collection-review-main`, with a `skill-collection-review:` declaration or the old
   `skillCollectionReview` payload) is left out too: OpenClaw 2026.10.10+ doctor deletes
@@ -1603,30 +1774,42 @@ never holds. With OpenClaw 2026.10.4 it prints and changes nothing.
   postconditions` line counts them, the end of the run repeats the warnings (with the
   provider lines), and `oc-upgrade status` lists them. With OpenClaw 2026.11.2 and later
   these are the jobs doctor left unbound: the closing note says `… still have no recorded
-  inference account after the migration: OpenClaw 2026.11.4 doctor left the jobs whose own
-  model is refused (its warnings are in oc-upgrade log); OpenClaw 2026.11.4 doctor records
+  inference account after the migration: OpenClaw 2026.11.11 doctor left the jobs whose own
+  model is refused (its warnings are in oc-upgrade log); OpenClaw 2026.11.11 doctor records
   only the account of a job's own model: …`, and `oc-upgrade status` describes what the
   bundled version's doctor does.
 - **The gateway's warning at start (OpenClaw 2026.11.2 and later).** At every start, and
-  again when a configuration reload restarts cron, the gateway writes to OpenClaw's own
-  log (`openclaw logs`, the Control UI's Logs page; not the add-on log) for each agent-turn
-  cron job without a recorded account, enabled or not, whose model is not on a CLI
-  runtime or a keyless local provider: `cron: automation has no recorded inference
-  account; run openclaw doctor --fix before its next scheduled run …`. For a job whose
-  own model runs on a configured key (in `models.providers.<p>.apiKey`: a literal key
-  with `auth: "api-key"`, as the gate's fixup sets it, a `${VAR}` reference or a
-  SecretRef; also a key only in the environment) this is expected and harmless: doctor
-  leaves such jobs unbound on purpose, and their own model runs on that key. The wrapper
-  refuses `openclaw doctor --fix`, and its add-on equivalent, `oc-upgrade retry
-  --doctor`, would not record an account for these jobs either, so the warning stays;
-  nothing to do. The end of the run and `oc-upgrade status` name these jobs in one info
-  line (`N cron job(s) … run their own model on a configured key … Expected and harmless
-  …`), split into the providers with a key in `models.providers.<p>.apiKey` and those
-  whose key can only come from the environment (`… or on a key from the environment
-  (<p>: a gateway_env_vars entry such as OPENAI_API_KEY or GEMINI_API_KEY) …`): for the
-  latter the gate cannot see whether the variable is set for the gateway; without it the
-  job has no credential and fails when it runs. A fallback of such a job on a stored login
-  still stops its chain (the `WARN` lines above).
+  again after each change of a `cron.*` setting, the gateway writes to OpenClaw's own
+  log (`openclaw logs`, the Control UI's Logs page; not the add-on log) for unbound
+  agent-turn cron jobs, enabled or not, whose model is not on a CLI runtime or a keyless
+  local provider: `cron: automation has no recorded inference account; run openclaw
+  doctor --fix before its next scheduled run …`.
+  - **With the bundled 2026.11.11** (openclaw/openclaw#195905) it writes this only for a
+    job whose own model's first credential is not a configured key: a stored login, AWS
+    SDK credentials, or none at all (a key variable that is missing for the gateway). A
+    job on a key in `models.providers.<p>.apiKey` (a literal key with `auth: "api-key"`,
+    as the gate's fixup sets it, a `${VAR}` reference or a SecretRef) or in a variable
+    that is set gets no warning. The check stops after 5 s in all (`cron: startup
+    inference diagnostics reached their time budget; N jobs were not checked. Run openclaw
+    doctor --lint for a complete check.`), and a job it cannot judge gets `cron: legacy
+    inference account readiness could not be determined; inspect it with openclaw doctor
+    --lint …`. `openclaw doctor --lint` is allowed in the add-on and checks every job. The
+    end of the run and `oc-upgrade status` name only the jobs whose own model is on a key
+    from the environment (`N cron job(s) … run their own model on a key from the
+    environment (<p>: a gateway_env_vars entry such as OPENAI_API_KEY or GEMINI_API_KEY)
+    and have no recorded inference account …`): the gate cannot see whether the variable
+    is set for the gateway; while it is missing the job has no credential, fails when it
+    runs, and gets the warning.
+  - **With 2026.11.4** the warning also covers jobs whose own model runs on a configured
+    key or a key from the environment. For those it is expected and harmless: doctor
+    leaves such jobs unbound on purpose, and their own model runs on that key. The end of
+    the run and `oc-upgrade status` name them in one info line (`N cron job(s) … run their
+    own model on a configured key … Expected and harmless …`).
+
+  The wrapper refuses `openclaw doctor --fix`, and its add-on equivalent, `oc-upgrade
+  retry --doctor`, would not record an account for these jobs either, so the warning
+  stays; nothing to do. A fallback of such a job on a stored login still stops its chain
+  (the `WARN` lines above).
 - **What to do**, in this order:
   1. **A literal key** (`provider <p>: …` line, where the gate could not set it itself,
      see above): after the start, run
@@ -1638,10 +1821,9 @@ never holds. With OpenClaw 2026.10.4 it prints and changes nothing.
      accepts the setting too, so you can set it before the update: there it changes
      nothing unless the provider also has a stored login or a key in the environment,
      which the configured key then outranks. Without it, OpenClaw's own migration
-     (2026.11.2 and later, so in the gate's doctor passes with the bundled 2026.11.4)
-     ties the jobs whose own model is on `<p>` to doctor's copy, with the cost of item 5:
-     where the gate cannot set it, set it on the version you update from, before the
-     update.
+     (2026.11.2 and later, so in the gate's doctor passes with the bundled 2026.11.11)
+     ties the jobs whose own model is on `<p>` to doctor's copy (item 5): where the gate
+     cannot set it, set it on the version you update from, before the update.
   2. **Or an env SecretRef**: add the key as a `gateway_env_vars` entry (for example
      name `GLM_API_KEY`) and restart the add-on, then run `openclaw config set
      models.providers.<p>.apiKey '{"source":"env","provider":"default","id":"GLM_API_KEY"}'
@@ -1661,7 +1843,7 @@ never holds. With OpenClaw 2026.10.4 it prints and changes nothing.
      `openclaw.json`).
   4. **A fallback on a stored login** (the job's own model needs no account: `… keeps
      working, but when it fails … stops at the fallback …`). OpenClaw's own migration
-     (2026.11.2 and later, also the bundled 2026.11.4) does not change this: it records
+     (2026.11.2 and later, also the bundled 2026.11.11) does not change this: it records
      only the account of the job's own model, so the job stays unbound and that fallback
      stays refused. Either do without the fallback:
      after the start, `openclaw automations edit <id> --fallbacks <list>` without it (the
@@ -1670,15 +1852,20 @@ never holds. With OpenClaw 2026.10.4 it prints and changes nothing.
      every run of that provider, not only cron, then uses that key instead of its stored
      login (for a subscription login: the metered API key). Do not bind the fallback with
      `@<profileId>`: that makes it the job's own model. On AWS SDK credentials, see below.
-  5. **Last resort**, for the job's own model on a stored login (a subscription login, a
-     token or a stored API key without one in `openclaw.json`):
+  5. **Bind the job's own model**, for the job's own model on a stored login (a
+     subscription login, a token or a stored API key without one in `openclaw.json`):
      after the start, `openclaw automations edit <id> --model
      <provider/model>@<profileId>` records the account (and makes that model the job's
-     model). The job then runs only on that account's provider: fallbacks to other
-     providers are refused (openclaw/openclaw#192463). With the bundled 2026.11.4 doctor
-     records the account of such a job itself during the migration, with the same cost,
-     when exactly one account fits; bind by hand only a job doctor left (its warnings are
-     in `oc-upgrade log`).
+     model). With the bundled 2026.11.11 only the job's candidates on that provider use
+     the recorded account; its fallbacks on other providers run on live credentials, as
+     in an interactive run (openclaw/openclaw#196539; there is no account per fallback).
+     The binding still ties the job to that one account: once it is signed in again,
+     replaced or removed, OpenClaw refuses the job's candidates on that provider until you
+     bind it again. With 2026.11.4 this was the last resort: the job then ran only on that
+     account's provider, and its fallbacks to other providers were refused
+     (openclaw/openclaw#192463). The bundled 2026.11.11 doctor records the account of such
+     a job itself during the migration, when it can tell which account fits; bind by hand
+     only a job doctor left (its warnings are in `oc-upgrade log`).
 
   `openclaw config set` is refused while a HOLD is active (the wrapper allows only
   `config validate|get|file|schema`): then edit `openclaw.json` by hand, or set it after
@@ -1700,7 +1887,10 @@ OpenClaw publishes its official npm plugins (`@openclaw/codex`, `@openclaw/acpx`
 that OpenClaw version or later. OpenClaw's doctor (`doctor --fix`, in the gate's doctor
 passes) itself brings the enabled official plugins of its catalog (codex, acpx, Brave, …)
 to the bundled release, from npm (a recorded pin newer than the release is kept); it
-skips disabled ones, and a fetch that fails is only a warning in the doctor log. The
+skips disabled ones, and a fetch that fails is only a warning in the doctor log. 2026.11.11
+records codex at the exact version (`@openclaw/codex@2026.11.11`) and the acpx and Brave
+installs it updated without a version (`@openclaw/acpx`); the plugin step below compares
+the installed versions, so both count. The
 add-on catches what doctor left behind (failed or consent-deferred fetches, install
 records doctor does not treat as official npm installs, package-id migrations) at start,
 after the migration gate (if one runs) and before the gateway starts, never during a HOLD:
@@ -1716,7 +1906,7 @@ after the migration gate (if one runs) and before the gateway starts, never duri
   npm settings, whether it serves the first of them in the bundled version (`npm view`, at
   most 30 seconds). Without an answer (offline, a blocked registry) it updates nothing and
   prints one line (`WARN: Official plugins not updated: the npm registry did not confirm
-  …`, with the plugins, their versions and the commands for later); the gateway starts at
+  …`, with the plugins and their versions); the gateway starts at
   once and the next start tries again. Otherwise each enabled one older than the bundled
   OpenClaw is updated with `openclaw plugins update <package>@<version>`, and the plugin
   list is read again to confirm the version. It never downgrades (a newer plugin is left as is, with a `WARN`)
@@ -1728,15 +1918,26 @@ after the migration gate (if one runs) and before the gateway starts, never duri
   list again: after a failed update, with a newer plugin (the `WARN` repeats), or when the
   list does not show a recorded install (`WARN: OpenClaw recorded the npm install of …`;
   `openclaw plugins doctor` reports why OpenClaw does not load it).
-  If an update fails or times out, the plugin keeps its version (OpenClaw 2026.10.10 to
-  2026.11.4 still load `@openclaw/codex` from 2026.9.7 on), the start goes on with a `WARN`, and
-  the next start tries again; by hand: `openclaw plugins update <package>@<version>`.
+  If an update fails or times out, the plugin keeps its version, the start goes on with a
+  `WARN`, and the next start tries again: restart the add-on (`openclaw plugins update
+  <package>@<version>` by hand is refused while the gateway runs, with OpenClaw 2026.11.4 as
+  with 2026.11.11: the command needs the state to itself). OpenClaw 2026.10.10 to 2026.11.4 still load `@openclaw/codex` from
+  2026.9.7 on. The bundled 2026.11.11 loads it only from 2026.11.5-beta.1 on, or at exactly
+  its own version (openclaw/openclaw#192760), so the Codex plugin of `0.5.94-full6`
+  (2026.11.4) is unavailable until it is updated. The `WARN` then says so (`… OpenClaw
+  2026.11.11 does not load it below 2026.11.5-beta.1, so it is unavailable until it is
+  updated …`), and so does an extra `WARN` when the registry did not answer.
+  `@openclaw/acpx` and the Brave plugin have no such minimum.
   Each update may take 5 minutes, and none starts more than 10 minutes into the step
   (the others wait for the next start). An add-on stop during the step ends the running
   update with its npm processes; the next start tries again.
 
 The precheck of a gate run lists the installed official plugins (`1/8 info: official
-plugins: …`). Enabled and disabled follow OpenClaw's own rules: a plugin is disabled by
+plugins: …`). `oc-upgrade check` warns about an enabled official plugin below the minimum
+the bundled OpenClaw loads (`WARN: @openclaw/codex 2026.11.4 is below the minimum version
+OpenClaw 2026.11.11 loads (2026.11.5-beta.1), so the plugin is unavailable until it is
+updated; …`, exit code 4): before the migration the gate's doctor and the plugin step
+after it update it; after the migration the line says to restart the add-on, whose plugin update step runs before the gateway. Enabled and disabled follow OpenClaw's own rules: a plugin is disabled by
 `plugins.entries.<id>.enabled: false`, and also by `plugins.enabled: false`, by
 `plugins.deny`, by a non-empty `plugins.allow` that does not list it, or when its channels
 are all disabled (`openclaw plugins list` shows it as disabled; the add-on leaves it
@@ -1775,24 +1976,427 @@ What OpenClaw leaves beside the plugins, the add-on reports and never deletes:
   --fix`). The add-on does not delete it and does not leave it out of backups: OpenClaw
   does not rebuild a capture its install records still refer to, so a restore needs it.
 
-#### Known limits with OpenClaw 2026.10.10 to 2026.11.4
+#### OpenClaw 2026.11.11 (`0.5.94-full7`)
 
-These apply from `0.5.94-full5`; `0.5.94-full6` bundles OpenClaw 2026.11.4 (a maintenance
-release of the 2026.11.3 line, built on 2026.11.1 and 2026.10.10); add-on versions with
-OpenClaw 2026.10.4 were not affected. The add-on cannot change them.
+`0.5.94-full7` bundles OpenClaw 2026.11.11, the second release of the 2026.11.10 line.
+OpenClaw branched this release line from its main line on 2026-11-16. It is not the successor of 2026.11.8 or 2026.11.9 (the 2026.11.5
+line, which this add-on version was first prepared with and never shipped), and 2026.11.4
+(`0.5.94-full6`) ended the separate 2026.11.3 line. 2026.11.11 carries the fixes of
+2026.11.4 as forward-ports, not as the same commits, except the delegation-policy follow-up
+(below). The update therefore behaves like a
+change of release line: the databases change one-way (state 22 → 40, agent 27 → 42), and a
+few fixes are missing (below). OpenClaw's own changelogs do not list every change: that of
+2026.11.10 omits its last 126 commits (for example openclaw/openclaw#204916, included configs
+on the first start after an upgrade, and #204908, gateway upgrades with unreadable optional
+state files), and that of 2026.11.11 names 7 pull requests of the 134 commits since
+2026.11.10 (not, for example, #205709, the start after an unclean stop, below). What
+follows applies with the bundled 2026.11.11; the add-on leaves OpenClaw's new defaults as
+they are.
 
-- **Control UI browsers.** The Control UI of OpenClaw 2026.10.10 to 2026.11.4 needs Safari 26.2 or
+**Changes you may notice**
+
+- **Telegram "couldn't confirm" notice.** OpenClaw fixed the notice for a reply that is
+  still being delivered itself (openclaw/openclaw#154417): the add-on's two patches for it
+  are gone ([Telegram replies with voice](#telegram-replies-with-voice-hotfix-tg-20261023)).
+  When OpenClaw's delivery recovery gives up on a reply (retries used up, outcome unknown),
+  the notice comes at once, without a new message from you, as with 2026.11.4
+  (openclaw/openclaw#195400).
+- **`apply_patch` outside the workspace.** For host execution (no sandbox) OpenClaw
+  2026.11.4 kept `apply_patch` inside the agent's workspace unless
+  `tools.exec.applyPatch.workspaceOnly` was `false`. 2026.11.11 (fef5e6bfc485) may write and
+  delete outside the workspace unless that key is `true`. For an agent that reads
+  untrusted input (mail, web pages), set `tools.exec.applyPatch.workspaceOnly: true`
+  (global), deny the tool `apply_patch` for that agent, or use a restricted session mode.
+  A `tools.deny` entry for `write` does not cover `apply_patch`.
+- **Plugins' own Control UI code.** `gateway.controlUi.experimental.customPlugins` is now
+  on by default (de50262a1f96): enabled plugins you installed yourself may add native pages
+  to the Control UI, and that code runs with the signed-in viewer's gateway permissions.
+  None of `@openclaw/codex`, `@openclaw/acpx` and the Brave plugin ships such pages. To keep
+  it off, set `gateway.controlUi.experimental.customPlugins: false` (it applies without a
+  restart; reload open tabs). An explicit `false` stays off across updates.
+- **Chat cold storage is on by default.** `session.maintenance.coldStorage.enabled` is now
+  `true` by default (2026.11.4: `false`; openclaw/openclaw#199899, `afterDays` 30). At start
+  and then every minute, OpenClaw moves chats that were inactive for 30 days into compressed
+  archives, `/config/.openclaw/agents/<id>/sessions/cold/<sha256>.jsonl.zst`, and keeps the
+  session's metadata. Opening such a chat restores its history; chat lists show no
+  last-message preview for it. The add-on keeps this default. **The archives are required
+  history:** OpenClaw cannot open an archived chat without its file ("Cold transcript archive
+  … is missing or unreadable. Restore it from a backup"). They are part of the add-on's
+  Home Assistant backup (no `backup_exclude` pattern matches them), and the add-on never
+  deletes them; keep them in every encrypted backup. `session.maintenance.coldStorage.enabled:
+  false` stops further archiving; chats already archived stay archived.
+- **Memory bound for shell commands.** On Linux, exec commands on the gateway host now run
+  under a memory bound for their whole process tree: the smaller of a quarter of the host's
+  (or the container's cgroup) memory and half of the memory left after the gateway itself
+  (openclaw/openclaw#182111). There is no setting. A memory-heavy command of an agent on a
+  small Home Assistant host can be stopped.
+- **Cron jobs without an owner.** A chat request to change what an automation without an
+  owner runs is refused (openclaw/openclaw#198621). Change such jobs on the Control UI's
+  Automations page or with `openclaw automations edit`.
+- **What scheduled runs may do.** Scheduled runs get an execution context of their own from
+  the conversation that created the automation. Doctor prints a read-only "Scheduled-run
+  access review": automations that lose access at their next run (for example owner-only
+  tools when the creator is not an owner, `sessions_yield`, the unscoped automations tool on
+  CLI backends), automations that pause because the conversation that created them is gone
+  (restore it and `openclaw automations enable <id>`, or recreate the automation),
+  automations on a CLI backend that now get the owner-only tools embedded runs already had,
+  and automations without conversation memory. Doctor also notes cron jobs with tools that
+  keep the restrictive legacy sender policy (`openclaw automations edit <id> --tools …` sets
+  an explicit tool cap). The gate repeats the headings at the end of its run (`WARN`/`info:
+  doctor: …`); the job lists are in `oc-upgrade log`. In the 2026.11.8 rehearsal the two
+  migrated heartbeat jobs lost `sessions_yield` and the unscoped automations tool.
+- **Repeated Telegram text, rarely.** A routed Telegram final reply whose send stayed
+  ambiguous is replayed once (openclaw/openclaw#192779): in rare cases a text answer arrives
+  twice. Replies with voice or other media are never replayed.
+- **Telegram after an update id reset.** The bot keeps receiving messages when Telegram
+  resets its update ids (openclaw/openclaw#201167). Before, it could stop receiving while
+  its status still showed it running.
+- **Heartbeat becomes a cron job.** OpenClaw retired the heartbeat settings
+  (openclaw/openclaw#179387): doctor turns `agents.defaults.heartbeat` and the agents'
+  `heartbeat` blocks (and the heartbeat jobs of earlier versions) into one ordinary cron job
+  per enrolled agent (an agent turn with the heartbeat prompt, only when the agent is idle,
+  skipped while its cron scratch is empty; delivery `none` when the target was `none`).
+  With `agents.defaults.heartbeat` alone (no `agentId`, no heartbeat block of an agent)
+  every configured agent is enrolled, so each agent gets its own job. Doctor moves `HEARTBEAT.md` into that job's cron scratch (a copy stays in
+  `/config/.openclaw/backups/heartbeat-migration/`), and the schema refuses the old keys
+  afterwards. The precheck says so (`1/8 info: heartbeat (…): OpenClaw 2026.11.11 retires the
+  heartbeat settings; …`), and the end of the run too (`info: doctor: doctor turned the
+  heartbeat settings into ordinary cron jobs …`). These jobs have no fallbacks of their own: they run
+  on the agent's model chain, now as a cron chain, where a fallback on a stored login
+  without a recorded account stops the run
+  ([Cron jobs without a recorded inference account](#cron-jobs-without-a-recorded-inference-account-openclaw-20261010)).
+  The add-on does not change them. After the first start, give each of them fallbacks that
+  need no stored login (`openclaw automations list` shows them; `openclaw automations edit
+  <id> --fallbacks <list>`, or `--fallbacks ""` for none); the cron report after the
+  migration includes them. Coming from 0.5.93, the gate no longer writes its two heartbeat
+  pins (`agents.defaults.heartbeat.agentId`, `.target`).
+- **Cron failure notices from the first failure.** A cron job that notifies about failures
+  (a delivery route, `cron.failureAlert`, or the conversation that owns the job) now does
+  so from its first failed run (2026.11.4: from the second), at most once an hour and the
+  same failure at most once a day. A heartbeat job that stops at a refused fallback sends
+  one at its first such run.
+- **Cron fallbacks of account-bound jobs** (openclaw/openclaw#196539). A cron job with a
+  recorded inference account now runs its fallbacks on other providers on live credentials,
+  as an interactive run does. Only its candidates on the recorded provider use the recorded
+  account; there is no account per fallback. A job without a recorded account is refused at
+  a fallback on a stored login as before, and that stops its chain
+  (openclaw/openclaw#192195). Doctor also records the account of a job on the Codex runtime
+  (openclaw/openclaw#189979). The add-on binds none of your jobs; the gate's texts describe
+  the new behaviour
+  ([Cron jobs without a recorded inference account](#cron-jobs-without-a-recorded-inference-account-openclaw-20261010)).
+- **Fewer cron warnings at gateway start** (openclaw/openclaw#195905). `cron: automation has
+  no recorded inference account …` is written only for unbound jobs whose own model is on a
+  stored login, or on a key variable that is missing for the gateway; jobs on a configured
+  key get none.
+- **Skill Workshop is a bundled plugin** (openclaw/openclaw#190365). Its settings live in
+  `plugins.entries.skill-workshop.config` now: doctor moves `skills.workshop` there (values
+  already in the plugin config win), and the schema refuses `skills.workshop` afterwards.
+  Drafts are kept in the owner agent's `workshop-skills/.drafts/`; doctor moves the drafts an
+  earlier doctor exported to `.archive/.retired-proposals/` there (`/learn drafts` lists
+  them; [Skill Workshop proposals](#skill-workshop-proposals-openclaw-20261010)).
+- **Codex plugin minimum.** 2026.11.11 no longer loads an enabled `@openclaw/codex` below
+  2026.11.5-beta.1 (openclaw/openclaw#192760), unless it has exactly OpenClaw's version.
+  Doctor and the add-on's plugin step bring it to 2026.11.11
+  ([Official plugins follow OpenClaw's version](#official-plugins-follow-openclaws-version)).
+- **Start after an unclean stop.** When the add-on's container was killed (out of memory, a
+  forced stop after the stop timeout), the gateway's state lock of the old container stays
+  behind. The new container cannot inspect that owner (another PID namespace), so OpenClaw
+  waits until the lock has not been renewed for 90 seconds and then takes it over
+  (openclaw/openclaw#205709): the gate's first doctor pass or the gateway start can take up
+  to about 90 seconds longer than usual (rehearsed: the gateway was ready after 114 s
+  instead of about 30 s, with `waiting for the previous Gateway to stop (last heartbeat …s
+  ago)` and `state ownership acquired after 85.1 s` in its log; a doctor pass waited 76 s).
+  During that time other `openclaw` commands in the terminal that need the state (for
+  example `openclaw sessions`, `openclaw plugins list`) end at once with `cannot verify
+  Gateway ownership from this process …`: wait and run them again. After a normal stop the
+  lock is released, and after a reboot of the host the old owner counts as stopped, so
+  neither waits. The wait can also be absent when the new container happens to get the old
+  one's PID namespace number. 2026.11.10 did not take such a lock over by itself; 2026.11.4
+  did, after the same 90 seconds.
+- **Model rows without an API.** A model you listed yourself in
+  `models.providers.<provider>.models` of `openclaw.json` now runs as an OpenAI-compatible
+  model unless the row or its provider block sets `api` or `baseUrl`, also when OpenClaw's
+  own catalog knows the model. For every provider but `openai` each request to it then
+  fails before it reaches the network: `Provider "google" requires an explicit base URL
+  before using an OpenAI-compatible API. Reload provider metadata or configure an
+  endpoint.` It fails as the primary model and as a fallback. OpenClaw 2026.11.4 used the
+  provider's own API for such a row. Rehearsed with a `google` row: after
+  `openclaw config set models.providers.google.api google-generative-ai` the model reached
+  Google's endpoint again. The precheck warns (`WARN [gate] 1/8 model providers: … Affected:
+  google: <model> (set models.providers.google.api to google-generative-ai) …`; it names
+  the API from OpenClaw's bundled provider manifests) and the migration continues;
+  `openclaw config validate`, doctor and `openclaw models status` do not report it. Set
+  the key before or after the update (it is valid in 2026.11.4 too). A provider block
+  without model rows, and one with a `baseUrl` (local servers, OpenAI-compatible
+  endpoints), is not affected.
+- **Replies to the bot's own documents.** The exception of the hotfix TG-20261112 for a
+  document the bot sent now depends on what OpenClaw cached
+  ([below](#telegram-replies-to-the-assistants-own-voice-messages-hotfix-tg-20261112)).
+- **New commands.** The wrapper refuses `openclaw database migration-capture create|restore`
+  and `openclaw database restore-session-dependencies` outside a HOLD too, unless
+  `OC_ADDON_UNSAFE=1`: they copy the state with its secrets into plaintext files the add-on
+  does not track, or replace it outside the add-on's backup and migration steps. Back up
+  with an encrypted Home Assistant backup instead. `openclaw database migration-capture
+  capabilities` only prints JSON and passes. The other new commands pass, for example
+  `openclaw pair <code>` (approves a browser that shows a pairing code and gives it
+  administrator control of the gateway) and `openclaw id …` (OpenClaw ID remote access,
+  off by default); see SECURITY.md. During a HOLD the wrapper refuses all of them, as before.
+
+**Fixes that 2026.11.11 does not have.** 2026.11.4 (`0.5.94-full6`) lacks the first four too. The
+last is a 2026.11.4 fix that 2026.11.11 drops, so on that point the update is a step back
+from `0.5.94-full6` (accepted; with `tools.openclaw.autoApproveChanges: false` every delegated
+change still waits for your approval). The add-on carries no patch for them.
+
+- openclaw/openclaw#196797: touch scrolling of dashboard panels in the Control UI (touch devices).
+  2026.11.8 had it.
+- openclaw/openclaw#200853: expanded sidebar sessions overlapping. 2026.11.8 had it.
+- openclaw/openclaw#199299: image descriptions over a ChatGPT OAuth login when OpenAI has
+  no API key. 2026.11.8 had it.
+- openclaw/openclaw#196362: doctor repairs session titles that were left as internal-wake
+  markers.
+- The follow-up "preserve admitted delegation policy" of 2026.11.4 and 2026.11.8 (on
+  OpenClaw's main line only from openclaw/openclaw#203901; 2026.11.4 has it): see
+  [Delegated changes](#delegated-changes-openclaw-2026114-ghsa-pw3x-g8v8-fvj2).
+
+OpenClaw's 2026.11.15 release branch has #196797 and #200853; it is not released. 2026.11.11
+has what 2026.11.4 had and the never-shipped 2026.11.8 lacked: #190863, the notice at once
+after a failed delivery recovery (#195400; both above) and #188833 (an agent's partial
+`tools.exec` override no longer drops a stricter global one for the Claude CLI runtime).
+#196539 (cron fallbacks of account-bound jobs) is new against both. It still carries the doctor
+compatibility records whose earliest removal date is 2026-11-29 (OpenClaw's changelog,
+"Upcoming deprecations"; among them the import of pre-July-2026 state; none is removed in
+this release). A later OpenClaw may drop them, so update from `0.5.94-full6` through this
+version, not past it.
+
+##### State upgrade at gateway start (OpenClaw 2026.11.11)
+
+OpenClaw 2026.11.11 can upgrade the state by itself when the gateway starts
+(openclaw/openclaw#198389). Before `openclaw gateway run` opens anything, it checks whether
+the state database or an agent database it finds is below the bundled schema (state 40,
+agent 42). If so, it copies the whole state into
+`/config/.openclaw/.upgrade-<version>-<pid>-<ms>/`, runs its own doctor on that copy
+(directly, not through the add-on's wrapper; killed after 30 minutes) and renames the result
+over the live files through a swap plan (`plan.json`). If that doctor fails, it rebuilds the
+databases with a generic copy instead and still starts. Before it writes the swap plan, it
+stages each other file it changes beside the live one, for example
+`.openclaw.json.upgrade-<version>-<pid>-<ms>` (the migrated config); OpenClaw removes that
+copy only when the upgrade fails with an error, so a crash before the plan leaves it. A
+`.upgrade-*` folder an earlier start left makes the start first apply that folder's swap
+plan, if it has one, and then delete the folder; one without a plan is only deleted. Every
+file it replaced stays as `<file>.pre-2026.11.11` (a hard link of the replaced file), and the
+copy's doctor log as `logs/state-upgrade-2026.11.11.log`. These are plaintext copies made
+outside the gate: `state/openclaw.sqlite.pre-2026.11.11` holds the auth profiles (keys and
+OAuth tokens), `openclaw.json.pre-2026.11.11` and the staged config copy the gateway token,
+and a `.upgrade-*` folder is a full copy of the state. None of them is the rollback point;
+the encrypted Home Assistant backup is.
+
+The gate's doctor still migrates in place (`openclaw doctor --fix`, as before), so after a
+clean gate run nothing is left for this upgrade, and the first start of 2026.11.11 only opens
+the databases. The gate makes sure of that (rule: no plaintext copies outside the encrypted
+Home Assistant backup):
+
+- **Precheck.** A `.upgrade-*` folder without `plan.json` is an unfinished copy beside an
+  untouched live state: a gate run deletes it, with the staged copies of the same attempt
+  (`1/8 deleted .upgrade-… in /config/.openclaw: an unfinished state-upgrade copy …`, then
+  `1/8 deleted .openclaw.json.upgrade-… in /config/.openclaw: the staged copy of the same
+  attempt …`), whatever `gate_cleanup_hours` says: the gate cannot pass while it exists, and
+  OpenClaw's next start would delete the folder anyway. `oc-upgrade gate --dry-run` and
+  `oc-upgrade check` only name it, and nothing is deleted while an OpenClaw process runs. If the delete fails,
+  the gate holds with `startup-upgrade-leftover`. A folder with `plan.json` is an interrupted
+  swap: some live files may already be replaced, and the next start applies the plan before
+  anything else. The gate holds with `startup-upgrade-unfinished` before its doctor would run
+  on such a state.
+- **Postconditions.** After doctor the gate checks what the first start would upgrade, and
+  holds with the hard code `pc-startup-upgrade` if anything is left: an orphan agent
+  database doctor left below the target, a store whose deletion history doctor could not
+  read ("deletion journal unavailable", "deletion history needs repair"), or any `.upgrade-*`
+  entry. Stores that OpenClaw's deletion journal or its reconstruction holds stay an `info`
+  line (`7/8 info: held agent database(s) … the gateway does not open them, and its start
+  does not upgrade them`). Otherwise the postconditions line says `no gateway-start upgrade
+  pending`.
+- **Every add-on start without a gate run.** Before OpenClaw starts, the plan checks for a
+  database below its target, for example after an agent folder was restored from an older
+  backup, and for a `.upgrade-*` folder with `plan.json`. It then holds with
+  `startup-upgrade-pending` (`startup-upgrade-unfinished` for a `plan.json`) instead of
+  starting OpenClaw, at every add-on start until the cause is gone (`oc-upgrade gate
+  --dry-run` says `would HOLD …`). A folder without a plan does not hold: that start deletes
+  it. A gateway restart after a crash within a running add-on is not checked again: if a
+  database fell below its target while the add-on ran, that restart upgrades it by copy and
+  swap, and its leftovers are listed and deleted as described next.
+- **After a failed start** (exit 78 or a crash loop) the HOLD text names what is pending and
+  points at the gateway's own lines in the add-on log: `State upgrade to <version> stopped:
+  …` (disk full or an I/O error; nothing was changed), `State upgrade to <version> not
+  applied: …` (the upgraded configuration is invalid; nothing was changed) and `State
+  upgrade chain failed at …`.
+- **Leftovers.** If such a start ran anyway (for example on a state restored outside the
+  add-on), `oc-upgrade status` lists what it left: a `WARN` for each `.upgrade-*` folder
+  with `plan.json`, then one line for the rest (`OpenClaw state-upgrade leftovers (a gateway
+  start upgraded the state by copy and swap): N item(s), …`: `.upgrade-*` folders without a
+  plan, `<file>.pre-<version>` files, `logs/state-upgrade-*.log` and the staged copies
+  `.<file>.upgrade-*` in `/config/.openclaw`; staged copies beside `$include` files elsewhere
+  are not looked for). The add-on deletes them `gate_cleanup_hours` after the newest of them
+  was made (for a `<file>.pre-<version>`, a hard link with the old file's time, the time of
+  the swap), and only after a healthy gateway start: a gateway that has been up 2 minutes, with no database below its target
+  and no swap plan left. Until then `oc-upgrade cleanup` says `kept until the gateway has run
+  2 min on the upgraded state, then due … h after the newest of them`. A `.upgrade-*` folder
+  with `plan.json`, or one of a start that is still running, is never deleted, and neither
+  are the staged copies with its suffix (the swap still needs them). Files below
+  `node_modules`, in workspaces inside the state directory and in the folders the start never
+  copies (`knowledge`, `browser`, `backups`, `cache`, `locks`, `tmp`) are not listed. With
+  `gate_cleanup_hours: 0` they are only listed: delete them yourself (a `.upgrade-*` folder
+  without a plan still goes at the next gate run, see Precheck, or OpenClaw start). With
+  another OpenClaw version the add-on only lists them.
+
+What to do on these HOLDs:
+
+- `startup-upgrade-unfinished`: do not delete the folder. Let OpenClaw finish the swap: in
+  the add-on terminal run `OC_ADDON_UNSAFE=1 openclaw gateway run`, wait for `Finished an
+  interrupted state upgrade to …`, stop it with Ctrl+C, then `oc-upgrade retry` and restart
+  the add-on (not rehearsed yet). Or restore the encrypted Home Assistant backup.
+- `startup-upgrade-leftover`: delete the listed folder by hand, then `oc-upgrade retry` and
+  restart.
+- `startup-upgrade-pending` and `pc-startup-upgrade`: move an agent folder you no longer use
+  (neither configured nor registered) out of `/config/.openclaw/agents` (it is in your
+  encrypted backup). Otherwise (for `pc-startup-upgrade` also a leftover `.upgrade-*` folder
+  without a plan) run `oc-upgrade retry --doctor`, so that the gate's doctor migrates in place; for a store
+  doctor held, first fix what doctor reported for it (`oc-upgrade log`). Then restart.
+
+##### Default cron partition
+
+OpenClaw keys its cron jobs, run history and receipts by their store ("partition", the
+`jobs.json` path the job was created for). From 2026.11.5 (state schema 34; the same in
+2026.11.11) the default store is a recorded identity (`cron.defaultStoreKey` in the state
+database). The schema migration records it itself when the cron rows belong to the default
+store `/config/.openclaw/cron/jobs.json` (or there are none), or when they all belong to one
+other store; a `cron.store` that names another file needs no record. Otherwise OpenClaw
+cannot tell which store to run: its doctor stops ("Doctor blocked"; its finding:
+`Doctor could not complete State integrity: Default cron partition selection is unresolved;
+cron is paused`) until a doctor run in a terminal selects the default ("Select the default
+cron partition"). With heartbeat settings in `openclaw.json` it also leaves the heartbeat
+migration for later and keeps those settings, which 2026.11.11 rejects (`Unrecognized key:
+"heartbeat"`): do not remove them by hand, selecting the store lets doctor finish that
+migration too. The gate's non-interactive doctor never selects one, so a retry alone does
+not help.
+
+- **Precheck:** a forecast from the state database (read-only): `WARN [gate] 1/8 the cron
+  rows belong to N store(s) and none is the default /config/.openclaw/cron/jobs.json
+  (partitions: <store> (<rows> row(s)); …): OpenClaw cannot tell which store to run, and its
+  doctor stops (… HOLD doctor-cron-partition) … Only the jobs of the selected store run
+  afterwards. The migration starts; the gate then holds with doctor-cron-partition …`.
+  Nothing is printed when the record will be made.
+- **Doctor pass:** the stop holds with the hard code `doctor-cron-partition`.
+- **Postconditions:** should a doctor finish without the record (cron paused), the gate
+  holds with the acceptable code `pc-cron-partition`.
+- **What to do:** in the add-on terminal `OC_ADDON_UNSAFE=1 openclaw doctor --fix`. At
+  "Select the default cron partition" the cursor starts on "Leave cron paused and decide
+  later" (Enter alone keeps cron paused): press the down arrow to the store your jobs run
+  from, then Enter. Doctor prints `Selected default cron partition <store>` and first saves
+  a plaintext copy of the state database (with 2026.11.11
+  `openclaw.sqlite.pre-startup-migration-<uuid>.bak`, earlier
+  `openclaw.sqlite.doctor-cron-<ms>-<uuid>.bak`), which `oc-upgrade status` lists (delete it
+  by hand once cron runs). Then `oc-upgrade retry` and restart. Only the jobs of the selected
+  store run afterwards; those of the other stores stay in the database but no longer run
+  (rehearsal: 5 jobs of a second store stopped). For `pc-cron-partition` you can instead
+  `oc-upgrade retry --accept pc-cron-partition`: the gateway starts and cron stays paused
+  until you select one.
+
+##### HOLD codes added for OpenClaw 2026.11.11
+
+These codes apply from the OpenClaw version named, so all of them with the bundled
+2026.11.11.
+
+| Code | Class | Cause | What to do |
+|---|---|---|---|
+| `doctor-plugin-source-unprepared` | hard | OpenClaw 2026.11.11: doctor stopped in its config repair after the Codex plugin update ("Plugin codex Doctor source must be prepared before loading"; [Doctor's config repair after the Codex plugin update](#doctors-config-repair-after-the-codex-plugin-update-openclaw-20261111)). The add-on's patch prevents it. | `oc-upgrade retry` and restart; if it comes back, update the add-on to a build with the patch, or restore the encrypted backup. |
+| `doctor-cron-partition` | hard | OpenClaw 2026.11.5+: doctor stopped because no default cron partition can be proven ("Default cron partition selection is unresolved"; [above](#default-cron-partition)). | Select the store in a terminal doctor as described above, then `oc-upgrade retry` and restart. |
+| `pc-cron-partition` | acceptable | OpenClaw 2026.11.5+: after the migration no default cron partition is recorded and none follows from the rows: cron is paused ([above](#default-cron-partition)). | See above. |
+| `doctor-config-unparsed` | hard | OpenClaw 2026.11.5+: doctor exited with code 2 because it could not parse `openclaw.json` ("config could not be parsed"). | Fix the file (`openclaw config validate` shows where), then `oc-upgrade retry` and restart. |
+| `doctor-database-unresolved` | hard | OpenClaw 2026.11.5+: doctor exited with code 2 because it could not resolve its database target ("database target could not be resolved"). | Check the database settings in `openclaw.json` (and their credentials) and that `/config/.openclaw/state` is readable, then `oc-upgrade retry` and restart. |
+| `startup-upgrade-unfinished` | hard | OpenClaw 2026.11.11: a `.upgrade-*` folder with its swap plan (`plan.json`) in `/config/.openclaw`, in the precheck or at a start without a gate run: an interrupted state upgrade of a gateway start; some live files may already be replaced ([State upgrade at gateway start](#state-upgrade-at-gateway-start-openclaw-20261111)). | Do not delete it; let OpenClaw finish the swap as described there, or restore the encrypted backup. |
+| `startup-upgrade-leftover` | hard | OpenClaw 2026.11.11: the precheck could not delete a `.upgrade-*` folder without a swap plan (an unfinished plaintext copy of the state; the live files are untouched). | Delete the listed folder by hand, then `oc-upgrade retry` and restart. |
+| `startup-upgrade-pending` | hard | OpenClaw 2026.11.11, at a start without a gate run: the gateway start would upgrade the state by copy and swap outside the gate; the reason lists the databases below their schema and the `.upgrade-*` folders (one without a swap plan alone does not hold: that start deletes it). Decided again at every add-on start. | Move an agent folder you no longer use out of `/config/.openclaw/agents`, otherwise `oc-upgrade retry --doctor`; then restart. |
+| `pc-startup-upgrade` | hard | OpenClaw 2026.11.11, after doctor: the first gateway start would still upgrade the state by copy and swap (an orphan store doctor left below the target, a store whose deletion history doctor could not read, a `.upgrade-*` entry). | As for `startup-upgrade-pending`; for a store doctor held, fix what doctor reported for it (`oc-upgrade log`), then `oc-upgrade retry --doctor`. |
+
+Other exit-2 runs keep `doctor-invocation`. `doctor-incomplete` (retry resumes) now also
+covers "Doctor startup timed out after 60000ms", and `doctor-backup-unverifiable` also
+"Doctor could not verify its admitted original recovery copy". A warning "Pre-repair
+recovery copy was unavailable" is no HOLD: the end of the run names it (`doctor could not
+save its pre-repair recovery copy (…); the encrypted Home Assistant backup stays the
+rollback point`). A plugin install index doctor left unchanged ("uses a retired JSON format
+and was left unchanged") counts as `doctor-retired-format`. 2026.11.11 doctor stops itself
+with SIGTERM when something keeps it running 10 s after it finished ("command settled but
+the process is still alive after 10000ms; …; terminating"), whatever exit code it meant (its
+settled-exit watchdog; no setting turns it off). The gate then takes the exit code from
+doctor's closing line (`Doctor complete.` is 0, "Doctor blocked; required repairs remain
+incomplete." 1, the texts of exit 2 give 2) and goes on as for that code; the pass line says
+so (`4/8 doctor pass 1: doctor finished, but a handle kept it running, so it stopped itself
+with SIGTERM 10 s later (rc -15, OpenClaw's settled-exit watchdog); its outro says exit 0`),
+and `oc-upgrade status` too (`doctor pass 1: rc -15 (stopped by its settled-exit watchdog;
+outro: exit 0) …`). Without such a line the pass holds with `doctor-crashed`.
+
+**What else the gate does differently with 2026.11.5 and later.**
+
+- `doctor-not-idempotent` and the third doctor pass ignore doctor's own time stamp
+  `wizard.lastRunAt`, which doctor writes on every config change (also 2026.11.4); the HOLD
+  names the paths the third pass changed. The run directory keeps `config.post-pass2.json`
+  from before the third pass and `config.post-pass3.json` after it (deleted with the run
+  like the other `config.*.json`).
+- Doctor logs its captures (`/config/.openclaw.update-captures/doctor-<uuid>/`) only at
+  debug level now. The gate records the capture directories that appear during its doctor
+  passes and deletes them with the run
+  ([Automatic deletion](#automatic-deletion-gate_cleanup_hours)).
+- Retired pre-July-2026 files that doctor imports itself are left to it
+  ([Pre-July-2026 leftovers](#upgrading-to-openclaw-202610-0594-full1--the-migration-gate)).
+- The device identity has moved to `/config/.openclaw/client/credentials.sqlite` (with
+  device keys and tokens); the gate's check for a leftover `identity/device.json` reads it
+  there.
+- Names of known provider variables that doctor does not copy as a literal key (cron
+  report): also `BIFROST_VIRTUAL_KEY`, `OMLX_API_KEY` and `REQUESTY_API_KEY`, and the marker
+  `omlx-local` (provider plugins new in the 2026.11.5 line), and `RERANK_API_KEY` (2026.11.10).
+
+**What else the gate does differently with 2026.11.11.**
+
+- Doctor's pre-repair cron backup of the state database is a pre-migration copy now,
+  `state/openclaw.sqlite.pre-startup-migration-<uuid>.bak`, still logged as `Saved pre-repair
+  cron backup: …` (the `.doctor-cron-` name stays for PostgreSQL). Doctor's new cold-chat
+  navigation step saves `openclaw-cold-navigation-recovery-<6 characters>/database.sqlite`
+  beside an agent database with cold archives before its first write, in every doctor run that
+  still finds archives without navigation (each run stops after 10 minutes of that work and
+  the next one resumes, so two passes can save two such copies). The gate counts both in
+  the pass line and deletes them with the run
+  ([Automatic deletion](#automatic-deletion-gate_cleanup_hours)).
+- The end of the run names chats in cold archives whose navigation doctor added (`info:
+  doctor: doctor added the navigation of N cold-archived chat(s) in …; M more follow at its next run
+  (oc-upgrade retry --doctor); until then they open through the cold restore as before`):
+  doctor works on it 10 minutes per run at most.
+- A `doctor-blocked` reason does not quote doctor's cron inference-account findings (check
+  `core/doctor/cron-inference-accounts`): they name auth profile ids, which can be e-mail
+  addresses. It counts them (`N cron inference-account finding(s), only in oc-upgrade log`).
+- The `orphan-agent-db` reason says that the gateway opens such a store read-only at each
+  start, and that one still below the target makes every start copy the state, so the gate
+  holds then (`pc-startup-upgrade`).
+
+#### Known limits with OpenClaw 2026.10.10 to 2026.11.11
+
+These apply from `0.5.94-full5`; `0.5.94-full6` bundled OpenClaw 2026.11.4 (a maintenance
+release of the 2026.11.3 line, built on 2026.11.1 and 2026.10.10), `0.5.94-full7` bundles
+2026.11.11 (of the 2026.11.10 line, a release line of its own; its changes are in
+[OpenClaw 2026.11.11](#openclaw-20261111-0594-full7)); add-on versions with OpenClaw 2026.10.4
+were not affected. The add-on cannot change them.
+
+- **Control UI browsers.** The Control UI of OpenClaw 2026.10.10 to 2026.11.11 needs Safari 26.2 or
   later (macOS, iOS or iPadOS 26.2+), or a Chrome or Firefox released within the last six
   months (Chrome 147+, Firefox 150+ as of October 2026). Web views inside apps need the
   same engine, for example when the Home Assistant Companion app shows the Control UI:
   Android System WebView 147+, iOS/iPadOS 26.2+. An older browser shows an update screen
   instead of the dashboard. Before the update, check the browsers and devices you open the
   Control UI with. The add-on page and the terminal (Ingress) are the add-on's own pages
-  and are not affected.
+  and are not affected. Touch scrolling of dashboard panels is as with 2026.11.4
+  (openclaw/openclaw#196797 is not in 2026.11.11).
 - **Large sessions (openclaw/openclaw#191847).** An open OpenClaw issue reports that the
   512 MB SQLite worker of 2026.10.10 runs out of memory on large Telegram direct-chat
-  sessions (not verified by the add-on); 2026.11.1, 2026.11.3 and 2026.11.4 have the same
-  worker limits, and none of the session memory fixes in 2026.11.3 or 2026.11.4 refers to
+  sessions (not verified by the add-on); 2026.11.1, 2026.11.3, 2026.11.4 and 2026.11.11 have
+  the same worker limits, and none of the session memory fixes in these versions refers to
   this issue. With
   these versions, the precheck shows your
   exposure before anything is changed (information only, no HOLD): `[gate] 1/8 info:
@@ -1801,10 +2405,12 @@ OpenClaw 2026.10.4 were not affected. The add-on cannot change them.
 - **Cron fallbacks.** OpenClaw 2026.10.10 and later refuse a cron job from before
   2026.10.10, or stop it at the first fallback, as soon as a model would use a stored
   login or AWS SDK credentials (openclaw/openclaw#192195). OpenClaw's own migration
-  (from 2026.11.2, so in the gate's doctor passes with the bundled 2026.11.4,
+  (from 2026.11.2, so in the gate's doctor passes with the bundled 2026.11.11,
   openclaw/openclaw#172792) records only the account of a job's own model: a job that
-  only stops at a fallback stays so, and a job it binds has its fallbacks to other
-  providers refused. A literal key in
+  only stops at a fallback stays so. A job it binds had its fallbacks to other providers
+  refused before 2026.11.10; from 2026.11.10 they run on live credentials
+  (openclaw/openclaw#196539; there is no account per fallback), so binding no longer
+  costs them. A literal key in
   `models.providers.<provider>.apiKey` (also a placeholder such as `EMPTY`) becomes a
   stored login during the migration: the gate sets `models.providers.<provider>.auth`
   to `"api-key"` itself where it can; act only on a remaining
@@ -1819,16 +2425,25 @@ OpenClaw 2026.10.4 were not affected. The add-on cannot change them.
   models; it cannot tell whether the lookup will work.
   Apart from its `auth: "api-key"` fixup the gate only reports the affected jobs; see
   [Cron jobs without a recorded inference account](#cron-jobs-without-a-recorded-inference-account-openclaw-20261010).
-- **Cron warning at every gateway start (OpenClaw 2026.11.2 and later).** The gateway
+- **Cron warning at gateway start (OpenClaw 2026.11.2 and later).** The gateway
   writes `cron: automation has no recorded inference account; run openclaw doctor --fix
   before its next scheduled run …` to OpenClaw's own log (`openclaw logs`, the Control
-  UI's Logs page; not the add-on log) for each unbound agent-turn cron job, also for jobs
-  whose own model runs on a configured key or a key from the environment, which doctor
-  leaves unbound on purpose and which run fine (with an environment key: while the
-  variable is set for the gateway). For those it is expected and harmless; `openclaw
+  UI's Logs page; not the add-on log) for unbound agent-turn cron jobs, at every start and
+  after each `cron.*` change. With the bundled 2026.11.11 only for jobs whose own model is
+  on a stored login, or on a key variable that is missing for the gateway; with 2026.11.4
+  also for jobs on a configured key or a key from the environment, which doctor leaves
+  unbound on purpose and which run fine. For those it is expected and harmless; `openclaw
   doctor --fix` is refused in the add-on, and `oc-upgrade retry --doctor` would not clear
   it either (see
   [Cron jobs without a recorded inference account](#cron-jobs-without-a-recorded-inference-account-openclaw-20261010)).
+- **OpenClaw's release checks.** For 2026.11.10-beta.2 OpenClaw waived some live tests,
+  among them the xAI and Z.AI lanes and a Control UI check, and the stable 2026.11.10
+  accepted a memory and CPU performance gap (its release validation waivers). 2026.11.11 is
+  a maintenance release on top of it. Among its fixes: how a cron run finishes when it
+  spawned subagents (openclaw/openclaw#204621), internal turns (subagent results,
+  `sessions_send`, restart continuations) that ran on the agent's default model instead of
+  the chosen one (#204896), and the compaction of very large sessions, which 2026.11.10
+  refused (#205783).
 - **No forecast on the current image.** `oc-upgrade check` of the add-on version you
   update from does not know these checks. They run in the precheck of the new image,
   before anything is written: a precheck HOLD leaves the state unchanged, `WARN` lines
@@ -1838,7 +2453,7 @@ OpenClaw 2026.10.4 were not affected. The add-on cannot change them.
 #### Memory search credentials and output caps (OpenClaw 2026.11.3)
 
 Two changes of OpenClaw 2026.11.3 can change how your agents work after the update; the
-bundled 2026.11.4 keeps both. The gate checks your `openclaw.json` for both in the precheck (read-only, never a HOLD, also
+bundled 2026.11.11 keeps both. The gate checks your `openclaw.json` for both in the precheck (read-only, never a HOLD, also
 in `oc-upgrade gate --dry-run`); it changes nothing.
 
 **Memory search credentials per agent (openclaw/openclaw#184966).** Before 2026.11.3
@@ -1855,7 +2470,7 @@ are `agents.entries.<id>.memory.search` (already the form of 2026.10.4); the gat
 reads the legacy keys `agents.defaults.memorySearch` and an agent's `memorySearch` (in
 `agents.list` or `agents.entries`), which doctor moves there.
 
-- **Precheck:** `WARN [gate] 1/8 memory search: OpenClaw 2026.11.4 no longer gives an
+- **Precheck:** `WARN [gate] 1/8 memory search: OpenClaw 2026.11.11 no longer gives an
   agent whose memory search provider differs from the shared one … N agent(s) lose shared
   fields: agent <id>: remote.apiKey, remote.headers …`. Only agent ids and field names
   are printed, never a value.
@@ -1877,7 +2492,7 @@ smaller `contextTokens` counts instead; without `contextWindow` OpenClaw assumes
 window under 8192 stays the cap. Only answers that reached the old cap get longer (long
 thinking, runaway output).
 
-- **Precheck:** `1/8 info: model output caps: OpenClaw 2026.11.4 gives a model row
+- **Precheck:** `1/8 info: model output caps: OpenClaw 2026.11.11 gives a model row
   without maxTokens … : glm/<model> (no contextWindow, so 200000 is assumed; output cap
   8192 -> 32768), …`: provider/model ids, the context window and the old and new cap,
   information only.
@@ -1899,8 +2514,9 @@ The security advisory GHSA-pw3x-g8v8-fvj2 affects OpenClaw 2026.9.2 up to before
 applied a persistent change an agent asked for (configuration set or unset, plugin
 installs, gateway restarts) without asking anyone whenever the exec defaults amounted to
 full access, also for an agent whose tool policy denied it the exec tools. 2026.11.4 fixes
-it (openclaw/openclaw#196984). Without a setting of its own (below), such a change is now
-applied without approval only
+it (openclaw/openclaw#196984); 2026.11.11, the bundled version, has the same fix with the same
+rules (b8980ca9a0b). Without a setting of its own (below), such a change is now applied
+without approval only
 
 - in an explicit **Full Access** session: the session permission mode Full Access, which
   only an operator with admin rights can choose for a session (Control UI), together with
@@ -1913,6 +2529,14 @@ applied without approval only
 
 Otherwise, in particular for an agent whose exec tool is denied or restricted, a human
 approves each change. OpenClaw checks this again at each persistent change.
+
+2026.11.11 lacks one follow-up of 2026.11.4 and 2026.11.8 ("preserve admitted delegation
+policy"; on OpenClaw's main line only from openclaw/openclaw#203901). It checks the
+containment of a change (sandbox, workspace-only file policy) against the configuration it
+read when the tool was built, not against the policy the run was admitted with. The add-on
+accepts this and carries no patch: the approval rules above are unchanged, and with
+`tools.openclaw.autoApproveChanges: false` every delegated change still waits for a human
+approval (SECURITY.md, section 1).
 
 The new setting `tools.openclaw.autoApproveChanges` (global) and
 `agents.entries.<id>.tools.openclaw.autoApproveChanges` (one agent; it takes precedence
@@ -1936,7 +2560,7 @@ config paths are printed):
 
 - **`true` where the tool is not denied:** the precheck, the end of the run and
   `oc-upgrade status` warn `WARN [gate] 1/8 delegated changes:
-  tools.openclaw.autoApproveChanges is true, so OpenClaw 2026.11.4 applies every permitted
+  tools.openclaw.autoApproveChanges is true, so OpenClaw 2026.11.11 applies every permitted
   change an agent asks the openclaw tool for (configuration, plugins, gateway restarts)
   without asking anyone, also for an agent whose exec tools are denied: the path
   GHSA-pw3x-g8v8-fvj2 closed (…). Only containment still stops it: … Unless you want that,
@@ -1950,7 +2574,7 @@ config paths are printed):
   or remove it before you remove the deny entry`.
 - **`openclaw` still in `tools.deny`** (global, or an agent's `agents.entries.<id>.tools.deny`;
   group entries such as `group:openclaw` are not counted): the end of the run adds
-  `[gate] info: delegated changes: OpenClaw 2026.11.4 contains the fix for
+  `[gate] info: delegated changes: OpenClaw 2026.11.11 contains the fix for
   GHSA-pw3x-g8v8-fvj2: for an agent whose exec tool is denied or restricted, a change it
   asks the openclaw tool for (…) now waits for a human approval. Without approval OpenClaw
   still applies such changes in a Full Access session, for an agent that may run exec on
@@ -1978,15 +2602,21 @@ OpenClaw 2026.10 doctor leaves a copy of the databases in
 ones only during a later doctor run, and every add-on backup includes them.
 `gate_cleanup_hours` (default 48 h) after a gate run has finished (`[gate] done`) the
 add-on deletes the doctor captures that run created: it finds them in the run's doctor
-logs and deletes only `doctor-<uuid>` directories inside
-`/config/.openclaw.update-captures/`. That includes captures OpenClaw marked with an
+logs and, since OpenClaw 2026.11.5 logs a capture only at debug level, also by the
+`doctor-<uuid>` directories that appeared there after the run's first doctor pass (the
+gate records them after each pass, before the next one and at the end of the run; one
+that was there before the first pass is not the run's), and deletes only `doctor-<uuid>`
+directories inside `/config/.openclaw.update-captures/`. That includes captures OpenClaw marked with an
 `outcome.json`, which OpenClaw itself would keep: the rule against plaintext copies of
 secrets takes precedence over OpenClaw's own retention. It also includes what OpenClaw
 2026.11 keeps of a capture that failed (for example on an orphan task delivery row, before
 doctor repairs it): doctor names that directory only as `Original update capture failed;
 evidence retained at …` and `Database backup files retained at …/database.…`, and it holds
-plaintext database copies too. A `doctor-<uuid>` directory that no doctor pass of a gate
-run names (a doctor you ran yourself) is kept; `oc-upgrade status` names it under
+plaintext database copies too. A `doctor-<uuid>` directory that no gate run names or
+recorded (a doctor you ran yourself while no gate run was open, or a capture from before a
+run's first doctor pass) is kept; a doctor you run by hand while a gate run is held (for
+example for `doctor-cron-partition`, before `oc-upgrade retry`) counts as part of that run:
+its captures and SQLite copies are deleted with it; `oc-upgrade status` names it under
 `Doctor captures no gate run names`: delete it yourself. The captures of a gate run that
 never finished (for example a held run whose state you then deleted, so that the next
 start closed it as abandoned) are kept as well, since the add-on cannot tell whether they
@@ -2000,7 +2630,8 @@ beside it: `<database>.pre-startup-migration-<id>.bak` (a full copy), from OpenC
 2026.10.10 for a fully declared migration instead `<id>.scoped.bak` (only the migrated
 tables: not a database, and only `openclaw database restore-migration-backup` can
 restore it). The update from 2026.10.4 to the 2026.10.10 line (2026.11.4) writes full
-copies of every database. OpenClaw keeps them; they are not the add-on's rollback point (the
+copies of every database; the pass lines of the update to 2026.11.11 count what its doctor
+copies. OpenClaw keeps them; they are not the add-on's rollback point (the
 encrypted Home Assistant backup is). The add-on deletes the copies a gate run's doctor
 passes saved at the same time as that run's doctor captures: the copies the run
 recorded per pass (`[gate] 4/8 doctor pass 1 … (1 full pre-migration SQLite copy by
@@ -2028,7 +2659,10 @@ moment it was deleted (device, inode, size, modification time).
 verified plaintext copy of the whole state database (with its device keys, tokens and
 other stored secrets) beside it:
 `/config/.openclaw/state/openclaw.sqlite.doctor-cron-<ms>-<uuid>.bak`, logged as `Saved
-pre-repair cron backup: <path>`. OpenClaw never deletes it. Doctor writes it for its
+pre-repair cron backup: <path>`. With 2026.11.11 on SQLite this backup is a pre-migration
+copy instead, `state/openclaw.sqlite.pre-startup-migration-<uuid>.bak`, logged the same
+way (the `.doctor-cron-` name stays for PostgreSQL); the add-on handles it like doctor's
+other pre-migration copies (above). OpenClaw never deletes it. Doctor writes it for its
 legacy cron repairs and the dreaming cron repair (also with 2026.10.4), from 2026.10.10
 also for provider renames, and from 2026.11.2 when its own cron account migration binds
 at least one job
@@ -2049,7 +2683,10 @@ directory beside it, `<database directory>/openclaw-<repair>-recovery-<6 charact
 logged as `Saved pre-repair SQLite backup: <path>` (a failed index repair: `Preserved
 pre-repair database: <path>`), and never deletes it: the index repair (also with
 2026.10.4), from the 2026.10.10 line also the media-persistence and transcript-directives
-migrations and the transcript-header, transcript-label and session-window repairs, and
+migrations and the transcript-header, transcript-label and session-window repairs, from
+2026.11.11 the cold-chat navigation step (`openclaw-cold-navigation-recovery-*`, per doctor
+run and agent database that still has cold archives without navigation, before its first
+write), and
 with every version the repair of orphaned `task_delivery_state` rows that the precheck
 lets doctor make (`state/openclaw-task-delivery-recovery-*/` also holds those rows in
 `orphan-rows.jsonl` and a `manifest.json`; logged as `… backup and row export: <path>`).
@@ -2068,13 +2705,62 @@ alone, delete those by hand. Beside an agent database outside `/config/.openclaw
 are only named in a `WARN`, as the pre-migration copies are. Never copy a
 `database.sqlite` from one over a database.
 
-Two other things OpenClaw leaves are never deleted by the add-on, only listed by
+**Doctor's pre-repair SQLite snapshots.** Before its auth profile, ACP, exec approvals and
+gateway token migrations doctor saves a verified full plaintext copy of the database beside
+it: `<database>.auth-profile-migration-<uuid>.bak` (the database holding the auth profile
+store: API keys and OAuth tokens), `<database>.pre-acp-key-migration-<uuid>.bak`,
+`<database>.pre-acp-metadata-migration-<uuid>.bak`,
+`<database>.pre-exec-approvals-migration-<uuid>.bak` and
+`<state database>.doctor-gateway-token.<uuid>.bak` (before doctor moves the gateway token
+into its secret store) (OpenClaw 2026.11.4 and 2026.11.11).
+OpenClaw never deletes them. The gate records the ones a doctor pass saved (the pass line,
+for example `[gate] 4/8 doctor pass 1 … (1 pre-repair SQLite snapshot (auth profile, ACP,
+exec approvals or gateway token migration) by doctor, …)`) and deletes them with the run's
+doctor captures, like the cron backups. `oc-upgrade status` lists all of them (`Doctor
+pre-repair SQLite snapshots (*.auth-profile-migration-*.bak, …): N (…)`); those no gate run recorded, for
+example from a gate run of `0.5.94-full6`, which did not know them yet, are named on a line
+of their own (`Doctor pre-repair SQLite snapshots no gate run names: …: kept, the add-on
+does not delete them: delete them yourself once you are satisfied`). Never copy one over a
+database.
+
+Three other things OpenClaw leaves are never deleted by the add-on, only listed by
 `oc-upgrade status`: a database doctor set aside as `<database>.corrupt-<time>` (the
 renamed original, a complete plaintext database; see
 [HOLD codes added for the OpenClaw 2026.10.10 line](#hold-codes-added-for-the-openclaw-20261010-line)),
-which you delete by hand once you are satisfied, and the plugin captures in
+which you delete by hand once you are satisfied; the credential files OpenClaw keeps after
+importing them (referenced OAuth sidecars, `credentials/oauth.json` and the agents' old auth
+files as `<file>.migrated-<time>-<uuid>`, earlier imports as `<file>.sqlite-import.<…>.bak`,
+the `allowFrom` files of removed channel accounts as `*.migrated`) in
+`/config/.openclaw/credentials/`, `credentials/auth-profiles/` and `agents/<id>/agent/`
+(`Credential archives OpenClaw kept after importing them (*.migrated*, *.sqlite-import.*.bak):
+…`; `credentials/oauth.json` and `auth-profiles.json` hold keys and OAuth tokens in
+plaintext), which you delete by hand once the logins work; and the plugin captures in
 `/config/.openclaw/tmp/plugin-captures/`, which OpenClaw still uses and removes itself
 (see [Official plugins follow OpenClaw's version](#official-plugins-follow-openclaws-version)).
+
+**Doctor's copy of an agent's `models.json` (OpenClaw 2026.11.11).** When an agent's
+`models.json` holds a provider block that is only an exact copy of a plugin's generated
+catalog (written there by an earlier OpenClaw, for example `azure-openai` or
+`google-antigravity`), doctor removes the block and first keeps the whole previous file as
+`agents/<id>/agent/models.json.bak-<ms>` (`Removed provider "…" (a copy of plugin …'s
+generated catalog) from …/models.json; backup: …`). The copy holds every other provider block
+of that file, literal `apiKey` values included. A gate run journals the copies its doctor
+passes made (the pass line counts them), and the add-on deletes them with that run's doctor
+captures. `oc-upgrade status` lists every such copy (`Doctor copies of an agent's
+models.json …`); delete one that no gate run made yourself once the models work.
+
+**What OpenClaw's own state upgrade at a gateway start leaves (OpenClaw 2026.11.11).**
+`.upgrade-*` folders without a swap plan, `<file>.pre-<version>` files,
+`logs/state-upgrade-*.log` and staged copies `.<file>.upgrade-*` are plaintext copies too.
+The add-on deletes them `gate_cleanup_hours` after the newest of them was made, but only once
+the gateway has run 2 minutes on the upgraded state with nothing left to upgrade. A
+`.upgrade-*` folder with `plan.json` is never deleted. A gate run's precheck deletes a
+`.upgrade-*` folder without a plan at once, also with `gate_cleanup_hours: 0`. See
+[State upgrade at gateway start](#state-upgrade-at-gateway-start-openclaw-20261111).
+
+**Chat cold archives (OpenClaw 2026.11.11)** in `/config/.openclaw/agents/<id>/sessions/cold/`
+are no copy: they are the only history of archived chats. The add-on never deletes them,
+and every Home Assistant backup of the add-on includes them.
 
 **Doctor's copy of `MEMORY.md` (OpenClaw 2026.11.4).** When a workspace still holds both a
 legacy `memory.md` and a `MEMORY.md` with other text, doctor moves `memory.md` to
@@ -2087,7 +2773,8 @@ normally never gets one, because the doctor of 2026.10.4 already merged these fi
 **The gate's own copies of `openclaw.json`.** A gate run keeps copies of `openclaw.json`
 from before and after each step in its run directory
 (`/config/.openclaw-upgrade/gate/runs/<run>/config.pre-pass1.json`, `config.post-pass1.json`,
-`config.post-fixups.json`, `config.post-pass2.json` and the others named `config.*.json`):
+`config.post-fixups.json`, `config.post-pass2.json`, `config.post-pass3.json` and the others
+named `config.*.json`):
 plaintext, with the gateway token, literal provider keys and channel tokens. The same goes
 for its saved output of `openclaw models status` and `models auth list`
 (`pc-models-status.json`, `pc-probe.json`, `pc-auth-list.json`, `pc-auth-order.json`), which
@@ -2252,8 +2939,8 @@ dated note therefore fell below 0.35 after about 45 days even on a perfect match
 no longer returned it (OpenClaw's keyword fallback could still return it in some
 cases, for example when no other result passed `minScore`).
 OpenClaw 2026.10.10-beta.1 applies `minScore` before the decay
-(openclaw/openclaw#168692); so do 2026.10.10, 2026.11.1, 2026.11.3 and 2026.11.4 (the
-bundled version).
+(openclaw/openclaw#168692); so do 2026.10.10, 2026.11.1, 2026.11.3, 2026.11.4 and 2026.11.11
+(the bundled version).
 There the threshold no longer filters old notes out. The half-life (still
 30 days) sets the order of the results and the score shown, and with the order which of
 the eligible results fit into the returned `maxResults` (default 6): with more eligible
@@ -2261,8 +2948,8 @@ hits than that, the 30-day decay can still push a strong older match out. The pa
 keeps strong older matches among them.
 
 **What the add-on changes.** The image sets the half-life to 365 days in OpenClaw's
-memory-search resolver (`dist/memory-search-*.mjs`; `memory-search-DD--gfEX.mjs` in
-2026.11.4, which still hard-codes 30 days), as one of the add-on's patches to OpenClaw (see "Patches to OpenClaw's files"
+memory-search resolver (`dist/memory-search-*.mjs`; `memory-search-DjeqUJt_.mjs` in
+2026.11.11, which still hard-codes 30 days), as one of the add-on's patches to OpenClaw (see "Patches to OpenClaw's files"
 below). There is no option for it.
 
 **Effect.** A note keeps 84 % of its score after 90 days (12.5 % with 30 days) and
@@ -2290,7 +2977,9 @@ This hotfix was written on 2026-10-23, after a Telegram
 outage on 21/22 October had swallowed voice replies together with their text. It ran
 in the container until 0.5.94-full4 put the same files into the image. It does not
 change timeouts, DNS, proxy or the Telegram API address, and it cannot prevent a
-Telegram outage; it makes replies more robust against one. Three changes:
+Telegram outage; it makes replies more robust against one. Three changes; with the
+bundled OpenClaw 2026.11.11 the add-on still patches the first and the third, OpenClaw itself
+fixes the second:
 
 1. **Long voice replies send their text first** (OpenClaw's queued reply delivery,
    which carries normal replies with media). A voice reply whose text is longer than a
@@ -2307,15 +2996,14 @@ Telegram outage; it makes replies more robust against one. Three changes:
    answer when the outcome of a reply stayed unknown. Without the hotfix this could also
    happen while the reply was still being sent (for example when you wrote again during
    a voice upload). Now the notice waits until that delivery has ended; a reply whose
-   outcome really stayed unknown is still reported once. With 2026.11.4 the notice can
-   also come on its own, without a new message from you: when OpenClaw's delivery recovery
-   gives up on a reply (its retries used up, outcome unknown, for example after a Telegram
-   outage or a restart during a reply). The hotfix lets that hand-over through, as stock
-   2026.11.4 does. OpenClaw fixed this on its main
-   branch (openclaw/openclaw#154417); it is in 2026.11.5 (and its betas 1 to 4) and
-   2026.11.6, not in 2026.10.10, 2026.11.1, 2026.11.3 or 2026.11.4. 2026.11.4
-   has a narrower guard of its own (it stops the notice only while the send is under way,
-   not until the reply is recorded as delivered), so the hotfix stays.
+   outcome really stayed unknown is still reported once. OpenClaw fixed this itself from
+   2026.11.5 (openclaw/openclaw#154417: the delivery's custody now ends only when the reply
+   is recorded as delivered, and the notice checks for a delivery in progress), so the
+   bundled 2026.11.11 needs no patch for it; 2026.10.4 and 2026.11.4 (the patch sets kept for
+   rollback and emergency builds) still have the add-on's two patches. When OpenClaw's
+   delivery recovery gives up on a reply (its retries used up, outcome unknown, for example
+   after a Telegram outage or a restart during a reply), 2026.11.4 and 2026.11.11 send the
+   notice at once, without a new message from you (in 2026.11.11 openclaw/openclaw#195400).
 3. **Voice and audio uploads use a fresh connection** (all Telegram requests), like text
    messages already did, with the same rule: an upload that broke off after Telegram may
    have received it is not sent again.
@@ -2324,17 +3012,20 @@ Telegram outage; it makes replies more robust against one. Three changes:
 The notice can still appear although the text arrived: when Telegram definitively
 rejects the audio after the text (for example "file is too big"), when the assistant already
 answered your next message before the upload of the previous one ended, or when the
-session was reset during the upload. With 2026.11.4 it can also arrive on its own, after a
-Telegram outage or a restart during a reply, for a reply whose delivery could not be
-confirmed (expected, not a failure of the hotfix). Replies that do not go through the queued delivery
+session was reset during the upload. For a reply whose delivery recovery gave up (after a
+Telegram outage or a restart during a reply) it arrives on its own, without a new message
+from you; expected, not a failure of the hotfix. With 2026.11.11 a routed
+text-only final reply whose send stayed ambiguous is sent once more
+(openclaw/openclaw#192779), so a text can rarely arrive twice; a voice reply is never sent
+again. Replies that do not go through the queued delivery
 (some fallback paths of the Telegram channel) still send the audio before the text. An
 upload that failed before the connection was made is not sent again successfully either
 (as before the hotfix). The
 regression tests are in `openclaw_assistant/tests/oc_patches/telegram_hotfix_<OpenClaw version>.test.mjs`
-(2026.11.4, the bundled version; 2026.10.4 for an image built with that version); they
-need the image's OpenClaw (run them in a container of the image with
-`node --test`; the negative controls, three for 2026.11.4 and two for 2026.10.4, need the
-stock modules in `OC_STOCK_DIST`).
+(2026.11.11, the bundled version; 2026.11.4 and 2026.10.4 for an image built with those
+versions); they need the image's OpenClaw (run them in a container of the image with
+`node --test`; the negative controls, two for 2026.11.11, three for 2026.11.4 and two for
+2026.10.4, need the stock modules in `OC_STOCK_DIST`).
 
 #### Telegram replies to the assistant's own voice messages (hotfix TG-20261112)
 
@@ -2343,19 +3034,25 @@ meaning to, for example with the quick reply of a notification on the phone), st
 OpenClaw downloads that voice message and adds it to **your** message, as if you had sent
 it. The assistant then reads "[Audio attachment could not be analyzed]" or, with audio
 transcription, `[Audio] User text: … Transcript: <the assistant's own words>`, and answers as if
-you had said them. This happens with both OpenClaw versions the add-on has patch sets for
-(2026.10.4 and 2026.11.4), with 2026.11.3 and still with 2026.11.6; OpenClaw has not fixed
-it.
+you had said them. This happens with every OpenClaw version the add-on has patch sets for
+(2026.10.4, 2026.11.4 and 2026.11.11) and with 2026.11.3, 2026.11.6, 2026.11.8 and 2026.11.10;
+OpenClaw
+has not fixed it.
 
 **What the add-on changes.** In OpenClaw's Telegram reply handling
-(`dist/bot-message-*.mjs`; `bot-message-CA5l5gzv.mjs` in 2026.11.4) the voice and audio
+(`dist/bot-message-*.mjs`; `bot-message-BqhOsRzi.mjs` in 2026.11.11) the voice and audio
 of messages the bot sent itself (sender id = the bot's own id) are no longer added to your
 message. They stay in the reply context under the bot's name (`Assistant (you)` with
 `<media:audio>` and the file), so the assistant still knows which message you answered. "Audio"
 means Telegram voice and audio messages (the assistant's voice replies are voice messages), plus a
 file with an `audio/…` type further up the reply chain once OpenClaw has downloaded it. A
 file the bot sent as a document (an `.mp3`, say) stays a document when you reply to it
-directly and is still added to your message, as before.
+directly and is still added to your message, as before, as long as OpenClaw records it as a
+document without an audio type. That depends on what OpenClaw knows about the message:
+from 2026.11.5 (openclaw/openclaw#174884, so with the bundled 2026.11.11) the media type of
+a cached reply entry wins over the reply target's Telegram kind, and without a cached reply
+chain the downloaded file's content type is used (also with 2026.11.4). Where that is an
+`audio/…` type, the file counts as audio and is not added.
 
 **Unchanged.** Your own media, including your voice messages (also older ones further up
 the reply chain); the bot's images, documents, stickers and videos (they are still
@@ -2364,18 +3061,50 @@ replied-to file; the assistant's voice replies (TTS; only with `tts.auto` "inbou
 changes. A voice message of another bot, or one forwarded into the chat, is not the bot's
 own and is handled as before.
 
-The patch (`telegram-reply-self-audio`) is in the patch sets for 2026.11.4 (bundled) and
-2026.10.4. Its regression tests,
-`openclaw_assistant/tests/oc_patches/telegram_reply_self_audio.test.mjs` (one file for both
-versions), run the real statements of the installed chunk with synthetic reply
+The patch (`telegram-reply-self-audio`) is in the patch sets for 2026.11.11 (bundled),
+2026.11.4 and 2026.10.4. Its regression tests,
+`openclaw_assistant/tests/oc_patches/telegram_reply_self_audio.test.mjs` (one file for all
+three versions; for the minified 2026.11.11 dist it maps the short local names), run the real statements of the installed chunk with synthetic reply
 chains and need no runtime dependencies (Node 22 or 24): `node --test` in a container of
 the image, or `OC_DIST=<package>/dist` for an unpacked package patched by
 `oc_dist_patch.py`; against a stock package the four bot-audio cases fail.
 
+#### Doctor's config repair after the Codex plugin update (OpenClaw 2026.11.11)
+
+On the update from `0.5.94-full6`, stock OpenClaw 2026.11.11 (like 2026.11.10) stops in the gate's first
+doctor pass with `Plugin codex Doctor source must be prepared before loading` (doctor exit
+code 1), and every retry stops the same way. This happens when the Codex plugin is
+enabled and `openclaw.json` holds something 2026.11.11 no longer accepts, so that doctor
+repairs the config after it has updated the plugin, for example the retired
+`agents.defaults.heartbeat` that the add-on writes for several agents. Doctor first
+updates `@openclaw/codex` from 2026.11.4 to 2026.11.11. In the config repair that
+follows, it restores the `${VAR}` references in `openclaw.json` outside the set of plugins
+it still defers, so it loads Codex's new setup code without preparing it. The same error
+is reported upstream (openclaw/openclaw#205695 for codex, #203442 for an npm provider
+plugin); the statement is unchanged in OpenClaw's branches up to 2026.12.1. 2026.11.8 did
+not have it.
+
+The add-on's patch `doctor-restore-env-refs-deferral` changes that one statement in
+`dist/automatic-config-repair-DirHmWYF.mjs`. Doctor now restores the references with the same
+deferred plugins as the preparation, migration and check of the repaired config around
+it. Nothing changes where the two sets already agree. In the rehearsal on 2026.11.11 the
+gate then migrated the 2026.11.4 state without a hold: both doctor passes ended with exit
+code 0, pass 2 left the config unchanged, a `${VAR}` reference in `openclaw.json` was
+still a reference afterwards, and the first gateway loaded codex, acpx and Brave. In the
+rehearsal on 2026.11.10 (the same module) a state that the stock version had already
+stopped on completed with `oc-upgrade retry`.
+
+Should the error still appear (an image without the patch), the gate holds with its own
+code `doctor-plugin-source-unprepared`. The advice is `oc-upgrade retry`. If the same
+reason comes back, update the add-on to a build with the patch, or restore the encrypted
+backup. Doctor's own advice, `openclaw update repair`, is refused by the add-on, and the
+add-on does not suggest the bypass: it also gets past the error, but it leaves a plaintext
+copy `openclaw.json.pre-update` that neither the gate nor `oc-upgrade status` tracks.
+
 #### Patches to OpenClaw's files
 
 The add-on changes a few of OpenClaw's own files in the image: the memory search
-half-life and the two Telegram hotfixes above. They are kept per OpenClaw version in
+half-life, the two Telegram hotfixes and, for 2026.11.11, the doctor fix above. They are kept per OpenClaw version in
 `openclaw_assistant/oc-patches/<version>/`: one unified diff per file and a
 `manifest.json` with each file's sha256 before and after. `oc_dist_patch.py` applies
 them at build time and fails the build when the installed OpenClaw is another version,
@@ -2387,35 +3116,48 @@ integrity check still passes) and the chunk hashes in
 `dist/runtime-dependency-ownership.json`, and re-checks every inventory entry. Every
 OpenClaw bump needs the patches re-derived, or dropped where OpenClaw fixed the problem
 itself; a version that needs none has a manifest with an empty `patches` list. Derive
-diffs with `diff -u` (lines are split on newlines only).
+diffs with `diff -u` (lines are split on newlines only). Most files of the 2026.11.11 dist
+end without a newline: a diff whose hunk reaches such a last line carries diff's `\ No
+newline at end of file` marker, and `oc_dist_patch.py` keeps or drops the final newline as
+the diff says. It refuses a marker that does not fit the file ("… does not match the file's
+final newline") and an empty stock file.
 
-**Patch sets in the repository (maintainers).** The image ships OpenClaw 2026.11.4
-(`OPENCLAW_VERSION=2026.11.4`, `NPM_BEFORE=2026-11-16T04:07:00Z`, just after
-`openclaw@2026.11.4` was published at 04:06:42Z; its newest exact dependency
-`@openclaw/ai@2026.11.4` at 03:48:02Z, the lockstep plugins `@openclaw/codex`,
-`@openclaw/acpx` and `@openclaw/brave-plugin` 2026.11.4 between 02:09 and 02:14Z). The
-repository keeps two patch sets:
+**Patch sets in the repository (maintainers).** The image ships OpenClaw 2026.11.11
+(`OPENCLAW_VERSION=2026.11.11`, `NPM_BEFORE=2026-11-28T04:06:00Z`, just after
+`openclaw@2026.11.11` was published at 04:05:49Z; its newest exact dependency
+`@openclaw/ai@2026.11.11` at 03:44:47Z, the lockstep plugins `@openclaw/codex`,
+`@openclaw/acpx` and `@openclaw/brave-plugin` 2026.11.11 between 03:15 and 03:17Z; apart
+from `@openclaw/ai` its dependency ranges are those of 2026.11.10; the global `acpx` CLI
+`0.21.1`, the version `@openclaw/acpx` 2026.11.11 pins). The repository keeps three patch
+sets:
 
-- `oc-patches/2026.11.4/`, the bundled version: the memory search half-life, the three
-  parts of TG-20261023 and `telegram-reply-self-audio` (TG-20261112).
-  `memory-search-half-life`, `telegram-voice-text-first`, `telegram-fetch-fresh-audio` and
-  `telegram-reply-self-audio` are the diffs of the 2026.11.3 set at the same lines, on the
-  renamed 2026.11.4 files (their sources are unchanged from 2026.11.3 to 2026.11.4).
-  `telegram-delivery-live-custody` has the same hunk bodies, 1 or 6 lines further down
-  (its chunk also holds `src/channels/turn/direct-delivery-custody.ts`, which 2026.11.4
-  changed in cf9a023c222a). `telegram-notice-live-guard` was re-derived: the notice code
-  moved into its own chunk (`pending-delivery-notice-*.mjs`), and the condition now also
-  carries OpenClaw's own `expectedIntentId` and `hasActiveDirectPendingFinalDelivery`
-  checks; the add-on's check follows them and applies only to calls without
-  `expectedIntentId`, so OpenClaw's own recovery hand-over (a queued final reply settled as
-  unknown after its retries) sends the notice at once, as stock 2026.11.4 does. That
-  upstream guard ends at the custody
-  release, before the reply is recorded as delivered, so both custody patches stay.
-  openclaw/openclaw#154417 is not in 2026.11.4; none of the problems is fixed upstream in
-  2026.11.4. `telegram-reply-self-audio` was derived from each version's stock
-  `bot-message` chunk: one hunk that replaces the same statement
-  (`extensions/telegram/src/bot-message-context.session.ts` is unchanged from 2026.10.10 to
-  2026.11.4; 2026.10.4 has other context lines).
+- `oc-patches/2026.11.11/`, the bundled version: `memory-search-half-life`,
+  `telegram-voice-text-first`, `telegram-fetch-fresh-audio`, `telegram-reply-self-audio`
+  and `doctor-restore-env-refs-deferral` (above; only this set has it).
+  The 2026.11.11 dist is minified (function-local names are single letters), puts each
+  module on one line after a `//!<source path>` marker (before: `//#region <source path>`)
+  and leaves most files without a final newline. The four diffs have the same logic as
+  those of 2026.11.4: the voice diff also imports `findTelegramRequestAuthorityError` from
+  the fetch chunk, and the reply diff uses the short local names.
+  `telegram-delivery-live-custody` and `telegram-notice-live-guard` are dropped: OpenClaw
+  fixed that part of the hotfix itself (openclaw/openclaw#154417). There is no gateway path
+  patch: 2026.11.11 carries openclaw/openclaw#190863 itself (d4c687ac8c97), so a
+  capability-scoped path `/__openclaw__/cap/<cap>/<rest>` whose `<rest>` starts with a second
+  slash or an encoded slash or backslash (`//`, `%2f`, `%5c`) is malformed and answered with
+  400, as with 2026.11.4. `tests/oc_patches/gateway_capability_path_2026.11.11.test.mjs`
+  checks that stock function (the real function of the chunk in a vm, no runtime
+  dependencies; it fails when the check is missing).
+- `oc-patches/2026.11.4/`, the OpenClaw of `0.5.94-full6`, the version users update from and
+  a rollback returns to; kept for rollback and emergency builds (`--build-arg
+  OPENCLAW_VERSION=2026.11.4 --build-arg NPM_BEFORE=2026-11-16T04:07:00Z`): the memory search
+  half-life, the three parts of TG-20261023 and `telegram-reply-self-audio`. There the
+  notice guard follows OpenClaw's own `expectedIntentId` and
+  `hasActiveDirectPendingFinalDelivery` checks and applies only to calls without
+  `expectedIntentId`, so OpenClaw's recovery hand-over sends the notice at once, as stock
+  2026.11.4 does; that upstream guard ends at the custody release, before the reply is
+  recorded as delivered, so both custody patches stay in that set. A rehearsal of the update
+  from `0.5.94-full6` starts from the published, immutable
+  `ghcr.io/nosdave/openclaw-assistant-aarch64:0.5.94-full6`, never from a build with this pin.
 - `oc-patches/2026.10.4/`, the OpenClaw of `0.5.94-full1` … `0.5.94-full4`, the version
   users update from and a rollback returns to. It stays for rollback and emergency builds:
   `--build-arg OPENCLAW_VERSION=2026.10.4 --build-arg NPM_BEFORE=2026-10-16T00:30:00Z`
@@ -2433,19 +3175,28 @@ The sets for 2026.10.10 (the rehearsal stand-in of the 2026.11.1 line) and 2026.
 together with their hotfix tests. The set for 2026.11.3 (the target of `0.5.94-full5`,
 which no installation updated to: `0.5.94-full1` … `0.5.94-full4` go straight to
 `0.5.94-full6`) was removed with `0.5.94-full6`, together with
-`telegram_hotfix_2026.11.3.test.mjs`. An image of another OpenClaw version does not build.
+`telegram_hotfix_2026.11.3.test.mjs`. The set for 2026.11.8 (the first target of
+`0.5.94-full7`, never shipped) was removed with `0.5.94-full7`, together with
+`telegram_hotfix_2026.11.8.test.mjs` and `gateway_capability_path_2026.11.8.test.mjs`;
+`0.5.94-full7` keeps 2026.10.4 and 2026.11.4 and adds 2026.11.11. An image of another
+OpenClaw version does not build.
 Checks:
 `OC_DIST_PATCH_REAL_PKG=<unpacked openclaw package> python3 -m unittest
 tests.test_dist_patch` applies the shipped set to a copy (it picks
 `oc-patches/<package version>/`), and in a container of the image
 `OC_STOCK_DIST=<stock package>/dist node --test
-tests/oc_patches/telegram_hotfix_2026.11.4.test.mjs` runs the hotfix tests (Node 24; outside
+tests/oc_patches/telegram_hotfix_2026.11.11.test.mjs` runs the hotfix tests (Node 24; outside
 the image, `OC_DIST=<copy>/dist` points them at a package patched by `oc_dist_patch.py`
 whose runtime dependencies resolve) and `node --test
-tests/oc_patches/telegram_reply_self_audio.test.mjs` those of TG-20261112 (no runtime
-dependencies needed, so `OC_DIST=<copy>/dist` works for any unpacked package). Moving
-from 2026.10.4 changes the databases one-way (state 20 → 22, agent 24 → 27); the
-encrypted Home Assistant backup stays the only rollback.
+tests/oc_patches/telegram_reply_self_audio.test.mjs` those of TG-20261112, `node --test
+tests/oc_patches/gateway_capability_path_2026.11.11.test.mjs` those of the gateway path check,
+`node --test tests/oc_patches/doctor_restore_env_refs_2026.11.11.test.mjs` those of the
+doctor patch (the real `planConfigRepair` in a vm with synthetic stubs, plus a negative
+control with the stock statement; against a stock package the patched-statement cases fail)
+(no runtime dependencies needed for these three, so `OC_DIST=<copy>/dist` works for any
+unpacked package). Moving to 2026.11.11 changes the databases one-way (from 2026.11.4: state
+22 → 40, agent 27 → 42; from 2026.10.4: state 20 → 40, agent 24 → 42); the encrypted Home
+Assistant backup stays the only rollback.
 
 **Test build without publishing (maintainers).** The image workflow
 (`.github/workflows/build-image.yaml`) publishes only from `main`. Started by hand on
@@ -2459,19 +3210,32 @@ so the dist patches and the build's checks run as for a release, but it pushes n
 
 - The CHANGELOG's `[Unreleased]` section gets its release label and
   `openclaw_assistant/config.yaml` gets the same `version`, in one commit. The new version
-  must differ from the one users update from (`0.5.94-full4` for `0.5.94-full6`;
-  `0.5.94-full5` was never installed): the
+  must differ from the ones users update from (`0.5.94-full6` and `0.5.94-full1` …
+  `0.5.94-full4` for `0.5.94-full7`; `0.5.94-full5` was never installed): the
   gate's backup check accepts only an encrypted backup that holds the add-on version from
   before the update, so an image that still said `0.5.94-full4` would hold every update
   from `0.5.94-full4` with `ha-backup-missing`. `tests/test_release_version.py` checks that
   `config.yaml` stays at the last released label while the top section is `[Unreleased]`,
   and equals the top label (and differs from the one below it) once it is labelled.
 - Before the release: a test build of the branch (above) and a host rehearsal of the
-  update from the published `0.5.94-full4` image
-  (`ghcr.io/nosdave/openclaw-assistant-aarch64:0.5.94-full4`, not a build of this
-  branch with the 2026.10.4 pin) to the image as it will be released (OpenClaw 2026.11.4;
-  the earlier rehearsals used 2026.10.10, 2026.11.1 and 2026.11.3). On 2026.11.4 check in
-  particular doctor's own cron account migration (the precheck's info and `WARN` lines
+  update from the published `0.5.94-full6` image
+  (`ghcr.io/nosdave/openclaw-assistant-aarch64:0.5.94-full6`, not a build of this
+  branch with the 2026.11.4 pin) to the image as it will be released (OpenClaw 2026.11.11;
+  the earlier rehearsals used 2026.10.10, 2026.11.1, 2026.11.3, from `0.5.94-full4`
+  2026.11.4, then 2026.11.8 and 2026.11.10). On 2026.11.11 check in particular that the first gateway start
+  after the gate logs no `Upgrading state to 2026.11.11` and leaves no `*.pre-2026.11.11`
+  file and no `.upgrade-*` folder, the exit codes of the doctor passes (the settled-exit
+  watchdog), the default cron partition (the precheck forecast against the store keys the
+  migration records), the heartbeat jobs doctor makes (one per agent), that doctor leaves
+  your cron jobs on a configured key unbound, the update of `@openclaw/codex` from 2026.11.4
+  (below the minimum 2026.11.5-beta.1 that 2026.11.11 loads), the cold archives of chats
+  older than 30 days, the doctor captures and pre-repair snapshots of the run (recorded,
+  then deleted after `gate_cleanup_hours`), a second run's idempotency, disk space and time
+  of the schema change (state 22 → 40, agent 27 → 42), the Telegram hotfix tests and the
+  gateway path tests in a container of the image, and the official plugin update to
+  2026.11.11. The
+  checks of the 2026.11.4 rehearsal still apply: doctor's own cron account migration (the
+  precheck's info and `WARN` lines
   against the jobs doctor binds and leaves, the pre-repair cron backup in the pass line,
   its deletion after `gate_cleanup_hours`), the gateway's cron warning at start for jobs
   on a configured key, the memory search and output cap lines of the precheck, the
@@ -2481,7 +3245,8 @@ so the dist patches and the build's checks run as for a release, but it pushes n
 - Patch sets: keep the set of the bundled OpenClaw and the one of the version users
   update from (for rollback and emergency builds); remove the sets of versions that were
   never shipped, with their hotfix tests and their entries in `tests/test_dist_patch.py`
-  and `tests/oc_patches/telegram_reply_self_audio.test.mjs` (for `0.5.94-full6`: kept
+  and `tests/oc_patches/telegram_reply_self_audio.test.mjs` (for `0.5.94-full7`: kept
+  2026.10.4 and 2026.11.4, added 2026.11.11, removed 2026.11.8; for `0.5.94-full6`: kept
   2026.10.4 and 2026.11.4, removed 2026.11.3; for `0.5.94-full5`: kept 2026.10.4 and
   2026.11.3, removed 2026.10.10 and 2026.11.1).
 
@@ -2709,8 +3474,8 @@ example with a notification's quick reply), the assistant answers as if you had 
 message: it comments on its own words as yours, or says your audio attachment could not be
 analyzed.
 
-**Cause**: stock OpenClaw adds the replied-to voice message to your message (up to
-2026.11.5-beta.2). The add-on's patch `telegram-reply-self-audio` keeps the bot's own
+**Cause**: stock OpenClaw adds the replied-to voice message to your message (still in
+2026.11.11). The add-on's patch `telegram-reply-self-audio` keeps the bot's own
 voice and audio out of your message; see "Telegram replies to the assistant's own voice messages
 (hotfix TG-20261112)".
 
@@ -2850,7 +3615,12 @@ explained in [Backup HOLD codes](#backup-hold-codes), the codes added for the Op
 2026.10.10 line (`orphan-agent-db`, `agent-db-held`, `sqlite-fk-violation`, the
 `*-unimported` codes, `doctor-retired-warning`, `skill-workshop-export-failed`,
 `config-heartbeat-hours`, `doctor-blocked`) in
-[HOLD codes added for the OpenClaw 2026.10.10 line](#hold-codes-added-for-the-openclaw-20261010-line).
+[HOLD codes added for the OpenClaw 2026.10.10 line](#hold-codes-added-for-the-openclaw-20261010-line),
+those of OpenClaw 2026.11.5 to 2026.11.11 (`doctor-cron-partition`, `pc-cron-partition`,
+`doctor-config-unparsed`, `doctor-database-unresolved`, `startup-upgrade-unfinished`,
+`startup-upgrade-leftover`, `startup-upgrade-pending`, `pc-startup-upgrade`,
+`doctor-plugin-source-unprepared`) in
+[HOLD codes added for OpenClaw 2026.11.11](#hold-codes-added-for-openclaw-20261111).
 If the HOLD happened after doctor started (`State: partially migrated`), either
 retry forward or roll back with the backup
 ([Safe rollback](#safe-rollback-after-an-openclaw-database-upgrade)). Do not run
@@ -2874,26 +3644,32 @@ can.
 
 ### Log: `cron: automation has no recorded inference account; run openclaw doctor --fix …`
 
-**Symptom**: from OpenClaw 2026.11.2 (`0.5.94-full6` bundles 2026.11.4) OpenClaw's own
+**Symptom**: from OpenClaw 2026.11.2 (`0.5.94-full7` bundles 2026.11.11) OpenClaw's own
 log shows this warning for cron jobs at every gateway start, and again after a
 configuration reload that restarts cron. It is in OpenClaw's file log, which `openclaw
 logs` (in the add-on terminal) and the Control UI's Logs page show, not in the add-on
 log in Home Assistant (the gateway does not print it to its console).
 
-**Cause**: the job (enabled or not) has no recorded inference account. For a job whose
-own model runs on a configured key (`models.providers.<p>.apiKey`, for example after the
-gate's `auth: "api-key"` fixup) or on a key from the environment (a `gateway_env_vars`
-entry such as `OPENAI_API_KEY` or `GEMINI_API_KEY`, for a provider without a key in
-`models.providers`) this is expected and harmless: OpenClaw's doctor leaves such jobs
-unbound on purpose, and their own model runs on that key. The end of the gate run and
-`oc-upgrade status` list them in one info line. A job on a key from the environment
-needs that variable set for the gateway, which the gate cannot check: without it the
-job has no credential and fails when it runs.
+**Cause**: the job (enabled or not) has no recorded inference account. With the bundled
+2026.11.11 the warning names only a job whose own model's first credential is no
+configured key: a stored login, AWS SDK credentials, or a key variable that is missing for
+the gateway (a `gateway_env_vars` entry such as `OPENAI_API_KEY` or `GEMINI_API_KEY`, for a
+provider without a key in `models.providers`). Jobs on a key in `models.providers.<p>.apiKey`
+(for example after the gate's `auth: "api-key"` fixup) or in a set variable get none. With
+2026.11.4 it also named those jobs, which is expected and harmless: OpenClaw's doctor
+leaves such jobs unbound on purpose, and their own model runs on that key. The end of the
+gate run and `oc-upgrade status` list the jobs on a key from the environment in one info
+line (with 2026.11.4 also the jobs on a configured key): the gate cannot check whether the
+variable is set for the gateway, and without it the job has no credential and fails when
+it runs. With 2026.11.11 the check stops after 5 s in all (`cron: startup inference
+diagnostics reached their time budget; N jobs were not checked …`).
 
-**Fix**: none needed for those jobs. Do not run `openclaw doctor --fix` (the wrapper
-refuses it); `oc-upgrade retry --doctor`, its add-on equivalent, would not record an
-account for these jobs either. A job that stops at a fallback on a stored login is
-reported by the gate with a `WARN` line and what to do; see
+**Fix**: for a job on a key from the environment, check that its `gateway_env_vars` entry
+is set, then restart the add-on. `openclaw doctor --lint` (allowed in the add-on) checks
+every job. Do not run `openclaw doctor --fix` (the wrapper refuses it); `oc-upgrade retry
+--doctor`, its add-on equivalent, would not record an account for jobs on a key either. A
+job on a stored login, or one that stops at a fallback on a stored login, is reported by
+the gate with a `WARN` line and what to do; see
 [Cron jobs without a recorded inference account](#cron-jobs-without-a-recorded-inference-account-openclaw-20261010).
 
 If such a fallback is an `openai/…` model on the Codex runtime (the gate's line says
@@ -2965,7 +3741,9 @@ last one is not narrowed down further). For a configuration problem run
 `openclaw config validate` (allowed in HOLD), fix the reported key, then
 `oc-upgrade retry` and restart. If the state needs a migration, `oc-upgrade retry`
 runs a maintenance gate (backup check, doctor twice, checks); a 2026.7 state gets the full migration gate instead. "Newer state" means a backup that matches this add-on
-version has to be restored.
+version has to be restored. With OpenClaw 2026.11.11 the HOLD text also names what the
+gateway start would upgrade by copy and swap, if anything, and the gateway's own lines on
+it ([State upgrade at gateway start](#state-upgrade-at-gateway-start-openclaw-20261111)).
 The gateway's own log is `/tmp/openclaw/openclaw-<date>.log`.
 
 > On OpenClaw 2026.7 (up to `0.5.93-full2`) a gateway that cannot start is
@@ -2974,8 +3752,9 @@ The gateway's own log is `/tmp/openclaw/openclaw-<date>.log`.
 
 ### Safe rollback after an OpenClaw database upgrade
 
-OpenClaw database migrations are one-way: 2026.7 cannot open a 2026.10 state, and
-2026.10.4 cannot open a state that 2026.11.3 or 2026.11.4 migrated (state 22, agent 27).
+OpenClaw database migrations are one-way: 2026.7 cannot open a 2026.10 state,
+2026.10.4 cannot open a state that 2026.11.3 or 2026.11.4 migrated (state 22, agent 27),
+and 2026.11.4 cannot open a state that 2026.11.11 migrated (state 40, agent 42).
 The only rollback point is **the encrypted Home Assistant backup** you made with the
 add-on stopped, right before updating (`oc-upgrade status` shows the one the gate
 checked under "HA backup checked"). Restoring the add-on from it brings back both the
@@ -2985,13 +3764,16 @@ previous add-on version and its `/config` data:
 2. In **Settings → System → Backups**, restore only the add-on from that backup (you
    need the backup encryption key).
 3. Check that the add-on page shows **the add-on version you updated from**, then start
-   it. The log must show that version's OpenClaw: `0.5.94-full1` to `0.5.94-full4` →
+   it. The log must show that version's OpenClaw: `0.5.94-full6` →
+   `OpenClaw runtime version: 2026.11.4`; `0.5.94-full1` to `0.5.94-full4` →
    `OpenClaw runtime version: 2026.10.4`; `0.5.93-full2` →
    `OpenClaw runtime version: 2026.7.35` (then a Codex/ChatGPT login may have to be
    repeated, because 2026.10 refreshes tokens).
 
 Work created after the backup is not present after a rollback, and Telegram messages
-that the newer OpenClaw already processed are not delivered again. Do not download the backup or
+that the newer OpenClaw already processed are not delivered again. The `<file>.pre-<version>`
+files that a gateway start of 2026.11.11 can leave after its own state upgrade are no
+rollback point either: never copy one over a live file. Do not download the backup or
 copy it, or `/config` paths, elsewhere as a second rollback point: the add-on needs
 none.
 
