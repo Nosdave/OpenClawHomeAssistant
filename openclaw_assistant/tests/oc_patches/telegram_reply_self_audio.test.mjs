@@ -7,7 +7,7 @@
 // reply chains (no bot token, no network, no gateway). No runtime dependencies; Node 22 or 24.
 // In a container of the image (the version is read from the package):
 //   node --test tests/oc_patches/telegram_reply_self_audio.test.mjs
-// or against an unpacked package (2026.10.4, 2026.11.4 or 2026.11.10) patched by oc_dist_patch.py:
+// or against an unpacked package (2026.10.4, 2026.11.4 or 2026.11.11) patched by oc_dist_patch.py:
 //   OC_DIST=<copy>/dist node --test tests/oc_patches/telegram_reply_self_audio.test.mjs
 // Negative control: OC_DIST=<stock package>/dist makes the bot-audio cases fail (stock merges the bot's audio).
 import fs from 'node:fs';
@@ -21,9 +21,9 @@ import { execFileSync } from 'node:child_process';
 const CHUNKS = {
   '2026.10.4': 'bot-message-CpKgMHf_.mjs',
   '2026.11.4': 'bot-message-CA5l5gzv.mjs',
-  '2026.11.10': 'bot-message-kCERMYkG.mjs',
+  '2026.11.11': 'bot-message-BqhOsRzi.mjs',
 };
-// Where the sliced code is and what its names are. 2026.11.10 ships a minified dist: the locals of
+// Where the sliced code is and what its names are. From 2026.11.10 the dist is minified: the locals of
 // buildTelegramInboundContextPayload are single letters, and the media-kind set lives in another chunk (the
 // message-cache-persistence.ts module of send-outbound-*.mjs).
 const PLAIN = {
@@ -36,10 +36,10 @@ const PLAIN = {
 const LAYOUT = {
   '2026.10.4': PLAIN,
   '2026.11.4': PLAIN,
-  // 2026.11.10: one line per module after a '//!<source path>' marker (no indentation; the session module runs over
+  // From 2026.11.10: one line per module after a '//!<source path>' marker (no indentation; the session module runs over
   // lines 19-23 because template literals hold literal newlines). The anchors are minified code, each once per chunk.
-  '2026.11.10': {
-    helpers: [['send-outbound-Cha9OCAg.mjs', 'const TELEGRAM_MEDIA_KINDS=', 'function parseStickerMetadata('],
+  '2026.11.11': {
+    helpers: [['send-outbound-BxF-4FEx.mjs', 'const TELEGRAM_MEDIA_KINDS=', 'function parseStickerMetadata('],
       [null, 'function resolveReplyChainMediaType(', 'async function buildTelegramInboundContextPayload(']],
     statements: ['const $=J[0];', 'const ke='],
     names: { primaryCtx: 'n', visibleReplyChain: 'J', visibleReplyTarget: 'G', replyMedia: 'a', allMedia: 'i',

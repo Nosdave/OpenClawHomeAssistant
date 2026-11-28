@@ -1,5 +1,5 @@
-// Upstream check for OpenClaw 2026.11.10 (no add-on patch). 2026.11.10 carries openclaw/openclaw#190863 itself
-// (d4c687ac8c97, src/gateway/plugin-node-capability.ts:343-344), so oc-patches/2026.11.10 has no
+// Upstream check for OpenClaw 2026.11.11 (no add-on patch). 2026.11.11 carries openclaw/openclaw#190863 itself
+// (d4c687ac8c97, src/gateway/plugin-node-capability.ts:343-344), so oc-patches/2026.11.11 has no
 // gateway-capability-path-guard. These tests check that the bundled stock function still marks a capability-scoped
 // path /__openclaw__/cap/<cap>/<rest> as malformed when <rest> starts with a second slash or an encoded slash or
 // backslash. The callers then answer 400 (server-http-request.ts:283-286, server-http-upgrades.ts:301-304).
@@ -8,10 +8,10 @@
 // '//!src/gateway/plugin-node-capability.ts'; the anchors are minified code, each once in the chunk.
 // They run the real normalizePluginNodeCapabilityScopedUrl in a vm with synthetic URLs (no gateway, no network, no
 // runtime dependencies; normalizeOptionalString is the string-coerce one-liner). Node 22 or 24.
-// In a container of the image built with OPENCLAW_VERSION=2026.11.10:
-//   node --test tests/oc_patches/gateway_capability_path_2026.11.10.test.mjs
+// In a container of the image built with OPENCLAW_VERSION=2026.11.11:
+//   node --test tests/oc_patches/gateway_capability_path_2026.11.11.test.mjs
 // or against an unpacked package (stock or patched by oc_dist_patch.py, the chunk is not patched):
-//   OC_DIST=<package>/dist node --test tests/oc_patches/gateway_capability_path_2026.11.10.test.mjs
+//   OC_DIST=<package>/dist node --test tests/oc_patches/gateway_capability_path_2026.11.11.test.mjs
 // A failure here means a later build lost the upstream guard: re-add the patch to oc-patches/<version>/.
 import fs from 'node:fs';
 import vm from 'node:vm';
@@ -20,7 +20,7 @@ import { test } from 'node:test';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 
-const OPENCLAW_VERSION = '2026.11.10';
+const OPENCLAW_VERSION = '2026.11.11';
 // Stock chunk (not patched; the marker line below pins the module it holds).
 const CHUNK = 'plugin-node-capability-C3FKPhfC.mjs';
 

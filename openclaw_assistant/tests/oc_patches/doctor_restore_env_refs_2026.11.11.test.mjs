@@ -1,6 +1,6 @@
-// Regression tests for the add-on patch doctor-restore-env-refs-deferral on OpenClaw 2026.11.10
-// (oc-patches/2026.11.10, openclaw/openclaw#205695). planConfigRepair prepares the plugins' configRepair contracts,
-// migrates and validates inside withPluginContracts (the deferral set of the config snapshot); stock 2026.11.10
+// Regression tests for the add-on patch doctor-restore-env-refs-deferral on OpenClaw 2026.11.11
+// (oc-patches/2026.11.11, openclaw/openclaw#205695). planConfigRepair prepares the plugins' configRepair contracts,
+// migrates and validates inside withPluginContracts (the deferral set of the config snapshot); stock 2026.11.11
 // restores the ${VAR} templates (restoreDoctorConfigEnvRefs) outside it, under the doctor-wide set. After doctor's
 // codex refresh the two differ (snapshot [codex], doctor-wide []), so the restore loads codex's unprepared contract and
 // doctor fails with "Plugin codex Doctor source must be prepared before loading". The patch runs the restore in the
@@ -10,10 +10,10 @@
 // (no doctor, no plugins, no config files, no network). The deferral scope is simulated like OpenClaw's
 // AsyncLocalStorage: withDeferredPluginDoctorMigrations(ids, fn) replaces the active set while fn runs. The stub
 // restore records the active set and throws OpenClaw's error when codex is not deferred (its contract unprepared).
-// Node 22 or 24. In a container of the image built with OPENCLAW_VERSION=2026.11.10:
-//   node --test tests/oc_patches/doctor_restore_env_refs_2026.11.10.test.mjs
+// Node 22 or 24. In a container of the image built with OPENCLAW_VERSION=2026.11.11:
+//   node --test tests/oc_patches/doctor_restore_env_refs_2026.11.11.test.mjs
 // or against an unpacked package patched by oc_dist_patch.py:
-//   OC_DIST=<package>/dist node --test tests/oc_patches/doctor_restore_env_refs_2026.11.10.test.mjs
+//   OC_DIST=<package>/dist node --test tests/oc_patches/doctor_restore_env_refs_2026.11.11.test.mjs
 // Against the stock package the first test fails (the restore throws); the negative control rebuilds the stock
 // statement from the patched one and expects the throw.
 import fs from 'node:fs';
@@ -24,8 +24,8 @@ import path from 'node:path';
 import util from 'node:util';
 import { execFileSync } from 'node:child_process';
 
-const OPENCLAW_VERSION = '2026.11.10';
-const CHUNK = 'automatic-config-repair-jSKnxU-v.mjs';
+const OPENCLAW_VERSION = '2026.11.11';
+const CHUNK = 'automatic-config-repair-DirHmWYF.mjs';
 const PATCHED = 'const d=t?withPluginContracts(()=>restoreDoctorConfigEnvRefs(u,prepareDoctorConfigReferenceSource(e))):u;';
 const STOCK = 'const d=t?restoreDoctorConfigEnvRefs(u,prepareDoctorConfigReferenceSource(e)):u;';
 const ERROR = 'Plugin codex Doctor source must be prepared before loading';
@@ -78,7 +78,7 @@ function world(source, { outer = [], snapshotSet = ['codex'] } = {}) {
     prepareDoctorConfigReferenceSource: (snap) => ({ authored: snap.parsed }),
     restoreDoctorConfigEnvRefs: (cfg) => {
       seen.restore.push([...active]);
-      // codex 2026.11.10 declares doctorContract.configRepair: loading it unprepared throws
+      // codex (from 2026.11.10) declares doctorContract.configRepair: loading it unprepared throws
       // PluginSetupPreparationRequiredError (plugin-setup-module.ts) unless the scope defers codex
       if (!active.includes('codex')) throw new Error(ERROR);
       return { ...cfg, restoredTemplates: true };

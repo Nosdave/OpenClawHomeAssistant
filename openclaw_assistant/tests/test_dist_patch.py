@@ -556,7 +556,7 @@ class MainTests(DistPatchCase):
 # OpenClaw fixed it, is a deliberate edit here (with the reason in CHANGELOG.md).
 _HOTFIX_2026_10 = {"memory-search-half-life", "telegram-voice-text-first", "telegram-delivery-live-custody",
                    "telegram-notice-live-guard", "telegram-fetch-fresh-audio",
-                   "telegram-reply-self-audio"}  # TG-20261112, not fixed upstream through 2026.11.10
+                   "telegram-reply-self-audio"}  # TG-20261112, not fixed upstream through 2026.11.11
 # 2026.11.4 keeps all six: its own live-send guard (hasActiveDirectPendingFinalDelivery, cf9a023c222a) ends at the
 # custody release, before the canonical settlement, so telegram-delivery-live-custody and telegram-notice-live-guard
 # stay (openclaw/openclaw#154417 is not in 2026.11.4); the other four regions are unchanged from 2026.11.3.
@@ -566,13 +566,15 @@ _HOTFIX_2026_10 = {"memory-search-half-life", "telegram-voice-text-first", "tele
 # which GATEWAY_PATH_TESTS checks. Its dist is one line per module ('//!<source path>' markers, mostly no final
 # newline), see oc_dist_patch.py. The 2026.11.8 set (with the #190863 backport) was never shipped and is removed.
 # It adds doctor-restore-env-refs-deferral (openclaw/openclaw#205695, not fixed upstream through 2026.12.1): doctor's
-# config repair after the codex refresh fails without it on an update from 2026.11.4 (rehearsal 1110).
+# config repair after the codex refresh fails without it on an update from 2026.11.4 (rehearsal on 2026.11.10).
+# 2026.11.11 keeps the same five (the patched modules are unchanged; only chunk names differ); the 2026.11.10 set
+# was never shipped and is removed.
 _HOTFIX_2026_11_10 = (_HOTFIX_2026_10 - {"telegram-delivery-live-custody", "telegram-notice-live-guard"}) | {
     "doctor-restore-env-refs-deferral"}
 EXPECTED_PATCHES = {
     "2026.10.4": _HOTFIX_2026_10,  # 0.5.94-full4: rollback and emergency builds
     "2026.11.4": _HOTFIX_2026_10,  # 0.5.94-full6 (the version full7 updates from): rollback and emergency builds
-    "2026.11.10": _HOTFIX_2026_11_10,  # the image default (Dockerfile ARG OPENCLAW_VERSION), from 0.5.94-full7
+    "2026.11.11": _HOTFIX_2026_11_10,  # the image default (Dockerfile ARG OPENCLAW_VERSION), from 0.5.94-full7
 }
 # Telegram patches whose regression tests are one file for all versions (it maps each version to the patched chunk)
 # instead of a part of tests/oc_patches/telegram_hotfix_<version>.test.mjs.
@@ -580,8 +582,8 @@ CROSS_VERSION_TESTS = {"telegram-reply-self-audio": "telegram_reply_self_audio.t
 # Versions whose own OpenClaw code holds the capability-scoped path check (openclaw/openclaw#190863), with the chunk
 # tests/oc_patches/gateway_capability_path_<version>.test.mjs runs: it checks the stock function still marks the
 # ambiguous scoped paths as malformed (the gateway answers 400, server-http-request.ts:283-286).
-GATEWAY_PATH_TESTS = {"2026.11.10": "plugin-node-capability-C3FKPhfC.mjs"}
-GATEWAY_PATH_GUARD = b"/^\\/(?:\\/|%2f|%5c)/i.test("  # the minified guard of 2026.11.10 (plugin-node-capability.ts:344)
+GATEWAY_PATH_TESTS = {"2026.11.11": "plugin-node-capability-C3FKPhfC.mjs"}
+GATEWAY_PATH_GUARD = b"/^\\/(?:\\/|%2f|%5c)/i.test("  # the minified guard from 2026.11.10 (plugin-node-capability.ts:344)
 
 
 def dockerfile_arg(name):

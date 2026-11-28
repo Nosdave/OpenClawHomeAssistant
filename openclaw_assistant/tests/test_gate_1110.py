@@ -444,12 +444,14 @@ class PluginSourceUnpreparedTests(unittest.TestCase):
 
 class DistPatchShippedTests(unittest.TestCase):
     def test_the_image_patch_set_carries_the_doctor_fix(self):
-        man = json.loads((ADDON / "oc-patches" / RT / "manifest.json").read_text())
+        image = "2026.11.11"  # the bundled version (Dockerfile ARG OPENCLAW_VERSION), of the 2026.11.10 line
+        self.assertIn(f"\nARG OPENCLAW_VERSION={image}\n", (ADDON / "Dockerfile").read_text())
+        man = json.loads((ADDON / "oc-patches" / image / "manifest.json").read_text())
         names = {e["name"]: e for e in man["patches"]}
         e = names["doctor-restore-env-refs-deferral"]
-        self.assertEqual(e["file"], "dist/automatic-config-repair-jSKnxU-v.mjs")
+        self.assertEqual(e["file"], "dist/automatic-config-repair-DirHmWYF.mjs")
         self.assertEqual(e["region"], "//!src/commands/doctor/shared/automatic-config-repair.ts")
-        diff = (ADDON / "oc-patches" / RT / e["diff"]).read_text()
+        diff = (ADDON / "oc-patches" / image / e["diff"]).read_text()
         self.assertIn("+function canPlanAutomaticConfigRepair(", diff)
         self.assertEqual(diff.count("withPluginContracts(()=>restoreDoctorConfigEnvRefs(u,"
                                     "prepareDoctorConfigReferenceSource(e)))"), 1)

@@ -236,9 +236,9 @@ options:
   # the same hours, counted from their own time. It also covers doctor's
   # pre-repair snapshots of whole databases (*.auth-profile-migration-*.bak,
   # *.pre-acp-*-migration-*.bak, *.pre-exec-approvals-migration-*.bak,
-  # *.doctor-gateway-token.*.bak; with OpenClaw 2026.11.10 also its copies of an
+  # *.doctor-gateway-token.*.bak; with OpenClaw 2026.11.11 also its copies of an
   # agent's models.json, models.json.bak-*, with the literal provider keys).
-  # With OpenClaw 2026.11.10 also what a gateway
+  # With OpenClaw 2026.11.11 also what a gateway
   # start's own state upgrade left (.upgrade-* without plan.json,
   # *.pre-<version>, logs/state-upgrade-*.log, .<file>.upgrade-*): the same hours
   # after the newest of it, and only after a healthy gateway start; a .upgrade-*

@@ -291,7 +291,7 @@ class RuntimeCapsTests(TmpCase):
     # the 2026.11.5+ release line (2026.11.8 and 2026.11.9 add nothing here)
     AT_1115 = dict(AT_1114, cron_partition_binding=True, retired_state_migrated=True, heartbeat_retired=True,
                    doctor_rc2_engine=True, workshop_drafts_dir=True, doctor_catalog_skips_shared_profile=True)
-    # 2026.11.10, its own release line (the bundled runtime of 0.5.94-full7): the gateway start's copy-and-swap state
+    # 2026.11.10, its own release line (0.5.94-full7 bundles its 2026.11.11): the gateway start's copy-and-swap state
     # upgrade, doctor's settled-exit watchdog, the cron changes and the skill-workshop plugin config; "-beta.1" counts
     # as 2026.11.10 (version_tuple ignores it)
     AT_11110 = dict(AT_1115, startup_state_upgrade=True, doctor_exit_watchdog=True, cron_backup_premigration=True,

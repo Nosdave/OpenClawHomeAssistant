@@ -1,4 +1,4 @@
-// Regression tests for the Telegram hotfix TG-20261023 on OpenClaw 2026.11.10 (oc-patches/2026.11.10:
+// Regression tests for the Telegram hotfix TG-20261023 on OpenClaw 2026.11.11 (oc-patches/2026.11.11:
 // telegram-voice-text-first, telegram-fetch-fresh-audio). Derived from telegram_hotfix_2026.11.4.test.mjs by way of
 // the 2026.11.8 harness (that set was never shipped and is removed). What differs from 2026.11.4:
 //  - the former parts telegram-delivery-live-custody and telegram-notice-live-guard are gone: OpenClaw fixes the
@@ -22,10 +22,10 @@
 //  - sendMediaBatch reads pendingMessageEffectParams (Telegram message effects, c1be284382d / #191646: an effect
 //    goes on the first message Telegram accepts); the harness provides it and checks that with text-first the effect
 //    and the inline keyboard go with the text, not with the voice.
-// Run in a container of the image built with OPENCLAW_VERSION=2026.11.10:
-//   node --test tests/oc_patches/telegram_hotfix_2026.11.10.test.mjs
+// Run in a container of the image built with OPENCLAW_VERSION=2026.11.11:
+//   node --test tests/oc_patches/telegram_hotfix_2026.11.11.test.mjs
 // or against an unpacked package patched by oc_dist_patch.py whose runtime dependencies resolve:
-//   OC_DIST=<copy>/dist OC_STOCK_DIST=<package>/dist node --test tests/oc_patches/telegram_hotfix_2026.11.10.test.mjs
+//   OC_DIST=<copy>/dist OC_STOCK_DIST=<package>/dist node --test tests/oc_patches/telegram_hotfix_2026.11.11.test.mjs
 import fs from 'node:fs';
 import vm from 'node:vm';
 import assert from 'node:assert/strict';
@@ -34,10 +34,10 @@ import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { pathToFileURL } from 'node:url';
 
-const OPENCLAW_VERSION = '2026.11.10';
-// Patched chunks (tests/test_dist_patch.py checks these names against oc-patches/2026.11.10/manifest.json).
-const SEND = 'send-BcsDv8XI.mjs';
-const FETCH = 'fetch-CpqTTyCO.mjs';
+const OPENCLAW_VERSION = '2026.11.11';
+// Patched chunks (tests/test_dist_patch.py checks these names against oc-patches/2026.11.11/manifest.json).
+const SEND = 'send-BNKiwrRS.mjs';
+const FETCH = 'fetch-D7iHlOMI.mjs';
 // Minified outer locals the sliced code reads (send: sendMessageTelegram; fetch: resolveTelegramTransport).
 const LOCALS = {
   send: { text: 't', opts: 'n', mediaUrls: 'h', finalMediaBatch: 'm', replyMarkup: '_', singleUseReplyTo: 'v',
