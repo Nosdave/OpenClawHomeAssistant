@@ -606,6 +606,79 @@ class DoctorCopiesOnDiskTests(T.GateEnv):
         self.assertEqual(G.doctor_copies(self.state), {C.rel(rec, self.state): (10, "recovery")})
 
 
+class ProviderApiRowsTests(Env1110):
+    """A model row of openclaw.json without api and baseUrl (row and provider): from the 2026.11.10 line it runs as
+    an OpenAI-compatible model without an endpoint and fails (rehearsal on 2026.11.11: a google fallback)."""
+
+    PROVS = {
+        "google": {"apiKey": {"source": "env", "provider": "default", "id": "GEMINI_API_KEY"}, "auth": "api-key",
+                   "models": [{"id": "gemini-4-neon", "contextWindow": 1048576}]},
+        "xai": {"models": [{"id": "grok-4.7"}, {"id": "own-api", "api": "openai-completions"}]},
+        "localx": {"models": [{"id": "m1"}]},
+        "vllm": {"baseUrl": "http://127.0.0.1:8000/v1", "apiKey": "sk-local-synthetic", "models": [{"id": "q"}]},
+        "anthropic": {"api": "anthropic-messages", "models": [{"id": "claude-x"}]},
+        "openai": {"models": [{"id": "gpt-x"}]},
+        "mistral": {"models": []},
+        "rowurl": {"models": [{"id": "r", "baseUrl": "http://127.0.0.1:9/v1"}]},
+    }
+
+    def manifests(self):
+        ext = self.pkg_dir / "dist" / "extensions"
+        for name, provs in (("google", {"google": {"api": "google-generative-ai", "baseUrl": "https://g.invalid"}}),
+                            ("xai", {"xai": {"api": "openai-responses", "baseUrl": "https://x.invalid"}}),
+                            ("broken", None)):
+            (ext / name).mkdir(parents=True, exist_ok=True)
+            (ext / name / "openclaw.plugin.json").write_text(
+                "{not json" if provs is None else json.dumps({"id": name, "modelCatalog": {"providers": provs}}))
+
+    def test_rows_without_api_and_base_url_are_listed(self):
+        cfg = {"models": {"providers": self.PROVS}}
+        self.assertEqual(G.provider_api_rows(cfg), [("google", ["gemini-4-neon"]), ("localx", ["m1"]),
+                                                    ("xai", ["grok-4.7"])])
+        for empty in ({}, {"models": []}, {"models": {"providers": "x"}}, {"models": {"providers": {"g": []}}}):
+            self.assertEqual(G.provider_api_rows(empty), [])
+
+    def test_bundled_apis_come_from_the_plugin_manifests(self):
+        self.assertEqual(G.bundled_provider_apis(str(self.pkg_dir)), {})
+        self.assertEqual(G.bundled_provider_apis(None), {})
+        self.manifests()
+        self.assertEqual(G.bundled_provider_apis(str(self.pkg_dir)),
+                         {"google": "google-generative-ai", "xai": "openai-responses"})
+
+    def precheck_lines(self, cfg, rt=RT):
+        to_1104(self.state)
+        self.write_cfg(cfg)
+        (self.upg / "gate").mkdir(parents=True, exist_ok=True)
+        (self.upg / "gate" / "migrated.json").write_text(json.dumps({"runtime": "2026.11.4", "mode": "bump"}))
+        self.set_runtime(rt, S if rt == RT else 22, A if rt == RT else 27)
+        self.hooks()
+        lines = []
+        self.quiet(G.dry_run, emit=lines.append)
+        return lines
+
+    def test_precheck_warns_with_ids_and_the_api_to_set(self):
+        self.manifests()
+        lines = self.precheck_lines(dict(CFG, models={"providers": self.PROVS}))
+        warn = [ln for ln in lines if "model providers:" in ln]
+        self.assertEqual(warn, [
+            "WARN [gate] 1/8 model providers: OpenClaw 2026.11.10 runs a model row of openclaw.json as an "
+            "OpenAI-compatible model when neither the row nor its provider block sets api or baseUrl, and every "
+            "request to it then fails (\"Provider ... requires an explicit base URL before using an "
+            "OpenAI-compatible API\"), as the primary model and as a fallback; OpenClaw 2026.11.4 used the "
+            "provider's own API. Affected: google: gemini-4-neon (set models.providers.google.api to "
+            "google-generative-ai); localx: m1 (set its api, and its baseUrl for an OpenAI-compatible API); "
+            "xai: grok-4.7 (set models.providers.xai.api to openai-responses and its baseUrl). Set it with openclaw "
+            "config set models.providers.<provider>.api <api> (the key is valid before the update too). The "
+            "migration continues"])
+        for bad in ("sk-local-synthetic", "GEMINI_API_KEY", "g.invalid", "x.invalid", "127.0.0.1"):
+            self.assertNotIn(bad, warn[0])
+
+    def test_no_warning_without_such_rows_or_before_the_line(self):
+        self.assertEqual([ln for ln in self.precheck_lines(CFG) if "model providers:" in ln], [])
+        self.assertFalse(C.runtime_caps("2026.11.4")["config_rows_openai_default"])
+        self.assertTrue(C.runtime_caps("2026.11.11")["config_rows_openai_default"])
+
+
 class NoNetworkCodexFloorTests(Env1110):
     """Offline on the update from 2026.11.4: doctor cannot update the enabled Codex plugin of 2026.11.4, which
     2026.11.10 does not load, so the no-network reason says that accepting it still ends in a hold."""

@@ -1124,7 +1124,10 @@ fixes 2026.11.11 lacks.
    2026.11.11 retires the heartbeat settings; …` (doctor turns them into cron jobs), and a
    `WARN` that ends `… the gate then holds with doctor-cron-partition …` if the default cron
    store cannot be recorded automatically
-   ([Default cron partition](#default-cron-partition)). The doctor pass lines can count
+   ([Default cron partition](#default-cron-partition)), and `WARN [gate] 1/8 model providers: …`
+   for model rows of `openclaw.json` without an API, which stop working after the update
+   until you set it ([OpenClaw 2026.11.11](#openclaw-20261111-0594-full7), "Model rows
+   without an API"). The doctor pass lines can count
    pre-repair SQLite snapshots (`… pre-repair SQLite snapshot (auth profile, ACP, exec
    approvals or gateway token migration) by doctor …`); they are deleted with the run. A pass
    line can also say `… doctor finished, but a handle kept it running, so it stopped itself
@@ -2100,9 +2103,32 @@ they are.
   behind. The new container cannot inspect that owner (another PID namespace), so OpenClaw
   waits until the lock has not been renewed for 90 seconds and then takes it over
   (openclaw/openclaw#205709): the gate's first doctor pass or the gateway start can take up
-  to about 90 seconds longer than usual. After a normal stop the lock is released, and
-  after a reboot of the host the old owner counts as stopped, so neither waits. 2026.11.10
-  did not take such a lock over by itself; 2026.11.4 did, after the same 90 seconds.
+  to about 90 seconds longer than usual (rehearsed: the gateway was ready after 114 s
+  instead of about 30 s, with `waiting for the previous Gateway to stop (last heartbeat …s
+  ago)` and `state ownership acquired after 85.1 s` in its log; a doctor pass waited 76 s).
+  During that time other `openclaw` commands in the terminal that need the state (for
+  example `openclaw sessions`, `openclaw plugins list`) end at once with `cannot verify
+  Gateway ownership from this process …`: wait and run them again. After a normal stop the
+  lock is released, and after a reboot of the host the old owner counts as stopped, so
+  neither waits. The wait can also be absent when the new container happens to get the old
+  one's PID namespace number. 2026.11.10 did not take such a lock over by itself; 2026.11.4
+  did, after the same 90 seconds.
+- **Model rows without an API.** A model you listed yourself in
+  `models.providers.<provider>.models` of `openclaw.json` now runs as an OpenAI-compatible
+  model unless the row or its provider block sets `api` or `baseUrl`, also when OpenClaw's
+  own catalog knows the model. For every provider but `openai` each request to it then
+  fails before it reaches the network: `Provider "google" requires an explicit base URL
+  before using an OpenAI-compatible API. Reload provider metadata or configure an
+  endpoint.` It fails as the primary model and as a fallback. OpenClaw 2026.11.4 used the
+  provider's own API for such a row. Rehearsed with a `google` row: after
+  `openclaw config set models.providers.google.api google-generative-ai` the model reached
+  Google's endpoint again. The precheck warns (`WARN [gate] 1/8 model providers: … Affected:
+  google: <model> (set models.providers.google.api to google-generative-ai) …`; it names
+  the API from OpenClaw's bundled provider manifests) and the migration continues;
+  `openclaw config validate`, doctor and `openclaw models status` do not report it. Set
+  the key before or after the update (it is valid in 2026.11.4 too). A provider block
+  without model rows, and one with a `baseUrl` (local servers, OpenAI-compatible
+  endpoints), is not affected.
 - **Replies to the bot's own documents.** The exception of the hotfix TG-20261112 for a
   document the bot sent now depends on what OpenClaw cached
   ([below](#telegram-replies-to-the-assistants-own-voice-messages-hotfix-tg-20261112)).
@@ -3061,11 +3087,12 @@ not have it.
 The add-on's patch `doctor-restore-env-refs-deferral` changes that one statement in
 `dist/automatic-config-repair-DirHmWYF.mjs`. Doctor now restores the references with the same
 deferred plugins as the preparation, migration and check of the repaired config around
-it. Nothing changes where the two sets already agree. In the rehearsal on 2026.11.10
-(the same module) the gate then migrated the 2026.11.4 state: pass 2 was clean, the Codex
-plugin's deferred data upgrade was recorded as completed, and the first gateway loaded
-codex, acpx and Brave. A state that the stock version had already stopped on completed
-with `oc-upgrade retry`.
+it. Nothing changes where the two sets already agree. In the rehearsal on 2026.11.11 the
+gate then migrated the 2026.11.4 state without a hold: both doctor passes ended with exit
+code 0, pass 2 left the config unchanged, a `${VAR}` reference in `openclaw.json` was
+still a reference afterwards, and the first gateway loaded codex, acpx and Brave. In the
+rehearsal on 2026.11.10 (the same module) a state that the stock version had already
+stopped on completed with `oc-upgrade retry`.
 
 Should the error still appear (an image without the patch), the gate holds with its own
 code `doctor-plugin-source-unprepared`. The advice is `oc-upgrade retry`. If the same

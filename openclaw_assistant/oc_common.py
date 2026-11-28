@@ -757,6 +757,15 @@ RUNTIME_CAPS = (
     # "skills.workshop->plugins.entries.skill-workshop.config", values already in the plugin config win): the skills
     # schema has no workshop key any more, so config validate refuses one (zod-schema.root-shape.ts)
     ("skill_workshop_plugin_config", (2026, 11, 10, 0)),
+    # a model row of openclaw.json (models.providers.<p>.models[]) whose row and provider block set neither api nor
+    # baseUrl runs as an OpenAI-compatible model without an endpoint (model.inline-provider.ts
+    # completeInlineProviderModel: api "openai-responses", baseUrl ""), also when the bundled catalog knows the
+    # model; for every provider but "openai" the request then fails with 'Provider "<p>" requires an explicit base
+    # URL before using an OpenAI-compatible API' (@openclaw/ai openai-transport-shared.ts
+    # resolveOpenAIClientBaseUrl). Rehearsed on 2026.11.11 with a google row; 2026.11.4 took the provider's own
+    # API there (its doctor did not yet remove the provider copies from the agents' models.json). Not verified on
+    # 2026.11.5 to 2026.11.10, which the add-on never bundled
+    ("config_rows_openai_default", (2026, 11, 10, 0)),
 )
 CAP_NAMES = tuple(n for n, _v in RUNTIME_CAPS)
 # Build-time record (Dockerfile): {"openclaw_version": ..., <cap>: true|false} for capabilities the image can

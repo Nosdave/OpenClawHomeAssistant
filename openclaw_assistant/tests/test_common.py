@@ -296,6 +296,7 @@ class RuntimeCapsTests(TmpCase):
     # as 2026.11.10 (version_tuple ignores it)
     AT_11110 = dict(AT_1115, startup_state_upgrade=True, doctor_exit_watchdog=True, cron_backup_premigration=True,
                     cron_bound_live_fallbacks=True, cron_load_warn_stored_only=True, cron_doctor_binds_codex=True,
+                    config_rows_openai_default=True,
                     skill_workshop_plugin_config=True)
 
     def setUp(self):

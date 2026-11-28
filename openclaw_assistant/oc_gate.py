@@ -2920,6 +2920,8 @@ class Gate:
         self.memory_remote_check()
         self.output_cap_info()
         self.delegation_check()
+        # 11h model rows without an API (WARN only)
+        self.provider_api_check()
         b = self.budget()
         if self.j is not None:
             self.j["budget"] = b
@@ -3872,6 +3874,19 @@ class Gate:
         lost = memory_remote_losses(self.cfg)
         if lost:
             self.warn(f"{self.pn('precheck')} {memory_remote_text(lost, self.pkg['version'])}")
+        return None
+
+    def provider_api_check(self):
+        """Precheck 11h (WARN, never a HOLD): from the 2026.11.10 line a model row of openclaw.json whose row and
+        provider block set neither api nor baseUrl runs as an OpenAI-compatible model without an endpoint, and
+        every request to it fails (provider_api_rows). Names provider and model ids and, from the bundled plugin
+        manifests, the API to set; no value of anything else. Read-only; runtime_caps config_rows_openai_default."""
+        if not self.caps()["config_rows_openai_default"]:
+            return None
+        rows = provider_api_rows(self.cfg)
+        if rows:
+            apis = bundled_provider_apis(self.pkg.get("pkg_dir"))
+            self.warn(f"{self.pn('precheck')} {provider_api_text(rows, apis, self.pkg['version'])}")
         return None
 
     def output_cap_info(self):
@@ -6913,6 +6928,75 @@ def memory_remote_text(lost, runtime):
             "openclaw.json) or a key for its provider in models.providers.<provider>; if it relied on shared headers "
             "that are no credential, rebuild its memory index afterwards (openclaw memory index --force). The "
             "migration continues")
+
+
+def _has_text(v):
+    return isinstance(v, str) and bool(v.strip())
+
+
+def provider_api_rows(cfg):
+    """[(provider, [model ids])] for the models.providers.<p> blocks of openclaw.json that set neither api nor baseUrl
+    and hold model rows that set neither: OpenClaw 2026.11.10+ (runtime_caps config_rows_openai_default) runs such a
+    row as an OpenAI-compatible model without an endpoint, which fails for every provider but "openai" (whose
+    endpoint the OpenAI client defaults). A block without rows keeps the catalog's models and is not listed."""
+    provs = _cfg_get(cfg if isinstance(cfg, dict) else {}, "models", "providers")
+    out = []
+    for p, pc in sorted(provs.items()) if isinstance(provs, dict) else []:
+        if not isinstance(pc, dict) or not isinstance(p, str) or not p.strip() or p.strip().lower() == "openai" \
+                or _has_text(pc.get("api")) or _has_text(pc.get("baseUrl")):
+            continue
+        ids = [row["id"].strip() for row in (pc.get("models") if isinstance(pc.get("models"), list) else [])
+               if isinstance(row, dict) and _has_text(row.get("id")) and not _has_text(row.get("api"))
+               and not _has_text(row.get("baseUrl"))]
+        if ids:
+            out.append((p.strip(), ids))
+    return out
+
+
+def bundled_provider_apis(pkg_dir):
+    """{provider id: api} from the model catalogs of the bundled plugin manifests
+    (<package>/dist/extensions/*/openclaw.plugin.json, modelCatalog.providers.<p>.api); {} when they cannot be
+    read. Reads only, at most 2 MiB per manifest."""
+    out = {}
+    try:
+        base = Path(pkg_dir) / "dist" / "extensions"
+        names = sorted(os.listdir(base))
+    except (OSError, TypeError):
+        return out
+    for name in names:
+        f = base / name / "openclaw.plugin.json"
+        try:
+            if not f.is_file() or f.stat().st_size > 2 * 1024 * 1024:
+                continue
+            provs = _cfg_get(json.loads(f.read_text(encoding="utf-8")), "modelCatalog", "providers")
+        except (OSError, ValueError):
+            continue
+        for p, pc in provs.items() if isinstance(provs, dict) else []:
+            if isinstance(p, str) and isinstance(pc, dict) and _has_text(pc.get("api")):
+                out.setdefault(p.strip().lower(), pc["api"].strip())
+    return out
+
+
+def provider_api_text(rows, apis, runtime):
+    """The precheck WARN text for provider_api_rows (provider ids, model ids and API names only)."""
+    def one(p, ids):
+        api = apis.get(p.lower())
+        if api and re.fullmatch(r"[a-z0-9][a-z0-9-]{0,63}", api):
+            fix = f"set models.providers.{printable(p)[:80]}.api to {api}" \
+                + (" and its baseUrl" if api.startswith("openai-") else "")
+        else:
+            fix = "set its api, and its baseUrl for an OpenAI-compatible API"
+        shown = ", ".join(printable(i)[:120] for i in ids[:CRON_REPORT_MAX])
+        more = f" and {len(ids) - CRON_REPORT_MAX} more" if len(ids) > CRON_REPORT_MAX else ""
+        return f"{printable(p)[:80]}: {shown}{more} ({fix})"
+    listed = "; ".join(one(p, ids) for p, ids in rows[:CRON_REPORT_MAX])
+    more = f"; and {len(rows) - CRON_REPORT_MAX} more provider(s)" if len(rows) > CRON_REPORT_MAX else ""
+    return (f"model providers: OpenClaw {printable(runtime)} runs a model row of openclaw.json as an OpenAI-compatible "
+            "model when neither the row nor its provider block sets api or baseUrl, and every request to it then "
+            "fails (\"Provider ... requires an explicit base URL before using an OpenAI-compatible API\"), as the "
+            "primary model and as a fallback; OpenClaw 2026.11.4 used the provider's own API. Affected: "
+            f"{listed}{more}. Set it with openclaw config set models.providers.<provider>.api <api> (the key is "
+            "valid before the update too). The migration continues")
 
 
 def _pos_num(v):
